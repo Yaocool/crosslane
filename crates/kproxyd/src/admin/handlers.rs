@@ -1521,14 +1521,9 @@ async fn validated_provider_filter(
     };
     let id = kproxy_core::provider::ProviderId::parse(provider)
         .map_err(|error| RpcError::bad_params(error.to_string()))?;
-    if !state
-        .providers
-        .descriptors()
-        .await
-        .iter()
-        .any(|descriptor| descriptor.id == id)
-    {
-        return Err(RpcError::bad_params(format!("provider not found: {id}")));
+    let descriptors = state.providers.descriptors().await;
+    if !descriptors.iter().any(|descriptor| descriptor.id == id) {
+        return Err(providers::unknown_provider(id.as_str(), &descriptors));
     }
     Ok(Some(id.to_string()))
 }

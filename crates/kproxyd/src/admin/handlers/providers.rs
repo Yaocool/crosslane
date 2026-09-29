@@ -57,13 +57,11 @@ pub(super) async fn handle_provider_show(state: &Arc<AppState>, params: Value) -
     }
     let params: Params = parse_params(params)?;
     let id = parse_provider_id(&params.provider)?;
-    let descriptor = state
-        .providers
-        .descriptors()
-        .await
-        .into_iter()
+    let descriptors = state.providers.descriptors().await;
+    let descriptor = descriptors
+        .iter()
         .find(|provider| provider.id == id)
-        .ok_or_else(|| RpcError::bad_params(format!("provider not found: {id}")))?;
+        .ok_or_else(|| unknown_provider(id.as_str(), &descriptors))?;
     to_value(descriptor)
 }
 
@@ -838,6 +836,18 @@ fn filter_descriptors(
     if selector.provider.as_deref() == Some("") {
         return Err(RpcError::bad_params("provider must not be empty"));
     }
+    if let Some(id) = selector
+        .provider
+        .as_deref()
+        .filter(|id| *id != ALL_PROVIDERS)
+    {
+        if !descriptors
+            .iter()
+            .any(|provider| provider.id.as_str() == id)
+        {
+            return Err(unknown_provider(id, &descriptors));
+        }
+    }
     let mut output = descriptors
         .into_iter()
         .filter(|descriptor| {
@@ -856,6 +866,18 @@ fn filter_descriptors(
         ));
     }
     Ok(output)
+}
+
+pub(super) fn unknown_provider(id: &str, descriptors: &[ProviderDescriptor]) -> RpcError {
+    let mut available = descriptors
+        .iter()
+        .map(|provider| format!("{} (kind={})", provider.id, provider.kind))
+        .collect::<Vec<_>>();
+    available.sort();
+    RpcError::bad_params(format!(
+        "provider not found: {id}; 可用实例 ID：{}。--provider 使用实例 ID，不是类型名称；运行 `kproxy provider list` 查看",
+        if available.is_empty() { "无".into() } else { available.join(", ") }
+    ))
 }
 
 async fn account_list_for_provider(
@@ -952,11 +974,22 @@ async fn copilot_runtime(
     provider: &str,
 ) -> Result<Arc<kproxy_copilot::CopilotProvider>, RpcError> {
     let id = parse_provider_id(provider)?;
-    state
-        .providers
-        .copilot(&id)
-        .await
-        .ok_or_else(|| RpcError::bad_params(format!("provider {id} is not a Copilot provider")))
+    let descriptors = state.providers.descriptors().await;
+    let descriptor = descriptors
+        .iter()
+        .find(|descriptor| descriptor.id == id)
+        .ok_or_else(|| unknown_provider(provider, &descriptors))?;
+    if descriptor.kind != "copilot" {
+        return Err(RpcError::bad_params(format!(
+            "provider {id} 的类型为 {}；该命令仅支持 GitHub Copilot (kind=copilot)",
+            descriptor.kind
+        )));
+    }
+    state.providers.copilot(&id).await.ok_or_else(|| {
+        RpcError::bad_params(format!(
+            "Copilot 实例 {id} 当前不可用；运行 `kproxy provider show {id}` 查看状态"
+        ))
+    })
 }
 
 fn parse_login_task(params: Value) -> Result<(String, String), RpcError> {
@@ -978,7 +1011,7 @@ fn provider_rpc_error(error: kproxy_provider::ProviderError) -> RpcError {
 
 #[cfg(test)]
 mod tests {
-    use super::copilot_account_state;
+    use super::*;
     use kproxy_copilot::CopilotAccountSummary;
 
     fn account() -> CopilotAccountSummary {
@@ -1006,5 +1039,36 @@ mod tests {
             (false, "disabled")
         );
         assert_eq!(copilot_account_state(true, &account()), (true, "available"));
+    }
+
+    #[test]
+    fn missing_provider_errors_list_actual_ids_without_substituting_driver_names() {
+        let descriptors = ["work-cp", "personal-cp"].map(|id| ProviderDescriptor {
+            id: ProviderId::parse(id).unwrap(),
+            kind: "copilot".into(),
+            enabled: true,
+            status: "ready".into(),
+            error: None,
+            capabilities: Default::default(),
+        });
+        let selector = ProviderSelector {
+            provider: Some("github-copilot".into()),
+            provider_kind: None,
+        };
+        let error = filter_descriptors(descriptors.to_vec(), &selector).unwrap_err();
+        assert_eq!(error.code, 400);
+        assert!(error.message.contains("work-cp (kind=copilot)"));
+        assert!(error.message.contains("personal-cp (kind=copilot)"));
+        assert!(error.message.contains("kproxy provider list"));
+        let selected = filter_descriptors(
+            descriptors.to_vec(),
+            &ProviderSelector {
+                provider: Some("work-cp".into()),
+                provider_kind: Some("copilot".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id.as_str(), "work-cp");
     }
 }
