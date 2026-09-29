@@ -269,6 +269,7 @@ fn uncomment_documented_settings() -> String {
 
 fn fully_populated_config() -> Config {
     let mut config = Config::default();
+    config.models.disabled = vec!["claude-sonnet-4.6".into()];
     config.pool.max_overage_credits_per_account = Some(500.0);
     let mut provider = ProviderConfig {
         id: "copilot".into(),
@@ -1084,4 +1085,18 @@ fn cross_provider_mapping_requires_an_explicit_source_opt_in() {
     config
         .validate()
         .expect("the source provider opt-in must enable the cross-provider rule");
+}
+#[test]
+fn disabled_models_validate_exact_global_ids_and_round_trip() {
+    let mut config = Config::default();
+    for invalid in ["", "*", "gpt ?", "kiro/claude-sonnet-4.6"] {
+        config.models.disabled = vec![invalid.into()];
+        assert!(config.validate().is_err(), "{invalid}");
+    }
+    config.models.disabled = vec!["claude-sonnet-4.6".into(), "gpt-test".into()];
+    config.validate().unwrap();
+    let decoded: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+    assert!(decoded.is_model_disabled("kiro/sonnet4.6"));
+    assert!(!decoded.is_model_disabled("claude-sonnet-4.5"));
+    assert_eq!(decoded.models.disabled, config.models.disabled);
 }

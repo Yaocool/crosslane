@@ -1,5 +1,8 @@
 //! Provider adapter contract and concurrent runtime registry.
 
+mod model_policy;
+pub use model_policy::ModelPolicy;
+
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::Arc;

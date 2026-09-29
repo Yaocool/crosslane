@@ -5,5 +5,6 @@
 pub mod account;
 pub mod config;
 pub mod ids;
+pub mod model_policy;
 pub mod paths;
 pub mod provider;

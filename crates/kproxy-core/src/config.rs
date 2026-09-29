@@ -418,6 +418,8 @@ impl Default for FeaturesConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ModelsConfig {
+    /// Globally disabled model IDs, across every provider and internal caller.
+    pub disabled: Vec<String>,
     /// 是否从上游动态发现模型。
     pub dynamic_discovery: bool,
     /// 模型缓存有效期。
@@ -427,9 +429,22 @@ pub struct ModelsConfig {
 impl Default for ModelsConfig {
     fn default() -> Self {
         Self {
+            disabled: Vec::new(),
             dynamic_discovery: true,
             cache_ttl_ms: 3_600_000,
         }
+    }
+}
+
+impl ModelsConfig {
+    pub fn is_disabled(&self, model: &str) -> bool {
+        if self.disabled.is_empty() {
+            return false;
+        }
+        let key = crate::model_policy::model_key(model);
+        self.disabled
+            .iter()
+            .any(|id| crate::model_policy::model_key(id) == key)
     }
 }
 
@@ -1097,6 +1112,23 @@ fn is_local_host(host: &str) -> bool {
 }
 
 impl Config {
+    pub fn is_model_disabled(&self, model: &str) -> bool {
+        self.models.is_disabled(self.unqualified_model(model))
+    }
+
+    pub fn unqualified_model<'a>(&self, model: &'a str) -> &'a str {
+        model
+            .split_once('/')
+            .filter(|(prefix, _)| {
+                if self.provider.is_empty() {
+                    *prefix == "kiro"
+                } else {
+                    self.provider.iter().any(|provider| provider.id == *prefix)
+                }
+            })
+            .map_or(model, |(_, id)| id)
+    }
+
     /// Provider instances after applying the legacy no-provider migration.
     pub fn effective_providers(&self) -> Vec<ProviderConfig> {
         if self.provider.is_empty() {
@@ -1385,6 +1417,27 @@ impl Config {
         }
         if self.models.dynamic_discovery && self.models.cache_ttl_ms == 0 {
             return invalid_config("models.cache_ttl_ms", "must be greater than zero");
+        }
+        for model in &self.models.disabled {
+            if model.trim().is_empty()
+                || model.contains(['*', '?'])
+                || model.chars().any(char::is_whitespace)
+            {
+                return invalid_config(
+                    "models.disabled",
+                    "must contain nonempty model IDs without whitespace or wildcards",
+                );
+            }
+            if model.split_once('/').is_some_and(|(prefix, _)| {
+                self.effective_providers()
+                    .iter()
+                    .any(|provider| provider.id == prefix)
+            }) {
+                return invalid_config(
+                    "models.disabled",
+                    "use unqualified model IDs; model disabling applies to all providers",
+                );
+            }
         }
         for (field, value) in [
             (
@@ -2099,9 +2152,13 @@ enable_tool_leak_filter = true
 default_model_id = ""
 
 # ----------------------------------------------------------------------------
-# Kiro 模型发现和后台任务
+# 全局模型开关、Kiro 模型发现和后台任务
 # ----------------------------------------------------------------------------
 [models]
+# 全局禁用的模型 ID（不带 provider 前缀），覆盖 Kiro/Copilot 与所有内部探测、回退。
+# 公共模型列表隐藏；CLI model list 标记不可用；model enable 解除，热更新生效。
+# 默认不禁用模型；取消下一行注释可启用示例规则。
+# disabled = ["claude-sonnet-4.6", "gpt-4.1"]
 # 是否从 Kiro 上游动态发现可用模型。
 dynamic_discovery = true
 # 模型发现结果的缓存时间；启用动态发现时必须大于 0。
