@@ -12,6 +12,17 @@ usage_error() {
   exit 2
 }
 
+# Only override the container's shell default when the host explicitly sets it.
+# Preserve argument boundaries and keep the value out of the Docker command line.
+exec_cli() {
+  docker_action="$1"
+  shift
+  if [ "${KPROXY_PROVIDER+x}" = x ]; then
+    exec docker "$docker_action" -e KPROXY_PROVIDER "$@"
+  fi
+  exec docker "$docker_action" "$@"
+}
+
 lifecycle_action=""
 navigation_only=0
 uninstall_yes=0
@@ -19,10 +30,12 @@ uninstall_backup_dir=""
 uninstall_retention="ask"
 top_level_command=""
 expect_socket_value=0
+expect_provider_value=0
 help_requested=0
 for argument in "$@"; do
-  if [ "$expect_socket_value" -eq 1 ]; then
+  if [ "$expect_socket_value" -eq 1 ] || [ "$expect_provider_value" -eq 1 ]; then
     expect_socket_value=0
+    expect_provider_value=0
     continue
   fi
   case "$argument" in
@@ -38,6 +51,11 @@ for argument in "$@"; do
       expect_socket_value=1
       ;;
     --socket=*)
+      ;;
+    --provider|-p)
+      expect_provider_value=1
+      ;;
+    --provider=*|-p?*)
       ;;
     *)
       if [ -z "$top_level_command" ]; then
@@ -492,7 +510,7 @@ if [ "$(container_state)" != "running" ]; then
     "$image_id" help --all >/dev/null 2>&1; then
     fail "cannot use stopped container image $image_id for offline CLI navigation; the image is unavailable or too old, so restart the service or deploy a matching image and wrapper"
   fi
-  exec docker run \
+  exec_cli run \
     --rm \
     --pull never \
     --network none \
@@ -522,15 +540,19 @@ is_account_batch=0
 top_level_command=""
 account_command=""
 expect_socket_value=0
+expect_provider_value=0
 for argument in "$@"; do
-  if [ "$expect_socket_value" -eq 1 ]; then
+  if [ "$expect_socket_value" -eq 1 ] || [ "$expect_provider_value" -eq 1 ]; then
     expect_socket_value=0
+    expect_provider_value=0
     continue
   fi
   case "$argument" in
     --json) continue ;;
     --socket) expect_socket_value=1; continue ;;
     --socket=*) continue ;;
+    --provider|-p) expect_provider_value=1; continue ;;
+    --provider=*|-p?*) continue ;;
   esac
   if [ -z "$top_level_command" ]; then
     top_level_command="$argument"
@@ -563,7 +585,7 @@ fi
 if [ -n "$host_batch_file" ] && [ "$host_batch_file" != "-" ] && [ -e "$host_batch_file" ]; then
   [ -f "$host_batch_file" ] || fail "host batch path is not a regular file: $host_batch_file"
   [ -r "$host_batch_file" ] || fail "host batch file is not readable: $host_batch_file"
-  exec docker exec -i \
+  exec_cli exec -i \
     -e KPROXY_WRAPPER_BATCH_STDIN=1 \
     -e KPROXY_WRAPPER_HOST_DATA_DIR \
     "$container_id" /usr/local/bin/kproxy "$@" < "$host_batch_file"
@@ -585,14 +607,14 @@ if [ -t 0 ] && [ -t 1 ]; then
   fi
   editor="${EDITOR:-vim}"
   visual="${VISUAL:-$editor}"
-  exec docker exec -it \
+  exec_cli exec -it \
     -e "TERM=$terminal_type" \
     -e "EDITOR=$editor" \
     -e "VISUAL=$visual" \
     -e KPROXY_WRAPPER_HOST_DATA_DIR \
     "$container_id" /usr/local/bin/kproxy "$@"
 else
-  exec docker exec -i \
+  exec_cli exec -i \
     -e KPROXY_WRAPPER_HOST_DATA_DIR \
     "$container_id" /usr/local/bin/kproxy "$@"
 fi

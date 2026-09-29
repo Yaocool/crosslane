@@ -18,6 +18,15 @@ fn run_wrapper_with_local_support(
     args: &[&str],
     local_supported: bool,
 ) -> (Output, String, String) {
+    run_wrapper_scoped(state, args, local_supported, None)
+}
+
+fn run_wrapper_scoped(
+    state: &str,
+    args: &[&str],
+    local_supported: bool,
+    provider: Option<&str>,
+) -> (Output, String, String) {
     let workspace = tempfile::tempdir().expect("tempdir");
     let docker = workspace.path().join("docker");
     let calls = workspace.path().join("docker.calls");
@@ -81,7 +90,13 @@ esac
             }
         })
         .collect::<Vec<_>>();
-    let output = Command::new("sh")
+    let mut command = Command::new("sh");
+    if let Some(provider) = provider {
+        command.env("KPROXY_PROVIDER", provider);
+    } else {
+        command.env_remove("KPROXY_PROVIDER");
+    }
+    let output = command
         .arg(wrapper)
         .args(&args)
         .env("PATH", path)
@@ -208,6 +223,65 @@ fn copilot_batch_files_are_streamed_from_the_host() {
     );
     assert!(!calls.contains("alice@example.com,secret"));
     assert_eq!(stdin, "email,password\nalice@example.com,secret\n");
+}
+
+#[test]
+fn provider_scope_does_not_break_host_batch_detection_at_any_depth() {
+    for args in [
+        &[
+            "--provider",
+            "work-cp",
+            "account",
+            "add",
+            "--batch",
+            "__HOST_BATCH__",
+        ][..],
+        &[
+            "account",
+            "--provider",
+            "work-cp",
+            "add",
+            "--batch",
+            "__HOST_BATCH__",
+        ][..],
+        &[
+            "-p",
+            "work-cp",
+            "account",
+            "add",
+            "--batch",
+            "__HOST_BATCH__",
+        ][..],
+        &["account", "-pwork-cp", "add", "--batch", "__HOST_BATCH__"][..],
+        &[
+            "--provider=work-cp",
+            "account",
+            "add",
+            "--batch",
+            "__HOST_BATCH__",
+        ][..],
+    ] {
+        let (output, calls, stdin) = run_wrapper("running", args);
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+        assert!(calls.contains("KPROXY_WRAPPER_BATCH_STDIN=1"), "{calls}");
+        assert_eq!(stdin, "email,password\nalice@example.com,secret\n");
+    }
+}
+
+#[test]
+fn host_provider_default_is_forwarded_for_business_batch_and_offline_navigation() {
+    for (state, args) in [
+        ("running", &["account", "list"][..]),
+        (
+            "running",
+            &["account", "add", "--batch", "__HOST_BATCH__"][..],
+        ),
+        ("exited", &["guide", "copilot"][..]),
+    ] {
+        let (output, calls, _) = run_wrapper_scoped(state, args, true, Some("work-cp"));
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert!(calls.contains("-e KPROXY_PROVIDER "), "{calls}");
+    }
 }
 
 #[test]
