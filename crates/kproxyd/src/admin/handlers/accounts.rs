@@ -151,10 +151,9 @@ pub(super) async fn handle_account_services(
     state: &Arc<AppState>,
     params: serde_json::Value,
 ) -> Handled {
-    let params: AccountRefParams = parse_params(params)?;
-    let account = state
-        .with_accounts(|store| store.find(&params.id).cloned())
-        .ok_or_else(|| RpcError::bad_params(format!("account not found: {}", params.id)))?;
+    let account: kproxy_ipc::protocol::ProviderAccountSummary =
+        serde_json::from_value(super::providers::handle_account_show(state, params).await?)
+            .map_err(|error| RpcError::internal(error.to_string()))?;
     let config = state.config.current();
     let runtime = state
         .proxy_services
@@ -166,7 +165,9 @@ pub(super) async fn handle_account_services(
     let mut services = config
         .proxy_service
         .iter()
-        .filter(|service| service.includes_account(&account))
+        .filter(|service| {
+            service.includes_provider_account(&account.provider_id, &account.id, &account.tags)
+        })
         .map(|service| {
             let mut binding_sources = Vec::new();
             if service.uses_global_account_pool() {
@@ -180,11 +181,10 @@ pub(super) async fn handle_account_services(
                         .map(|tag| format!("tag:{tag}")),
                 );
             }
-            if service
-                .account_ids
-                .iter()
-                .any(|account_id| account_id == &account.id)
-            {
+            if service.account_ids.iter().any(|account_id| {
+                account_id == &format!("{}/{}", account.provider_id, account.id)
+                    || (account.provider_id == "kiro" && account_id == &account.id)
+            }) {
                 binding_sources.push("manual".to_owned());
             }
             let running = runtime.get(&service.id).is_some_and(|view| view.running);
@@ -204,8 +204,12 @@ pub(super) async fn handle_account_services(
             .then_with(|| left.service_id.cmp(&right.service_id))
     });
     to_value(AccountServicesResult {
-        account_id: account.id,
-        account_email: account.email,
+        account_id: if account.provider_id == "kiro" {
+            account.id
+        } else {
+            format!("{}/{}", account.provider_id, account.id)
+        },
+        account_email: account.email.unwrap_or(account.display_name),
         services,
     })
 }

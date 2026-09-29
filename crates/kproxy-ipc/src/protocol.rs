@@ -596,6 +596,8 @@ pub struct ProxyServiceApiKeysParams {
 pub struct ProxyServiceAccountsParams {
     /// 服务 ID 或名称。
     pub service: String,
+    #[serde(default)]
+    pub provider: Option<String>,
 }
 
 /// `service.account.add` / `service.account.remove` 参数。
@@ -605,6 +607,8 @@ pub struct ProxyServiceAccountChangeParams {
     pub service: String,
     /// 账号 ID 或邮箱。
     pub accounts: Vec<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
 }
 
 /// API 代理服务的有效账号池。
@@ -624,6 +628,9 @@ pub struct ProxyServiceAccountsResult {
     pub excluded_account_ids: Vec<String>,
     #[serde(default)]
     pub accounts: Vec<AccountSummary>,
+    /// Unified pool view. The legacy Kiro-only accounts array remains available.
+    #[serde(default)]
+    pub provider_accounts: Vec<ProviderAccountSummary>,
 }
 
 /// 服务绑定的 API key 视图。

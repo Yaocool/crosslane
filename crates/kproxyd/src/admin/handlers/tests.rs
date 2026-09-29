@@ -259,6 +259,100 @@ async fn mixed_provider_tag_batch_validates_duplicates_and_ambiguity_before_muta
 }
 
 #[tokio::test]
+async fn copilot_service_pool_uses_tags_qualified_bindings_and_exclusions() {
+    let (_directory, state) = state_with_copilot().await;
+    expect_ok(
+        dispatch(
+            &state,
+            Request::new(
+                1,
+                method::V2_ACCOUNT_TAG,
+                serde_json::json!({"id":"acc_b85b28b7","add":["team"]}),
+            ),
+        )
+        .await,
+    );
+    let service = ProxyServiceConfig {
+        id: "svc_copilot".into(),
+        name: "copilot-test".into(),
+        enabled: false,
+        host: "127.0.0.1".into(),
+        port: 5589,
+        allowed_providers: vec!["copilot".into()],
+        default_provider: "copilot".into(),
+        account_tag: Some(ServiceAccountTags::One("team".into())),
+        ..ProxyServiceConfig::default()
+    };
+    let mut config = state.config.current().as_ref().clone();
+    config.proxy_service.push(service.clone());
+    state.config.replace(config.clone());
+    let result = service_accounts_result(&state, &service).await.unwrap();
+    assert_eq!(result["accounts"], serde_json::json!([]));
+    assert_eq!(result["provider_accounts"][0]["provider_id"], "copilot");
+    let bound = expect_ok(
+        dispatch(
+            &state,
+            Request::new(
+                2,
+                method::ACCOUNT_SERVICES,
+                serde_json::json!({"id":"acc_b85b28b7"}),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(
+        bound["services"][0]["binding_sources"],
+        serde_json::json!(["tag:team"])
+    );
+    assert!(matches!(
+        dispatch(
+            &state,
+            Request::new(
+                3,
+                method::V2_ACCOUNT_TAG,
+                serde_json::json!({"id":"acc_b85b28b7","remove":["team"]})
+            )
+        )
+        .await,
+        Response::Err { .. }
+    ));
+    assert!(matches!(
+        dispatch(
+            &state,
+            Request::new(
+                4,
+                method::V2_ACCOUNT_REMOVE,
+                serde_json::json!({"id":"acc_b85b28b7"})
+            )
+        )
+        .await,
+        Response::Err { .. }
+    ));
+    config.proxy_service[0].excluded_account_ids = vec!["copilot/acc_b85b28b7".into()];
+    state.config.replace(config.clone());
+    let result = service_accounts_result(&state, &config.proxy_service[0])
+        .await
+        .unwrap();
+    assert_eq!(result["provider_accounts"], serde_json::json!([]));
+    expect_ok(
+        dispatch(
+            &state,
+            Request::new(
+                5,
+                method::V2_ACCOUNT_TAG,
+                serde_json::json!({"id":"acc_b85b28b7","add":["unbound"]}),
+            ),
+        )
+        .await,
+    );
+    let mut manual = service;
+    manual.account_tag = Some(ServiceAccountTags::One("no-match".into()));
+    manual.account_ids = vec!["copilot/acc_b85b28b7".into()];
+    let result = service_accounts_result(&state, &manual).await.unwrap();
+    assert_eq!(result["provider_accounts"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn remote_copilot_login_rejects_missing_or_malformed_credentials_without_echoing_secrets() {
     let (_directory, state) = state_with(vec![]).await;
     for (method, params, expected) in [
@@ -829,7 +923,7 @@ async fn service_account_pool_combines_tag_manual_accounts_and_exclusions() {
             Request::new(
                 4,
                 method::SERVICE_ACCOUNT_ADD,
-                serde_json::json!({"service":"team","accounts":["manual@example.com"]}),
+                serde_json::json!({"service":"team","accounts":["MANUAL@EXAMPLE.COM"]}),
             ),
         )
         .await,

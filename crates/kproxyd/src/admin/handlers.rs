@@ -696,10 +696,22 @@ async fn handle_status(state: &Arc<AppState>, params: serde_json::Value) -> Hand
                 })
                 .collect::<Vec<_>>();
             readiness_providers.extend(relevant.iter().map(|provider| (*provider).to_string()));
-            if !relevant
+            let service_config = config
+                .proxy_service
                 .iter()
-                .any(|provider| available_accounts.contains(*provider))
-            {
+                .find(|configured| configured.id == service.id);
+            if !account_list.accounts.iter().any(|account| {
+                account.enabled
+                    && account.health == "available"
+                    && relevant.contains(&account.provider_id.as_str())
+                    && service_config.is_some_and(|configured| {
+                        configured.includes_provider_account(
+                            &account.provider_id,
+                            &account.id,
+                            &account.tags,
+                        )
+                    })
+            }) {
                 readiness_reasons.push(format!(
                     "proxy service {} has no available account in its provider scope",
                     service.name
@@ -1569,7 +1581,25 @@ async fn handle_service_accounts(state: &Arc<AppState>, params: serde_json::Valu
         .iter()
         .find(|service| service.id == selector || service.name == selector)
         .ok_or_else(|| RpcError::bad_params(format!("proxy service not found: {selector}")))?;
-    service_accounts_result(state, service).await
+    let mut result = service_accounts_result(state, service).await?;
+    if let Some(provider) = params.provider.filter(|id| id != "all") {
+        if !config
+            .effective_providers()
+            .iter()
+            .any(|p| p.id == provider)
+        {
+            return Err(RpcError::bad_params(format!(
+                "provider not found: {provider}"
+            )));
+        }
+        if let Some(accounts) = result["provider_accounts"].as_array_mut() {
+            accounts.retain(|account| account["provider_id"] == provider);
+        }
+        if provider != "kiro" {
+            result["accounts"] = serde_json::json!([]);
+        }
+    }
+    Ok(result)
 }
 
 async fn handle_service_account_change(
@@ -1609,21 +1639,29 @@ async fn handle_service_account_change(
             .await
             .map_err(RpcError::bad_params)?;
     }
-    let accounts = state.with_accounts(|store| store.all().to_vec());
     let mut resolved_ids = Vec::new();
     for reference in params.accounts {
         let reference = reference.trim();
         if reference.is_empty() {
             return Err(RpcError::bad_params("account references must not be empty"));
         }
-        let account = accounts
-            .iter()
-            .find(|account| {
-                account.id == reference || account.email.eq_ignore_ascii_case(reference)
-            })
-            .ok_or_else(|| RpcError::bad_params(format!("account not found: {reference}")))?;
-        if !resolved_ids.contains(&account.id) {
-            resolved_ids.push(account.id.clone());
+        let resolved =
+            providers::resolve_account_ref(state, params.provider.as_deref(), reference).await?;
+        let value = providers::handle_account_show(
+            state,
+            serde_json::json!({"id":resolved.account_id,"provider":resolved.provider_id}),
+        )
+        .await?;
+        let id = value["id"]
+            .as_str()
+            .ok_or_else(|| RpcError::internal("account has no id"))?;
+        let qualified = if resolved.provider_id.as_str() == "kiro" {
+            id.to_owned()
+        } else {
+            format!("{}/{id}", resolved.provider_id)
+        };
+        if !resolved_ids.contains(&qualified) {
+            resolved_ids.push(qualified);
         }
     }
 
@@ -1635,6 +1673,31 @@ async fn handle_service_account_change(
         .find(|service| service.id == selector || service.name == selector)
         .ok_or_else(|| RpcError::bad_params(format!("proxy service not found: {selector}")))?;
     let original_service = service.clone();
+    // Both forms are accepted for Kiro, but mutations persist the legacy form
+    // so adding a qualified alias also clears an existing qualified exclusion.
+    for references in [&mut service.account_ids, &mut service.excluded_account_ids] {
+        for id in references.iter_mut() {
+            if let Some(local) = id.strip_prefix("kiro/") {
+                *id = local.to_owned();
+            }
+        }
+        references.sort();
+        references.dedup();
+    }
+    if add {
+        for id in &resolved_ids {
+            let provider = id.split_once('/').map(|(p, _)| p).unwrap_or("kiro");
+            if !(if service.allowed_providers.is_empty() {
+                provider == "kiro"
+            } else {
+                service.allowed_providers.iter().any(|p| p == provider)
+            }) {
+                return Err(RpcError::bad_params(format!(
+                    "provider {provider} is not allowed for this service"
+                )));
+            }
+        }
+    }
     if add {
         service
             .excluded_account_ids
@@ -1701,6 +1764,29 @@ async fn service_accounts_result(state: &Arc<AppState>, service: &ProxyServiceCo
     accounts.sort_by(|left, right| {
         compare_account_identity(&left.email, &left.id, &right.email, &right.id)
     });
+    let all: ProviderAccountListResult = serde_json::from_value(
+        providers::handle_account_list(state, serde_json::Value::Null).await?,
+    )
+    .map_err(|error| RpcError::internal(error.to_string()))?;
+    let allowed = state
+        .config
+        .current()
+        .allowed_providers_for_service(service)
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if all.errors.keys().any(|provider| allowed.contains(provider)) {
+        return Err(RpcError::bad_params(
+            "service account pool is unavailable for one or more providers",
+        ));
+    }
+    let provider_accounts = all
+        .accounts
+        .into_iter()
+        .filter(|account| {
+            service.includes_provider_account(&account.provider_id, &account.id, &account.tags)
+        })
+        .collect();
     to_value(ProxyServiceAccountsResult {
         service_id: service.id.clone(),
         service_name: service.name.clone(),
@@ -1714,6 +1800,7 @@ async fn service_accounts_result(state: &Arc<AppState>, service: &ProxyServiceCo
         account_ids: service.account_ids.clone(),
         excluded_account_ids: service.excluded_account_ids.clone(),
         accounts,
+        provider_accounts,
     })
 }
 

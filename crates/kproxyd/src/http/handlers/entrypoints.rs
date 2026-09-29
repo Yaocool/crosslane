@@ -29,8 +29,9 @@ struct ServiceAccountHealth {
 
 async fn service_account_health(service: &ServiceHttpState) -> ServiceAccountHealth {
     let config = service.app.config.current();
+    let current_service = service.current_service();
     let allowed = config
-        .allowed_providers_for_service(&service.service)
+        .allowed_providers_for_service(&current_service)
         .into_iter()
         .map(str::to_owned)
         .collect::<BTreeSet<_>>();
@@ -96,6 +97,13 @@ async fn service_account_health(service: &ServiceHttpState) -> ServiceAccountHea
                     continue;
                 };
                 for account in runtime.account_summaries().await {
+                    if !current_service.includes_provider_account(
+                        &provider.id,
+                        &account.id,
+                        &account.tags,
+                    ) {
+                        continue;
+                    }
                     health.total += 1;
                     if !provider.enabled || !account.enabled {
                         health.disabled += 1;

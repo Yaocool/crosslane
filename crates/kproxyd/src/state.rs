@@ -263,7 +263,7 @@ impl AppState {
         web_search_replay: WebSearchReplayCodec,
     ) -> anyhow::Result<Self> {
         let current = config.current();
-        validate_service_account_references(&current, accounts.all())
+        validate_service_account_references(&current, accounts.all(), &paths.data_dir)
             .map_err(anyhow::Error::msg)?;
         meter.set_daily_limit(current.pool.daily_credit_limit);
         accounts.set_compression_threshold(current.storage.compression_threshold);
@@ -538,7 +538,7 @@ impl AppState {
         let previous = self.runtime_config_snapshot();
         validate_service_account_tag_transitions(&previous, next)?;
         let accounts = self.with_accounts(|store| store.all().to_vec());
-        validate_service_account_references(next, &accounts)?;
+        validate_service_account_references(next, &accounts, &self.paths.data_dir)?;
         self.config.replace(next.clone());
         self.apply_runtime_config(next);
         if let Err(error) = self.providers.reconcile(next, &self.paths.data_dir).await {
@@ -1321,6 +1321,7 @@ fn same_account_tags(left: &[String], right: &[String]) -> bool {
 fn validate_service_account_references(
     config: &Config,
     accounts: &[Account],
+    data_dir: &std::path::Path,
 ) -> Result<(), String> {
     let known_ids = accounts
         .iter()
@@ -1332,7 +1333,38 @@ fn validate_service_account_references(
         // deleted, preventing an account re-imported with the same ID from
         // silently rejoining this service.
         for account_id in &service.account_ids {
-            if !known_ids.contains(account_id.as_str()) {
+            let (provider_id, local_id) = account_id
+                .split_once('/')
+                .unwrap_or(("kiro", account_id.as_str()));
+            let exists = if provider_id == "kiro" {
+                known_ids.contains(local_id)
+            } else {
+                let provider = config
+                    .effective_providers()
+                    .into_iter()
+                    .find(|p| p.id == provider_id && p.kind == "copilot");
+                if provider.is_none() {
+                    return Err(format!("unknown account provider {provider_id}"));
+                }
+                kproxy_core::provider::ProviderId::parse(provider_id)
+                    .map_err(|error| error.to_string())?;
+                let file = data_dir
+                    .join("providers")
+                    .join(provider_id)
+                    .join("accounts.json");
+                let value: serde_json::Value = std::fs::read(file)
+                    .ok()
+                    .and_then(|raw| serde_json::from_slice(&raw).ok())
+                    .unwrap_or_default();
+                // Legacy arrays and the provider-scoped persistence envelope.
+                let items = value.get("accounts").unwrap_or(&value);
+                let owner_matches = value.get("provider_id").is_none_or(|id| id == provider_id);
+                owner_matches
+                    && items
+                        .as_array()
+                        .is_some_and(|items| items.iter().any(|account| account["id"] == local_id))
+            };
+            if !exists {
                 return Err(format!(
                     "proxy service {} ({}) references unknown account {account_id}",
                     service.name, service.id

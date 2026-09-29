@@ -876,6 +876,118 @@ async fn copilot_provider_routes_native_chat_models_mapping_and_usage_end_to_end
         Response::Err { .. }
     ));
 
+    // A Chat-only upstream model is available through both other public APIs.
+    for streaming in [false, true] {
+        let reply = if streaming {
+            ResponseTemplate::new(200).set_body_raw(
+                "data: {\"id\":\"bridge\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"adapted\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":6,\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":2}},\"copilot_usage\":{\"total_nano_aiu\":55}}\n\ndata: [DONE]\n\n",
+                "text/event-stream")
+        } else {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id":"bridge","model":"gpt-test","choices":[{"message":{"role":"assistant","content":"adapted"},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":6,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":2}},
+                "copilot_usage":{"total_nano_aiu":55}
+            }))
+        };
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"stream":streaming,"max_completion_tokens":64}),
+            ))
+            .respond_with(reply)
+            .expect(2)
+            .mount(&upstream)
+            .await;
+        for endpoint in ["messages", "responses"] {
+            let body = if endpoint == "messages" {
+                serde_json::json!({"model":"gpt-test","messages":[{"role":"user","content":"hello"}],"max_tokens":64,"stream":streaming})
+            } else {
+                serde_json::json!({"model":"gpt-test","input":"hello","max_output_tokens":64,"stream":streaming})
+            };
+            let response = client
+                .post(format!("http://127.0.0.1:{port}/v1/{endpoint}"))
+                .bearer_auth(daemon.api_key.as_deref().unwrap())
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let text = response.text().await.unwrap();
+            assert!(text.contains("adapted"), "{endpoint}: {text}");
+            assert!(text.contains("total_nano_aiu"));
+            if streaming {
+                assert!(text.contains(if endpoint == "messages" {
+                    "message_stop"
+                } else {
+                    "response.completed"
+                }));
+            }
+        }
+    }
+    // Token counting is explicit local estimation on non-Messages models.
+    let counted = client.post(format!("http://127.0.0.1:{port}/v1/messages/count_tokens"))
+        .bearer_auth(daemon.api_key.as_deref().unwrap())
+        .json(&serde_json::json!({"model":"gpt-test","messages":[{"role":"user","content":"estimate input"}]}))
+        .send().await.unwrap();
+    assert_eq!(counted.status(), reqwest::StatusCode::OK);
+    assert_eq!(counted.headers()["x-kproxy-token-count-source"], "estimate");
+    let counted: serde_json::Value = counted.json().await.unwrap();
+    assert_eq!(counted["estimated"], true);
+    assert!(counted["input_tokens"].as_u64().unwrap() > 0);
+    let keys = expect_ok(
+        daemon
+            .call("apikey.list", serde_json::json!({"provider":"copilot"}))
+            .await,
+    );
+    let history = keys[0]["usage"]["history"].as_array().unwrap();
+    let adapted = history
+        .iter()
+        .filter(|record| record["provider_billing"]["amount"] == 55)
+        .count();
+    assert_eq!(adapted, 4);
+    assert_eq!(history.last().unwrap()["token_usage_source"], "unreported");
+
+    // The same service account commands persist qualified Copilot membership.
+    let service_id = services["services"][0]["id"].as_str().unwrap();
+    let removed = expect_ok(
+        daemon
+            .call(
+                "service.account.remove",
+                serde_json::json!({
+                    "service":service_id,"accounts":[account_id],"provider":"copilot"
+                }),
+            )
+            .await,
+    );
+    assert_eq!(removed["provider_accounts"], serde_json::json!([]));
+    let health: serde_json::Value = client
+        .get(format!("http://127.0.0.1:{port}/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(health["total_accounts"], 0);
+    let blocked = client.post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .bearer_auth(daemon.api_key.as_deref().unwrap())
+        .json(&serde_json::json!({"model":"gpt-test","messages":[{"role":"user","content":"excluded"}],"max_tokens":64}))
+        .send().await.unwrap();
+    assert_eq!(blocked.status(), reqwest::StatusCode::BAD_REQUEST);
+    let added = expect_ok(
+        daemon
+            .call(
+                "service.account.add",
+                serde_json::json!({
+                    "service":service_id,"accounts":[format!("copilot/{account_id}")]
+                }),
+            )
+            .await,
+    );
+    assert_eq!(added["provider_accounts"][0]["id"], account_id);
+    let stored = std::fs::read_to_string(daemon.home.path().join("config.toml")).unwrap();
+    assert!(stored.contains(&format!("copilot/{account_id}")));
+
     upstream.verify().await;
     daemon.stop().await;
 }
