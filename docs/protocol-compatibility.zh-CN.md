@@ -4,6 +4,43 @@
 
 本文描述当前源码的 Claude Messages 与 OpenAI Chat Completions 转换行为。Responses 的工具、状态和流式差异见 [Responses 与 Codex 接入](openai-responses.md)。兼容指可接入以下能力，不代表完整实现官方 API。
 
+## Copilot 三协议转换
+
+动态发现的所有非 embedding Copilot 生成模型均提供 Messages、Chat Completions 和 Responses。
+调度先限定服务账号池和账号真实模型目录，优先原生接口，缺少目标协议时才转换。
+公开 `protocols` 包含三种接口，`capabilities.native_protocols` 保留上游原生协议；内部逐账号
+目录不被扩写，转换不会绕过模型权限。
+
+转换覆盖完整历史、system/developer、函数工具与并行结果、图片/内联文件、文本/思考增量、
+结束原因、usage/cache 和原始 `copilot_usage`。流式处理支持 UTF-8 分片、CRLF、多行 SSE、
+稳定工具索引与尾部用量；错误或断流不会补发成功事件。转换路径限制单个 SSE 事件 8 MiB、
+完整响应/累计流 64 MiB。
+协议要求的初始零用量用 `kproxy_usage_source: unreported` 标记，收到真实 usage 后才
+按 provider 用量记录，避免把“未报告”误记为“报告了零”。
+拒绝回答会保留正文和 OpenAI refusal 字段。输出长度耗尽时保留工具参数片段和未完成的
+结束原因，Responses 输出项也标记为 incomplete，不将正常截断误报成传输失败。
+JSON Schema 在 Chat `response_format`、Responses `text.format` 和 Messages
+`output_config.format` 之间转换，并保留同时指定的 thinking effort。转换到 Messages
+时需要具体 schema；OpenAI `json_object` 模式应使用原生 OpenAI 接口或改为明确 schema。
+最终 schema 约束仍取决于上游模型能力，字段依据
+[Anthropic 结构化输出契约](https://platform.claude.com/docs/en/build-with-claude/structured-outputs)。
+
+需要转换时不模拟上游托管能力：`previous_response_id`/`conversation` 应改成完整历史，
+后台任务、托管工具和远端文件 ID 会明确报错；原生路径仍保留这些字段。
+协议转换不为模型增加视觉/推理能力，也不保证结构化输出；不透明思考签名无法跨协议通用回放。
+已知 Claude 家族按版本选择 manual/adaptive thinking，未知模型不强加 Claude 思考参数。
+`count_tokens` 对原生 Messages 模型透传，其他模型返回带 `estimated: true` 和
+`x-kproxy-token-count-source: estimate` 的本地估算，不计为上游生成用量。
+
+本次独立 Rust 实现参考了高关注度项目
+[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI/tree/main/internal/translator) 的双向转换与流式生命周期、
+[LiteLLM](https://github.com/BerriAI/litellm) 的协议/能力边界，以及
+[copilot-api](https://github.com/ericc-ch/copilot-api) 的 Copilot Messages 适配。
+思考模式依据 [Anthropic 文档](https://platform.claude.com/docs/en/build-with-claude/extended-thinking)。
+测试使用 mock 上游，不代表真实 Copilot 席位与全部模型已逐一验收。
+
+下文的 Kiro 专用转换规则不改变 Copilot 原生转发。
+
 ## Kiro 客户端版本与 2026 年 11 月停用通知
 
 根据收到的 AWS Health 通知，2026-11-09 起，IDE 低于 `0.11.133`、CLI 低于

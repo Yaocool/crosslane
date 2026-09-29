@@ -239,9 +239,11 @@ kproxy service remove-account team-a alice@example.com
 The effective pool is “any selected tag matches + explicit additions - exclusions”; exclusion
 wins. Without a service tag, the base set contains every account. Health,
 readiness, model discovery, initial dispatch, retries, and compaction summaries
-all stay within the service's effective pool. An account that belongs to any
-service cannot have its tags changed or be deleted; inspect every binding with
-`account services`, then unbind it from each service with `service remove-account`.
+all stay within the service's effective pool. A Kiro account that belongs to any
+service cannot have its tags changed or be deleted. Copilot also protects bound
+accounts from deletion and tag changes that remove them from an existing pool;
+adding labels to a global/manual pool is allowed. Inspect bindings with
+`account services`, then unbind with `service remove-account` when required.
 Stop a service before changing its pool tag:
 
 ```bash
@@ -250,8 +252,10 @@ kproxy service edit team-a --account-tag team-b team-c  # or --clear-account-tag
 kproxy service enable team-a
 ```
 
-Omitting `--host` defaults to `0.0.0.0`. Key listings expose metadata unless
-`--show-secret` is supplied. Services accept only bound API keys. Messages defaults
+Omitting `--host` defaults to `0.0.0.0`. `service apikey <service>` (alias of
+`service apikeys`) displays full keys by default, including JSON output. Use
+`--redact` to hide them; the old `--show-secret` flag is still accepted.
+Services accept only bound API keys. Messages defaults
 to Claude Code admission; Chat/Responses default to Codex. To allow another client,
 use `service edit` or `apikey edit` with `--skip-user-agent-check true`. Key authentication,
 quota and concurrency limits still apply. Request examples are in the [README](../README.md)
@@ -455,6 +459,43 @@ Replace IDs, names, paths and secrets with your own values. `diagnose all` and
 `ready`, `account list`, and `logs show` for initial inspection.
 
 ## Migration from the old CLI
+
+Provider scope is shared across the command tree: `kproxy --provider copilot
+account list`, `kproxy account --provider copilot list` and the leaf form are
+equivalent. `-p` is the short form. `KPROXY_PROVIDER` sets the shell default;
+explicit flags override it. The value is the configured instance ID shown by
+`provider list`, not the driver kind or the display name “GitHub Copilot”.
+For example, an instance created with `--id work-cp --kind copilot` uses
+`--provider work-cp`. `provider show work-cp` prints commands using that ID;
+`guide copilot -p work-cp` also produces matching setup examples.
+The Docker wrapper forwards this shell default and recognizes provider options
+before or after command groups when streaming a host CSV. Update the installed
+wrapper together with the CLI to use these forms.
+
+Nested help and `help --all` identify shared, Kiro-only, Copilot-only, global and
+resource-selected commands. Global operations and commands that locate a
+resource by positional ID/name ignore `KPROXY_PROVIDER` and reject an explicit
+`--provider` instead of silently ignoring it. Global model disable/enable retains
+its stricter check: override a shell scope with `--provider all`. Kiro tasks accept
+only `kiro`; model-cache refresh accepts an instance ID; global tasks do not take
+a provider. `tasks list` labels the scope of each task.
+
+For `service edit`, `apikey edit`, and `model-map edit`, provider permission changes
+require an explicit `--provider`; the shell default never replaces existing
+permissions. `--provider` and `--clear-providers` cannot be combined.
+When `service edit --provider ...` excludes the current default provider, the first
+new ID becomes the default unless `--default-provider` is supplied. Existing defaults
+still in scope are retained. API key permissions remain independent.
+
+Use `account add --provider kiro --auth sso/api-key` or `--provider copilot
+--auth device-flow` for the shared authentication entry point; the old Kiro
+commands remain available. See the [provider guide](providers-and-copilot.zh-CN.md#统一和按来源管理).
+
+`pool` and `account refresh/probe/reset-health --all` now default to all providers;
+pass `--provider kiro` to retain the previous scope. `account export` still
+defaults to the legacy Kiro format; request `--provider all` for unified export.
+Service account listing, tags, explicit bindings and exclusions now include
+Copilot. Qualify ambiguous account references with `provider/account_id`.
 
 | Previous form | Current form |
 | --- | --- |

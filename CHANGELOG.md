@@ -1,13 +1,22 @@
 # Changelog
 
 This file records user-visible changes. The current source still declares
-`0.2.4`, but includes changes after the `v0.2.4` tag. Items below are unreleased;
+`1.2.0`, and this history includes changes after the `v0.2.4` tag. Items below are unreleased;
 they must receive a new version rather than replacing that tag or its image.
 
 ## Unreleased — since v0.2.4
 
 ### Breaking changes and migration
 
+- `service apikey` / `service apikeys` now display full API keys by default in
+  text and JSON; use `--redact` to hide them. Old secret-display flags still work.
+- Explicit `--provider` on global or resource-ID-selected commands now fails
+  instead of being ignored. Shell provider defaults do not affect those commands;
+  global model policy retains its explicit `--provider all` override requirement.
+
+- `pool` and `account refresh/probe/reset-health --all` now default to all
+  providers. Use `--provider kiro` to keep the old scope. Account export keeps its
+  legacy Kiro default; use `--provider all` for a unified export.
 - CLI groups `logs`, `models`, `tasks`, and `diagnose` now show help when used
   without an action. Use `logs show`, `models list`, `tasks list`, and `diagnose all`
   for data. Bare groups with `--json` fail with exit code 2.
@@ -22,6 +31,28 @@ they must receive a new version rather than replacing that tag or its image.
 
 ### Added
 
+- Provider ID/type columns, actual-instance next-step hints, per-command scope
+  labels, task scope summaries, `-p` at every command depth, scoped provider lists,
+  and custom-ID setup guides. Missing-provider errors list configured IDs. Service
+  scope edits retain a valid default or select the first newly allowed provider.
+- Docker wrapper forwarding for `KPROXY_PROVIDER` and host CSV batches with a
+  provider option at any command depth. Update the installed wrapper with the CLI.
+
+- Persistent global model disabling with `model disable/enable` (`models` remains
+  supported). CLI lists retain disabled entries; public catalogs hide them.
+  Shared transport barriers reject disabled models across protocols, mappings,
+  defaults, fallback, retries, stream continuations and internal probes, including
+  clients created before a hot reload. Configuration resets preserve deny rules.
+
+- Global `--provider` at any command depth and `KPROXY_PROVIDER` shell defaults;
+  a shared `account add` entry point for Kiro SSO/API keys and Copilot Device Flow.
+  Existing provider-specific authentication commands remain available.
+- Chat Completions, Responses and Messages JSON/SSE adaptation for every
+  discovered non-embedding Copilot generation model, with native endpoint
+  preference, function-tool history, multimodal input, usage and billing retention.
+  Local token-count estimates are explicitly marked when Messages is not native.
+- Unified service account listing, binding, tag pools and exclusions for Kiro
+  and Copilot; qualified account references persist without changing legacy IDs.
 - Per-service account pools selected by account tag, with global-pool fallback,
   explicit account additions and exclusions, binding-aware account mutation
   guards, stopped-service-only tag changes, reverse account-to-service lookup,
@@ -44,6 +75,16 @@ they must receive a new version rather than replacing that tag or its image.
 
 ### Fixed
 
+- Preserve existing resource permissions when editing under `KPROXY_PROVIDER`;
+  require explicit scope changes and reject contradictory provider flags.
+- Report partial provider-pool discovery as a failure with retained error details;
+  exclude globally disabled models from operational account/pool availability.
+- Retain structured-output schemas, refusal content, and incomplete tool-call
+  finish reasons across Copilot protocol conversion, including streaming output.
+- Resolve Copilot accounts when tagging by bare ID, including the legacy tag RPC;
+  validate all batch selectors and duplicate aliases before changing tags.
+- Apply Copilot service account membership to scheduling and health/readiness,
+  observe live membership edits, and retain protocol errors in request statistics.
 - Update upstream client identities to Kiro IDE `1.0.437` and CLI `2.21.4`
   ahead of the 2026-11-09 retirement of older clients. Share the version baseline
   across generation, metadata and Social token refresh, add missing CLI Management

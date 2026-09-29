@@ -4,6 +4,55 @@
 
 This reference describes Claude Messages and OpenAI Chat Completions in the current source. See [Responses and Codex](openai-responses.md) for its tool, state, and streaming contracts. Compatibility covers the behavior below, not the complete hosted APIs.
 
+## Copilot protocol adaptation
+
+Every discovered non-embedding Copilot generation model is exposed through
+Messages, Chat Completions and Responses. Selection enforces the service account
+pool and each account's actual model catalog. Native endpoints are preferred;
+conversion is used when no eligible account supports the caller's protocol.
+Public `protocols` includes all three; `capabilities.native_protocols` records
+the upstream protocols without changing the internal per-account catalog.
+
+The bridge maps history, system/developer instructions, function calls/results,
+parallel tools, images/inline files, text/reasoning deltas, finish reasons and
+usage. It handles split UTF-8, CRLF and multiline SSE, stable tool indexes, late
+usage and raw `copilot_usage`. Truncated/error streams stay failed. Adapted SSE
+events are bounded at 8 MiB and full responses/streams at 64 MiB.
+Required numeric usage scaffolding carries `kproxy_usage_source: unreported`
+until upstream usage arrives, and is not recorded as provider-reported zero usage.
+Refusals retain their content and OpenAI refusal fields. An output-length stop
+retains partial tool arguments and the incomplete finish reason; it is not
+reported as a transport failure. Responses output items also retain incomplete status.
+JSON schemas are mapped between Chat `response_format`, Responses `text.format`
+and Messages `output_config.format`, preserving concurrent thinking effort.
+Messages adaptation requires a concrete JSON schema for structured output;
+OpenAI `json_object` requires a native OpenAI endpoint or an explicit schema.
+Schema enforcement remains an upstream model capability, as described in the
+[Anthropic structured-output contract](https://platform.claude.com/docs/en/build-with-claude/structured-outputs).
+
+Features requiring upstream state or hosted execution are not emulated:
+adapted requests must send complete history instead of `previous_response_id`
+or `conversation`, and cannot request background jobs, hosted tools or remote
+file IDs. Native requests retain those fields. Conversion does not grant a
+model new image/reasoning capabilities or guarantee structured output. Opaque
+reasoning replay is not portable across protocols. Known Claude thinking
+families use their manual/adaptive dialect; unknown models receive no invented
+Claude thinking controls.
+
+Messages token counting stays native where available. Other models return a
+local estimate (`estimated: true`, `x-kproxy-token-count-source: estimate`);
+estimates do not become provider-reported generation usage.
+
+Reference implementations reviewed for the independent Rust bridge:
+[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI/tree/main/internal/translator)
+(bidirectional translation and stream lifecycle),
+[LiteLLM](https://github.com/BerriAI/litellm) (protocol/capability boundaries), and
+[copilot-api](https://github.com/ericc-ch/copilot-api) (Copilot Messages bridging).
+See also Anthropic's [thinking dialects](https://platform.claude.com/docs/en/build-with-claude/extended-thinking).
+Tests use mock upstreams; they do not certify a real Copilot seat or model.
+
+The remaining Kiro-specific conversion rules do not change Copilot native forwarding.
+
 ## Kiro client versions and the November 2026 retirement
 
 The received AWS Health notice says IDE versions before `0.11.133` and CLI

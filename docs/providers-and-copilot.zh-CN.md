@@ -13,19 +13,25 @@
 | 范围 | 命令 | 配置 |
 | --- | --- | --- |
 | 两者共用 | `provider`、`status`、`ready`、大部分 `account` 操作、`pool`、`models`、`model-map`、`service`、`apikey`、`stats`、`logs show/follow` | `[[provider]]`、`[[model_mapping]]`、`[[proxy_service]]`、`[[api_key]]` 通过实例 ID 或允许来源限定 |
-| Kiro 专项 | `account add-sso/add-api-key/import/services/overage/regen-machine-id`、`diagnose`、`subscriptions`、`alert` 的当前事件、`pool --explain` 评分 | `[upstream]`、`[pool]`、`[features]`、`[models]`、`[context]`、`[storage]`、`[sso]`、`[model_thinking_mode]`、当前 `[notify]`/`[[webhook]]` 告警 |
-| Copilot 专项 | `account add --provider <ID> --auth device-flow` 或 `--token-stdin` | 对应 `kind="copilot"` 实例的 `[provider.settings]`、`[provider.pool]`、`[provider.models]`、`[provider.routing]` |
-| 全局 | `health`、`version`、`config` 管理、`logs trace/files/path`、服务进程生命周期 | `[server]`、`[log]`、`[admin]` |
+| Kiro 专项 | `account add-sso/add-api-key/import/overage/regen-machine-id`、`diagnose`、订阅详情、`alert` 的当前事件、`pool --explain` 评分 | `[upstream]`、`[pool]`、`[features]`、`[models]` 的发现/缓存配置、`[context]`、`[storage]`、`[sso]`、`[model_thinking_mode]`、当前 `[notify]`/`[[webhook]]` 告警 |
+| 来源专用认证 | 统一使用 `account add`；Kiro 的 `--auth sso/api-key`，Copilot 的 `--auth device-flow` 或 `--token-stdin` | Copilot 配置位于对应实例的 `[provider.settings]`、`[provider.pool]`、`[provider.models]`、`[provider.routing]` |
+| 全局 | `health`、`version`、`config` 管理、`logs trace/files/path`、服务进程生命周期 | `[server]`、`[log]`、`[admin]`、`models.disabled` |
 
 `tasks` 属于混合范围：`token_refresh/status_check/health_recheck` 只操作 Kiro；
-`model_cache_refresh` 可使用 `--provider kiro|copilot`；统计持久化等任务是全局的。
-`pool --provider copilot` 只列出账号和模型支持，不显示 Kiro 的三因子评分；请同时用
-`--model <Copilot 模型 ID>` 覆盖默认的 Kiro 模型名。
-`service accounts/add-account/remove-account` 与 `--account-tag` 目前只作用于 Kiro 账号池；
-Copilot 账号列表请用 `account list --provider <ID>`。
+`model_cache_refresh` 可使用 `--provider <ID>`；统计持久化等任务是全局的。
+`pool` 默认聚合全部来源；`pool --provider copilot` 不带 `--model` 时检查账号是否有可用模型，
+可用 `--model <ID>` 缩小范围。仅 `pool --provider kiro` 提供 Kiro 的三因子评分。
+`service accounts/add-account/remove-account` 与 `--account-tag` 均支持 Kiro/Copilot 账号池；
+服务与账号仍受允许的实例 ID 范围限制。
 `model-map --below-credits-percent` 也仅适用于 Kiro。
 
 ## 快速配置 Copilot
+
+`provider list` 的“实例 ID”用于 `--provider`（简写 `-p`）；“类型 (kind)”只用于驱动选择。
+例如实例 ID 为 `work-cp`、kind 为 `copilot`，后续命令必须用 `-p work-cp`。
+`provider show work-cp` 会给出该实例的下一步命令；`guide copilot -p work-cp` 可生成对应示例。
+也可 `export KPROXY_PROVIDER=work-cp` 省略重复参数，显式 `-p` 优先；全局和按资源 ID
+定位的操作不使用这个默认值。`help --all` 和各层 `--help` 都标明操作范围。
 
 先添加 provider。此命令创建一个 Copilot 模型来源实例（账号池、模型发现和路由的配置范围），
 不会添加或授权 GitHub 用户账号。新建实例会将默认公开 OAuth Client ID 写入配置文件；
@@ -72,8 +78,8 @@ printf '%s\n' "$GITHUB_TOKEN" | \
   kproxy account add --provider copilot --token-stdin
 ```
 
-`--provider` 是实例 ID：若创建时用了 `--id github-copilot`，后续必须使用
-`--provider github-copilot`；`--kind copilot` 是驱动类型。
+`--provider` 是实例 ID：本页示例创建的是 `copilot`，后续也使用 `--provider copilot`；
+自定义为 `work-cp` 时改用 `--provider work-cp`，`--kind copilot` 始终表示驱动类型。
 
 不提供浏览器凭证时，Device Flow 会在终端显示授权网址和验证码。用户在自己电脑的
 无痕/隐私窗口登录并授权，CLI 保持轮询。添加多个用户时，关闭上一用户的所有无痕窗口再继续。
@@ -90,7 +96,7 @@ full 镜像或启用了 `sso` feature 的 daemon 可以在服务器上启动独�
 交互添加（命令中的 provider ID 按实际配置填写）：
 
 ```bash
-kproxy account add --provider github-copilot --auth device-flow --headless
+kproxy account add --provider copilot --auth device-flow --headless
 ```
 
 在终端填写完整 GitHub 用户名，选择 Azure SSO、GitHub 密码或两套凭证；密码输入不回显。
@@ -101,7 +107,7 @@ CSV 批量添加按顺序逐个完成远端无痕登录，先校验整个文件�
 
 ```bash
 chmod 600 /secure/copilot.csv
-kproxy account add --provider github-copilot --batch /secure/copilot.csv
+kproxy account add --provider copilot --batch /secure/copilot.csv
 ```
 
 ```csv
@@ -120,7 +126,7 @@ Enterprise Managed User 非交互示例：
 
 ```bash
 printf '%s\n' "$AZURE_PASSWORD" | kproxy account add \
-  --provider github-copilot --auth device-flow \
+  --provider copilot --auth device-flow \
   --username USER_SHORTCODE --sso-username user@example.com --password-stdin
 ```
 
@@ -146,7 +152,7 @@ GitHub 个人账号和 Azure 各有一套密码时，使用 `--credentials-stdin
 ```
 
 ```bash
-kproxy account add --provider github-copilot --auth device-flow \
+kproxy account add --provider copilot --auth device-flow \
   --credentials-stdin < /secure/copilot-login.json
 ```
 
@@ -156,7 +162,7 @@ Azure 密码；暂不支持的外部联邦身份提供商会明确报错。MFA �
 
 ```bash
 printf '%s\n' "$MFA_CODE" | kproxy account login-code \
-  --provider github-copilot --task login_TASK_ID --code-stdin
+  --provider copilot --task login_TASK_ID --code-stdin
 ```
 
 CAPTCHA、Passkey、安全密钥、强制改密和受管设备要求不会被自动跳过。组织策略要求这些步骤时，
@@ -261,13 +267,27 @@ kproxy apikey edit <KEY_ID> \
 
 ## 协议和模型映射
 
-Copilot adapter 原生转发以下接口，并保留 JSON 或 SSE 响应：
+Copilot 的所有非 embedding 生成模型均提供以下三种接口，支持 JSON 和 SSE：
 
 - `POST /v1/messages`
-- `POST /v1/messages/count_tokens`
 - `POST /v1/chat/completions`
 - `POST /v1/responses`
-- `GET /v1/models`
+
+根据选中账号的模型目录选择上游接口；有原生能力时优先透传，否则在三种协议间转换。
+公开目录的 `protocols` 表示代理提供的接口，`capabilities.native_protocols` 保留上游原生能力；
+账号内部目录仍按真实原生能力调度。embedding 模型不出现在生成模型列表中。
+
+转换覆盖完整会话、system/developer、函数工具及并行结果、图片/内联文件、文本和思考流、
+结束原因、usage/cache 与原始 `copilot_usage`。SSE 分片、UTF-8、工具索引及终止事件均增量处理；
+中途断流或上游错误不会补发成功结束。`count_tokens` 对 Messages 原生模型使用原生接口，
+其他模型返回本地估算，并以 `estimated: true` 和 `x-kproxy-token-count-source: estimate`
+标记；估算不作为上游生成用量计费。
+
+协议转换不会为模型增加视觉、推理或托管工具能力。需要转换时，Responses
+`previous_response_id`/`conversation`、后台任务、托管工具和远端文件 ID 等缺少执行链路的
+能力会明确报错；客户端应发送完整会话。原生接口保留其原有字段与能力。
+结构化输出、缓存提示和思考控制的效果取决于选中的模型；转换不承诺完整托管 API 等价。
+具体边界与参考项目见[协议兼容说明](protocol-compatibility.zh-CN.md#copilot-三协议转换)。
 
 模型映射共用同一套规则引擎，可以按 provider、代理服务和 API key 限定：
 
@@ -303,13 +323,76 @@ Kiro 上游。
 
 `[provider.routing].default_model_id` 是该来源没有命中显式规则时的默认目标。Kiro 仍保留原有的
 账号额度条件、动态模型解析，以及 `enable_model_fallback` 控制的上游容量错误同族 fallback。
-Copilot 映射在 provider adapter 前执行，并在调度前按账号模型目录和协议能力过滤；它不会把一个
-不支持目标协议的同名模型当作可用模型，也不会对上游容量错误自动更换模型，需使用显式映射或
-默认目标控制该行为。
+Copilot 映射在 provider adapter 前执行，按服务账号池和账号的原生模型目录过滤，再选择原生
+接口或转换路径。转换不会绕过账号模型权限，也不会对上游容量错误自动更换模型；仍需使用
+显式映射或默认目标控制该行为。
 
 ## 统一和按来源管理
 
-不指定范围的读取命令会聚合 provider；写操作要求能唯一定位账号，也可显式指定 provider：
+统一采用“资源 + 动作 + provider 范围”：`account`、`service`、`models`、`apikey`、`stats`
+等共用一棵命令树。`--provider` 可放在根命令、命令组或最终子命令上，也可通过
+`KPROXY_PROVIDER` 设置当前 shell 的默认范围；显式参数优先于环境变量。
+编辑已有 service、API key 或模型映射时，只有显式 `--provider` 才会替换来源权限，
+环境变量不会隐式修改权限；该参数与 `--clear-providers` 互斥。
+
+列表默认聚合来源，单账号操作按 ID/邮箱/登录名自动定位；有重名时使用
+`<provider>/<account>` 或 `--provider` 消歧。`account export` 为保持旧导出格式，省略
+范围仍导出 Kiro；全量导出使用 `--provider all`。`refresh/probe/reset-health --all` 和
+`pool` 默认范围为全部 provider，可用 `--provider kiro` 保持旧范围。
+
+```bash
+# 以下写法均可使用；裸 ID 在唯一匹配时自动定位 provider
+kproxy --provider copilot account tag acc_b85b28b7 --add copilot-test
+kproxy account --provider copilot tag acc_b85b28b7 --add copilot-test
+kproxy account tag --add copilot-test acc_b85b28b7
+
+export KPROXY_PROVIDER=copilot
+kproxy account list
+kproxy models list
+kproxy account refresh --all
+unset KPROXY_PROVIDER
+
+# 共用账号添加入口，原 add-sso/add-api-key 命令继续保留
+kproxy --provider kiro account add --auth sso --email user@example.com --password-stdin
+kproxy --provider kiro account add --auth api-key --email user@example.com --token-stdin
+kproxy --provider copilot account add --auth device-flow
+```
+
+服务标签池对两种 provider 都生效，规则为“标签并集/全局池 + 手工加入 − 排除”。
+手工绑定的 Copilot ID 持久化为 `provider/account_id`，旧裸 ID 仍表示 Kiro。
+Copilot 删除绑定账号、使账号退出现有标签池的改标操作会提示先调整绑定；给全局池或手工
+绑定账号增加标签可直接执行。Kiro 保持原有绑定保护规则。
+
+```bash
+kproxy service accounts <SERVICE> --provider copilot
+kproxy service add-account <SERVICE> copilot/acc_b85b28b7
+kproxy service remove-account <SERVICE> copilot/acc_b85b28b7
+kproxy account services copilot/acc_b85b28b7
+```
+
+其他常用命令：
+
+全局模型开关适用于全部来源：
+
+```bash
+kproxy model disable claude-sonnet-4.6 gpt-4.1
+kproxy model list
+kproxy model enable gpt-4.1
+```
+
+使用模型列表中的 ID，不带 `kiro/`、`copilot/` 等来源前缀；支持一次指定多个模型，
+不支持通配符。`model` 是 `models` 的别名。若设置了 `KPROXY_PROVIDER`，全局开关可显式
+加 `--provider all`。CLI 的人类可读列表标记“不可用（已禁用）”，JSON 条目带
+`disabled: true`、`available: false`；上游不再提供的禁用 ID 仍作为全局规则展示。
+
+配置保存于 `[models].disabled`，可通过配置热更新修改，普通配置重置会保留禁用规则。
+公共 `/models`、`/v1/models` 的 OpenAI、Anthropic 和混合格式均不展示禁用项。
+原始请求和最终下游模型均检查禁用规则，因此别名、映射、默认模型和回退不能绕过。
+底层发送前还会校验共享的最新规则，覆盖流式续接、压缩摘要、重试、token 计数与账户探测。
+全部探测候选被禁用时跳过推理探测；模型目录/凭证刷新仍可进行，它们不调用模型。
+
+禁用更新会等待已经开始发送的请求取得响应头，再对排队和后续发送生效。
+已发送的请求无法撤回，其响应可以结束；后续重试或续接必须重新通过检查。
 
 ```bash
 kproxy provider list

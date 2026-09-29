@@ -205,8 +205,9 @@ kproxy service remove-account team-a alice@example.com
 
 服务的有效账号池为“匹配任一所选标签的账号 + 手工加入账号 - 排除账号”；排除优先。服务未指定标签时，
 基础集合是全部账号。健康检查、就绪检查、模型列表、首次调度、重试及压缩摘要请求都限定在
-该服务的有效账号池内。账号一旦属于任意服务，就不能修改标签或删除；需要先通过
-`account services` 查看全部绑定，再通过 `service remove-account` 从所有服务解除绑定。
+该服务的有效账号池内。Kiro 账号绑定服务后不能修改标签或删除；Copilot 也保护绑定账号的
+删除和会使其退出现有池的标签修改，但允许向全局池/手工绑定账号增加标签。需要解除绑定时，
+先通过 `account services` 查看全部绑定，再使用 `service remove-account`。
 修改服务的账号标签必须先停用服务：
 
 ```bash
@@ -215,7 +216,8 @@ kproxy service edit team-a --account-tag team-b team-c  # 或 --clear-account-ta
 kproxy service enable team-a
 ```
 
-省略 `--host` 时默认绑定 `0.0.0.0`。Key 元数据默认不含明文，显式 `--show-secret` 才显示。
+省略 `--host` 时默认绑定 `0.0.0.0`。`service apikey <服务>`（兼容 `service apikeys`）
+默认显示完整密钥，JSON 输出相同；`--redact` 可隐藏明文。旧 `--show-secret` 参数仍可使用。
 服务只接受已绑定的 API Key。默认 Messages 只接受 Claude Code，Chat/Responses 只接受 Codex；
 第三方客户端可通过 `service edit` 或 `apikey edit` 设置 `--skip-user-agent-check true`。
 这项豁免不关闭 Key 认证、额度和并发限制。请求示例见 [README](../README.zh-CN.md)和
@@ -388,6 +390,36 @@ reload 会发送 `SIGHUP`。需要重启的配置仍要执行 `sudo systemctl re
 `health`、`ready`、`account list` 和 `logs show`。
 
 ## 旧命令迁移
+
+`--provider` 现在可放在任意层级，例如 `kproxy --provider copilot account list`、
+`kproxy account --provider copilot list` 与末尾写法等价。`KPROXY_PROVIDER` 设置当前
+shell 的默认来源，显式参数优先；`-p` 是简写。参数必须使用 `provider list` 的实例 ID，
+不能使用驱动类型或“GitHub Copilot”显示名称。例如 `--id work-cp --kind copilot` 创建的
+实例要用 `--provider work-cp`。`provider show work-cp` 会输出使用实际 ID 的操作命令；
+`guide copilot -p work-cp` 可生成对应的接入示例。
+Docker wrapper 会转发该环境变量，并在 provider 参数放于任意命令层级时正确转发宿主机
+批量 CSV 文件；使用这些写法时需要同步更新已安装的 wrapper。
+
+子命令帮助和 `help --all` 都标明共用、仅 Kiro、仅 Copilot、全局或按资源定位的范围。
+全局操作和按位置参数中的 ID/名称定位资源的命令忽略 `KPROXY_PROVIDER`，并拒绝显式
+`--provider`，避免参数被悄悄忽略。全局模型禁用/启用仍保留更严格的检查：有默认来源时
+用 `--provider all` 覆盖。Kiro 任务仅接受 `kiro`，模型刷新任务可选具体实例，全局任务
+不接受来源参数；`tasks list` 直接显示各任务适用范围。
+
+`service edit`、`apikey edit` 和 `model-map edit` 修改来源权限必须显式传入 `--provider`；
+环境变量不会覆盖资源现有权限。`--provider` 与 `--clear-providers` 不能同时使用。
+`service edit --provider ...` 排除原默认来源时会自动选第一个新 ID；原默认仍在范围内则
+保留，也可用 `--default-provider` 显式指定。API key 权限仍需独立配置。
+
+账号添加统一使用 `account add`：Kiro 选
+`--provider kiro --auth sso` 或 `--auth api-key`，Copilot 选
+`--provider copilot --auth device-flow`；旧 Kiro 认证命令仍保留。
+完整示例见[按来源管理](providers-and-copilot.zh-CN.md#统一和按来源管理)。
+
+`pool` 和 `account refresh/probe/reset-health --all` 默认覆盖全部 provider；加
+`--provider kiro` 可保留旧范围。`account export` 仍默认旧 Kiro 格式，全量需
+`--provider all`。服务账号列表、标签池、手工绑定和排除均支持 Copilot；账号重名时
+使用 `provider/account_id` 消歧。
 
 | 旧写法 | 当前写法 |
 | --- | --- |

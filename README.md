@@ -23,7 +23,7 @@ The project has no GUI, MITM, or local client configuration rewriting.
 | --- | --- |
 | APIs | Messages, token counting, Chat Completions, Responses, model discovery; JSON and SSE generation. |
 | Accounts | Provider-isolated pools, per-account concurrency, enable/disable, tags, probes and refresh; Kiro quota scheduling and Copilot Device Flow. |
-| Upstream routing | Regional Kiro runtimes and GovCloud isolation; Copilot short-lived API tokens, dynamic endpoints and native protocol forwarding. |
+| Upstream routing | Regional Kiro runtimes and GovCloud isolation; Copilot dynamic endpoints, native forwarding and Chat/Responses/Messages adaptation for non-embedding models. |
 | Models and tools | Cross-provider discovery, conditional mapping and access scopes; Kiro tool replay, Claude Tool Search and Web Search. |
 | Operations | Hot-reloaded TOML, API-key quotas, TLS, webhooks, trace logs, persisted statistics, Docker and systemd. |
 | Compatibility limits | Format/strict hints do not guarantee structured output. Responses state expires and is lost on restart. Hosted tools and automatic compaction differ by protocol. |
@@ -115,6 +115,23 @@ Do not reuse a `ksk_...` upstream key as the proxy client key. Import schemas,
 SSO login and credential handling are covered in [account setup](docs/startup-and-debugging.md#4-add-or-import-accounts).
 `health` checks daemon liveness; `ready` checks business prerequisites. A real
 generation request additionally verifies the upstream route and consumes quota.
+
+### Global model disabling
+
+Disable models globally across Kiro/Copilot, every protocol, default routing,
+fallback, retries, and internal probes:
+
+```bash
+kproxy model disable claude-sonnet-4.6 gpt-4.1
+kproxy model list                         # retained, marked unavailable/disabled
+kproxy model enable claude-sonnet-4.6      # takes effect without restarting
+```
+
+Rules persist in `[models].disabled` and survive configuration resets. Public
+`/models` and `/v1/models` hide disabled entries. `model` is an alias for `models`;
+use unqualified model IDs because the policy applies to every provider. Once
+the update completes, queued and subsequent sends are blocked; requests already
+sent cannot be recalled.
 
 ### Kiro overage credits
 

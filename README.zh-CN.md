@@ -20,7 +20,7 @@ Kiro 支持企业 SSO 凭证（AWS IAM Identity Center/IdC）和显式导入的 
 | --- | --- |
 | API | Messages、Token 计数、Chat Completions、Responses、模型发现；生成支持 JSON 和 SSE。 |
 | 账号 | Provider 隔离账号池、单账号并发、启停、标签、探测和刷新；Kiro 保留额度调度，Copilot 支持 Device Flow。 |
-| 上游路由 | Kiro 区域 runtime 与 GovCloud 隔离；Copilot 短期 API token、动态 endpoint 和原生协议透传。 |
+| 上游路由 | Kiro 区域 runtime 与 GovCloud 隔离；Copilot 动态 endpoint、原生透传和非 embedding 模型的 Chat/Responses/Messages 转换。 |
 | 模型与工具 | 跨 provider 动态发现、条件映射和访问范围；Kiro 继续支持工具回放、Claude Tool Search 与 Web Search。 |
 | 运维 | TOML 热重载、API Key 限额、TLS、Webhook、Trace 日志、持久化统计、Docker 和 systemd。 |
 | 兼容限制 | format/strict 提示不提供结构化输出保证；Responses 状态会过期且重启丢失；托管工具与自动压缩的支持范围因协议而异。 |
@@ -103,6 +103,20 @@ kproxy ready
 不要将 `ksk_...` 上游密钥作为代理客户端 Key。导入格式、SSO 登录和凭证处理见
 [账号配置](docs/startup-and-debugging.zh-CN.md#4-添加或导入账号)。`health` 检查 daemon 存活，
 `ready` 检查业务前置条件；真实生成还需验证上游路由，并会消耗额度。
+
+### 全局模型禁用
+
+模型可全局禁用，立即作用于 Kiro/Copilot、所有协议、默认模型、回退、重试和内部探测：
+
+```bash
+kproxy model disable claude-sonnet-4.6 gpt-4.1
+kproxy model list                         # 保留条目，标记“不可用（已禁用）”
+kproxy model enable claude-sonnet-4.6      # 解除禁用，无需重启
+```
+
+规则持久化在 `[models].disabled`，公共 `/models`、`/v1/models` 均隐藏禁用项。
+`model` 与 `models` 等价；禁用规则跨全部 provider，使用不带 provider 前缀的模型 ID。
+配置重置会保留规则。禁用确认生效后，排队请求和后续发送均被拦截；此前已发送的请求无法撤回。
 
 ### Kiro 超额额度
 
