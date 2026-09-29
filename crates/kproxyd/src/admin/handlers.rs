@@ -84,7 +84,7 @@ pub async fn dispatch(state: &Arc<AppState>, request: Request) -> Response {
         method::ACCOUNT_ADD_SSO => handle_account_add_sso(state, request.params).await,
         method::ACCOUNT_REMOVE => handle_account_remove(state, request.params).await,
         method::ACCOUNT_SET_ENABLED => handle_account_set_enabled(state, request.params).await,
-        method::ACCOUNT_TAG => handle_account_tag(state, request.params).await,
+        method::ACCOUNT_TAG => providers::handle_account_tag(state, request.params).await,
         method::ACCOUNT_REGEN_MACHINE_ID => {
             handle_regenerate_machine_id(state, request.params).await
         }

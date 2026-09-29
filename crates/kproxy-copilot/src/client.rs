@@ -551,26 +551,69 @@ impl CopilotProvider {
         add: &[String],
         remove: &[String],
     ) -> Result<CopilotAccountSummary, ProviderError> {
+        self.update_accounts_tags(&[id_or_login.to_owned()], add, remove)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| not_found_account(id_or_login))
+    }
+
+    /// Validate and persist a whole provider-local batch before publishing it.
+    pub async fn update_accounts_tags(
+        &self,
+        ids: &[String],
+        add: &[String],
+        remove: &[String],
+    ) -> Result<Vec<CopilotAccountSummary>, ProviderError> {
+        let normalize = |tags: &[String]| -> Result<Vec<String>, ProviderError> {
+            tags.iter()
+                .map(|tag| {
+                    let tag = tag.trim();
+                    if tag.is_empty() {
+                        Err(ProviderError::new(
+                            ProviderErrorKind::InvalidRequest,
+                            StatusCode::BAD_REQUEST,
+                            "account tag must not be empty",
+                        ))
+                    } else {
+                        Ok(tag.to_owned())
+                    }
+                })
+                .collect()
+        };
+        let add = normalize(add)?;
+        let remove = normalize(remove)?;
         let _mutation = self.mutation.lock().await;
         let mut accounts = self.accounts.write().await;
         let mut next = accounts.clone();
-        let account = next
-            .iter_mut()
-            .find(|account| account.id == id_or_login || account.login == id_or_login)
-            .ok_or_else(|| not_found_account(id_or_login))?;
-        for tag in add {
-            if !account.tags.contains(tag) {
-                account.tags.push(tag.clone());
+        let mut summaries = Vec::with_capacity(ids.len());
+        let mut seen = BTreeSet::new();
+        for id in ids {
+            let account = next
+                .iter_mut()
+                .find(|account| account.id == *id || account.login == *id)
+                .ok_or_else(|| not_found_account(id))?;
+            if !seen.insert(account.id.clone()) {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::InvalidRequest,
+                    StatusCode::BAD_REQUEST,
+                    format!("account specified more than once: {}", account.id),
+                ));
             }
+            for tag in &add {
+                if !account.tags.contains(tag) {
+                    account.tags.push(tag.clone());
+                }
+            }
+            account.tags.retain(|tag| !remove.contains(tag));
+            account.tags.sort();
+            account.tags.dedup();
+            account.updated_at = Some(now_secs());
+            summaries.push(self.account_summary(account));
         }
-        account.tags.retain(|tag| !remove.contains(tag));
-        account.tags.sort();
-        account.tags.dedup();
-        account.updated_at = Some(now_secs());
-        let summary = self.account_summary(account);
         save_accounts(&self.accounts_path, &self.id, &next).await?;
         *accounts = next;
-        Ok(summary)
+        Ok(summaries)
     }
 
     pub async fn reset_account_health(

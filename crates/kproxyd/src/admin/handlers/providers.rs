@@ -408,6 +408,12 @@ pub(super) async fn handle_account_remove(state: &Arc<AppState>, params: Value) 
         return super::handle_account_remove(state, json!({"id":reference.account_id})).await;
     }
     let runtime = copilot_runtime(state, reference.provider_id.as_str()).await?;
+    let _mutation = state.lock_config_mutation().await;
+    let account = runtime
+        .account(&reference.account_id)
+        .await
+        .ok_or_else(|| RpcError::bad_params(format!("account not found: {reference}")))?;
+    ensure_provider_account_unbound(state, &account.provider_id, &account.id, &account.tags)?;
     to_value(
         runtime
             .remove_account(&reference.account_id)
@@ -444,28 +450,177 @@ pub(super) async fn handle_account_tag(state: &Arc<AppState>, params: Value) -> 
     #[derive(Deserialize)]
     struct Params {
         provider: Option<String>,
-        id: String,
+        id: Option<String>,
+        ids: Option<Vec<String>>,
         #[serde(default)]
         add: Vec<String>,
         #[serde(default)]
         remove: Vec<String>,
     }
     let params: Params = parse_params(params)?;
-    let reference = resolve_account_ref(state, params.provider.as_deref(), &params.id).await?;
-    if reference.provider_id.as_str() == "kiro" {
-        return super::handle_account_tag(
+    let single = params.id.clone();
+    let ids = match (params.id, params.ids) {
+        (Some(id), None) if !id.trim().is_empty() => vec![id],
+        (None, Some(ids)) if !ids.is_empty() => ids,
+        _ => return Err(RpcError::bad_params("specify either a non-empty id or ids")),
+    };
+    let normalize = |tags: Vec<String>| -> Result<Vec<String>, RpcError> {
+        tags.into_iter()
+            .map(|tag| {
+                let tag = tag.trim();
+                if tag.is_empty() {
+                    Err(RpcError::bad_params("account tag must not be empty"))
+                } else {
+                    Ok(tag.to_owned())
+                }
+            })
+            .collect()
+    };
+    let add = normalize(params.add)?;
+    let remove = normalize(params.remove)?;
+    let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut ordered = Vec::new();
+    let mut seen = BTreeSet::new();
+    // Resolve and validate the entire batch before any provider is mutated.
+    for id in &ids {
+        let reference = resolve_account_ref(state, params.provider.as_deref(), id).await?;
+        let value = handle_account_show(
             state,
-            json!({"id":reference.account_id,"add":params.add,"remove":params.remove}),
+            json!({"provider":reference.provider_id,"id":reference.account_id}),
         )
-        .await;
+        .await?;
+        let account: ProviderAccountSummary =
+            serde_json::from_value(value).map_err(|error| RpcError::internal(error.to_string()))?;
+        let key = (account.provider_id.clone(), account.id.clone());
+        if !seen.insert(key.clone()) {
+            return Err(RpcError::bad_params(format!(
+                "account specified more than once: {reference}"
+            )));
+        }
+        let mut tags = account.tags.iter().cloned().collect::<BTreeSet<_>>();
+        tags.extend(add.iter().cloned());
+        tags.retain(|tag| !remove.contains(tag));
+        if tags != account.tags.iter().cloned().collect() {
+            ensure_provider_tags_change_safe(
+                state,
+                &account.provider_id,
+                &account.id,
+                &account.tags,
+                &tags.iter().cloned().collect::<Vec<_>>(),
+            )?;
+        }
+        if account.provider_id == "kiro" {
+            let kiro = state
+                .with_accounts(|store| store.find(&account.id).cloned())
+                .ok_or_else(|| RpcError::bad_params(format!("account not found: {id}")))?;
+            let mut tags = account.tags.iter().cloned().collect::<BTreeSet<_>>();
+            tags.extend(add.iter().cloned());
+            tags.retain(|tag| !remove.contains(tag));
+            if tags != account.tags.iter().cloned().collect() {
+                super::accounts::ensure_account_unbound(state, &kiro, "changing its tags")?;
+            }
+        }
+        groups
+            .entry(account.provider_id)
+            .or_default()
+            .push(account.id);
+        ordered.push(key);
     }
-    let runtime = copilot_runtime(state, reference.provider_id.as_str()).await?;
-    to_value(
-        runtime
-            .update_account_tags(&reference.account_id, &params.add, &params.remove)
-            .await
-            .map_err(provider_rpc_error)?,
-    )
+    let mut results = BTreeMap::new();
+    for (provider, ids) in groups {
+        if provider == "kiro" {
+            let value =
+                super::handle_account_tag(state, json!({"ids":ids,"add":add,"remove":remove}))
+                    .await?;
+            let batch: kproxy_ipc::protocol::AccountTagBatchResult = serde_json::from_value(value)
+                .map_err(|error| RpcError::internal(error.to_string()))?;
+            for account in batch.accounts {
+                results.insert((provider.clone(), account.id.clone()), json!(account));
+            }
+        } else {
+            let runtime = copilot_runtime(state, &provider).await?;
+            let _mutation = state.lock_config_mutation().await;
+            for id in &ids {
+                let account = runtime
+                    .account(id)
+                    .await
+                    .ok_or_else(|| RpcError::bad_params(format!("account not found: {id}")))?;
+                let mut tags = account.tags.iter().cloned().collect::<BTreeSet<_>>();
+                tags.extend(add.iter().cloned());
+                tags.retain(|tag| !remove.contains(tag));
+                if tags != account.tags.iter().cloned().collect() {
+                    ensure_provider_tags_change_safe(
+                        state,
+                        &provider,
+                        &account.id,
+                        &account.tags,
+                        &tags.into_iter().collect::<Vec<_>>(),
+                    )?;
+                }
+            }
+            for account in runtime
+                .update_accounts_tags(&ids, &add, &remove)
+                .await
+                .map_err(provider_rpc_error)?
+            {
+                results.insert(
+                    (provider.clone(), account.id.clone()),
+                    json!({"id":account.id,"provider_id":provider,"tags":account.tags}),
+                );
+            }
+        }
+    }
+    let mut accounts = ordered
+        .into_iter()
+        .filter_map(|key| results.remove(&key))
+        .collect::<Vec<_>>();
+    if let Some(id) = single {
+        let mut result = accounts.remove(0);
+        result["id"] = json!(id);
+        Ok(result)
+    } else {
+        Ok(json!({"accounts":accounts}))
+    }
+}
+
+fn ensure_provider_account_unbound(
+    state: &AppState,
+    provider: &str,
+    id: &str,
+    tags: &[String],
+) -> Result<(), RpcError> {
+    let config = state.config.current();
+    let services = config
+        .proxy_service
+        .iter()
+        .filter(|service| service.includes_provider_account(provider, id, tags))
+        .map(|service| format!("{} ({})", service.name, service.id))
+        .collect::<Vec<_>>();
+    if services.is_empty() {
+        return Ok(());
+    }
+    Err(RpcError::bad_params(format!("account {provider}/{id} is bound to proxy service(s) {}; unbind it before changing tags or removing it",services.join(", "))))
+}
+
+fn ensure_provider_tags_change_safe(
+    state: &AppState,
+    provider: &str,
+    id: &str,
+    before: &[String],
+    after: &[String],
+) -> Result<(), RpcError> {
+    // Labels on global/manual pools do not change membership. Only removal from
+    // an existing tagged pool needs an explicit service unbind first.
+    let config = state.config.current();
+    let leaves_pool = config.proxy_service.iter().any(|service| {
+        service.includes_provider_account(provider, id, before)
+            && !service.includes_provider_account(provider, id, after)
+    });
+    if leaves_pool {
+        ensure_provider_account_unbound(state, provider, id, before)
+    } else {
+        Ok(())
+    }
 }
 
 pub(super) async fn handle_account_probe(state: &Arc<AppState>, params: Value) -> Handled {
@@ -700,9 +855,9 @@ async fn account_list_for_provider(
 }
 
 #[derive(Debug)]
-struct ResolvedAccountRef {
-    provider_id: ProviderId,
-    account_id: String,
+pub(super) struct ResolvedAccountRef {
+    pub(super) provider_id: ProviderId,
+    pub(super) account_id: String,
 }
 
 impl std::fmt::Display for ResolvedAccountRef {
@@ -724,11 +879,13 @@ async fn parse_account_ref(
     resolve_account_ref(state, params.provider.as_deref(), &params.id).await
 }
 
-async fn resolve_account_ref(
+pub(super) async fn resolve_account_ref(
     state: &Arc<AppState>,
     explicit_provider: Option<&str>,
     id: &str,
 ) -> Result<ResolvedAccountRef, RpcError> {
+    let explicit_provider = explicit_provider.filter(|provider| *provider != "all");
+    let id = id.trim();
     let (qualified_provider, account_id) = id
         .split_once('/')
         .map_or((None, id), |(provider, account)| (Some(provider), account));
@@ -740,22 +897,26 @@ async fn resolve_account_ref(
             "qualified account reference conflicts with --provider",
         ));
     }
-    if let Some(provider) = explicit_provider.or(qualified_provider) {
-        return Ok(ResolvedAccountRef {
-            provider_id: parse_provider_id(provider)?,
-            account_id: account_id.into(),
-        });
-    }
     let list: ProviderAccountListResult =
-        serde_json::from_value(handle_account_list(state, Value::Null).await?)
-            .map_err(|error| RpcError::internal(error.to_string()))?;
+        if let Some(provider) = explicit_provider.or(qualified_provider) {
+            account_list_for_provider(state, &parse_provider_id(provider)?).await?
+        } else {
+            serde_json::from_value(handle_account_list(state, Value::Null).await?)
+                .map_err(|error| RpcError::internal(error.to_string()))?
+        };
+    if !list.complete {
+        return Err(RpcError::bad_params("cannot resolve an unqualified account while provider discovery is incomplete; specify --provider"));
+    }
     let matches = list
         .accounts
         .into_iter()
         .filter(|account| {
             account.id == account_id
-                || account.display_name == account_id
-                || account.email.as_deref() == Some(account_id)
+                || account.display_name.eq_ignore_ascii_case(account_id)
+                || account
+                    .email
+                    .as_deref()
+                    .is_some_and(|email| email.eq_ignore_ascii_case(account_id))
         })
         .collect::<Vec<_>>();
     match matches.as_slice() {

@@ -651,7 +651,7 @@ pub(super) async fn handle_account_tag(
     }
 }
 
-fn ensure_account_unbound(
+pub(super) fn ensure_account_unbound(
     state: &AppState,
     account: &Account,
     operation: &str,

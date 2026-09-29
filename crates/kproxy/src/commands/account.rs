@@ -280,7 +280,7 @@ pub enum AccountCommand {
         #[arg(long)]
         provider: Option<String>,
     },
-    /// 为 Kiro/Copilot 账号增删标签；服务标签筛选只作用于 Kiro。
+    /// 为 Kiro/Copilot 账号增删标签，自动识别账号归属。
     #[command(
         long_about = "为 Kiro/Copilot 账号增删标签，可同时添加和移除。Kiro 未指定 --provider 的批量修改会先校验全部账号；Copilot 按账号逐个修改，不能保证整批原子性。service --account-tag 目前只筛选 Kiro 账号，不筛选 Copilot。\n\n示例：\n  kproxy account tag acc_7f3a --provider kiro --add prod\n  kproxy account tag acc_8b2c --provider copilot --add team-a",
         group(clap::ArgGroup::new("tag_change").required(true).multiple(true).args(["add", "remove"]))
@@ -1713,9 +1713,7 @@ async fn remove_accounts(
 
 /// Tag one or more accounts.
 ///
-/// A provider-qualified reference resolves per account through the v2 method,
-/// which is single-account only; the unqualified Kiro path keeps the batch
-/// method so a batch stays all-or-nothing.
+/// Resolve every selector on the daemon before applying a provider-local batch.
 async fn tag_accounts(
     client: &mut AdminClient,
     ids: &[String],
@@ -1724,36 +1722,11 @@ async fn tag_accounts(
     provider: Option<&str>,
     json: bool,
 ) -> Result<()> {
-    let provider_qualified =
-        provider.is_some() || ids.iter().any(|id| id.split_once('/').is_some());
-    if provider_qualified {
-        let mut results = Vec::with_capacity(ids.len());
-        for id in ids {
-            let result: AccountTagResult = client
-                .call(
-                    method::V2_ACCOUNT_TAG,
-                    serde_json::json!({
-                        "id": id,
-                        "add": add,
-                        "remove": remove,
-                        "provider": provider,
-                    }),
-                )
-                .await?;
-            results.push(result);
-        }
-        if json {
-            print_json(&AccountTagBatchResult { accounts: results })?;
-        } else {
-            for result in &results {
-                print_tag_result(result);
-            }
-        }
-    } else if let [id] = ids {
+    if let [id] = ids {
         let result: AccountTagResult = client
             .call(
-                method::ACCOUNT_TAG,
-                serde_json::json!({"id": id, "add": add, "remove": remove}),
+                method::V2_ACCOUNT_TAG,
+                serde_json::json!({"id": id, "add": add, "remove": remove, "provider": provider}),
             )
             .await?;
         if json {
@@ -1764,8 +1737,8 @@ async fn tag_accounts(
     } else {
         let result: AccountTagBatchResult = client
             .call(
-                method::ACCOUNT_TAG,
-                serde_json::json!({"ids": ids, "add": add, "remove": remove}),
+                method::V2_ACCOUNT_TAG,
+                serde_json::json!({"ids": ids, "add": add, "remove": remove, "provider": provider}),
             )
             .await?;
         if json {

@@ -122,6 +122,142 @@ fn expect_ok(response: Response) -> serde_json::Value {
     }
 }
 
+async fn state_with_copilot() -> (TempDir, Arc<AppState>) {
+    let (directory, state) = state_with(vec![sample_account(
+        "acc_00000001",
+        "kiro@example.com",
+        true,
+    )])
+    .await;
+    let provider_dir = state.paths.data_dir.join("providers/copilot");
+    tokio::fs::create_dir_all(&provider_dir).await.unwrap();
+    tokio::fs::write(provider_dir.join("accounts.json"),serde_json::json!([{
+        "id":"acc_b85b28b7","github_host":"github.com","github_user_id":42,"login":"octocat","email":"octocat@example.com",
+        "tags":[],"enabled":true,"credentials":{"github_access_token":"fixture-only"},"created_at":0,"supported_models":[]
+    }]).to_string()).await.unwrap();
+    let mut config = state.config.current().as_ref().clone();
+    config.provider = vec![
+        ProviderConfig::default(),
+        ProviderConfig {
+            id: "copilot".into(),
+            kind: "copilot".into(),
+            ..ProviderConfig::default()
+        },
+    ];
+    state.config.replace(config.clone());
+    state
+        .providers
+        .reconcile(&config, &state.paths.data_dir)
+        .await
+        .unwrap();
+    (directory, state)
+}
+
+#[tokio::test]
+async fn copilot_tag_resolves_bare_ids_for_old_and_new_clients_and_persists() {
+    let (_directory, state) = state_with_copilot().await;
+    for method in [method::ACCOUNT_TAG, method::V2_ACCOUNT_TAG] {
+        let result = expect_ok(
+            dispatch(
+                &state,
+                Request::new(
+                    1,
+                    method,
+                    serde_json::json!({
+                        "id":"acc_b85b28b7","add":[" copilot-test ","copilot-test"],"remove":[]
+                    }),
+                ),
+            )
+            .await,
+        );
+        assert_eq!(result["tags"], serde_json::json!(["copilot-test"]));
+    }
+    let bytes = tokio::fs::read(state.paths.data_dir.join("providers/copilot/accounts.json"))
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        value["accounts"][0]["tags"],
+        serde_json::json!(["copilot-test"])
+    );
+    let failure = dispatch(
+        &state,
+        Request::new(
+            2,
+            method::V2_ACCOUNT_TAG,
+            serde_json::json!({
+                "ids":["acc_b85b28b7","missing"],"add":["should-not-apply"]
+            }),
+        ),
+    )
+    .await;
+    assert!(matches!(failure, Response::Err { .. }));
+    let value = expect_ok(
+        dispatch(
+            &state,
+            Request::new(
+                3,
+                method::V2_ACCOUNT_SHOW,
+                serde_json::json!({"id":"acc_b85b28b7"}),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(value["tags"], serde_json::json!(["copilot-test"]));
+}
+
+#[tokio::test]
+async fn mixed_provider_tag_batch_validates_duplicates_and_ambiguity_before_mutation() {
+    let (_directory, state) = state_with_copilot().await;
+    for provider in [Some("copilot"), Some("all"), None] {
+        let resolved = providers::resolve_account_ref(&state, provider, "OCTOCAT@EXAMPLE.COM")
+            .await
+            .unwrap();
+        assert_eq!(resolved.provider_id.as_str(), "copilot");
+        assert_eq!(resolved.account_id, "acc_b85b28b7");
+    }
+    let duplicate = dispatch(
+        &state,
+        Request::new(
+            1,
+            method::V2_ACCOUNT_TAG,
+            serde_json::json!({
+                "ids":["acc_b85b28b7","copilot/octocat"],"add":["duplicate"]
+            }),
+        ),
+    )
+    .await;
+    assert!(matches!(duplicate, Response::Err { .. }));
+    let mixed = expect_ok(
+        dispatch(
+            &state,
+            Request::new(
+                2,
+                method::V2_ACCOUNT_TAG,
+                serde_json::json!({
+                    "ids":["acc_00000001","acc_b85b28b7"],"add":["shared"]
+                }),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(mixed["accounts"].as_array().unwrap().len(), 2);
+    assert_eq!(mixed["accounts"][0]["tags"], serde_json::json!(["shared"]));
+    assert_eq!(mixed["accounts"][1]["tags"], serde_json::json!(["shared"]));
+    let conflict = dispatch(
+        &state,
+        Request::new(
+            3,
+            method::V2_ACCOUNT_TAG,
+            serde_json::json!({
+                "id":"copilot/acc_b85b28b7","provider":"kiro","add":["bad"]
+            }),
+        ),
+    )
+    .await;
+    assert!(matches!(conflict, Response::Err { .. }));
+}
+
 #[tokio::test]
 async fn remote_copilot_login_rejects_missing_or_malformed_credentials_without_echoing_secrets() {
     let (_directory, state) = state_with(vec![]).await;
