@@ -984,25 +984,29 @@ impl ProxyServiceConfig {
     /// Exclusions override both the tag-derived base pool and explicit manual
     /// bindings. A service without an account tag inherits the global pool.
     pub fn includes_account(&self, account: &Account) -> bool {
-        if self
-            .excluded_account_ids
-            .iter()
-            .any(|account_id| account_id == &account.id)
-        {
+        self.includes_provider_account("kiro", &account.id, &account.tags)
+    }
+
+    /// Provider-qualified IDs prevent collisions between independent stores.
+    /// Bare IDs retain their historical Kiro meaning.
+    pub fn includes_provider_account(&self, provider: &str, id: &str, tags: &[String]) -> bool {
+        if !effective_provider_scope(&self.allowed_providers).contains(&provider) {
             return false;
         }
-        if self
-            .account_ids
-            .iter()
-            .any(|account_id| account_id == &account.id)
-        {
+        let qualified = format!("{provider}/{id}");
+        let matches =
+            |reference: &String| reference == &qualified || (provider == "kiro" && reference == id);
+        if self.excluded_account_ids.iter().any(matches) {
+            return false;
+        }
+        if self.account_ids.iter().any(matches) {
             return true;
         }
         self.uses_global_account_pool()
             || self
                 .selected_account_tags()
                 .iter()
-                .any(|tag| account.tags.iter().any(|account_tag| account_tag == tag))
+                .any(|tag| tags.contains(tag))
     }
 
     /// Returns true when the service inherits every non-excluded account.
