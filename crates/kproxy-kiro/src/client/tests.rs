@@ -5,6 +5,46 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::*;
 
+#[tokio::test]
+async fn disabled_models_block_direct_calls_and_clones_already_waiting_for_a_slot() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let policy = Arc::new(kproxy_provider::ModelPolicy::default());
+    let client = test_client(&server).with_model_policy(Arc::clone(&policy));
+    let old_client = client.clone();
+    let slots = Arc::clone(&client.stream_slots)
+        .acquire_many_owned(client.stream_slots.available_permits() as u32)
+        .await
+        .unwrap();
+    let account = account(AuthMethod::Social);
+    let payload = payload();
+    let waiting = old_client.generate(&account, &payload, Some(EndpointKey::Codewhisperer));
+    tokio::pin!(waiting);
+    assert!(futures::poll!(&mut waiting).is_pending());
+    policy
+        .replace(&kproxy_core::config::ModelsConfig {
+            disabled: vec!["sonnet4".into()],
+            ..Default::default()
+        })
+        .await;
+    drop(slots);
+    let error = waiting.await.err().expect("queued request must be blocked");
+    assert_eq!(error.status, Some(400));
+    assert!(error.message.contains("model_disabled"));
+    assert!(!error.is_auth() && !error.is_retriable());
+    assert!(client.generate(&account, &payload, None).await.is_err());
+    assert!(server.received_requests().await.unwrap().is_empty());
+    policy.replace(&Default::default()).await;
+    assert!(old_client
+        .generate(&account, &payload, Some(EndpointKey::Codewhisperer))
+        .await
+        .is_ok());
+}
+
 fn account(method: AuthMethod) -> Account {
     Account {
         id: "acc_test".into(),

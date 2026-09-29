@@ -963,16 +963,23 @@ async fn handle_pool(state: &Arc<AppState>, params: serde_json::Value) -> Handle
         .into_iter()
         .map(|account| (account.id.clone(), account.display_name().to_owned()))
         .collect::<HashMap<_, _>>();
+    let disabled = state.config.current().is_model_disabled(&params.model);
     let scores = pool
         .explain(&params.model)
         .await
         .into_iter()
-        .map(|score| PoolAccountView {
-            account_name: account_names
-                .get(&score.account_id)
-                .cloned()
-                .unwrap_or_default(),
-            score,
+        .map(|mut score| {
+            if disabled {
+                score.eligible = false;
+                score.reason = "model_disabled".into();
+            }
+            PoolAccountView {
+                account_name: account_names
+                    .get(&score.account_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                score,
+            }
         })
         .collect::<Vec<_>>();
     let pool_config = state.runtime_config_snapshot().pool;
@@ -1326,7 +1333,7 @@ async fn handle_model_resolve(state: &Arc<AppState>, params: serde_json::Value) 
             );
             used_default = resolved_model.is_some();
         }
-        let error = resolved_model.is_none().then(|| {
+        let mut error = resolved_model.is_none().then(|| {
             if config.features.default_model_id.trim().is_empty() || !cache_loaded {
                 format!(
                     "model '{}' is not present in this account's {model_source}",
@@ -1339,6 +1346,18 @@ async fn handle_model_resolve(state: &Arc<AppState>, params: serde_json::Value) 
                 )
             }
         });
+        if [
+            Some(input_model),
+            Some(route.mapped.as_str()),
+            resolved_model.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|model| config.is_model_disabled(model))
+        {
+            resolved_model = None;
+            error = Some("model_disabled: model is globally disabled".into());
+        }
         results.push(ModelResolutionAccount {
             account_id: account.id,
             account_name,
@@ -1942,7 +1961,7 @@ async fn handle_service_create(state: &Arc<AppState>, params: serde_json::Value)
     .await
     .map_err(|error| RpcError::internal(error.to_string()))?;
 
-    state.apply_runtime_config(&next);
+    state.apply_runtime_config(&next).await;
     state.config.replace(next.clone());
     state.mark_config_reloaded(now_secs());
     let failures = state.reconcile_proxy_services(&next).await;
@@ -1956,7 +1975,7 @@ async fn handle_service_create(state: &Arc<AppState>, params: serde_json::Value)
             Some(0o600),
         )
         .await;
-        state.apply_runtime_config(&previous);
+        state.apply_runtime_config(&previous).await;
         state.config.replace(previous.clone());
         let _rollback_failures = state.reconcile_proxy_services(&previous).await;
         if let Err(rollback_error) = rollback_write {
@@ -2022,7 +2041,7 @@ async fn handle_service_delete(state: &Arc<AppState>, params: serde_json::Value)
     .await
     .map_err(|error| RpcError::internal(error.to_string()))?;
 
-    state.apply_runtime_config(&next);
+    state.apply_runtime_config(&next).await;
     state.config.replace(next.clone());
     state.mark_config_reloaded(now_secs());
     let failures = state.reconcile_proxy_services(&next).await;

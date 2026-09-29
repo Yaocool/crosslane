@@ -6,6 +6,9 @@ use thiserror::Error;
 
 use kproxy_core::config::ServiceAccountTags;
 
+/// Capability required before changing global model deny rules.
+pub const GLOBAL_MODEL_DISABLE_FEATURE: &str = "global_model_disable";
+
 /// 管理面方法名。
 pub mod method {
     /// RPC/provider feature handshake.
@@ -242,6 +245,9 @@ pub struct ProviderAccountListResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderModelListResult {
+    /// Global deny rules, including models no longer present in a catalog.
+    #[serde(default)]
+    pub disabled_models: Vec<String>,
     pub schema_version: u32,
     pub scope: ProviderSelector,
     pub models: Vec<kproxy_core::provider::ProviderModel>,

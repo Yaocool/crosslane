@@ -129,6 +129,13 @@ async fn dispatch_upstream(
 ) -> Result<DispatchOutcome, ExecuteError> {
     let mut input_tokens = input_tokens;
     let config = state.config.current();
+    if config.is_model_disabled(requested_model) {
+        return Err(ExecuteError::Upstream(kproxy_kiro::KiroError {
+            status: Some(400),
+            endpoint: "model-policy".into(),
+            message: format!("model_disabled: model {requested_model} is globally disabled"),
+        }));
+    }
     let pool = state.pool();
     let account_count = account_ids.len() as u32;
     let attempts = retry_attempt_count(config.upstream.max_retries, account_count);
@@ -373,6 +380,18 @@ async fn dispatch_upstream(
             }
             lease
         };
+        let live_config = state.config.current();
+        if let Some(disabled) = model_path
+            .iter()
+            .chain([&actual_model, &mapped_model])
+            .find(|model| live_config.is_model_disabled(model))
+        {
+            return Err(ExecuteError::Upstream(kproxy_kiro::KiroError {
+                status: Some(400),
+                endpoint: "model-policy".into(),
+                message: format!("model_disabled: model {disabled} is globally disabled"),
+            }));
+        }
         if !super::super::model_is_allowed(allowed_models, "kiro", &actual_model) {
             return Err(ExecuteError::ModelNotAllowed {
                 provider_id: "kiro".into(),
@@ -622,7 +641,9 @@ async fn dispatch_upstream(
                 }
                 last_error = Some(error);
                 if config.features.enable_model_fallback && fallback_model.is_none() {
-                    let (models, _) = state.models.get(config.models.cache_ttl_ms);
+                    let (mut models, _) = state.models.get(config.models.cache_ttl_ms);
+                    models
+                        .retain(|model| !state.config.current().is_model_disabled(&model.model_id));
                     if let Some(fallback) = find_model_fallback(&actual_model, &models) {
                         let resolved = if let Some(runtime) = pool.get(&account.id).await {
                             let resolved = runtime.resolve_model(&fallback).await;

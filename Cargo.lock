@@ -1160,6 +1160,7 @@ dependencies = [
  "http",
  "hyper-rustls",
  "kproxy-core",
+ "kproxy-provider",
  "kproxy-translate",
  "quinn",
  "quinn-proto",

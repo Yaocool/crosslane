@@ -680,6 +680,8 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
             &config.features.default_model_id,
             &available_models,
         );
+        provider_gateway::ensure_model_enabled(&config, &route.mapped, ErrorFormat::Claude)?;
+        provider_gateway::ensure_model_enabled(&config, &authorization_model, ErrorFormat::Claude)?;
         provider_gateway::authorize_model(
             authenticated_key.as_ref(),
             "kiro",
@@ -871,6 +873,7 @@ pub async fn models(
                     ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string(), format)
                 })?;
             let (mut models, errors) = state.providers.models(&provider_ids, false).await;
+            models.retain(|model| !state.config.current().is_model_disabled(&model.id));
             if let Some(key) = authenticated
                 .as_ref()
                 .filter(|key| !key.allowed_models.is_empty())
@@ -903,8 +906,9 @@ pub async fn models(
             return provider_model_list(models, allowed.len() > 1, protocol, query.as_ref());
         }
         if !config.models.dynamic_discovery {
-            let models =
+            let mut models =
                 filter_kiro_models_for_key(fallback_models(&config), authenticated.as_ref());
+            models.retain(|model| !config.is_model_disabled(&model.model_id));
             return model_list(models, protocol, query.as_ref());
         }
         let (cached, fresh) = state.models.get(config.models.cache_ttl_ms);
@@ -928,7 +932,8 @@ pub async fn models(
             cached
         };
         let models = service_models(&state, &account_ids, models).await;
-        let models = filter_kiro_models_for_key(models, authenticated.as_ref());
+        let mut models = filter_kiro_models_for_key(models, authenticated.as_ref());
+        models.retain(|model| !state.config.current().is_model_disabled(&model.model_id));
         model_list(models, protocol, query.as_ref())
     }
     .await;
@@ -2097,6 +2102,7 @@ fn upstream_api_error(
     format: ErrorFormat,
 ) -> ApiError {
     let model_resolution_error = error.endpoint == "model-resolution";
+    let model_disabled = error.endpoint == "model-policy";
     let upstream_status = error.status;
     let upstream_throttle = error.is_throttle();
     let model_unavailable = error.is_model_temporarily_unavailable();
@@ -2107,7 +2113,7 @@ fn upstream_api_error(
             || error.is_quota()
             || error.is_throttle()
             || matches!(error.status, Some(500..=599)));
-    let status = if model_resolution_error {
+    let status = if model_resolution_error || model_disabled {
         StatusCode::BAD_REQUEST
     } else {
         match error.status {
@@ -2146,7 +2152,12 @@ fn upstream_api_error(
     output.upstream_status = upstream_status;
     output.error_stage = "upstream_dispatch";
     output.account_error = account_error;
-    if model_resolution_error {
+    if model_disabled {
+        output.error_code = "model_disabled";
+        output.error_stage = "model_policy";
+        output.upstream_status = None;
+        output.account_error = false;
+    } else if model_resolution_error {
         output.error_code = "model_not_available";
         output.error_stage = "model_resolution";
         output.account_error = false;

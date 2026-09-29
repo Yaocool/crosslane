@@ -22,6 +22,7 @@ use crate::stats::ModelCache;
 pub(crate) mod browser_login;
 
 pub struct ProviderManager {
+    model_policy: Arc<kproxy_provider::ModelPolicy>,
     registry: Arc<ProviderRegistry>,
     copilots: RwLock<BTreeMap<ProviderId, CopilotEntry>>,
     kiro_models: Arc<ModelCache>,
@@ -36,6 +37,7 @@ struct CopilotEntry {
 impl ProviderManager {
     pub fn new(kiro_models: Arc<ModelCache>) -> Self {
         Self {
+            model_policy: Arc::new(kproxy_provider::ModelPolicy::default()),
             registry: Arc::new(ProviderRegistry::new()),
             copilots: RwLock::new(BTreeMap::new()),
             kiro_models,
@@ -45,6 +47,11 @@ impl ProviderManager {
 
     pub fn registry(&self) -> Arc<ProviderRegistry> {
         Arc::clone(&self.registry)
+    }
+
+    pub fn with_model_policy(mut self, policy: Arc<kproxy_provider::ModelPolicy>) -> Self {
+        self.model_policy = policy;
+        self
     }
 
     pub async fn reconcile(&self, config: &Config, data_dir: &Path) -> Result<(), String> {
@@ -73,7 +80,9 @@ impl ProviderManager {
                                 provider_accounts_path(data_dir, &id),
                             )
                             .await
-                            .map(Arc::new)
+                            .map(|runtime| {
+                                Arc::new(runtime.with_model_policy(Arc::clone(&self.model_policy)))
+                            })
                         }
                     } else {
                         CopilotProvider::load(
@@ -83,7 +92,9 @@ impl ProviderManager {
                             provider_accounts_path(data_dir, &id),
                         )
                         .await
-                        .map(Arc::new)
+                        .map(|runtime| {
+                            Arc::new(runtime.with_model_policy(Arc::clone(&self.model_policy)))
+                        })
                     };
                     match runtime {
                         Ok(runtime) => {

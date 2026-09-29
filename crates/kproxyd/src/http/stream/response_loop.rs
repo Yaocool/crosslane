@@ -586,7 +586,8 @@ pub fn response(
                     && config.features.enable_model_fallback
                     && fallback_model.is_none()
                 {
-                    let (models, _) = context.state.models.get(config.models.cache_ttl_ms);
+                    let (mut models, _) = context.state.models.get(config.models.cache_ttl_ms);
+                    models.retain(|model| !context.state.config.current().is_model_disabled(&model.model_id));
                     if let Some(fallback) =
                         super::super::handlers::find_model_fallback(&context.kiro_model, &models)
                             .filter(|fallback| {

@@ -105,6 +105,7 @@ pub(super) fn select_provider_route(
     });
     let (initial_provider, unqualified_model) =
         explicit.unwrap_or((default_provider, original_model.as_str()));
+    ensure_model_enabled(config, unqualified_model, format)?;
     authorize_provider(config, service, authenticated_key, initial_provider, format)?;
     let provider = providers
         .iter()
@@ -252,6 +253,7 @@ pub(super) fn select_provider_route(
             )
             .with_provider_id(selected_provider)
         })?;
+    ensure_model_enabled(config, upstream_model, format)?;
     // Kiro finishes account-aware mapping, alias resolution, and fallback in
     // the legacy executor. Authorize that final wire model there. Adapter
     // providers have already completed routing and can be checked now.
@@ -304,6 +306,25 @@ pub(super) fn select_provider_route(
         lock_kiro_mapping,
         body,
     })
+}
+
+pub(super) fn ensure_model_enabled(
+    config: &Config,
+    model: &str,
+    format: ErrorFormat,
+) -> Result<(), ApiError> {
+    let unqualified = config.unqualified_model(model);
+    if config.models.is_disabled(unqualified) {
+        let mut error = ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("model_disabled: model {unqualified} is globally disabled"),
+            format,
+        );
+        error.error_code = "model_disabled";
+        error.error_stage = "model_policy";
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn authorize_provider(
@@ -893,6 +914,11 @@ fn provider_api_error(
     api.retry_after = error.retryable;
     api.account_error = error.account_error;
     api.upstream_status = Some(error.status.as_u16());
+    if error.upstream_code.as_deref() == Some("model_disabled") {
+        api.error_code = "model_disabled";
+        api.error_stage = "model_policy";
+        api.upstream_status = None;
+    }
     api.log_context.provider_id = provider_id.into();
     api.log_context.endpoint = provider_id.into();
     api.log_context.mapped_model = model.into();

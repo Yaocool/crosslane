@@ -145,6 +145,7 @@ pub struct AppState {
     pub paths: Paths,
     pool: RwLock<AccountPool>,
     kiro: RwLock<KiroClient>,
+    model_policy: Arc<kproxy_provider::ModelPolicy>,
     pub meter: Arc<Meter>,
     notifier: RwLock<Notifier>,
     pub tokenizer: TokenCountCache,
@@ -275,8 +276,10 @@ impl AppState {
             runtime_url: std::env::var("KPROXY_RUNTIME_URL").ok(),
             management_url: std::env::var("KPROXY_MANAGEMENT_URL").ok(),
         };
+        let model_policy = Arc::new(kproxy_provider::ModelPolicy::new(current.models.clone()));
         let kiro = KiroClient::new(current.upstream.clone(), overrides)
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?
+            .with_model_policy(Arc::clone(&model_policy));
         let refresher = TokenRefresher::new(current.effective_token_refresh_before_expiry())
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         let pool = AccountPool::new(accounts.all().to_vec(), current.pool.clone());
@@ -289,13 +292,17 @@ impl AppState {
         let admission_limit = current.server.max_concurrent_requests.max(1);
         let connection_limit = current.server.max_connections.max(1);
         let models = Arc::new(ModelCache::default());
-        let providers = Arc::new(crate::providers::ProviderManager::new(Arc::clone(&models)));
+        let providers = Arc::new(
+            crate::providers::ProviderManager::new(Arc::clone(&models))
+                .with_model_policy(Arc::clone(&model_policy)),
+        );
         Ok(Self {
             config,
             accounts: Arc::new(RwLock::new(accounts)),
             paths,
             pool: RwLock::new(pool),
             kiro: RwLock::new(kiro),
+            model_policy,
             meter,
             notifier: RwLock::new(notifier),
             tokenizer: TokenCountCache::new(512).map_err(anyhow::Error::msg)?,
@@ -540,10 +547,10 @@ impl AppState {
         let accounts = self.with_accounts(|store| store.all().to_vec());
         validate_service_account_references(next, &accounts, &self.paths.data_dir)?;
         self.config.replace(next.clone());
-        self.apply_runtime_config(next);
+        self.apply_runtime_config(next).await;
         if let Err(error) = self.providers.reconcile(next, &self.paths.data_dir).await {
             self.config.replace(previous.clone());
-            self.apply_runtime_config(&previous);
+            self.apply_runtime_config(&previous).await;
             let rollback_error = self
                 .providers
                 .reconcile(&previous, &self.paths.data_dir)
@@ -564,7 +571,7 @@ impl AppState {
 
         let apply_error = format_service_failures(&failures);
         self.config.replace(previous.clone());
-        self.apply_runtime_config(&previous);
+        self.apply_runtime_config(&previous).await;
         let provider_rollback_error = self
             .providers
             .reconcile(&previous, &self.paths.data_dir)
@@ -637,6 +644,10 @@ impl AppState {
         // Work on an attempt-local copy so routing to another model cannot
         // permanently erase the original request's effort or thinking controls.
         let mut prepared = payload.clone();
+        if let Some(intent) = prepared.model_request_intent.as_mut() {
+            let config = self.config.current();
+            intent.requested_model = config.unqualified_model(&intent.requested_model).to_owned();
+        }
         self.prepare_model_request(&mut prepared);
         let result = self.kiro().generate(account, &prepared, None).await;
         match &result {
@@ -1065,8 +1076,11 @@ impl AppState {
     }
 
     /// 将文件热重载同步到依赖配置构造的运行时组件。
-    pub fn apply_runtime_config(&self, next: &Config) {
+    pub async fn apply_runtime_config(&self, next: &Config) {
         let previous = read_lock(&self.runtime_config).clone();
+        if previous.models.disabled != next.models.disabled {
+            self.model_policy.replace(&next.models).await;
+        }
         if serde_json::to_string(&previous.log).ok() != serde_json::to_string(&next.log).ok() {
             if let Err(error) = crate::logging::reload_config(&next.log) {
                 tracing::warn!(%error, "failed to hot-reload log configuration");
@@ -1104,7 +1118,7 @@ impl AppState {
                 management_url: std::env::var("KPROXY_MANAGEMENT_URL").ok(),
             };
             if let Ok(client) = KiroClient::new(next.upstream.clone(), overrides) {
-                *write_lock(&self.kiro) = client;
+                *write_lock(&self.kiro) = client.with_model_policy(Arc::clone(&self.model_policy));
             }
         }
         if previous.upstream.token_refresh_before_expiry

@@ -852,10 +852,17 @@ pub(super) async fn probe_account_inner(
             .set_supported_models(models.iter().map(|model| model.model_id.clone()))
             .await;
     }
-    let model = models
-        .first()
-        .map(|model| model.model_id.clone())
-        .unwrap_or_else(|| "minimax-m2.5".into());
+    let candidates = if models.is_empty() {
+        vec!["minimax-m2.5".to_owned()]
+    } else {
+        models.iter().map(|model| model.model_id.clone()).collect()
+    };
+    let Some(model) = candidates
+        .into_iter()
+        .find(|model| !state.config.current().models.is_disabled(model))
+    else {
+        return serde_json::json!({"account_id":account.id,"ok":false,"skipped":true,"error":"all probe models are globally disabled"});
+    };
     let request = kproxy_translate::OpenAiRequest {
         model: model.clone(),
         messages: vec![kproxy_translate::OpenAiMessage {

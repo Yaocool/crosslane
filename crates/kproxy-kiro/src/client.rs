@@ -488,6 +488,7 @@ fn subscription_kind(raw: &str, title: &str) -> SubscriptionKind {
 
 #[derive(Clone)]
 pub struct KiroClient {
+    model_policy: Arc<kproxy_provider::ModelPolicy>,
     short: Client,
     mcp: Client,
     stream: Client,
@@ -551,6 +552,7 @@ impl KiroClient {
             .build()
             .map_err(build_error)?;
         Ok(Self {
+            model_policy: Arc::new(kproxy_provider::ModelPolicy::default()),
             short,
             mcp,
             stream,
@@ -580,12 +582,43 @@ impl KiroClient {
         Arc::clone(&self.cache)
     }
 
+    pub fn with_model_policy(mut self, policy: Arc<kproxy_provider::ModelPolicy>) -> Self {
+        self.model_policy = policy;
+        self
+    }
+
+    async fn admit_model<'a>(
+        &'a self,
+        payload: &KiroPayload,
+    ) -> Result<tokio::sync::RwLockReadGuard<'a, kproxy_core::config::ModelsConfig>, KiroError>
+    {
+        let actual = payload
+            .conversation_state
+            .current_message
+            .user_input_message
+            .model_id
+            .as_str();
+        let original = payload
+            .model_request_intent
+            .as_ref()
+            .map_or(actual, |intent| intent.requested_model.as_str());
+        self.model_policy
+            .admit(&[actual, original])
+            .await
+            .map_err(|error| KiroError {
+                status: Some(400),
+                endpoint: "model-policy".into(),
+                message: error.to_string(),
+            })
+    }
+
     pub async fn generate(
         &self,
         account: &Account,
         payload: &KiroPayload,
         explicit: Option<EndpointKey>,
     ) -> Result<KiroResponse, KiroError> {
+        drop(self.admit_model(payload).await?);
         let explicit = explicit.or(self.upstream.preferred_endpoint.map(EndpointKey::from));
         let order = self
             .cache
@@ -1067,6 +1100,7 @@ impl KiroClient {
                 }
             }
         }
+        let model_permit = self.admit_model(&payload).await?;
         let response = self
             .stream
             .post(&endpoint.url)
@@ -1079,6 +1113,7 @@ impl KiroClient {
                 endpoint: endpoint.name.into(),
                 message: error.to_string(),
             })?;
+        drop(model_permit);
         if response.status().is_success() {
             return Ok(KiroResponse {
                 endpoint,

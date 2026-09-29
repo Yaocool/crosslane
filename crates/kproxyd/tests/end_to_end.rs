@@ -18,6 +18,9 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 static HTTP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+#[path = "end_to_end/model_policy.rs"]
+mod model_policy;
+
 #[path = "end_to_end/responses.rs"]
 mod responses;
 
@@ -1597,20 +1600,31 @@ priority = 10
 
 #[tokio::test]
 async fn temporarily_unavailable_model_falls_back_to_lower_same_family_model() {
-    assert_model_fallback_controls(false, false).await;
+    assert_model_fallback_controls(false, false, false).await;
 }
 
 #[tokio::test]
 async fn streaming_http_fallback_rebuilds_model_controls() {
-    assert_model_fallback_controls(true, false).await;
+    assert_model_fallback_controls(true, false, false).await;
 }
 
 #[tokio::test]
 async fn streaming_event_fallback_rebuilds_model_controls() {
-    assert_model_fallback_controls(true, true).await;
+    assert_model_fallback_controls(true, true, false).await;
 }
 
-async fn assert_model_fallback_controls(stream: bool, stream_failure: bool) {
+#[tokio::test]
+async fn disabled_models_never_receive_capacity_or_stream_fallback_requests() {
+    for (stream, stream_failure) in [(false, false), (true, false), (true, true)] {
+        assert_model_fallback_controls(stream, stream_failure, true).await;
+    }
+}
+
+async fn assert_model_fallback_controls(
+    stream: bool,
+    stream_failure: bool,
+    disable_fallback: bool,
+) {
     let _http_guard = HTTP_TEST_LOCK.lock().await;
     let mock = MockServer::start().await;
     Mock::given(method("GET"))
@@ -1679,6 +1693,13 @@ async fn assert_model_fallback_controls(stream: bool, stream_failure: bool) {
     let models = expect_ok(daemon.call("models", serde_json::json!({})).await);
     assert_eq!(models.as_array().map(Vec::len), Some(2));
 
+    if disable_fallback {
+        model_policy::configure(&daemon, |config| {
+            config.models.disabled = vec!["claude-opus-4.8".into()]
+        })
+        .await;
+    }
+
     let response = reqwest::Client::new()
         .post(format!("http://127.0.0.1:{port}/v1/messages"))
         .header(
@@ -1699,6 +1720,28 @@ async fn assert_model_fallback_controls(stream: bool, stream_failure: bool) {
         .send()
         .await
         .expect("call Claude fallback path");
+    if disable_fallback {
+        let body = response.text().await.unwrap();
+        assert!(
+            !body.contains("completed with the fallback model"),
+            "{body}"
+        );
+        let requests = mock.received_requests().await.unwrap();
+        let generated = requests
+            .iter()
+            .filter(|request| request.method.as_str() == "POST")
+            .collect::<Vec<_>>();
+        assert!(!generated.is_empty());
+        for request in generated {
+            let payload: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(
+                payload["conversationState"]["currentMessage"]["userInputMessage"]["modelId"],
+                "claude-opus-5"
+            );
+        }
+        daemon.stop().await;
+        return;
+    }
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let body = response.text().await.expect("Claude response body");
     assert!(body.contains("completed with the fallback model"), "{body}");

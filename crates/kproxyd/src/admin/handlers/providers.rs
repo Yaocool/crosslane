@@ -25,12 +25,15 @@ pub(super) async fn handle_capabilities(state: &Arc<AppState>) -> Handled {
             "provider_scoped_account_tags",
             "provider_scoped_account_probe",
             "provider_scoped_models",
+            kproxy_ipc::protocol::GLOBAL_MODEL_DISABLE_FEATURE,
             "provider_scoped_model_mapping",
             "provider_scoped_statistics",
             "copilot_device_flow",
             "copilot_native_messages",
             "copilot_native_chat_completions",
-            "copilot_native_responses"
+            "copilot_native_responses",
+            "copilot_protocol_adaptation",
+            "provider_scoped_service_account_pools"
         ]
     }))
 }
@@ -124,6 +127,14 @@ pub(super) async fn handle_account_list(state: &Arc<AppState>, params: Value) ->
                 );
             }
         }
+    }
+    let config = state.config.current();
+    for account in &mut accounts {
+        // Discovery caches retain the full catalog for re-enabling. Operational
+        // account/pool views must not advertise a denied model as schedulable.
+        account
+            .supported_models
+            .retain(|model| !config.is_model_disabled(model));
     }
     accounts.retain(|account| {
         params
@@ -722,6 +733,7 @@ pub(super) async fn handle_models(state: &Arc<AppState>, params: Value) -> Handl
     let (models, mut errors) = state.providers.models(&ids, params.refresh).await;
     errors.append(&mut refresh_errors);
     to_value(ProviderModelListResult {
+        disabled_models: state.config.current().models.disabled.clone(),
         schema_version: 2,
         scope: params.selector,
         models,
