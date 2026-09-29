@@ -44,6 +44,18 @@ pub(crate) struct ServiceHttpState {
 }
 
 impl ServiceHttpState {
+    /// Pool membership edits apply without restarting the listener.
+    pub fn current_service(&self) -> ProxyServiceConfig {
+        self.app
+            .config
+            .current()
+            .proxy_service
+            .iter()
+            .find(|service| service.id == self.service.id)
+            .cloned()
+            .unwrap_or_else(|| self.service.as_ref().clone())
+    }
+
     /// Resolve the service's effective account pool for one request. Keeping a
     /// fixed ID snapshot prevents retries and internal subrequests from
     /// escaping the service pool if accounts change mid-request.
@@ -52,13 +64,7 @@ impl ServiceHttpState {
         // must not restart the listening socket. Resolve the latest service
         // snapshot by stable ID so new requests observe those edits while
         // already accepted requests keep their fixed account ID set.
-        let config = self.app.config.current();
-        let service = config
-            .proxy_service
-            .iter()
-            .find(|service| service.id == self.service.id)
-            .cloned()
-            .unwrap_or_else(|| self.service.as_ref().clone());
+        let service = self.current_service();
         Arc::new(
             self.app
                 .pool()

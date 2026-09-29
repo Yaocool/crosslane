@@ -296,6 +296,7 @@ struct PersistedModelCache {
 /// One configured Copilot provider instance with isolated accounts and token
 /// cache.
 pub struct CopilotProvider {
+    model_policy: Arc<kproxy_provider::ModelPolicy>,
     id: ProviderId,
     enabled: bool,
     settings: CopilotSettings,
@@ -312,6 +313,7 @@ pub struct CopilotProvider {
     model_refresh: Mutex<()>,
     device_logins: Mutex<HashMap<String, DeviceLoginTask>>,
     last_error: StdRwLock<Option<String>>,
+    tokenizer: std::sync::OnceLock<Result<kproxy_translate::TokenCountCache, String>>,
 }
 
 impl CopilotProvider {
@@ -341,6 +343,8 @@ impl CopilotProvider {
             })
             .collect();
         Ok(Self {
+            model_policy: Arc::new(kproxy_provider::ModelPolicy::default()),
+            tokenizer: std::sync::OnceLock::new(),
             id,
             enabled,
             settings,
@@ -362,6 +366,11 @@ impl CopilotProvider {
 
     pub fn id(&self) -> &ProviderId {
         &self.id
+    }
+
+    pub fn with_model_policy(mut self, policy: Arc<kproxy_provider::ModelPolicy>) -> Self {
+        self.model_policy = policy;
+        self
     }
 
     /// Trusted OAuth origin for browser-side credential entry.
@@ -1291,12 +1300,39 @@ impl CopilotProvider {
         headers
     }
 
+    async fn pool_account_ids(
+        &self,
+        pool: Option<&kproxy_core::config::ProxyServiceConfig>,
+    ) -> Option<BTreeSet<String>> {
+        let pool = pool?;
+        Some(
+            self.accounts
+                .read()
+                .await
+                .iter()
+                .filter(|account| {
+                    pool.includes_provider_account(self.id.as_str(), &account.id, &account.tags)
+                })
+                .map(|account| account.id.clone())
+                .collect(),
+        )
+    }
+
     async fn acquire_account(
         &self,
         excluded: &[String],
         model: &str,
         protocol: ProviderProtocol,
-    ) -> Result<(CopilotAccount, tokio::sync::OwnedSemaphorePermit), ProviderError> {
+        native_only: bool,
+        account_ids: Option<&BTreeSet<String>>,
+    ) -> Result<
+        (
+            CopilotAccount,
+            tokio::sync::OwnedSemaphorePermit,
+            ProviderModel,
+        ),
+        ProviderError,
+    > {
         let now = now_secs();
         let capable_accounts = self
             .model_cache
@@ -1305,29 +1341,49 @@ impl CopilotProvider {
             .accounts
             .iter()
             .filter_map(|(account_id, entry)| {
-                (cache_entry_is_usable(entry, now, self.settings.model_max_stale_secs)
-                    && entry.models.iter().any(|candidate| {
-                        candidate.id == model && candidate.protocols.contains(&protocol)
-                    }))
-                .then_some(account_id.clone())
+                if !cache_entry_is_usable(entry, now, self.settings.model_max_stale_secs) {
+                    return None;
+                }
+                entry
+                    .models
+                    .iter()
+                    .find(|candidate| {
+                        candidate.id == model
+                            && !is_embedding_model(candidate)
+                            && if native_only {
+                                candidate.protocols.contains(&protocol)
+                            } else {
+                                !candidate.protocols.is_empty()
+                            }
+                    })
+                    .map(|candidate| (account_id.clone(), candidate.clone()))
             })
-            .collect::<BTreeSet<_>>();
-        let accounts = self
+            .collect::<BTreeMap<_, _>>();
+        let mut accounts = self
             .accounts
             .read()
             .await
             .iter()
             .filter(|account| {
                 account.enabled
+                    && account_ids.is_none_or(|ids| ids.contains(&account.id))
                     && !excluded.contains(&account.id)
                     && account
                         .supported_models
                         .iter()
                         .any(|candidate| candidate == model)
-                    && capable_accounts.contains(&account.id)
+                    && capable_accounts.contains_key(&account.id)
             })
             .cloned()
             .collect::<Vec<_>>();
+        // Native-capable accounts preserve fields with no portable equivalent
+        // (for example Responses state); do not randomly adapt those requests.
+        if accounts
+            .iter()
+            .any(|account| capable_accounts[&account.id].protocols.contains(&protocol))
+        {
+            accounts.retain(|account| capable_accounts[&account.id].protocols.contains(&protocol));
+        }
         if accounts.is_empty() {
             let mut error = ProviderError::new(
                 ProviderErrorKind::InvalidRequest,
@@ -1364,7 +1420,11 @@ impl CopilotProvider {
         }
         for (account, limit) in &candidates {
             if let Ok(permit) = Arc::clone(limit).try_acquire_owned() {
-                return Ok((account.clone(), permit));
+                return Ok((
+                    account.clone(),
+                    permit,
+                    capable_accounts[&account.id].clone(),
+                ));
             }
         }
         let (account, limit) = candidates
@@ -1377,21 +1437,29 @@ impl CopilotProvider {
                 account.id
             ))
         })?;
-        Ok((account, permit))
+        let model = capable_accounts[&account.id].clone();
+        Ok((account, permit, model))
     }
 
     async fn execute_path(
         &self,
         request: ProviderRequest,
-        upstream_path: &str,
+        fixed_path: Option<&str>,
     ) -> Result<ProviderResponse, ProviderError> {
+        drop(
+            self.model_policy
+                .admit(&[
+                    &request.model,
+                    request.original_model.as_deref().unwrap_or(&request.model),
+                ])
+                .await?,
+        );
         if !self.enabled {
             return Err(ProviderError::unavailable(format!(
                 "provider {} is disabled",
                 self.id
             )));
         }
-        let prepared = prepare_provider_request(&request)?;
         let account_count = self
             .accounts
             .read()
@@ -1405,11 +1473,19 @@ impl CopilotProvider {
                         .any(|candidate| candidate == &request.model)
             })
             .count();
+        // Freeze membership for this request, including failover retries.
+        let account_ids = self.pool_account_ids(request.account_pool.as_ref()).await;
         let mut excluded = Vec::new();
         let mut last_error = None;
         for _ in 0..account_count.max(1) {
-            let (account, permit) = match self
-                .acquire_account(&excluded, &request.model, request.protocol)
+            let (account, permit, model) = match self
+                .acquire_account(
+                    &excluded,
+                    &request.model,
+                    request.protocol,
+                    fixed_path.is_some(),
+                    account_ids.as_ref(),
+                )
                 .await
             {
                 Ok(acquired) => acquired,
@@ -1417,6 +1493,42 @@ impl CopilotProvider {
                 Err(error) => return Err(error),
             };
             excluded.push(account.id.clone());
+            let upstream_protocol = if model.protocols.contains(&request.protocol) {
+                request.protocol
+            } else {
+                model.protocols[0]
+            };
+            let upstream_path = fixed_path.unwrap_or(match upstream_protocol {
+                ProviderProtocol::ClaudeMessages => "/v1/messages",
+                ProviderProtocol::OpenAiChat => "/chat/completions",
+                ProviderProtocol::OpenAiResponses => "/responses",
+            });
+            let mut upstream_request = request.clone();
+            upstream_request.protocol = upstream_protocol;
+            if upstream_protocol != request.protocol {
+                let body: Value = serde_json::from_slice(&request.body).map_err(|_| {
+                    ProviderError::new(
+                        ProviderErrorKind::InvalidRequest,
+                        StatusCode::BAD_REQUEST,
+                        "invalid request JSON",
+                    )
+                })?;
+                let translated = kproxy_translate::bridge::translate_request(
+                    &body,
+                    request.protocol,
+                    upstream_protocol,
+                    model.max_output_tokens,
+                )
+                .map_err(|error| {
+                    ProviderError::new(
+                        ProviderErrorKind::InvalidRequest,
+                        StatusCode::BAD_REQUEST,
+                        error.to_string(),
+                    )
+                })?;
+                upstream_request.body = bytes::Bytes::from(translated.to_string());
+            }
+            let prepared = prepare_provider_request(&upstream_request)?;
             let mut token = match self.api_token(&account).await {
                 Ok(token) => token,
                 Err(error) => {
@@ -1429,21 +1541,29 @@ impl CopilotProvider {
             let mut retried_auth = false;
             loop {
                 let url = endpoint_url(&token.endpoint, upstream_path)?;
-                let response = match self
+                let model_permit = self
+                    .model_policy
+                    .admit(&[
+                        &request.model,
+                        request.original_model.as_deref().unwrap_or(&request.model),
+                    ])
+                    .await?;
+                let sent = self
                     .http
                     .post(url)
                     .headers(self.upstream_headers(
                         &token.token,
                         Some(&request.headers),
-                        request.protocol,
+                        upstream_protocol,
                         prepared.streaming,
                         prepared.vision,
                     ))
                     .header("x-request-id", &request.trace_id)
                     .body(prepared.body.clone())
                     .send()
-                    .await
-                {
+                    .await;
+                drop(model_permit);
+                let response = match sent {
                     Ok(response) => response,
                     Err(error) => {
                         let error = transport_error(error);
@@ -1489,7 +1609,18 @@ impl CopilotProvider {
                     }
                     self.set_provider_runtime_error(None);
                 }
-                return Ok(response_from_reqwest(response, account.id.clone(), permit));
+                let response = response_from_reqwest(response, account.id.clone(), permit);
+                if upstream_protocol == request.protocol {
+                    return Ok(response);
+                }
+                return super::bridge::adapt_response(
+                    response,
+                    upstream_protocol,
+                    request.protocol,
+                    prepared.streaming,
+                    &request.model,
+                )
+                .await;
             }
         }
         let error = last_error.unwrap_or_else(|| {
@@ -1541,7 +1672,7 @@ impl ProviderAdapter for CopilotProvider {
                 device_flow: true,
                 token_import: true,
                 model_discovery: true,
-                token_counting: CapabilitySupport::Native,
+                token_counting: CapabilitySupport::Adapted,
                 usage: CapabilitySupport::Native,
             },
         }
@@ -1693,20 +1824,121 @@ impl ProviderAdapter for CopilotProvider {
     }
 
     async fn execute(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
-        let path = match request.protocol {
-            ProviderProtocol::ClaudeMessages => "/v1/messages",
-            ProviderProtocol::OpenAiChat => "/chat/completions",
-            ProviderProtocol::OpenAiResponses => "/responses",
-        };
-        self.execute_path(request, path).await
+        self.execute_path(request, None).await
     }
 
     async fn count_tokens(
         &self,
         request: ProviderRequest,
     ) -> Result<ProviderResponse, ProviderError> {
-        self.execute_path(request, "/v1/messages/count_tokens")
+        drop(
+            self.model_policy
+                .admit(&[
+                    &request.model,
+                    request.original_model.as_deref().unwrap_or(&request.model),
+                ])
+                .await?,
+        );
+        if !self.enabled {
+            return Err(ProviderError::unavailable(format!(
+                "provider {} is disabled",
+                self.id
+            )));
+        }
+        let account_ids = self.pool_account_ids(request.account_pool.as_ref()).await;
+        let (account, permit, model) = self
+            .acquire_account(
+                &[],
+                &request.model,
+                ProviderProtocol::ClaudeMessages,
+                false,
+                account_ids.as_ref(),
+            )
+            .await?;
+        if !model.protocols.contains(&ProviderProtocol::ClaudeMessages) {
+            let body: Value = serde_json::from_slice(&request.body).map_err(|_| {
+                ProviderError::new(
+                    ProviderErrorKind::InvalidRequest,
+                    StatusCode::BAD_REQUEST,
+                    "invalid request JSON",
+                )
+            })?;
+            // Validate the same content shapes used by adapted generation.
+            kproxy_translate::bridge::translate_request(
+                &body,
+                ProviderProtocol::ClaudeMessages,
+                ProviderProtocol::OpenAiChat,
+                model.max_output_tokens,
+            )
+            .map_err(|error| {
+                ProviderError::new(
+                    ProviderErrorKind::InvalidRequest,
+                    StatusCode::BAD_REQUEST,
+                    error.to_string(),
+                )
+            })?;
+            let mut input = serde_json::json!({"system":body["system"],"messages":body["messages"],"tools":body["tools"]});
+            let mut attachment_tokens = 0;
+            strip_counted_attachments(&mut input, &mut attachment_tokens);
+            let tokenizer = self
+                .tokenizer
+                .get_or_init(|| kproxy_translate::TokenCountCache::new(128))
+                .as_ref()
+                .map_err(|error| internal_error(error.clone()))?;
+            let tokens = tokenizer
+                .count(input.to_string())
+                .await
+                .map_err(internal_error)?
+                + attachment_tokens;
+            drop(permit);
+            let mut headers = HeaderMap::new();
+            headers.insert("content-type", HeaderValue::from_static("application/json"));
+            headers.insert(
+                "x-kproxy-token-count-source",
+                HeaderValue::from_static("estimate"),
+            );
+            return Ok(ProviderResponse {
+                status: StatusCode::OK,
+                headers,
+                body: ProviderResponseBody::Full(bytes::Bytes::from(
+                    serde_json::json!({"input_tokens":tokens,"estimated":true}).to_string(),
+                )),
+                account_id: Some(account.id),
+                upstream_request_id: None,
+            });
+        }
+        drop(permit);
+        self.execute_path(request, Some("/v1/messages/count_tokens"))
             .await
+    }
+}
+
+fn strip_counted_attachments(value: &mut Value, attachment_tokens: &mut usize) {
+    if matches!(
+        value["type"].as_str(),
+        Some("image" | "image_url" | "input_image")
+    ) {
+        *attachment_tokens += 1024;
+        *value = serde_json::json!({"type":"image"});
+    } else if value["type"] == "document" && value["source"]["type"] != "text" {
+        *attachment_tokens += value["source"]["data"]
+            .as_str()
+            .map_or(1024, |data| data.len() / 4 + 256);
+        *value = serde_json::json!({"type":"document"});
+    } else {
+        match value {
+            Value::Array(items) => {
+                for item in items {
+                    strip_counted_attachments(item, attachment_tokens);
+                }
+            }
+            Value::Object(fields) => {
+                for field in fields.values_mut() {
+                    strip_counted_attachments(field, attachment_tokens);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1724,6 +1956,7 @@ fn prepare_provider_request(
     let object = value
         .as_object_mut()
         .ok_or_else(|| internal_error("routed provider request must be a JSON object"))?;
+    object.insert("model".into(), Value::String(request.model.clone()));
     let streaming = object
         .get("stream")
         .and_then(Value::as_bool)
@@ -1931,7 +2164,29 @@ fn aggregate_model_cache(
             }
         }
     }
-    models.into_values().collect()
+    models
+        .into_values()
+        .filter(|model| !is_embedding_model(model) && !model.protocols.is_empty())
+        .map(|mut model| {
+            if !model.capabilities.is_object() {
+                model.capabilities = serde_json::json!({});
+            }
+            model.capabilities["native_protocols"] = serde_json::json!(model.protocols);
+            model.protocols = vec![
+                ProviderProtocol::ClaudeMessages,
+                ProviderProtocol::OpenAiChat,
+                ProviderProtocol::OpenAiResponses,
+            ];
+            model
+        })
+        .collect()
+}
+
+fn is_embedding_model(model: &ProviderModel) -> bool {
+    model.id.to_ascii_lowercase().contains("embedding")
+        || model.capabilities["type"].as_str().is_some_and(|kind| {
+            kind.eq_ignore_ascii_case("embeddings") || kind.eq_ignore_ascii_case("embedding")
+        })
 }
 
 fn merge_model_metadata(current: &mut ProviderModel, candidate: &ProviderModel) {
@@ -2026,6 +2281,16 @@ fn parse_models(
 }
 
 fn model_protocols(value: &Value, model_id: &str) -> Vec<ProviderProtocol> {
+    if model_id.to_ascii_lowercase().contains("embedding")
+        || value
+            .pointer("/capabilities/type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| {
+                kind.eq_ignore_ascii_case("embeddings") || kind.eq_ignore_ascii_case("embedding")
+            })
+    {
+        return Vec::new();
+    }
     let declared = [
         "/capabilities/supported_endpoints",
         "/capabilities/endpoints",
@@ -2299,6 +2564,255 @@ mod tests {
             .expect(1)
             .mount(server)
             .await;
+    }
+
+    #[tokio::test]
+    async fn disabled_models_block_all_protocols_and_native_count_tokens_before_any_io() {
+        let server = MockServer::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        let policy = Arc::new(kproxy_provider::ModelPolicy::default());
+        let provider = mock_provider(&server, directory.path())
+            .await
+            .with_model_policy(Arc::clone(&policy));
+        policy
+            .replace(&kproxy_core::config::ModelsConfig {
+                disabled: vec!["gpt-test".into()],
+                ..Default::default()
+            })
+            .await;
+        for protocol in [
+            ProviderProtocol::OpenAiChat,
+            ProviderProtocol::OpenAiResponses,
+            ProviderProtocol::ClaudeMessages,
+        ] {
+            for model in ["gpt-test", "mapped-allowed"] {
+                for streaming in [false, true] {
+                    let request = ProviderRequest {
+                        model: model.into(),
+                        original_model: Some("gpt-test".into()),
+                        protocol,
+                        path: "/ignored".into(),
+                        headers: HeaderMap::new(),
+                        body: bytes::Bytes::from(
+                            serde_json::json!({"model":model,"stream":streaming}).to_string(),
+                        ),
+                        trace_id: "deny-test".into(),
+                        service_id: "test".into(),
+                        account_pool: None,
+                        api_key_id: None,
+                    };
+                    let error = provider.execute(request.clone()).await.err().unwrap();
+                    assert_eq!(error.upstream_code.as_deref(), Some("model_disabled"));
+                    assert!(!error.account_error && !error.retryable);
+                    assert_eq!(
+                        provider
+                            .count_tokens(request)
+                            .await
+                            .err()
+                            .unwrap()
+                            .upstream_code
+                            .as_deref(),
+                        Some("model_disabled")
+                    );
+                }
+            }
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn adapts_each_non_native_protocol_over_http_in_both_response_modes() {
+        use ProviderProtocol::{ClaudeMessages, OpenAiChat, OpenAiResponses};
+        for native in [ClaudeMessages, OpenAiChat, OpenAiResponses] {
+            for caller in [ClaudeMessages, OpenAiChat, OpenAiResponses] {
+                if caller == native {
+                    continue;
+                }
+                for streaming in [false, true] {
+                    let server = MockServer::start().await;
+                    let directory = tempfile::tempdir().unwrap();
+                    mount_account_exchange(&server, "github-token").await;
+                    let provider = mock_provider(&server, directory.path()).await;
+                    let account = provider
+                        .import_token("github-token".into(), None)
+                        .await
+                        .unwrap();
+                    provider
+                        .model_cache
+                        .write()
+                        .await
+                        .accounts
+                        .get_mut(&account.id)
+                        .unwrap()
+                        .models[0]
+                        .protocols = vec![native];
+                    let (path, full, sse) = match native {
+                        ClaudeMessages => ("/v1/messages",serde_json::json!({"id":"m","model":"gpt-test","type":"message","content":[{"type":"text","text":"translated"}],"stop_reason":"end_turn","usage":{"input_tokens":4,"output_tokens":2},"copilot_usage":{"total_nano_aiu":7}}),
+                            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"gpt-test\",\"usage\":{\"input_tokens\":4}}}\n\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"translated\"}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2},\"copilot_usage\":{\"total_nano_aiu\":7}}\n\ndata: {\"type\":\"message_stop\"}\n\n"),
+                        OpenAiChat => ("/chat/completions",serde_json::json!({"id":"c","model":"gpt-test","choices":[{"message":{"role":"assistant","content":"translated"},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":2},"copilot_usage":{"total_nano_aiu":7}}),
+                            "data: {\"id\":\"c\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"translated\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2},\"copilot_usage\":{\"total_nano_aiu\":7}}\n\ndata: [DONE]\n\n"),
+                        OpenAiResponses => ("/responses",serde_json::json!({"id":"r","model":"gpt-test","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"translated"}]}],"usage":{"input_tokens":4,"output_tokens":2},"copilot_usage":{"total_nano_aiu":7}}),
+                            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"model\":\"gpt-test\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"translated\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":4,\"output_tokens\":2},\"copilot_usage\":{\"total_nano_aiu\":7}}}\n\n"),
+                    };
+                    let reply = if streaming {
+                        ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream")
+                    } else {
+                        ResponseTemplate::new(200).set_body_json(full)
+                    };
+                    Mock::given(method("POST"))
+                        .and(wiremock::matchers::path(path))
+                        .and(header("authorization", "Bearer copilot-api-token"))
+                        .respond_with(reply)
+                        .expect(1)
+                        .mount(&server)
+                        .await;
+                    let mut body = match caller {
+                        OpenAiResponses => serde_json::json!({"model":"gpt-test","input":"hello"}),
+                        _ => {
+                            serde_json::json!({"model":"gpt-test","messages":[{"role":"user","content":"hello"}],"max_tokens":64})
+                        }
+                    };
+                    body["stream"] = serde_json::json!(streaming);
+                    let response = provider
+                        .execute(ProviderRequest {
+                            original_model: None,
+                            protocol: caller,
+                            model: "gpt-test".into(),
+                            path: "/client".into(),
+                            headers: HeaderMap::new(),
+                            body: bytes::Bytes::from(body.to_string()),
+                            trace_id: "bridge-test".into(),
+                            service_id: "test".into(),
+                            account_pool: None,
+                            api_key_id: None,
+                        })
+                        .await
+                        .unwrap_or_else(|error| {
+                            panic!("{native:?} -> {caller:?}, stream={streaming}: {error}")
+                        });
+                    assert_eq!(response.status, StatusCode::OK);
+                    assert_eq!(response.account_id.as_deref(), Some(account.id.as_str()));
+                    let output = match response.body {
+                        ProviderResponseBody::Full(bytes) => bytes.to_vec(),
+                        ProviderResponseBody::Stream(mut stream) => {
+                            let mut bytes = Vec::new();
+                            while let Some(chunk) = stream.next().await {
+                                bytes.extend_from_slice(&chunk.unwrap());
+                            }
+                            bytes
+                        }
+                    };
+                    let output = String::from_utf8(output).unwrap();
+                    assert!(output.contains("translated"), "{native:?}->{caller:?}");
+                    assert!(output.contains("total_nano_aiu"));
+                    let upstream = server
+                        .received_requests()
+                        .await
+                        .unwrap()
+                        .into_iter()
+                        .find(|r| r.method == "POST")
+                        .unwrap();
+                    let forwarded: Value = serde_json::from_slice(&upstream.body).unwrap();
+                    assert_eq!(forwarded["model"], "gpt-test");
+                    assert!(forwarded
+                        .get(if native == OpenAiResponses {
+                            "input"
+                        } else {
+                            "messages"
+                        })
+                        .is_some());
+                    server.verify().await;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn public_catalog_expands_protocols_without_changing_native_cache_or_exposing_embeddings()
+    {
+        let server = MockServer::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        mount_account_exchange(&server, "github-token").await;
+        let provider = mock_provider(&server, directory.path()).await;
+        let account = provider
+            .import_token("github-token".into(), None)
+            .await
+            .unwrap();
+        {
+            let mut cache = provider.model_cache.write().await;
+            let entry = cache.accounts.get_mut(&account.id).unwrap();
+            entry.models[0].protocols = vec![ProviderProtocol::OpenAiChat];
+            let mut embedding = entry.models[0].clone();
+            embedding.id = "text-embedding-test".into();
+            entry.models.push(embedding);
+        }
+        let models = provider.models(false).await.unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].protocols.len(), 3);
+        assert_eq!(
+            models[0].capabilities["native_protocols"],
+            serde_json::json!(["open_ai_chat"])
+        );
+        assert_eq!(
+            provider.model_cache.read().await.accounts[&account.id].models[0].protocols,
+            [ProviderProtocol::OpenAiChat]
+        );
+        let mut pool = kproxy_core::config::ProxyServiceConfig {
+            allowed_providers: vec!["copilot".into()],
+            account_tag: Some(kproxy_core::config::ServiceAccountTags::One("team".into())),
+            ..Default::default()
+        };
+        let before = provider.pool_account_ids(Some(&pool)).await;
+        assert!(provider
+            .acquire_account(
+                &[],
+                "gpt-test",
+                ProviderProtocol::ClaudeMessages,
+                false,
+                before.as_ref()
+            )
+            .await
+            .is_err());
+        provider
+            .update_account_tags(&account.id, &["team".into()], &[])
+            .await
+            .unwrap();
+        assert!(provider
+            .acquire_account(
+                &[],
+                "gpt-test",
+                ProviderProtocol::ClaudeMessages,
+                false,
+                before.as_ref()
+            )
+            .await
+            .is_err());
+        let after = provider.pool_account_ids(Some(&pool)).await;
+        let selected = provider
+            .acquire_account(
+                &[],
+                "gpt-test",
+                ProviderProtocol::ClaudeMessages,
+                false,
+                after.as_ref(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(selected.0.id, account.id);
+        drop(selected);
+        pool.excluded_account_ids
+            .push(format!("copilot/{}", account.id));
+        let excluded = provider.pool_account_ids(Some(&pool)).await;
+        assert!(provider
+            .acquire_account(
+                &[],
+                "gpt-test",
+                ProviderProtocol::ClaudeMessages,
+                false,
+                excluded.as_ref()
+            )
+            .await
+            .is_err());
     }
 
     #[test]
@@ -2600,6 +3114,7 @@ mod tests {
 
         let unavailable = match provider
             .execute(ProviderRequest {
+                original_model: None,
                 protocol: ProviderProtocol::OpenAiChat,
                 model: "missing-model".into(),
                 path: "/v1/chat/completions".into(),
@@ -2607,6 +3122,7 @@ mod tests {
                 body: bytes::Bytes::from_static(br#"{"model":"missing-model"}"#),
                 trace_id: "trace-missing".into(),
                 service_id: "svc-test".into(),
+                account_pool: None,
                 api_key_id: Some("ak-test".into()),
             })
             .await
@@ -2621,6 +3137,7 @@ mod tests {
 
         let response = provider
             .execute(ProviderRequest {
+                    original_model: None,
                 protocol: ProviderProtocol::OpenAiChat,
                 model: "gpt-test".into(),
                 path: "/v1/chat/completions".into(),
@@ -2630,6 +3147,7 @@ mod tests {
                 ),
                 trace_id: "trace-test".into(),
                 service_id: "svc-test".into(),
+                account_pool: None,
                 api_key_id: Some("ak-test".into()),
             })
             .await
@@ -2916,6 +3434,7 @@ mod tests {
             (
                 false,
                 ProviderRequest {
+                    original_model: None,
                     protocol: ProviderProtocol::ClaudeMessages,
                     model: "gpt-test".into(),
                     path: "/v1/messages".into(),
@@ -2923,12 +3442,14 @@ mod tests {
                     body: serde_json::to_vec(&messages).unwrap().into(),
                     trace_id: "trace-messages".into(),
                     service_id: "svc-test".into(),
+                    account_pool: None,
                     api_key_id: Some("ak-test".into()),
                 },
             ),
             (
                 false,
                 ProviderRequest {
+                    original_model: None,
                     protocol: ProviderProtocol::OpenAiResponses,
                     model: "gpt-test".into(),
                     path: "/v1/responses".into(),
@@ -2936,12 +3457,14 @@ mod tests {
                     body: serde_json::to_vec(&responses).unwrap().into(),
                     trace_id: "trace-responses".into(),
                     service_id: "svc-test".into(),
+                    account_pool: None,
                     api_key_id: Some("ak-test".into()),
                 },
             ),
             (
                 true,
                 ProviderRequest {
+                    original_model: None,
                     protocol: ProviderProtocol::ClaudeMessages,
                     model: "gpt-test".into(),
                     path: "/v1/messages/count_tokens".into(),
@@ -2949,6 +3472,7 @@ mod tests {
                     body: serde_json::to_vec(&count).unwrap().into(),
                     trace_id: "trace-count".into(),
                     service_id: "svc-test".into(),
+                    account_pool: None,
                     api_key_id: Some("ak-test".into()),
                 },
             ),
@@ -3016,6 +3540,7 @@ mod tests {
             .await
             .unwrap();
         let request = ProviderRequest {
+            original_model: None,
             protocol: ProviderProtocol::OpenAiChat,
             model: "gpt-test".into(),
             path: "/v1/chat/completions".into(),
@@ -3025,6 +3550,7 @@ mod tests {
             ),
             trace_id: "trace-health".into(),
             service_id: "svc-test".into(),
+            account_pool: None,
             api_key_id: Some("ak-test".into()),
         };
         let failed = provider.execute(request.clone()).await.unwrap();

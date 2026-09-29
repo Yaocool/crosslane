@@ -400,11 +400,20 @@ pub(super) async fn execute_provider(
     let request = ProviderRequest {
         protocol,
         model: route.upstream_model.clone(),
+        original_model: Some(
+            service
+                .app
+                .config
+                .current()
+                .unqualified_model(&route.original_model)
+                .to_owned(),
+        ),
         path: path.clone(),
         headers,
         body: route.body,
         trace_id: trace_id.clone(),
         service_id: service.service.id.clone(),
+        account_pool: Some(service.current_service()),
         api_key_id: api_key_id.clone(),
     };
     let error_model = route.upstream_model.clone();
@@ -522,6 +531,7 @@ struct ProviderUsage {
     cache_write_tokens: u64,
     reasoning_tokens: u64,
     billing: Option<ProviderBilling>,
+    error: Option<String>,
 }
 
 impl ProviderUsage {
@@ -532,10 +542,27 @@ impl ProviderUsage {
     }
 
     fn from_value(value: &Value) -> Self {
+        // Local token estimates are returned to the caller, but are not
+        // provider-reported generation usage.
+        if value.get("estimated").and_then(Value::as_bool) == Some(true) {
+            return Self::default();
+        }
         let mut usage = Self {
             billing: copilot_billing(value),
+            error: provider_response_error(value),
             ..Self::default()
         };
+        if [
+            value.get("kproxy_usage_source"),
+            value.pointer("/message/kproxy_usage_source"),
+            value.pointer("/response/kproxy_usage_source"),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|source| source == "unreported")
+        {
+            return usage;
+        }
         usage.merge_object(value);
         for candidate in [
             value.get("usage"),
@@ -544,6 +571,7 @@ impl ProviderUsage {
         ]
         .into_iter()
         .flatten()
+        .filter(|candidate| candidate.is_object())
         {
             usage.reported = true;
             usage.merge_object(candidate);
@@ -582,6 +610,15 @@ impl ProviderUsage {
             self.reasoning_tokens = self.reasoning_tokens.max(tokens);
         }
         if let Some(details) = value
+            .get("input_tokens_details")
+            .or_else(|| value.get("prompt_tokens_details"))
+        {
+            if let Some(tokens) = details.get("cached_tokens").and_then(Value::as_u64) {
+                self.reported = true;
+                self.cache_read_tokens = self.cache_read_tokens.max(tokens);
+            }
+        }
+        if let Some(details) = value
             .get("output_tokens_details")
             .or_else(|| value.get("completion_tokens_details"))
         {
@@ -602,7 +639,36 @@ impl ProviderUsage {
         if other.billing.is_some() {
             self.billing = other.billing;
         }
+        if other.error.is_some() {
+            self.error = other.error;
+        }
     }
+}
+
+fn provider_response_error(value: &Value) -> Option<String> {
+    let error = value
+        .get("error")
+        .or_else(|| value.pointer("/response/error"))
+        .filter(|error| !error.is_null());
+    let failed = matches!(
+        value.get("type").and_then(Value::as_str),
+        Some("error" | "response.failed")
+    ) || value.get("status").and_then(Value::as_str) == Some("failed");
+    if error.is_none() && !failed {
+        return None;
+    }
+    Some(
+        error
+            .and_then(|error| {
+                error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .or_else(|| error.as_str())
+            })
+            .or_else(|| value.get("message").and_then(Value::as_str))
+            .unwrap_or("upstream returned a protocol error")
+            .to_owned(),
+    )
 }
 
 fn copilot_billing(value: &Value) -> Option<ProviderBilling> {
@@ -731,10 +797,11 @@ impl ProviderUsageScanner {
 async fn record_provider_request(
     state: &Arc<AppState>,
     metadata: &ProviderRequestMetadata,
-    usage: ProviderUsage,
+    mut usage: ProviderUsage,
     stream_error: Option<String>,
     reservation: CreditReservation,
 ) {
+    let stream_error = stream_error.or_else(|| usage.error.take());
     let status = if stream_error.is_some() && metadata.status < 400 {
         502
     } else {
@@ -1178,5 +1245,28 @@ data: {"choices":[],"copilot_usage":{"total_nano_aiu":12345,"cost_per_batch":9}}
             br#"{"response":{"usage":{"input_tokens":1,"output_tokens":2},"copilot_usage":{"total_nano_aiu":3}}}"#,
         );
         assert_eq!(usage.billing.expect("nested billing").amount, Some(3));
+    }
+
+    #[test]
+    fn usage_scanner_records_protocol_failures_and_excludes_local_estimates() {
+        let estimate = ProviderUsage::from_bytes(br#"{"input_tokens":42,"estimated":true}"#);
+        assert!(!estimate.reported);
+        assert_eq!(estimate.input_tokens, 0);
+        let scaffold = ProviderUsage::from_bytes(br#"{"message":{"usage":{"input_tokens":0,"output_tokens":0},"kproxy_usage_source":"unreported"},"copilot_usage":{"total_nano_aiu":8}}"#);
+        assert!(!scaffold.reported);
+        assert_eq!(scaffold.billing.unwrap().amount, Some(8));
+        for payload in [
+            r#"{"type":"error","error":{"message":"failed"}}"#,
+            r#"{"type":"error","message":"failed","code":"rate_limit"}"#,
+            r#"{"type":"response.failed","response":{"error":{"message":"failed"}}}"#,
+        ] {
+            let mut scanner = ProviderUsageScanner::default();
+            scanner.push(format!("data: {payload}\n\n").as_bytes());
+            assert_eq!(scanner.finish().error.as_deref(), Some("failed"));
+        }
+        let usage = ProviderUsage::from_bytes(
+            br#"{"usage":{"prompt_tokens":12,"prompt_tokens_details":{"cached_tokens":8}}}"#,
+        );
+        assert_eq!(usage.cache_read_tokens, 8);
     }
 }

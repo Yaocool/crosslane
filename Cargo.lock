@@ -1114,6 +1114,7 @@ dependencies = [
  "kproxy-core",
  "kproxy-provider",
  "kproxy-store",
+ "kproxy-translate",
  "reqwest 0.12.7",
  "serde",
  "serde_json",

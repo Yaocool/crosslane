@@ -25,11 +25,15 @@ pub struct ProviderRequest {
     pub protocol: ProviderProtocol,
     /// Provider-local model ID after shared mapping and authorization.
     pub model: String,
+    /// Original unqualified model, retained across mappings for live deny checks.
+    pub original_model: Option<String>,
     pub path: String,
     pub headers: HeaderMap,
     pub body: Bytes,
     pub trace_id: String,
     pub service_id: String,
+    /// Immutable service membership rules for account selection and failover.
+    pub account_pool: Option<kproxy_core::config::ProxyServiceConfig>,
     pub api_key_id: Option<String>,
 }
 

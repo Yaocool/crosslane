@@ -2,6 +2,7 @@
 
 mod account;
 mod auth;
+mod bridge;
 mod client;
 
 pub use account::{CopilotAccount, CopilotAccountSummary, CopilotCredentials};

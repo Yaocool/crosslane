@@ -9,6 +9,7 @@ license.workspace = true
 kproxy-core.workspace = true
 kproxy-provider.workspace = true
 kproxy-store.workspace = true
+kproxy-translate.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
