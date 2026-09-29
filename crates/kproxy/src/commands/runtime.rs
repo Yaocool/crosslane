@@ -26,7 +26,7 @@ use crate::ModelMapCommand;
 pub enum ServiceCommand {
     /// 列出 Kiro/Copilot API 代理服务。
     #[command(
-        after_help = "可用 --provider kiro|copilot 筛选允许该来源的服务；省略时显示全部。\n\n示例：\n  kproxy service list --provider kiro\n  kproxy service list --provider copilot"
+        after_help = "可用 --provider <ID> 筛选允许该来源的服务；省略时显示全部。\n\n示例：\n  kproxy service list --provider kiro\n  kproxy service list --provider copilot"
     )]
     List {
         /// 只显示允许该提供源的服务；`all` 等同于不筛选。
@@ -43,7 +43,7 @@ pub enum ServiceCommand {
     },
     /// 创建并启动服务，同时生成首个 API key。
     #[command(
-        after_help = "省略 --provider 时保持 Kiro-only；服务与自动生成的 API key 使用相同来源范围。--account-tag 仅筛选 Kiro 账号。多个服务需使用不同端口。\n\n示例：\n  kproxy service create --name kiro --port 5580 --provider kiro --default-provider kiro\n  kproxy service create --name copilot --port 5581 --provider copilot --default-provider copilot\n  kproxy service create --name unified --port 5582 --provider kiro --provider copilot --default-provider kiro"
+        after_help = "省略 --provider 时保持 Kiro-only；服务与自动生成的 API key 使用相同来源范围。--account-tag 筛选服务允许的 Kiro/Copilot 账号。多个服务需使用不同端口。\n\n示例：\n  kproxy service create --name kiro --port 5580 --provider kiro --default-provider kiro\n  kproxy service create --name copilot --port 5581 --provider copilot --default-provider copilot\n  kproxy service create --name unified --port 5582 --provider kiro --provider copilot --default-provider kiro"
     )]
     Create {
         #[arg(long)]
@@ -53,7 +53,7 @@ pub enum ServiceCommand {
         /// 监听端口，范围 1024..=65535。
         #[arg(long, value_parser = parse_service_port)]
         port: Option<u16>,
-        /// 使用一个或多个 Kiro 账号标签的并集作为基础账号池；不指定时使用全局账号池。
+        /// 使用一个或多个 Kiro/Copilot 账号标签的并集作为基础账号池；不指定时使用全局账号池。
         #[arg(long, num_args = 1.., value_delimiter = ',', value_name = "TAG")]
         account_tag: Vec<String>,
         /// 是否允许该服务的已认证请求跳过客户端 User-Agent 校验。
@@ -73,15 +73,15 @@ pub enum ServiceCommand {
         )]
         api_key_format: String,
         /// 服务和首个 API key 允许使用的提供源，可重复或逗号分隔。
-        #[arg(long = "provider", value_delimiter = ',')]
+        #[arg(id = "provider", long = "provider", value_delimiter = ',')]
         providers: Vec<String>,
-        /// 未带 provider 前缀的模型请求使用的提供源。
+        /// 无前缀模型请求的默认实例；省略时使用 --provider 的第一个 ID，未指定来源时为 kiro。
         #[arg(long)]
         default_provider: Option<String>,
     },
     /// 修改服务监听、Kiro/Copilot 来源范围或 API key。
     #[command(
-        after_help = "--provider 替换允许来源；--default-provider 指定无前缀模型请求的默认来源。--account-tag/账号手工绑定只作用于 Kiro，修改标签前需停用服务。API key 参数接受 ID 或名称，可重复使用。\n\n示例：\n  kproxy service edit main --provider kiro --provider copilot --default-provider kiro\n  kproxy service edit main --add-api-key ci\n  kproxy service edit main --skip-user-agent-check true"
+        after_help = "--provider 替换允许来源；原默认来源不在新范围时自动使用第一个 ID。--default-provider 可显式指定默认来源。--account-tag/账号手工绑定支持 Kiro/Copilot，修改标签前需停用服务。API key 参数接受 ID 或名称，可重复使用。\n\n示例：\n  kproxy service edit main --provider kiro --provider copilot --default-provider kiro\n  kproxy service edit main --add-api-key ci\n  kproxy service edit main --skip-user-agent-check true"
     )]
     Edit {
         /// 当前服务 ID 或名称。
@@ -98,10 +98,10 @@ pub enum ServiceCommand {
         /// 设置是否允许该服务的已认证请求跳过客户端 User-Agent 校验。
         #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
         skip_user_agent_check: Option<bool>,
-        /// 修改服务的 Kiro 基础账号标签（可指定多个）；服务必须先停用。
+        /// 修改服务的基础账号标签（可指定多个）；服务必须先停用。
         #[arg(long, num_args = 1.., value_delimiter = ',', value_name = "TAG", conflicts_with = "clear_account_tag")]
         account_tag: Vec<String>,
-        /// 清除 Kiro 基础账号标签并恢复使用其全局账号池；服务必须先停用。
+        /// 清除基础账号标签并恢复使用其全局账号池；服务必须先停用。
         #[arg(long)]
         clear_account_tag: bool,
         /// 增加绑定的 API key ID 或名称，可重复或逗号分隔。
@@ -111,7 +111,7 @@ pub enum ServiceCommand {
         #[arg(long, value_delimiter = ',', value_name = "KEY")]
         remove_api_key: Vec<String>,
         /// 替换服务允许的提供源，可重复或逗号分隔。
-        #[arg(long = "provider", value_delimiter = ',')]
+        #[arg(id = "provider", long = "provider", value_delimiter = ',')]
         providers: Vec<String>,
         /// 清空显式范围并恢复为旧版 Kiro-only 语义。
         #[arg(long)]
@@ -145,30 +145,36 @@ pub enum ServiceCommand {
         #[arg(short = 'y', long)]
         yes: bool,
     },
-    /// 查看 Kiro/Copilot 服务绑定的 API key；明文需显式输出。
+    /// 查看服务绑定的 API key，默认直接显示完整密钥。
     #[command(
         name = "apikeys",
-        after_help = "示例：\n  kproxy service apikeys main\n  kproxy service apikeys svc_abcd --show-secret"
+        visible_alias = "apikey",
+        after_help = "默认显示完整密钥；--redact 可隐藏密钥。\n\n示例：\n  kproxy service apikey main\n  kproxy service apikeys svc_abcd\n  kproxy service apikey main --redact"
     )]
     ApiKeys {
         /// 服务 ID 或名称。
         service: String,
-        /// 输出 API key 明文。注意终端记录和 CI 日志泄露风险。
-        #[arg(long)]
+        /// 兼容旧命令；现在默认显示明文。
+        #[arg(long, alias = "show-secrets", hide = true, conflicts_with = "redact")]
         show_secret: bool,
+        /// 隐藏 API key 明文。
+        #[arg(long)]
+        redact: bool,
     },
-    /// 查看服务的 Kiro 有效账号池。
+    /// 查看服务的 Kiro/Copilot 有效账号池。
     #[command(
-        after_help = "仅列出 Kiro 账号；Copilot 请用 `kproxy account list --provider copilot` 查看。\n\n示例：\n  kproxy service accounts main"
+        after_help = "显示服务内两种来源的有效账号，可用 --provider 筛选。\n\n示例：\n  kproxy service accounts main"
     )]
     Accounts {
         /// 服务 ID 或名称。
         service: String,
+        #[arg(long)]
+        provider: Option<String>,
     },
-    /// 手工向服务 Kiro 账号池加入账号；账号可使用任意标签。
+    /// 手工向服务账号池加入 Kiro/Copilot 账号；账号可使用任意标签。
     #[command(
         name = "add-account",
-        after_help = "仅适用于 Kiro 账号；Copilot 账号由 provider 的账号池管理。\n\n示例：\n  kproxy service add-account main acc_7f3a2b1c\n  kproxy service add-account main user@example.com"
+        after_help = "两种来源均支持；裸 ID 自动解析归属，重名时使用 provider/account_id 或 --provider。\n\n示例：\n  kproxy service add-account main acc_7f3a2b1c\n  kproxy service add-account main user@example.com"
     )]
     AddAccount {
         /// 服务 ID 或名称。
@@ -176,11 +182,13 @@ pub enum ServiceCommand {
         /// 一个或多个账号 ID/邮箱。
         #[arg(required = true, num_args = 1.., value_name = "ID_OR_EMAIL")]
         accounts: Vec<String>,
+        #[arg(long)]
+        provider: Option<String>,
     },
-    /// 从服务 Kiro 账号池排除账号。
+    /// 从服务账号池排除 Kiro/Copilot 账号。
     #[command(
         name = "remove-account",
-        after_help = "仅适用于 Kiro 账号；Copilot 账号由 provider 的账号池管理。\n\n示例：\n  kproxy service remove-account main acc_7f3a2b1c"
+        after_help = "两种来源均支持；裸 ID 自动解析归属，重名时使用 provider/account_id 或 --provider。\n\n示例：\n  kproxy service remove-account main acc_7f3a2b1c"
     )]
     RemoveAccount {
         /// 服务 ID 或名称。
@@ -188,6 +196,8 @@ pub enum ServiceCommand {
         /// 一个或多个账号 ID/邮箱。
         #[arg(required = true, num_args = 1.., value_name = "ID_OR_EMAIL")]
         accounts: Vec<String>,
+        #[arg(long)]
+        provider: Option<String>,
     },
 }
 
@@ -238,7 +248,7 @@ pub enum ApiKeyCommand {
         )]
         skip_user_agent_check: bool,
         /// 允许使用的提供源，可重复或逗号分隔；省略时仅允许 Kiro。
-        #[arg(long = "provider", value_delimiter = ',')]
+        #[arg(id = "provider", long = "provider", value_delimiter = ',')]
         providers: Vec<String>,
         /// 允许的模型 glob，可使用 provider/model 形式。
         #[arg(long = "model", value_delimiter = ',')]
@@ -254,7 +264,7 @@ pub enum ApiKeyCommand {
         #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
         skip_user_agent_check: Option<bool>,
         /// 替换允许使用的提供源。
-        #[arg(long = "provider", value_delimiter = ',')]
+        #[arg(id = "provider", long = "provider", value_delimiter = ',')]
         providers: Vec<String>,
         #[arg(long)]
         clear_providers: bool,
@@ -562,6 +572,32 @@ pub async fn simple_rpc(
     let value: serde_json::Value = client.call(method_name, params).await?;
     if json {
         print_json(&value)?;
+    } else if method_name == method::TASKS {
+        let tasks = value
+            .as_object()
+            .ok_or_else(|| anyhow!("daemon 返回的任务列表无效"))?;
+        let rows = tasks
+            .iter()
+            .map(|(name, task)| {
+                vec![
+                    name.clone(),
+                    crate::cli::scope::task_scope(name).into(),
+                    task["interval_ms"]
+                        .as_u64()
+                        .map(|ms| format!("{ms} ms"))
+                        .unwrap_or_else(|| "-".into()),
+                    task["run"]["last_run_at"]
+                        .as_i64()
+                        .map(format_timestamp)
+                        .unwrap_or_else(|| "尚未执行".into()),
+                    task["run"]["last_result"].as_str().unwrap_or("-").into(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            render_table(&["任务", "适用范围", "周期", "上次执行", "结果"], &rows)
+        );
     } else {
         print_human_value(&value);
     }
@@ -638,56 +674,94 @@ pub async fn show_pool(
                 serde_json::json!({"provider":provider}),
             )
             .await?;
-        if json {
-            return print_json(&serde_json::json!({
-                "provider":provider,
-                "model":model,
-                "accounts":value["accounts"]
-            }));
-        }
         let accounts = value["accounts"]
             .as_array()
             .ok_or_else(|| anyhow!("daemon 返回的 provider 账号池无效"))?;
-        let rows = accounts
-            .iter()
-            .map(|account| {
-                let models = account["supported_models"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(serde_json::Value::as_str)
-                    .collect::<Vec<_>>();
-                let enabled = account["enabled"].as_bool().unwrap_or(false);
-                let supports = models.contains(&model);
-                vec![
-                    account["provider_id"].as_str().unwrap_or("-").into(),
-                    account["id"].as_str().unwrap_or("-").into(),
-                    account["display_name"].as_str().unwrap_or("-").into(),
-                    if enabled && supports {
-                        "可调度"
+        let errors = value["errors"].as_object();
+        let complete = value["complete"].as_bool().unwrap_or(true)
+            && errors.is_none_or(|errors| errors.is_empty());
+        if json {
+            print_json(&serde_json::json!({
+                "provider":provider,
+                "model":model,
+                "accounts":accounts,
+                "complete":complete,
+                "errors":errors.cloned().unwrap_or_default()
+            }))?;
+        } else {
+            let rows = accounts
+                .iter()
+                .map(|account| {
+                    let models = account["supported_models"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(serde_json::Value::as_str)
+                        .collect::<Vec<_>>();
+                    let enabled = account["enabled"].as_bool().unwrap_or(false);
+                    let supports = if model.is_empty() {
+                        !models.is_empty()
                     } else {
-                        "不可调度"
-                    }
-                    .into(),
-                    account["auth_state"].as_str().unwrap_or("unknown").into(),
-                    if models.is_empty() {
-                        "-".into()
-                    } else {
-                        models.join(",")
-                    },
-                ]
-            })
-            .collect::<Vec<_>>();
-        println!("提供源 {provider}  模型 {model}  账号 {}", rows.len());
-        println!(
-            "{}",
-            render_table(
-                &["提供源", "账号", "名称", "状态", "认证", "已发现模型"],
-                &rows
-            )
-        );
+                        models.contains(&model)
+                    };
+                    let healthy = account["health"] == "available";
+                    vec![
+                        account["provider_id"].as_str().unwrap_or("-").into(),
+                        crate::cli::scope::kind_name(
+                            account["provider_kind"].as_str().unwrap_or("-"),
+                        )
+                        .into(),
+                        account["id"].as_str().unwrap_or("-").into(),
+                        account["display_name"].as_str().unwrap_or("-").into(),
+                        if enabled && supports && healthy {
+                            "可调度"
+                        } else {
+                            "不可调度"
+                        }
+                        .into(),
+                        account["auth_state"].as_str().unwrap_or("unknown").into(),
+                        if models.is_empty() {
+                            "-".into()
+                        } else {
+                            models.join(",")
+                        },
+                    ]
+                })
+                .collect::<Vec<_>>();
+            println!(
+                "提供源 {provider}  模型 {}  账号 {}",
+                if model.is_empty() { "全部" } else { model },
+                rows.len()
+            );
+            println!(
+                "{}",
+                render_table(
+                    &[
+                        "实例 ID",
+                        "类型 (kind)",
+                        "账号",
+                        "名称",
+                        "状态",
+                        "认证",
+                        "已发现模型"
+                    ],
+                    &rows
+                )
+            );
+            for (provider, error) in errors.into_iter().flatten() {
+                eprintln!("{provider}: {}", error.as_str().unwrap_or("查询失败"));
+            }
+        }
+        if !complete {
+            return Err(anyhow!("部分提供源的账号池查询失败"));
+        }
         return Ok(());
     }
+    let model = if model.is_empty() {
+        "minimax-m2.5"
+    } else {
+        model
+    };
     let value: serde_json::Value = client
         .call(method::POOL, serde_json::json!({"model":model}))
         .await?;
@@ -1036,11 +1110,8 @@ pub async fn run_service(
                     result.service.port
                 );
                 println!(
-                    "已创建默认 API key {} ({})：\n{}\n可用 `kproxy service apikeys {} --show-secret` 再次查看。",
-                    result.api_key.id,
-                    result.api_key.name,
-                    result.api_key.key,
-                    result.service.id
+                    "已创建默认 API key {} ({})：\n{}\n可用 `kproxy service apikey {}` 再次查看。",
+                    result.api_key.id, result.api_key.name, result.api_key.key, result.service.id
                 );
             }
             Ok(())
@@ -1103,12 +1174,12 @@ pub async fn run_service(
                 } else if let Some(value) = service_tag_toml_value(&account_tag) {
                     table.insert("account_tag".into(), value);
                 }
-                if clear_providers {
-                    table.remove("allowed_providers");
-                } else if !providers.is_empty() {
-                    table.insert("allowed_providers".into(), string_array_value(&providers));
-                }
-                replace_optional_string(table, "default_provider", default_provider.as_deref());
+                update_service_provider_scope(
+                    table,
+                    &providers,
+                    clear_providers,
+                    default_provider.as_deref(),
+                );
                 let key_ids = table
                     .entry("api_key_ids")
                     .or_insert_with(|| toml::Value::Array(Vec::new()))
@@ -1197,12 +1268,13 @@ pub async fn run_service(
         }
         ServiceCommand::ApiKeys {
             service,
-            show_secret,
+            show_secret: _,
+            redact,
         } => {
             let result: ProxyServiceApiKeysResult = client
                 .call(
                     method::SERVICE_APIKEYS,
-                    serde_json::json!({"service":service,"show_secret":show_secret}),
+                    serde_json::json!({"service":service,"show_secret":!redact}),
                 )
                 .await?;
             if json {
@@ -1213,6 +1285,7 @@ pub async fn run_service(
                     result.service_id, result.service_name
                 );
             } else {
+                println!("服务 {} ({})", result.service_name, result.service_id);
                 let rows = result
                     .api_keys
                     .into_iter()
@@ -1254,35 +1327,40 @@ pub async fn run_service(
                         &rows
                     )
                 );
-                if !show_secret {
-                    println!("使用 --show-secret 显示明文 API Key。");
-                }
             }
             Ok(())
         }
-        ServiceCommand::Accounts { service } => {
+        ServiceCommand::Accounts { service, provider } => {
             let result: ProxyServiceAccountsResult = client
                 .call(
                     method::SERVICE_ACCOUNTS,
-                    serde_json::json!({"service":service}),
+                    serde_json::json!({"service":service,"provider":provider}),
                 )
                 .await?;
             print_service_accounts(&result, json)
         }
-        ServiceCommand::AddAccount { service, accounts } => {
+        ServiceCommand::AddAccount {
+            service,
+            accounts,
+            provider,
+        } => {
             let result: ProxyServiceAccountsResult = client
                 .call(
                     method::SERVICE_ACCOUNT_ADD,
-                    serde_json::json!({"service":service,"accounts":accounts}),
+                    serde_json::json!({"service":service,"accounts":accounts,"provider":provider}),
                 )
                 .await?;
             print_service_accounts(&result, json)
         }
-        ServiceCommand::RemoveAccount { service, accounts } => {
+        ServiceCommand::RemoveAccount {
+            service,
+            accounts,
+            provider,
+        } => {
             let result: ProxyServiceAccountsResult = client
                 .call(
                     method::SERVICE_ACCOUNT_REMOVE,
-                    serde_json::json!({"service":service,"accounts":accounts}),
+                    serde_json::json!({"service":service,"accounts":accounts,"provider":provider}),
                 )
                 .await?;
             print_service_accounts(&result, json)
@@ -1350,6 +1428,26 @@ fn print_service_accounts(result: &ProxyServiceAccountsResult, json: bool) -> Re
             result.excluded_account_ids.join(",")
         }
     );
+    if !result.provider_accounts.is_empty() {
+        let rows = result
+            .provider_accounts
+            .iter()
+            .map(|account| {
+                vec![
+                    account.provider_id.clone(),
+                    account.id.clone(),
+                    account.display_name.clone(),
+                    account.tags.join(","),
+                    account.health.clone(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            render_table(&["PROVIDER", "ID", "账号", "标签", "状态"], &rows)
+        );
+        return Ok(());
+    }
     if result.accounts.is_empty() {
         println!(
             "API 代理服务 {} ({}) 当前没有有效账号。",
@@ -1474,6 +1572,43 @@ async fn set_service_enabled(
         Ok(())
     })
     .await
+}
+
+fn update_service_provider_scope(
+    table: &mut toml::map::Map<String, toml::Value>,
+    providers: &[String],
+    clear: bool,
+    default_provider: Option<&str>,
+) {
+    if clear {
+        table.remove("allowed_providers");
+    } else if !providers.is_empty() {
+        table.insert("allowed_providers".into(), string_array_value(providers));
+    }
+    if let Some(default_provider) = default_provider {
+        table.insert(
+            "default_provider".into(),
+            toml::Value::String(default_provider.into()),
+        );
+    } else if clear || !providers.is_empty() {
+        let allowed = if clear {
+            &["kiro".to_owned()][..]
+        } else {
+            providers
+        };
+        let current = table
+            .get("default_provider")
+            .and_then(toml::Value::as_str)
+            .filter(|id| !id.is_empty())
+            .unwrap_or("kiro");
+        // Preserve an allowed default; otherwise follow service create's first-ID rule.
+        if !allowed.iter().any(|id| id == current) {
+            table.insert(
+                "default_provider".into(),
+                toml::Value::String(allowed[0].clone()),
+            );
+        }
+    }
 }
 
 fn find_service_table_mut<'a>(
@@ -1662,7 +1797,11 @@ pub async fn add_provider(
     if json {
         print_json(&serde_json::json!({"provider":id,"created":true}))
     } else {
-        println!("已添加提供源 {id}");
+        println!(
+            "已添加提供源 {id}（{}）",
+            crate::cli::scope::kind_name(kind)
+        );
+        crate::cli::scope::print_next_steps(id, kind);
         Ok(())
     }
 }
@@ -2174,9 +2313,9 @@ const CONFIG_MODULES: &[ConfigModule] = &[
         name: "models",
         key: "models",
         category: "来源参数",
-        scope: "kiro",
-        description: "Kiro 动态模型发现与缓存；Copilot 在 provider.models 配置",
-        preferred_command: "-",
+        scope: "mixed",
+        description: "全局模型禁用与 Kiro 模型发现/缓存；Copilot 缓存在 provider.models 配置",
+        preferred_command: "model disable/enable",
         aliases: &[],
         is_array: false,
     },
@@ -2707,7 +2846,7 @@ pub async fn reset_config(
     let path = PathBuf::from(paths.config_file);
     let prompt = module.map_or_else(
         || {
-            "确认将运行配置恢复为默认设置？Kiro 专项与全局参数会重置，提供源、API key、代理服务和告警配置会保留，模型映射会被清除"
+            "确认将运行配置恢复为默认设置？Kiro 专项与全局参数会重置，提供源、API key、代理服务、模型禁用规则和告警配置会保留，模型映射会被清除"
                 .to_string()
         },
         |module| {
@@ -2805,6 +2944,9 @@ fn render_config_module_reset(raw: &str, module: &ConfigModule) -> Result<String
         .as_table_mut()
         .ok_or_else(|| anyhow!("config root must be a TOML table"))?
         .insert(module.key.into(), default_value);
+    if module.key == "models" {
+        preserve_model_denials(&before, &mut after);
+    }
     let output =
         kproxy_store::config_update::render_update_preserving_comments(raw, &before, &after)
             .context("生成模块重置配置失败")?;
@@ -2838,6 +2980,7 @@ fn render_reset_config_preserving_resources_and_alerts(raw: &str) -> Result<Stri
             after_table.insert(section.into(), value.clone());
         }
     }
+    preserve_model_denials(&current, &mut after);
 
     let output =
         kproxy_store::config_update::render_update_preserving_comments(&defaults, &before, &after)
@@ -2846,6 +2989,17 @@ fn render_reset_config_preserving_resources_and_alerts(raw: &str) -> Result<Stri
         toml::from_str(&output).context("重置后的配置无法解析")?;
     config.validate().context("重置后的配置校验失败")?;
     Ok(output)
+}
+
+fn preserve_model_denials(before: &toml::Value, after: &mut toml::Value) {
+    if let Some(disabled) = before
+        .get("models")
+        .and_then(|models| models.get("disabled"))
+    {
+        if let Some(models) = after.get_mut("models").and_then(toml::Value::as_table_mut) {
+            models.insert("disabled".into(), disabled.clone());
+        }
+    }
 }
 
 async fn write_config_backup(path: &Path, contents: &[u8]) -> Result<PathBuf> {
@@ -2971,17 +3125,94 @@ fn is_executable(path: &Path) -> bool {
     path.is_file()
 }
 
+pub async fn set_models_enabled(
+    client: &mut AdminClient,
+    models: &[String],
+    enabled: bool,
+    json: bool,
+) -> Result<()> {
+    let capabilities: serde_json::Value = client
+        .call(method::V2_CAPABILITIES, serde_json::json!({}))
+        .await
+        .context("读取 daemon 全局模型禁用能力失败，请确认 kproxy 和 kproxyd 均已更新")?;
+    if !capabilities["features"].as_array().is_some_and(|features| {
+        features.iter().any(|feature| {
+            feature.as_str() == Some(kproxy_ipc::protocol::GLOBAL_MODEL_DISABLE_FEATURE)
+        })
+    }) {
+        return Err(anyhow!(
+            "运行中的 kproxyd 不支持全局模型禁用，请升级 daemon 后重试；未修改配置"
+        ));
+    }
+    mutate_config(client, |root| {
+        let mut validation: kproxy_core::config::Config =
+            toml::Value::Table(root.clone()).try_into()?;
+        validation.models.disabled = models.to_vec();
+        validation.validate()?;
+        let table = root
+            .entry("models")
+            .or_insert_with(|| toml::Value::Table(Default::default()))
+            .as_table_mut()
+            .ok_or_else(|| anyhow!("models must be a table"))?;
+        let disabled = table
+            .entry("disabled")
+            .or_insert_with(|| toml::Value::Array(Vec::new()))
+            .as_array_mut()
+            .ok_or_else(|| anyhow!("models.disabled must be an array"))?;
+        for model in models {
+            let key = kproxy_core::model_policy::model_key(model);
+            disabled.retain(|item| {
+                item.as_str()
+                    .is_none_or(|id| kproxy_core::model_policy::model_key(id) != key)
+            });
+            if !enabled {
+                disabled.push(toml::Value::String(model.clone()));
+            }
+        }
+        Ok(())
+    })
+    .await?;
+    if json {
+        print_json(
+            &serde_json::json!({"models":models,"enabled":enabled,"scope":"all","applied":true}),
+        )?;
+    } else {
+        println!(
+            "{}模型（全部 provider，已生效）：{}",
+            if enabled { "已启用" } else { "已禁用" },
+            models.join(", ")
+        );
+    }
+    Ok(())
+}
+
 pub async fn show_models(client: &mut AdminClient, mapped: bool, json: bool) -> Result<()> {
-    let models: Vec<kproxy_kiro::ModelInfo> =
+    let mut models: Vec<kproxy_kiro::ModelInfo> =
         client.call(method::MODELS, serde_json::json!({})).await?;
+    let config = effective_config(client).await?;
+    for id in &config.models.disabled {
+        if !models.iter().any(|model| {
+            kproxy_core::model_policy::model_key(&model.model_id)
+                == kproxy_core::model_policy::model_key(id)
+        }) {
+            models.push(serde_json::from_value(serde_json::json!({"modelId":id}))?);
+        }
+    }
     if !mapped {
         if json {
-            return print_json(&models);
+            let mut value = serde_json::to_value(&models)?;
+            for model in value.as_array_mut().into_iter().flatten() {
+                let disabled = config
+                    .models
+                    .is_disabled(model["modelId"].as_str().unwrap_or_default());
+                model["disabled"] = disabled.into();
+                model["available"] = (!disabled).into();
+            }
+            return print_json(&value);
         }
-        print!("{}", render_model_list(&models));
+        print!("{}", render_model_list(&models, &config.models));
         return Ok(());
     }
-    let config = effective_config(client).await?;
     let available_models = models
         .iter()
         .map(|model| model.model_id.clone())
@@ -3006,6 +3237,8 @@ pub async fn show_models(client: &mut AdminClient, mapped: bool, json: bool) -> 
                     .map(model_token_limits)
                     .unwrap_or_default();
             ModelListRoute {
+                disabled: config.models.is_disabled(&model.model_id)
+                    || config.models.is_disabled(&route.mapped),
                 input: model.model_id.clone(),
                 mapped: route.mapped,
                 rule: route.rule,
@@ -3022,7 +3255,9 @@ pub async fn show_models(client: &mut AdminClient, mapped: bool, json: bool) -> 
                     serde_json::json!({
                         "input":route.input,
                         "mapped":route.mapped,
-                        "rule":route.rule
+                        "rule":route.rule,
+                        "disabled":route.disabled,
+                        "available":!route.disabled
                     })
                 })
                 .collect::<Vec<_>>(),
@@ -3035,6 +3270,7 @@ pub async fn show_models(client: &mut AdminClient, mapped: bool, json: bool) -> 
 
 #[derive(Debug)]
 struct ModelListRoute {
+    disabled: bool,
     input: String,
     mapped: String,
     rule: Option<String>,
@@ -3042,7 +3278,10 @@ struct ModelListRoute {
     max_output_tokens: Option<u32>,
 }
 
-fn render_model_list(models: &[kproxy_kiro::ModelInfo]) -> String {
+fn render_model_list(
+    models: &[kproxy_kiro::ModelInfo],
+    policy: &kproxy_core::config::ModelsConfig,
+) -> String {
     if models.is_empty() {
         return "暂无可用模型。\n".into();
     }
@@ -3051,6 +3290,11 @@ fn render_model_list(models: &[kproxy_kiro::ModelInfo]) -> String {
         .map(|model| {
             vec![
                 model.model_id.clone(),
+                if policy.is_disabled(&model.model_id) {
+                    "不可用（已禁用）".into()
+                } else {
+                    "可用".into()
+                },
                 format_model_token_limit(model_token_limits(model).0),
                 format_model_token_limit(model_token_limits(model).1),
                 if model.model_name.trim().is_empty() {
@@ -3061,7 +3305,7 @@ fn render_model_list(models: &[kproxy_kiro::ModelInfo]) -> String {
             ]
         })
         .collect::<Vec<_>>();
-    render_table(&["模型", "输入上下文", "输出上限", "名称"], &rows)
+    render_table(&["模型", "状态", "输入上下文", "输出上限", "名称"], &rows)
 }
 
 fn render_mapped_model_list(routes: &[ModelListRoute]) -> String {
@@ -3073,6 +3317,11 @@ fn render_mapped_model_list(routes: &[ModelListRoute]) -> String {
         .map(|route| {
             vec![
                 route.input.clone(),
+                if route.disabled {
+                    "不可用（已禁用）".into()
+                } else {
+                    "可用".into()
+                },
                 route.mapped.clone(),
                 format_model_token_limit(route.max_input_tokens),
                 format_model_token_limit(route.max_output_tokens),
@@ -3081,7 +3330,14 @@ fn render_mapped_model_list(routes: &[ModelListRoute]) -> String {
         })
         .collect::<Vec<_>>();
     render_table(
-        &["输入模型", "映射模型", "输入上下文", "输出上限", "规则"],
+        &[
+            "输入模型",
+            "状态",
+            "映射模型",
+            "输入上下文",
+            "输出上限",
+            "规则",
+        ],
         &rows,
     )
 }

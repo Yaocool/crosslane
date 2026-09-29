@@ -86,7 +86,7 @@ const TOPICS: &[(&str, &str)] = &[
     ("docker", "Docker 运行方式和数据卷"),
 ];
 
-pub fn print(topic: Option<&str>) -> Result<()> {
+pub fn print(topic: Option<&str>, provider: Option<&str>) -> Result<()> {
     let Some(topic) = topic else {
         println!("可用指南主题：");
         for (name, description) in TOPICS {
@@ -95,7 +95,23 @@ pub fn print(topic: Option<&str>) -> Result<()> {
         println!("\n新用户可先看 `kproxy guide kiro` 或 `kproxy guide copilot`；命令参数用 `kproxy help <命令路径>` 查看。");
         return Ok(());
     };
-    println!("{}", topic_text(topic)?);
+    let mut text = topic_text(topic)?.to_owned();
+    if topic == "copilot" {
+        if let Some(id) = provider.filter(|id| *id != "all" && *id != "kiro") {
+            for prefix in [
+                "--provider",
+                "--default-provider",
+                "--id",
+                "provider edit",
+                "provider show",
+            ] {
+                text = text.replace(&format!("{prefix} copilot"), &format!("{prefix} {id}"));
+            }
+            println!("以下示例使用实例 ID：{id}（类型：GitHub Copilot）。\n");
+        }
+    }
+    println!("{text}");
+    println!("\n--provider/-p 使用 `provider list` 中的实例 ID；--kind/--provider-kind 使用驱动类型。可用 `kproxy guide copilot -p <ID>` 按自定义 ID 生成接入示例。");
     Ok(())
 }
 
@@ -103,8 +119,8 @@ fn topic_text(topic: &str) -> Result<&'static str> {
     let text = match topic {
         "provider" => {
             r#"命令适用范围
-  两者共用：provider、status、ready、account list/show/rm/enable/disable/tag/export/refresh/probe/reset-health、pool、models、model-map、service、apikey、stats、logs show/follow；按命令使用 --provider 选择实例，省略时注意各命令的默认来源。
-  Kiro 专项：account add-sso/add-api-key/import/services/overage/regen-machine-id、diagnose、subscriptions、pool --explain 评分、alert 事件、tasks token_refresh/status_check/health_recheck。
+  两者共用：provider、status、ready、account add/list/show/rm/enable/disable/tag/export/refresh/probe/reset-health/services、pool、models、model-map、service、apikey、stats、logs show/follow；--provider 可放在任意子命令前后，也可设置 KPROXY_PROVIDER；列表与 --all 操作默认聚合全部来源，单账号按 ID 自动识别；export 保持旧 Kiro 格式，需 --provider all 才导出全部。
+  Kiro 专项：account add-sso/add-api-key/import/overage/regen-machine-id、diagnose、subscriptions、pool --explain 评分、alert 事件、tasks token_refresh/status_check/health_recheck。
   Copilot 专项：account add --provider copilot --auth device-flow（或 --token-stdin）；OAuth/endpoint 设置属于 Copilot provider 实例。
   全局：health、version、config、logs trace/files/path、daemon 生命周期；其中 config 模块各有适用范围，见 kproxy guide config。
 
@@ -119,8 +135,9 @@ fn topic_text(topic: &str) -> Result<&'static str> {
         "kiro" => {
             r#"Kiro 接入（未显式配置 provider 时默认提供 kiro）
 1. 添加账号：
-   printf '%s\n' "$PASSWORD" | kproxy account add-sso --email user@example.com --start-url https://example.awsapps.com/start --password-stdin
-   或 kproxy account add-api-key --email user@example.com --key-stdin < /secure/kiro-key
+   printf '%s\n' "$PASSWORD" | kproxy --provider kiro account add --auth sso --email user@example.com --start-url https://example.awsapps.com/start --password-stdin
+   或 kproxy --provider kiro account add --auth api-key --email user@example.com --token-stdin < /secure/kiro-key
+   原 account add-sso/add-api-key 命令继续可用。
    SSO 批量导入：kproxy guide sso
 2. 检查账号和模型：
    kproxy account list --provider kiro
@@ -144,7 +161,7 @@ diagnose all/endpoints、account overage 是 Kiro 专项功能。"#
    --username 填完整 GitHub 用户名；--sso-username 填 Azure 登录名，此时 stdin 密码仅用于 Azure。普通 GitHub 密码登录省略 --sso-username。两套密码不同可用 --credentials-stdin 读取 JSON。密码不保存在账号文件中。
    未提供浏览器凭证时，仍可在自己电脑的无痕/隐私窗口手动授权：
    kproxy account add --provider copilot --auth device-flow
-   --provider 始终填创建实例时的 --id；如果实例叫 github-copilot，上述 --provider 也必须用 github-copilot。远端模式按任务隔离浏览器会话；MFA 推送仍需本人批准，动态验证码用 account login-code 提交。--capture-headers 可在服务器受保护文件中记录完整敏感 header，默认关闭。
+   --provider 始终填创建实例时的 --id；以 provider list 的实例 ID 为准，不要填写 GitHub Copilot 类型名称。远端模式按任务隔离浏览器会话；MFA 推送仍需本人批准，动态验证码用 account login-code 提交。--capture-headers 可在服务器受保护文件中记录完整敏感 header，默认关闭。
    Azure 条件访问拒绝（如 AADSTS53003）需由 Entra 管理员检查失败策略；安全信息注册需先按组织要求完成，不能复制 header 绕过。
 3. 检查账号和模型：
    kproxy account list --provider copilot
@@ -156,20 +173,20 @@ diagnose all/endpoints、account overage 是 Kiro 专项功能。"#
 Copilot API 地址优先使用账号 token 返回的 endpoint；仅当缺失且企业网络要求专属域名时才需配置 api_endpoint_fallback。"#
         }
         "status" => {
-            "`kproxy status` 展示 Kiro/Copilot 提供源、代理服务、账号池和本次启动后的请求统计；`--provider kiro|copilot` 只看指定来源，省略时聚合全部；`--since` 或 `--start/--end` 控制时间范围，`--watch` 每 2 秒刷新。"
+            "`kproxy status` 展示 Kiro/Copilot 提供源、代理服务、账号池和本次启动后的请求统计；`--provider <ID>` 只看指定来源，省略时聚合全部；`--since` 或 `--start/--end` 控制时间范围，`--watch` 每 2 秒刷新。"
         }
         "health" => {
-            "`kproxy health` 是全局 daemon 管理面检查，不按来源拆分；账号或代理服务为空不会让该检查失败。`kproxy ready --provider kiro|copilot` 检查指定来源引用的服务与账号是否就绪；省略来源时检查整体业务就绪。"
+            "`kproxy health` 是全局 daemon 管理面检查，不按来源拆分；账号或代理服务为空不会让该检查失败。`kproxy ready --provider <ID>` 检查指定来源引用的服务与账号是否就绪；省略来源时检查整体业务就绪。"
         }
         "version" => "`kproxy version` 显示 CLI 版本、Rust MSRV 和默认 Kiro 上游端点；Copilot API 地址由各账号的 token 响应决定。",
         "account" => {
-            "Kiro 使用 `account add-sso`、`add-api-key` 或 `import`；Copilot 使用 `account add --provider copilot --auth device-flow`，也可用 `--token-stdin` 导入 GitHub token。`list/show/rm/enable/disable/tag/export/refresh/probe/reset-health` 覆盖两者，可用 `--provider` 消歧；但 `refresh --all` 省略来源时默认 Kiro。Kiro 的 `probe` 做真实推理，Copilot 的 `probe` 刷新凭证与模型目录；Copilot 标签不会影响服务的 `--account-tag`。`overage`、`regen-machine-id`、`services` 仅适用于 Kiro。详情见 `kproxy guide kiro` 和 `kproxy guide copilot`。"
+            "统一用 `account add --provider <ID>` 添加账号：Kiro 的 --auth sso 搭配 --email/--password-stdin，--token-stdin 搭配 --email 导入 API key；Copilot 默认 Device Flow，--token-stdin 导入 GitHub token。旧 add-sso/add-api-key/import 保留。`list/show/rm/enable/disable/tag/export/refresh/probe/reset-health` 覆盖两者，可用 `--provider` 消歧；`refresh/probe/reset-health --all` 省略来源时覆盖全部来源。Kiro 的 `probe` 做真实推理，Copilot 的 `probe` 刷新凭证与模型目录；两种来源均支持标签筛选与 account services；`overage`、`regen-machine-id` 仅适用于 Kiro。详情见 `kproxy guide kiro` 和 `kproxy guide copilot`。"
         }
         "balance" => {
             "本评分仅用于 Kiro 账号池：score = active_ratio×weight_active + used_credit_ratio×weight_credit + recent_idle_penalty×weight_idle。\n分数越低越优先；随后加入小幅随机抖动。用 `kproxy pool --provider kiro --watch --explain` 查看实时评分。Copilot 的 `pool` 只显示账号认证与模型支持，不提供这组三因子评分。"
         }
         "pool" => {
-            "`kproxy pool --provider kiro --model <模型> --explain` 展示 Kiro 账号可调度性、排队和三因子评分；省略 --provider 默认 Kiro。`--provider copilot --model <模型>` 展示 Copilot 账号认证状态及已发现模型，默认模型名来自 Kiro，查询 Copilot 时应显式传入 --model；--explain 不提供 Kiro 式评分。两者均可 --watch；Kiro 评分原理见 `kproxy guide balance`。"
+            "`kproxy pool --provider kiro --model <模型> --explain` 展示 Kiro 账号可调度性、排队和三因子评分；省略 --provider 聚合全部来源。`--provider copilot` 展示 Copilot 账号认证状态及已发现模型，可用 --model 检查某个模型；--explain 不提供 Kiro 式评分。两者均可 --watch；Kiro 评分原理见 `kproxy guide balance`。"
         }
         "model-map" => {
             "模型映射按 priority 从小到大匹配；Kiro/Copilot 都可用 `--provider <ID>` 指定规则范围。add 省略来源时为 Kiro-only，edit 省略时保留原有范围。source_models 支持 `*`；replace/alias 选首个目标，loadbalance 按 weights 随机。`--below-credits-percent` 仅适用于 Kiro，不能与 Copilot 规则或跨来源目标组合。用 `model-map list/test --provider copilot` 核对 Copilot 映射；跨来源映射另需显式开启 provider 的 allow_cross_provider_fallback。"
@@ -179,7 +196,7 @@ Copilot API 地址优先使用账号 token 返回的 endpoint；仅当缺失且�
 批量：CSV 仅含 email,password 两列，运行 `kproxy account add-sso --batch accounts.csv -c 1 --tag team-a`；也可用 `--batch - < accounts.csv` 从 stdin 读取。可重复的 `--tag` 应用于本批全部账号；`--start-url` 可覆盖全局值，`--headful` 可手工完成额外验证。默认/full 构建包含 SSO。"#
         }
         "service" => {
-            "`kproxy service list/show/create/edit/enable/disable/apikeys/delete` 管理独立代理监听。create 省略来源时保持 Kiro-only；`service create --name copilot --port 5581 --provider copilot --default-provider copilot` 创建 Copilot-only 服务；`--provider kiro --provider copilot --default-provider kiro` 创建双来源服务。多个服务需要使用不同端口。`service accounts/add-account/remove-account` 与 `--account-tag` 当前仅作用于 Kiro 账号池，不用于筛选或操作 Copilot 账号；Copilot 可用 `account list --provider copilot` 查看。修改 Kiro 账号标签前须先停用服务。API key 也有独立来源范围；删除服务时仅级联删除未共享 key。"
+            "`kproxy service list/show/create/edit/enable/disable/apikeys/delete` 管理独立代理监听。create 省略来源时保持 Kiro-only；`service create --name copilot --port 5581 --provider copilot --default-provider copilot` 创建 Copilot-only 服务；`--provider kiro --provider copilot --default-provider kiro` 创建双来源服务。多个服务需要使用不同端口。`service apikey <服务>` 默认显示完整密钥，`--redact` 隐藏密钥。修改 --provider 后原默认来源不在新范围时自动选第一个 ID。`service accounts/add-account/remove-account` 与 `--account-tag` 支持两种来源；Copilot 的手工加入/排除持久化为 provider/account_id。修改服务标签筛选前先停用服务，修改已绑定 Kiro 账号标签或使 Copilot 退出标签池前先解绑。API key 也有独立来源范围；删除服务时仅级联删除未共享 key。"
         }
         "config" => {
             r#"配置默认位于 $KPROXY_HOME/config.toml；全局设置无需为 Kiro/Copilot 分别复制。
@@ -191,7 +208,7 @@ Copilot API 地址优先使用账号 token 返回的 endpoint；仅当缺失且�
 
   注意：`config show` 的原始或生效配置可能包含凭证；请勿直接粘贴输出到日志或工单。
 
-`kproxy config list` 显示每个模块的适用来源，`show <模块> --effective` 查看合并默认值后的配置。新建 Copilot 实例会在配置文件中写入默认 Client ID；用 `kproxy config path` 定位文件，或在组织要求自有 OAuth App 时用 `kproxy provider edit copilot --setting 'client_id="Iv1.your-app"'` 覆盖。Kiro SSO 用 `config edit sso`，不是 Copilot 的 Azure SSO URL。`config reset <模块>` 只重置所选模块；不指定模块会重置 Kiro 与全局运行参数、清除模型映射，同时保留提供源、API key、服务和告警。server.host/port 仅是新建服务默认值，已有服务用 service edit 修改；admin.socket 和 TLS 模式切换需重启 daemon。"#
+`kproxy config list` 显示每个模块的适用来源，`show <模块> --effective` 查看合并默认值后的配置。新建 Copilot 实例会在配置文件中写入默认 Client ID；用 `kproxy config path` 定位文件，或在组织要求自有 OAuth App 时用 `kproxy provider edit copilot --setting 'client_id="Iv1.your-app"'` 覆盖。Kiro SSO 用 `config edit sso`，不是 Copilot 的 Azure SSO URL。`config reset <模块>` 只重置所选模块；不指定模块会重置 Kiro 与全局运行参数、清除模型映射，同时保留提供源、API key、服务、模型禁用规则和告警。server.host/port 仅是新建服务默认值，已有服务用 service edit 修改；admin.socket 和 TLS 模式切换需重启 daemon。"#
         }
         "apikey" => {
             "API key 可用 `--provider kiro`、`--provider copilot` 限定允许来源；add 省略时保持 Kiro-only，重复传入可允许两者，并可用 `--model 'copilot/*'` 限制模型。service create 自动生成的 key 继承服务来源范围。`apikey list/usage/history --provider <ID>` 是查询过滤；`limit` 的累计 credits 上限跨该 key 的来源共用，`reset-usage` 清除全部来源累计用量，不单独按来源重置。`show/edit` 可查看或修改范围；删除需确认。"
@@ -203,19 +220,19 @@ Copilot API 地址优先使用账号 token 返回的 endpoint；仅当缺失且�
             "`kproxy subscriptions --provider kiro [账号]` 查询 Kiro 上游企业订阅计划；省略账号时使用可调度 Kiro 账号。Copilot 不提供权威订阅/席位数据，`--provider copilot` 或 `all` 中该来源返回 supported=false；Copilot 可用性请用 `account probe --provider copilot` 和 `models list --provider copilot` 检查。"
         }
         "tasks" => {
-            "`kproxy tasks list` 查看全部任务。`token_refresh/status_check/health_recheck` 操作 Kiro 账号池；`model_cache_refresh` 可用 `tasks run model_cache_refresh --provider kiro|copilot` 按来源刷新；`stats_persist/daily_reset/proxy_service_reconcile` 为全局任务。其他任务不接受 --provider。Copilot API token 在其 provider 内独立按需刷新，不使用 Kiro 的 token_refresh 任务。"
+            "`kproxy tasks list` 查看全部任务。`token_refresh/status_check/health_recheck` 操作 Kiro 账号池；`model_cache_refresh` 可用 `tasks run model_cache_refresh --provider <ID>` 按来源刷新；`stats_persist/daily_reset/proxy_service_reconcile` 为全局任务。Kiro 任务只接受 --provider kiro；全局任务不接受 --provider。Copilot API token 在其 provider 内独立按需刷新，不使用 Kiro 的 token_refresh 任务。"
         }
         "stats" => {
-            "`kproxy stats` 默认聚合 Kiro/Copilot 的持久化请求统计；`--provider kiro|copilot` 限定来源，`--detail --by provider` 比较来源分组。可用 `--since 1h` 或带时区的 `--start/--end` 查询时间段；`--by model|account|apikey|endpoint` 查看其他维度。"
+            "`kproxy stats` 默认聚合 Kiro/Copilot 的持久化请求统计；`--provider <ID>` 限定来源，`--detail --by provider` 比较来源分组。可用 `--since 1h` 或带时区的 `--start/--end` 查询时间段；`--by model|account|apikey|endpoint` 查看其他维度。"
         }
         "logs" => {
-            "`kproxy logs show/follow --provider kiro|copilot` 查看对应来源的结构化请求日志；省略来源时显示全部，并可配合 --account、--level 和 --tail。`logs trace <TRACE_ID>` 按 trace ID 跨全部来源和日志分片查询，不提供来源参数；`logs files/path` 管理全局日志文件和路径。"
+            "`kproxy logs show/follow --provider <ID>` 查看对应来源的结构化请求日志；省略来源时显示全部，并可配合 --account、--level 和 --tail。`logs trace <TRACE_ID>` 按 trace ID 跨全部来源和日志分片查询，不提供来源参数；`logs files/path` 管理全局日志文件和路径。"
         }
         "alert" => {
             "`kproxy alert events` 当前列出的额度保护、额度耗尽、服务额度耗尽和 token 刷新失败事件来自 Kiro 账号池；不能作为 Copilot Enterprise 席位、授权或额度监控。`alert platforms/config` 和 `add/edit/delete/list/test/logs` 管理这些事件的通知目标；通知平台本身是共享机制，但当前没有 Copilot 专项告警事件。"
         }
         "models" => {
-            "`kproxy models list` 默认聚合全部来源；`--provider kiro --refresh` 和 `--provider copilot --refresh` 分别刷新并查看 Kiro、Copilot 的模型、输入上下文和输出上限，`-` 表示上游未返回对应元数据。`--mapped` 同时显示显式映射结果。`kproxy models resolve <MODEL_ID> --provider <ID>` 显示指定来源中的映射与最终模型；还可配合 `--api-key` 和 `--refresh`。"
+            "`kproxy models list` 默认聚合全部来源；`--provider kiro --refresh` 和 `--provider copilot --refresh` 分别刷新并查看 Kiro、Copilot 的模型、输入上下文和输出上限，`-` 表示上游未返回对应元数据。`--mapped` 同时显示显式映射结果。`kproxy models resolve <MODEL_ID> --provider <ID>` 显示指定来源中的映射与最终模型；还可配合 `--api-key` 和 `--refresh`。`model` 与 `models` 等价。`model disable/enable <MODEL_ID...>` 全局禁用/启用模型（跨全部 provider，使用不带来源前缀的 ID；若有 KPROXY_PROVIDER 请覆盖 --provider all）。禁用规则保存在 models.disabled，热更新生效，配置重置保留。CLI 列表标记不可用，公共列表隐藏；直接请求、映射、默认模型、回退、重试和内部探测均在发送前拦截。已发送请求无法撤回。"
         }
         "docker" => {
             "默认 `docker compose up -d --build` 构建 runtime-full，启用全部 feature 并包含 Chromium SSO 运行时。数据保存在 kproxy-data 命名卷。"

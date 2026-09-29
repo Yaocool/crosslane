@@ -1,13 +1,13 @@
 //! Static shell-completion generation.
 
-use clap::{CommandFactory, ValueEnum};
+use clap::ValueEnum;
 use clap_complete::{generate, shells};
 use std::io::Write;
 
-use crate::{cli::guide::Topic, Cli, CompletionShell};
+use crate::{cli::guide::Topic, CompletionShell};
 
 pub fn print(shell: CompletionShell) -> std::io::Result<()> {
-    let mut command = Cli::command();
+    let mut command = super::command();
     let binary_name = command.get_name().to_owned();
     let mut output = std::io::stdout();
     match shell {

@@ -62,8 +62,8 @@ pub enum AccountCommand {
         /// 提供源实例 ID；默认聚合全部提供源。
         #[arg(long, default_value = "all")]
         provider: String,
-        /// 按提供源驱动类型筛选。
-        #[arg(long)]
+        /// 按驱动类型筛选；不是实例 ID。
+        #[arg(long, value_parser = ["kiro", "copilot"])]
         provider_kind: Option<String>,
         /// 只显示带该标签的账号。
         #[arg(long, value_name = "TAG")]
@@ -109,39 +109,44 @@ pub enum AccountCommand {
         #[arg(long)]
         provider: Option<String>,
     },
-    /// 通过 Device Flow 或 GitHub token 添加 Copilot 账号。
+    /// 统一添加 Kiro SSO/API key 或 Copilot Device Flow/token 账号。
     #[command(
-        after_help = "--provider 填 provider add --id 创建的实例 ID。--headless 交互填写账号并隐藏输入密码；--batch 从 CSV 逐个登录。提供浏览器凭证时，由远端 daemon 的独立无痕 Chromium 完成 Device Flow；--sso-username 表示标准输入的密码仅用于 Azure SSO。未提供浏览器凭证时，仍可在本地无痕窗口手动授权。Kiro 请使用 account add-sso。\n\n示例：\n  kproxy account add --provider github-copilot --auth device-flow --headless\n  kproxy account add --provider github-copilot --batch copilot.csv\n  kproxy account add --provider github-copilot --auth device-flow --username USER_SHORTCODE --sso-username user@example.com --password-stdin\n  kproxy account add --provider github-copilot --auth device-flow --credentials-stdin < login.json\n  kproxy account add --provider github-copilot --auth device-flow\n  printf '%s\\n' \"$GITHUB_TOKEN\" | kproxy account add --provider github-copilot --token-stdin\n\nCSV 表头：github_username,github_password,sso_username,sso_password,sso_start_url,label；仅 github_username 为必选列，密码需提供 GitHub 或 Azure SSO 其中一套。",
+        after_help = "--provider 填 provider add --id 创建的实例 ID。--headless 交互填写账号并隐藏输入密码；--batch 从 CSV 逐个登录。提供浏览器凭证时，由远端 daemon 的独立无痕 Chromium 完成 Device Flow；--sso-username 表示标准输入的密码仅用于 Azure SSO。未提供浏览器凭证时，仍可在本地无痕窗口手动授权。Kiro 使用 account add --provider kiro --auth sso --email EMAIL --password-stdin，或 --token-stdin 导入 API key；原 add-sso/add-api-key 命令继续可用。\n\n示例：\n  kproxy account add --provider copilot --auth device-flow --headless\n  kproxy account add --provider copilot --batch copilot.csv\n  kproxy account add --provider copilot --auth device-flow --username USER_SHORTCODE --sso-username user@example.com --password-stdin\n  kproxy account add --provider copilot --auth device-flow --credentials-stdin < login.json\n  kproxy account add --provider copilot --auth device-flow\n  printf '%s\\n' \"$GITHUB_TOKEN\" | kproxy account add --provider copilot --token-stdin\n\nCSV 表头：github_username,github_password,sso_username,sso_password,sso_start_url,label；仅 github_username 为必选列，密码需提供 GitHub 或 Azure SSO 其中一套。",
         group(clap::ArgGroup::new("browser_credentials").args(["username", "credentials_stdin", "headless", "batch"]).multiple(true))
     )]
     Add {
-        /// 提供源实例 ID，例如 github-copilot；不是驱动 kind。
-        #[arg(long)]
+        /// 提供源实例 ID，见 provider list 的实例 ID 列；不是驱动 kind。
+        // Clap checks leaf requirements before propagating parent globals.
+        // Validate the resolved value after propagation, allowing root scope.
+        #[arg(long, default_value = "", hide_default_value = true)]
         provider: String,
-        /// 认证方式；Copilot 当前支持 device-flow。
-        #[arg(long, value_parser = ["device-flow"])]
+        /// Kiro 支持 sso/api-key；Copilot 支持 device-flow，省略时按来源选择。
+        #[arg(long, value_parser = ["device-flow", "sso", "api-key"])]
         auth: Option<String>,
-        /// 从标准输入读取 GitHub token 并显式导入。
-        #[arg(long, conflicts_with_all = ["auth", "browser_credentials", "capture_headers"])]
+        /// 从标准输入读取 Kiro API key 或 GitHub token 并显式导入。
+        #[arg(long, conflicts_with_all = ["credentials_stdin", "batch", "headless", "password_stdin", "capture_headers"])]
         token_stdin: bool,
-        /// 在远端无痕浏览器登录的 GitHub 用户名。
-        #[arg(long, conflicts_with_all = ["credentials_stdin", "batch"])]
+        /// Kiro 邮箱（--email）或在远端无痕浏览器登录的 GitHub 用户名。
+        #[arg(long, visible_alias = "email", conflicts_with_all = ["credentials_stdin", "batch"])]
         username: Option<String>,
         /// 从标准输入读取一行密码；指定 --sso-username 时仅发送给 Azure。
         #[arg(long, requires = "username", conflicts_with_all = ["headless", "credentials_stdin", "batch"])]
         password_stdin: bool,
-        /// Azure SSO 登录名，可与 GitHub 用户名不同。
+        /// Copilot：Azure SSO 登录名，可与 GitHub 用户名不同。
         #[arg(long, requires = "browser_credentials", conflicts_with_all = ["credentials_stdin", "batch"])]
         sso_username: Option<String>,
-        /// 交互填写账号并隐藏输入密码，由远端无痕浏览器登录。
+        /// Copilot：交互填写账号并隐藏输入密码，由远端无痕浏览器登录。
         #[arg(long, conflicts_with_all = ["password_stdin", "credentials_stdin", "batch"])]
         headless: bool,
-        /// 从 CSV 逐个进行远端无痕登录；使用 - 从标准输入读取。
+        /// 批量添加：Kiro 用 email,password；Copilot 用下方 CSV 表头；- 表示标准输入。
         #[arg(long, value_name = "CSV", conflicts_with_all = ["username", "password_stdin", "sso_username", "credentials_stdin", "headless"])]
         batch: Option<String>,
-        /// GitHub 组织或企业的 HTTPS SSO 入口。
-        #[arg(long, requires = "browser_credentials")]
+        /// Kiro SSO 入口（--start-url）或 GitHub 组织/企业的 HTTPS SSO 入口。
+        #[arg(long, visible_alias = "start-url", requires = "browser_credentials")]
         sso_start_url: Option<String>,
+        /// Kiro AWS 区域。
+        #[arg(long, default_value = "us-east-1")]
+        region: String,
         /// 从标准输入读取 GitHub/Azure 浏览器凭证 JSON；仅用于本次登录。
         #[arg(long, conflicts_with_all = ["username", "password_stdin", "sso_username"])]
         credentials_stdin: bool,
@@ -153,7 +158,7 @@ pub enum AccountCommand {
     },
     /// 向正在运行的远端 Copilot 浏览器提交 MFA 验证码。
     LoginCode {
-        #[arg(long)]
+        #[arg(long, default_value = "", hide_default_value = true)]
         provider: String,
         #[arg(long)]
         task: String,
@@ -161,13 +166,15 @@ pub enum AccountCommand {
         #[arg(long, required = true)]
         code_stdin: bool,
     },
-    /// 查看 Kiro 账号绑定的 API 代理服务。
+    /// 查看 Kiro/Copilot 账号绑定的 API 代理服务。
     #[command(
-        long_about = "查看 Kiro 账号当前属于哪些 API 代理服务，并显示全局池、标签或手工绑定来源。\n\n示例：\n  kproxy account services acc_7f3a2b1c\n  kproxy account services alice@example.com"
+        long_about = "查看 Kiro/Copilot 账号当前属于哪些 API 代理服务，并显示全局池、标签或手工绑定来源。\n\n示例：\n  kproxy account services acc_7f3a2b1c\n  kproxy account services alice@example.com"
     )]
     Services {
         /// 账号 ID 或邮箱。
         id: String,
+        #[arg(long)]
+        provider: Option<String>,
     },
     /// 从 JSON 导入已有 Kiro 凭证。
     #[command(
@@ -282,7 +289,7 @@ pub enum AccountCommand {
     },
     /// 为 Kiro/Copilot 账号增删标签，自动识别账号归属。
     #[command(
-        long_about = "为 Kiro/Copilot 账号增删标签，可同时添加和移除。Kiro 未指定 --provider 的批量修改会先校验全部账号；Copilot 按账号逐个修改，不能保证整批原子性。service --account-tag 目前只筛选 Kiro 账号，不筛选 Copilot。\n\n示例：\n  kproxy account tag acc_7f3a --provider kiro --add prod\n  kproxy account tag acc_8b2c --provider copilot --add team-a",
+        long_about = "为 Kiro/Copilot 账号增删标签，可同时添加和移除。未指定 --provider 时按 ID/邮箱/登录名解析归属，重名需用 provider/account_id 消歧。整批先校验，每个 provider 内一次持久化；跨 provider 不提供分布式事务。服务 --account-tag 支持两种来源。\n\n示例：\n  kproxy account tag acc_7f3a --provider kiro --add prod\n  kproxy account tag acc_8b2c --provider copilot --add team-a",
         group(clap::ArgGroup::new("tag_change").required(true).multiple(true).args(["add", "remove"]))
     )]
     Tag {
@@ -309,14 +316,14 @@ pub enum AccountCommand {
     },
     /// 立即刷新 Kiro/Copilot 账号 token。
     #[command(
-        after_help = "--all 省略 --provider 时默认 Kiro；Copilot 请显式指定实例 ID。\n\n示例：\n  kproxy account refresh --provider kiro --all\n  kproxy account refresh --provider copilot --all",
+        after_help = "--all 省略 --provider 时覆盖全部来源；使用 --provider 限定实例。\n\n示例：\n  kproxy account refresh --provider kiro --all\n  kproxy account refresh --provider copilot --all",
         group(clap::ArgGroup::new("refresh_target").required(true).multiple(false).args(["id", "all"]))
     )]
     Refresh {
         id: Option<String>,
         #[arg(long, conflicts_with = "id")]
         all: bool,
-        /// 限定提供源；--all 时默认 kiro，也可指定 all 聚合全部。
+        /// 限定提供源；--all 时默认聚合全部来源。
         #[arg(long)]
         provider: Option<String>,
     },
@@ -407,6 +414,7 @@ fn build_provider_list_rows(accounts: &[ProviderAccountSummary]) -> Vec<Vec<Stri
                 .unwrap_or_else(|| "-".into());
             vec![
                 account.provider_id.clone(),
+                crate::cli::scope::kind_name(&account.provider_kind).to_owned(),
                 account.id.clone(),
                 account.display_name.clone(),
                 if account.enabled {
@@ -450,7 +458,11 @@ fn print_provider_detail(account: &ProviderAccountSummary) {
         "{}/{}   {}",
         account.provider_id, account.id, account.display_name
     );
-    println!("类型      {}", account.provider_kind);
+    println!("实例 ID   {}", account.provider_id);
+    println!(
+        "类型      {}",
+        crate::cli::scope::kind_name(&account.provider_kind)
+    );
     println!("状态      {}", display_provider_health(&account.health));
     println!("认证      {}", account.auth_state);
     if let Some(email) = &account.email {
@@ -1061,6 +1073,7 @@ async fn run_overage(
 
 /// 执行账号子命令。
 pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) -> Result<()> {
+    let command = normalize_add(command)?;
     match command {
         AccountCommand::List {
             provider,
@@ -1094,7 +1107,8 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
                     "{}",
                     render_table(
                         &[
-                            "PROVIDER",
+                            "实例 ID",
+                            "类型 (kind)",
                             "ID",
                             "账号",
                             "状态",
@@ -1139,6 +1153,7 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
             headless,
             batch,
             sso_start_url,
+            region: _,
             credentials_stdin,
             capture_headers,
             label,
@@ -1240,9 +1255,12 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
                 println!("验证码已交给远端浏览器；请在原登录命令查看结果");
             }
         }
-        AccountCommand::Services { id } => {
+        AccountCommand::Services { id, provider } => {
             let result: AccountServicesResult = client
-                .call(method::ACCOUNT_SERVICES, serde_json::json!({"id":id}))
+                .call(
+                    method::ACCOUNT_SERVICES,
+                    serde_json::json!({"id":id,"provider":provider}),
+                )
                 .await?;
             print_account_services(&result, json)?;
         }
@@ -1422,14 +1440,18 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
         }
         AccountCommand::Refresh { id, all, provider } => {
             if all {
-                let provider = provider.as_deref().unwrap_or("kiro");
+                let provider = provider.as_deref().unwrap_or("all");
                 let list: ProviderAccountListResult = client
                     .call(
                         method::V2_ACCOUNT_LIST,
                         serde_json::json!({"provider":provider}),
                     )
                     .await?;
-                let mut failures = Vec::new();
+                let mut failures = list
+                    .errors
+                    .iter()
+                    .map(|(provider, error)| format!("{provider}: {error}"))
+                    .collect::<Vec<_>>();
                 let mut results = Vec::new();
                 for account in list.accounts {
                     match client
@@ -1473,7 +1495,7 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
                 run_provider_account_batch(
                     client,
                     method::V2_ACCOUNT_PROBE,
-                    provider.as_deref().unwrap_or("kiro"),
+                    provider.as_deref().unwrap_or("all"),
                 )
                 .await?
             } else {
@@ -1511,7 +1533,7 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
                 run_provider_account_batch(
                     client,
                     method::V2_ACCOUNT_RESET_HEALTH,
-                    provider.as_deref().unwrap_or("kiro"),
+                    provider.as_deref().unwrap_or("all"),
                 )
                 .await?
             } else {
@@ -1529,15 +1551,108 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
     Ok(())
 }
 
+/// Keep one entry point while reusing the established provider authentication
+/// implementations. Legacy add-sso/add-api-key commands remain compatible.
+fn normalize_add(command: AccountCommand) -> Result<AccountCommand> {
+    match command {
+        AccountCommand::Add {
+            provider,
+            auth,
+            token_stdin,
+            username,
+            password_stdin,
+            sso_username,
+            headless,
+            batch,
+            sso_start_url,
+            region,
+            credentials_stdin,
+            capture_headers,
+            label,
+        } if provider == "kiro" => {
+            if sso_username.is_some()
+                || credentials_stdin
+                || capture_headers
+                || label.is_some()
+                || headless
+            {
+                return Err(anyhow!("该参数用于 Copilot；Kiro 使用 --email、--start-url、--password-stdin 或 --batch"));
+            }
+            match auth
+                .as_deref()
+                .unwrap_or(if token_stdin { "api-key" } else { "sso" })
+            {
+                "api-key" => {
+                    if batch.is_some() || password_stdin || sso_start_url.is_some() {
+                        return Err(anyhow!("api-key 不支持 SSO 参数"));
+                    }
+                    Ok(AccountCommand::AddApiKey {
+                        email: username.ok_or_else(|| anyhow!("Kiro API key 需要 --email"))?,
+                        region,
+                        key_stdin: token_stdin,
+                        tags: vec![],
+                    })
+                }
+                "sso" if !token_stdin => {
+                    if batch.is_none() && (username.is_none() || !password_stdin) {
+                        return Err(anyhow!(
+                            "Kiro SSO 需要 --email 与 --password-stdin，或 --batch"
+                        ));
+                    }
+                    Ok(AccountCommand::AddSso {
+                        email: username,
+                        start_url: sso_start_url,
+                        region,
+                        password_stdin,
+                        batch,
+                        concurrency: None,
+                        headful: false,
+                        tags: vec![],
+                    })
+                }
+                _ => Err(anyhow!("Kiro 支持 --auth sso 或 --auth api-key")),
+            }
+        }
+        AccountCommand::Add {
+            ref provider,
+            ref auth,
+            token_stdin,
+            ref region,
+            ref username,
+            ref sso_username,
+            ref sso_start_url,
+            ..
+        } => {
+            if provider == "all" {
+                return Err(anyhow!("添加账号需要明确的 --provider 实例 ID"));
+            }
+            if auth.as_deref().is_some_and(|auth| auth != "device-flow")
+                || (token_stdin && auth.is_some())
+            {
+                return Err(anyhow!("Copilot 使用 --auth device-flow 或 --token-stdin"));
+            }
+            if token_stdin
+                && (username.is_some() || sso_username.is_some() || sso_start_url.is_some())
+            {
+                return Err(anyhow!("Copilot token 导入不能同时提供浏览器登录参数"));
+            }
+            if region != "us-east-1" {
+                return Err(anyhow!("--region 仅适用于 Kiro"));
+            }
+            Ok(command)
+        }
+        _ => Ok(command),
+    }
+}
+
 fn empty_account_hint(provider: &str, filtered: bool) -> String {
     if filtered {
         return "没有符合筛选条件的账号。".into();
     }
     match provider {
         "all" => "暂无账号。Kiro 接入见 `kproxy guide kiro`；GitHub Copilot 接入见 `kproxy guide copilot`。".into(),
-        "kiro" => "暂无 Kiro 账号。使用 `kproxy account add-sso` 或 `add-api-key`；详情见 `kproxy guide kiro`。".into(),
-        "copilot" => "暂无 GitHub Copilot 账号。使用 `kproxy account add --provider copilot --auth device-flow`；详情见 `kproxy guide copilot`。".into(),
-        _ => format!("提供源 {provider} 暂无账号。请按该来源的认证方式添加；查看 `kproxy guide provider`。"),
+        "kiro" => "暂无 Kiro 账号。使用 `kproxy account add --provider kiro --auth sso --email <EMAIL> --password-stdin`，或 --auth api-key；详情见 `kproxy guide kiro`。".into(),
+        _ => format!("实例 {provider} 暂无账号。使用 `kproxy account add --provider {provider}` 自动选择认证方式；查看 `kproxy provider show {provider}` 获取该实例的接入命令。"),
     }
 }
 
@@ -1553,7 +1668,11 @@ async fn run_provider_account_batch(
         )
         .await?;
     let mut results = Vec::new();
-    let mut errors = Vec::new();
+    let mut errors = list
+        .errors
+        .iter()
+        .map(|(provider, error)| format!("{provider}: {error}"))
+        .collect::<Vec<_>>();
     for account in list.accounts {
         match client
             .call::<serde_json::Value>(
@@ -2040,17 +2159,105 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unified_add_dispatches_kiro_auth_and_rejects_wrong_provider_modes() {
+        use clap::Parser;
+        let parse = |args: &[&str]| {
+            let cli = crate::Cli::try_parse_from(args).unwrap();
+            let Some(crate::Command::Account {
+                command: Some(command),
+            }) = cli.command
+            else {
+                panic!("account command");
+            };
+            normalize_add(command)
+        };
+        let sso = parse(&[
+            "kproxy",
+            "--provider",
+            "kiro",
+            "account",
+            "add",
+            "--auth",
+            "sso",
+            "--email",
+            "test@example.com",
+            "--password-stdin",
+            "--start-url",
+            "https://example.awsapps.com/start",
+        ])
+        .unwrap();
+        assert!(
+            matches!(sso,AccountCommand::AddSso { email:Some(email), password_stdin:true, .. } if email == "test@example.com")
+        );
+        let key = parse(&[
+            "kproxy",
+            "account",
+            "add",
+            "--provider",
+            "kiro",
+            "--email",
+            "test@example.com",
+            "--token-stdin",
+        ])
+        .unwrap();
+        assert!(matches!(
+            key,
+            AccountCommand::AddApiKey {
+                key_stdin: true,
+                ..
+            }
+        ));
+        assert!(parse(&[
+            "kproxy",
+            "--provider",
+            "copilot",
+            "account",
+            "add",
+            "--auth",
+            "sso"
+        ])
+        .is_err());
+        assert!(parse(&[
+            "kproxy",
+            "--provider",
+            "all",
+            "account",
+            "add",
+            "--auth",
+            "device-flow"
+        ])
+        .is_err());
+        assert!(matches!(
+            parse(&[
+                "kproxy",
+                "--provider",
+                "copilot",
+                "account",
+                "add",
+                "--auth",
+                "device-flow"
+            ])
+            .unwrap(),
+            AccountCommand::Add { .. }
+        ));
+    }
+
+    #[test]
     fn empty_account_hints_match_provider_auth_flow() {
         let all = empty_account_hint("all", false);
         assert!(all.contains("guide kiro"));
         assert!(all.contains("guide copilot"));
 
         let kiro = empty_account_hint("kiro", false);
-        assert!(kiro.contains("add-sso"));
+        assert!(kiro.contains("account add --provider kiro --auth sso"));
         assert!(!kiro.contains("device-flow"));
 
         let copilot = empty_account_hint("copilot", false);
-        assert!(copilot.contains("account add --provider copilot --auth device-flow"));
+        assert!(copilot.contains("account add --provider copilot`"));
+        let custom = empty_account_hint("work-cp", false);
+        assert!(custom.contains("account add --provider work-cp`"));
+        assert!(custom.contains("provider show work-cp"));
+        assert!(!custom.contains("--provider copilot"));
 
         assert_eq!(
             empty_account_hint("copilot", true),
@@ -2120,10 +2327,11 @@ mod tests {
             }),
         };
         let rows = build_provider_list_rows(&[account]);
-        assert_eq!(rows[0][3], "可用");
-        assert_eq!(rows[0][4], "10000.01/10500.00/20000.00");
-        assert_eq!(rows[0][5], "500.00/10000.00");
-        assert_eq!(rows[0][6], "prod");
+        assert_eq!(rows[0][1], "Kiro (kiro)");
+        assert_eq!(rows[0][4], "可用");
+        assert_eq!(rows[0][5], "10000.01/10500.00/20000.00");
+        assert_eq!(rows[0][6], "500.00/10000.00");
+        assert_eq!(rows[0][7], "prod");
     }
 
     #[test]
@@ -2153,8 +2361,8 @@ mod tests {
             account(false, Some(500.0)),
             account(true, Option::<f64>::None),
         ]);
-        assert_eq!(rows[0][5], "关闭(500.00)/10000.00");
-        assert_eq!(rows[1][5], "Kiro上限/10000.00");
+        assert_eq!(rows[0][6], "关闭(500.00)/10000.00");
+        assert_eq!(rows[1][6], "Kiro上限/10000.00");
     }
 
     #[test]
@@ -2382,13 +2590,14 @@ mod tests {
         .await
         .expect("batch tag");
         let request = server.await.expect("server task");
-        assert_eq!(request.method, method::ACCOUNT_TAG);
+        assert_eq!(request.method, method::V2_ACCOUNT_TAG);
         assert_eq!(
             request.params,
             serde_json::json!({
                 "ids": ["acc_00000001", "acc_00000002"],
                 "add": ["test"],
-                "remove": []
+                "remove": [],
+                "provider": null
             })
         );
     }

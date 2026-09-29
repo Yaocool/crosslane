@@ -9,6 +9,7 @@ fn run(current_dir: &Path, args: &[&str]) -> Output {
         .current_dir(current_dir)
         .env_remove("KPROXY_ADMIN_SOCKET")
         .env_remove("KPROXY_WRAPPER_LOCAL_ONLY")
+        .env_remove("KPROXY_PROVIDER")
         .env("RUST_BACKTRACE", "0")
         .output()
         .expect("run kproxy")
@@ -16,6 +17,79 @@ fn run(current_dir: &Path, args: &[&str]) -> Output {
 
 fn stdout(output: &Output) -> String {
     String::from_utf8(output.stdout.clone()).expect("UTF-8 stdout")
+}
+
+#[test]
+fn help_distinguishes_ids_types_and_every_leaf_scope() {
+    let workspace = tempfile::tempdir().unwrap();
+    for (args, scope) in [
+        (&["account", "add", "--help"][..], "Kiro / GitHub Copilot"),
+        (&["account", "overage", "enable", "--help"][..], "仅 Kiro"),
+        (
+            &["account", "login-code", "--help"][..],
+            "仅 GitHub Copilot",
+        ),
+        (&["service", "apikey", "--help"][..], "按资源 ID/名称定位"),
+        (&["model", "disable", "--help"][..], "全局"),
+    ] {
+        let output = run(workspace.path(), args);
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+        let help = stdout(&output);
+        assert!(help.contains(&format!("适用范围：{scope}")), "{help}");
+        assert!(!help.contains("--provider github-copilot"), "{help}");
+    }
+    let account = stdout(&run(workspace.path(), &["account", "add", "--help"]));
+    assert!(account.contains("-p, --provider <ID>"));
+    let key = stdout(&run(workspace.path(), &["service", "apikey", "--help"]));
+    assert!(key.contains("默认直接显示完整密钥"));
+    assert!(!key.contains("--provider <ID>"));
+    assert!(!key.contains("--show-secret"));
+    let tree = stdout(&run(workspace.path(), &["help", "--all"]));
+    for label in [
+        "[仅 Kiro]",
+        "[仅 GitHub Copilot]",
+        "[全局]",
+        "[按资源 ID/名称定位]",
+    ] {
+        assert!(tree.contains(label), "missing {label}");
+    }
+}
+
+#[test]
+fn custom_provider_guide_uses_instance_id_without_changing_driver_kind() {
+    let workspace = tempfile::tempdir().unwrap();
+    let output = run(workspace.path(), &["guide", "copilot", "-p", "work-cp"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let guide = stdout(&output);
+    assert!(guide.contains("--id work-cp --kind copilot"));
+    assert!(guide.contains("account add --provider work-cp"));
+    assert!(guide.contains("--default-provider work-cp"));
+    assert!(!guide.contains("--provider copilot"));
+}
+
+#[test]
+fn unsupported_scope_fails_before_loading_runtime_environment() {
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join(".env"), "BROKEN='unterminated\n").unwrap();
+    for args in [
+        &["health"][..],
+        &["config", "show"][..],
+        &["service", "show", "main"][..],
+        &["model-map", "delete", "rule", "--yes"][..],
+        &["tasks", "list"][..],
+    ] {
+        let mut scoped = vec!["-p", "work-cp"];
+        scoped.extend_from_slice(args);
+        let output = run(workspace.path(), &scoped);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{scoped:?}: {}",
+            stderr(&output)
+        );
+        assert!(stderr(&output).contains("不接受 --provider"));
+        assert!(!stderr(&output).contains("unterminated"));
+    }
 }
 
 fn stderr(output: &Output) -> String {

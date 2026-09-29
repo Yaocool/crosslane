@@ -24,6 +24,16 @@ use crate::output::{format_relative, format_timestamp, print_json, render_table}
     after_help = "来源与命令适用范围：guide provider、guide kiro、guide copilot\n常用查询：status、health、ready、stats、pool、subscriptions\n命令组：provider、account、config、apikey、service、alert、logs、models、model-map、tasks、diagnose\n宿主机操作：restart、stop、uninstall\n帮助与补全：help、guide、completions"
 )]
 struct Cli {
+    /// 提供源实例 ID（见 provider list）；可放在任意子命令前后，也可用 KPROXY_PROVIDER。
+    #[arg(
+        short = 'p',
+        long,
+        global = true,
+        env = "KPROXY_PROVIDER",
+        value_name = "ID",
+        value_delimiter = ','
+    )]
+    provider: Vec<String>,
     /// 管理面 socket 路径，默认读取配置文件。
     #[arg(long, global = true, value_name = "PATH", env = "KPROXY_ADMIN_SOCKET")]
     socket: Option<String>,
@@ -120,7 +130,7 @@ enum Command {
     },
     /// 账号管理。
     #[command(
-        after_help = "Kiro：account add-sso / add-api-key；Copilot：account add --provider copilot --auth device-flow。\n\n示例：\n  kproxy account list --provider kiro\n  kproxy account list --provider copilot\n  kproxy account probe --provider copilot <ACCOUNT_ID>\n  kproxy account overage\n\n操作说明：kproxy guide kiro、kproxy guide copilot、kproxy guide account"
+        after_help = "统一入口：account add --provider <ID>；Kiro 使用 --auth sso/api-key，Copilot 使用 --auth device-flow。兼容命令 account add-sso / add-api-key 仅适用于 Kiro。\n\n示例：\n  kproxy account list --provider kiro\n  kproxy account list --provider copilot\n  kproxy account probe --provider copilot <ACCOUNT_ID>\n  kproxy account overage\n\n操作说明：kproxy guide kiro、kproxy guide copilot、kproxy guide account"
     )]
     Account {
         #[command(subcommand)]
@@ -128,14 +138,14 @@ enum Command {
     },
     /// Kiro 查看调度评分；Copilot 查看账号及模型支持。
     #[command(
-        after_help = "Kiro 显示排队、额度与选号评分；Copilot 显示账号认证和模型支持，--explain 的评分明细不适用于 Copilot。默认模型名来自 Kiro，查询 Copilot 时请显式传入 --model。\n\n示例：\n  kproxy pool --provider kiro --model claude-sonnet-4 --explain\n  kproxy pool --provider copilot --model <已授权模型ID> --watch"
+        after_help = "Kiro 显示排队、额度与选号评分；Copilot 显示账号认证和模型支持，--explain 的评分明细不适用于 Copilot。省略来源显示全部账号，省略模型展示已发现模型；按单个模型检查时使用 --model。\n\n示例：\n  kproxy pool --provider kiro --model claude-sonnet-4 --explain\n  kproxy pool --provider copilot --model <已授权模型ID> --watch"
     )]
     Pool {
-        /// 查看指定提供源的账号池；默认 Kiro。
-        #[arg(long, default_value = "kiro")]
+        /// 查看指定提供源的账号池；默认全部来源。
+        #[arg(long, default_value = "all")]
         provider: String,
         /// 按该模型检查账号是否可调度。
-        #[arg(long, default_value = "minimax-m2.5")]
+        #[arg(long, default_value = "")]
         model: String,
         /// 每 2 秒刷新；交互终端中原地更新。
         #[arg(long)]
@@ -164,7 +174,7 @@ enum Command {
     },
     /// 查看或运行 Kiro、Copilot 与全局周期任务。
     #[command(
-        after_help = "token_refresh/status_check/health_recheck 为 Kiro 专项；model_cache_refresh 可用 --provider kiro|copilot 限定；stats_persist 等为全局任务。\n\n示例：\n  kproxy tasks list\n  kproxy tasks run status_check\n  kproxy tasks run model_cache_refresh --provider copilot\n\n操作说明：kproxy guide tasks"
+        after_help = "token_refresh/status_check/health_recheck 为 Kiro 专项；model_cache_refresh 可用 --provider <ID> 限定；stats_persist 等为全局任务。\n\n示例：\n  kproxy tasks list\n  kproxy tasks run status_check\n  kproxy tasks run model_cache_refresh --provider copilot\n\n操作说明：kproxy guide tasks"
     )]
     Tasks {
         #[command(subcommand)]
@@ -224,8 +234,9 @@ enum Command {
         #[command(subcommand)]
         command: Option<crate::commands::runtime::AlertCommand>,
     },
-    /// 显示 Kiro/Copilot 动态模型、输入上下文与输出上限。
+    /// 查看、解析及全局禁用/启用 Kiro/Copilot 模型。
     #[command(
+        visible_alias = "model",
         after_help = "示例：\n  kproxy models list --provider kiro --refresh\n  kproxy models list --provider copilot --refresh\n  kproxy models list --provider all --mapped\n  kproxy models resolve <MODEL_ID> --provider copilot\n\n操作说明：kproxy guide models"
     )]
     Models {
@@ -303,7 +314,11 @@ impl StatsGroup {
 enum ProviderCommand {
     /// 列出 Kiro/Copilot 实例及运行状态。
     List {
+        /// 按实例 ID 筛选；省略或 all 显示全部。
         #[arg(long)]
+        provider: Option<String>,
+        /// 按驱动类型筛选，与实例 ID 无关。
+        #[arg(long, value_parser = ["kiro", "copilot"])]
         provider_kind: Option<String>,
     },
     /// 显示 Kiro/Copilot 实例的能力和运行状态（不显示凭证设置）。
@@ -314,9 +329,11 @@ enum ProviderCommand {
         after_help = "未显式配置 provider 时内置 Kiro；首次添加 Copilot 会保留 Kiro 实例。新建 Copilot 实例会将默认公开 Client ID 写入 [provider.settings]，可在配置文件中修改。\n\n示例：\n  kproxy provider add --id copilot --kind copilot\n  kproxy config path\n  kproxy provider show copilot"
     )]
     Add {
+        /// 自定义实例 ID，后续 --provider 使用此值；例如 copilot、team-a。
         #[arg(long)]
         id: String,
-        #[arg(long)]
+        /// 驱动类型；不是实例 ID。
+        #[arg(long, value_parser = ["kiro", "copilot"])]
         kind: String,
         /// 驱动设置，格式为 KEY=TOML_VALUE，可重复。
         #[arg(long = "setting", value_name = "KEY=VALUE")]
@@ -367,6 +384,23 @@ enum ProviderCommand {
 
 #[derive(Debug, Subcommand)]
 enum ModelsCommand {
+    /// 全局禁用模型：所有提供源、协议、回退和内部探测均禁止调用。
+    #[command(
+        after_help = "支持一次指定多个模型 ID。如设置了 KPROXY_PROVIDER，请用 --provider all 明确执行全局操作。\n\n示例：\n  kproxy model disable gpt-4.1 --provider all"
+    )]
+    Disable {
+        /// 不带 provider 前缀的模型 ID；支持一次指定多个。
+        #[arg(required = true, num_args = 1..)]
+        models: Vec<String>,
+    },
+    /// 解除模型的全局禁用规则，立即生效。
+    #[command(
+        after_help = "如设置了 KPROXY_PROVIDER，请用 --provider all 明确执行全局操作。\n\n示例：\n  kproxy model enable gpt-4.1 --provider all"
+    )]
+    Enable {
+        #[arg(required = true, num_args = 1..)]
+        models: Vec<String>,
+    },
     /// 列出一个或全部提供源发现的模型、输入上下文与输出上限。
     #[command(
         after_help = "示例：\n  kproxy models list --provider kiro --refresh\n  kproxy models list --provider copilot --refresh\n  kproxy models list --provider all --mapped"
@@ -381,8 +415,8 @@ enum ModelsCommand {
         /// 仅显示一个提供源实例；默认聚合全部来源。
         #[arg(long, default_value = "all")]
         provider: String,
-        /// 按驱动类型筛选。
-        #[arg(long)]
+        /// 按驱动类型筛选，与实例 ID 无关。
+        #[arg(long, value_parser = ["kiro", "copilot"])]
         provider_kind: Option<String>,
     },
     /// 查询客户端 model ID 在指定提供源中的映射与最终模型。
@@ -543,7 +577,7 @@ enum ModelMapCommand {
         #[arg(long = "api-key", value_delimiter = ',')]
         api_key_ids: Vec<String>,
         /// 规则作用的提供源，可重复或逗号分隔；省略时保持旧版 Kiro 范围。
-        #[arg(long = "provider", value_delimiter = ',')]
+        #[arg(id = "provider", long = "provider", value_delimiter = ',')]
         providers: Vec<String>,
         /// 规则作用的代理服务，可重复或逗号分隔。
         #[arg(long = "service", value_delimiter = ',')]
@@ -580,7 +614,7 @@ enum ModelMapCommand {
         api_key_ids: Vec<String>,
         #[arg(long)]
         clear_api_keys: bool,
-        #[arg(long = "provider", value_delimiter = ',')]
+        #[arg(id = "provider", long = "provider", value_delimiter = ',')]
         providers: Vec<String>,
         #[arg(long)]
         clear_providers: bool,
@@ -627,11 +661,11 @@ enum TaskCommand {
     List,
     /// 立即运行一个任务。
     #[command(
-        after_help = "token_refresh/status_check/health_recheck 属于 Kiro；model_cache_refresh 支持 --provider kiro|copilot；stats_persist/daily_reset/proxy_service_reconcile 属于全局。其他任务不能使用 --provider。\n\n示例：\n  kproxy tasks run status_check\n  kproxy tasks run model_cache_refresh --provider copilot\n  kproxy tasks run proxy_service_reconcile"
+        after_help = "token_refresh/status_check/health_recheck 属于 Kiro；model_cache_refresh 支持 --provider <ID>；stats_persist/daily_reset/proxy_service_reconcile 属于全局。Kiro 任务只接受 --provider kiro；全局任务不接受 --provider。\n\n示例：\n  kproxy tasks run status_check\n  kproxy tasks run model_cache_refresh --provider copilot\n  kproxy tasks run proxy_service_reconcile"
     )]
     Run {
         name: String,
-        /// 限定模型缓存刷新提供源；其他任务不接受该参数。
+        /// 限定模型缓存刷新提供源；Kiro 任务只接受 kiro，全局任务不接受该参数。
         #[arg(long)]
         provider: Option<String>,
     },
@@ -740,7 +774,7 @@ enum ConfigCommand {
     List,
     /// 显示配置。
     #[command(
-        after_help = "Kiro 专项：upstream/pool/features/models/context/storage/sso 等；Copilot 驱动配置：provider；server/log/admin 等为全局。原始或生效配置可能包含凭证，请勿分享未脱敏输出。\n\n示例：\n  kproxy config list\n  kproxy config show pool --effective\n  kproxy provider show copilot"
+        after_help = "Kiro 专项：upstream/pool/features/context/storage/sso 等；models 包含全局禁用规则和 Kiro 发现配置；Copilot 驱动配置：provider；server/log/admin 等为全局。原始或生效配置可能包含凭证，请勿分享未脱敏输出。\n\n示例：\n  kproxy config list\n  kproxy config show pool --effective\n  kproxy provider show copilot"
     )]
     Show {
         /// 只显示指定模块；使用 `kproxy config list` 查看模块名。
@@ -872,14 +906,25 @@ async fn main() -> Result<()> {
             unreachable!("host lifecycle commands returned before connecting to the daemon")
         }
         Command::Provider {
-            command: Some(ProviderCommand::List { provider_kind }),
+            command:
+                Some(ProviderCommand::List {
+                    provider,
+                    provider_kind,
+                }),
         } => {
-            show_providers(&mut client, None, provider_kind.as_deref(), cli.json).await?;
+            show_providers(
+                &mut client,
+                provider.as_deref(),
+                provider_kind.as_deref(),
+                false,
+                cli.json,
+            )
+            .await?;
         }
         Command::Provider {
             command: Some(ProviderCommand::Show { id }),
         } => {
-            show_providers(&mut client, Some(&id), None, cli.json).await?;
+            show_providers(&mut client, Some(&id), None, true, cli.json).await?;
         }
         Command::Provider {
             command:
@@ -1238,6 +1283,14 @@ async fn main() -> Result<()> {
             crate::commands::runtime::run_alert(&mut client, command, cli.json).await?;
         }
         Command::Models { command } => match command {
+            Some(ModelsCommand::Disable { models }) => {
+                crate::commands::runtime::set_models_enabled(&mut client, &models, false, cli.json)
+                    .await?;
+            }
+            Some(ModelsCommand::Enable { models }) => {
+                crate::commands::runtime::set_models_enabled(&mut client, &models, true, cli.json)
+                    .await?;
+            }
             Some(ModelsCommand::List {
                 mapped,
                 refresh,
@@ -1317,9 +1370,11 @@ async fn show_providers(
     client: &mut AdminClient,
     provider: Option<&str>,
     provider_kind: Option<&str>,
+    detail: bool,
     json: bool,
 ) -> Result<()> {
-    if let Some(provider) = provider {
+    if detail {
+        let provider = provider.expect("provider show has an ID");
         let value: kproxy_core::provider::ProviderDescriptor = client
             .call(
                 method::V2_PROVIDER_SHOW,
@@ -1332,7 +1387,7 @@ async fn show_providers(
         println!(
             "{}   {}   {}",
             value.id,
-            value.kind,
+            cli::scope::kind_name(&value.kind),
             display_runtime_status(&value.status)
         );
         println!("启用      {}", if value.enabled { "是" } else { "否" });
@@ -1353,12 +1408,13 @@ async fn show_providers(
         if let Some(error) = value.error {
             println!("错误      {error}");
         }
+        cli::scope::print_next_steps(value.id.as_str(), &value.kind);
         return Ok(());
     }
     let value: serde_json::Value = client
         .call(
             method::V2_PROVIDER_LIST,
-            serde_json::json!({"provider_kind":provider_kind}),
+            serde_json::json!({"provider":provider,"provider_kind":provider_kind}),
         )
         .await?;
     if json {
@@ -1379,7 +1435,7 @@ async fn show_providers(
                 .join(",");
             vec![
                 provider["id"].as_str().unwrap_or("-").into(),
-                provider["kind"].as_str().unwrap_or("-").into(),
+                cli::scope::kind_name(provider["kind"].as_str().unwrap_or("-")).into(),
                 if provider["enabled"].as_bool().unwrap_or(false) {
                     "是".into()
                 } else {
@@ -1393,7 +1449,20 @@ async fn show_providers(
         .collect::<Vec<_>>();
     println!(
         "{}",
-        render_table(&["PROVIDER", "KIND", "启用", "状态", "协议", "错误"], &rows)
+        render_table(
+            &[
+                "实例 ID (--provider)",
+                "类型 (kind)",
+                "启用",
+                "状态",
+                "协议",
+                "错误"
+            ],
+            &rows
+        )
+    );
+    println!(
+        "--provider/-p 使用第一列实例 ID；用 `kproxy provider show <ID>` 查看该实例的接入命令。"
     );
     Ok(())
 }
@@ -1440,7 +1509,11 @@ async fn show_provider_models(
     } else {
         None
     };
-    let enriched = result
+    let policy = kproxy_core::config::ModelsConfig {
+        disabled: result.disabled_models.clone(),
+        ..Default::default()
+    };
+    let mut enriched = result
         .models
         .iter()
         .map(|model| {
@@ -1472,16 +1545,29 @@ async fn show_provider_models(
                 "max_output_tokens":model.max_output_tokens,
                 "protocols":model.protocols,
                 "capabilities":model.capabilities,
+                "disabled":policy.is_disabled(&model.id),
+                "available":!policy.is_disabled(&model.id),
                 "mapped_model":route.as_ref().map(|route| route.mapped.as_str()),
                 "mapping_rule":route.and_then(|route| route.rule),
             })
         })
         .collect::<Vec<_>>();
+    for id in &policy.disabled {
+        if !result.models.iter().any(|model| {
+            kproxy_core::model_policy::model_key(&model.id)
+                == kproxy_core::model_policy::model_key(id)
+        }) {
+            enriched.push(
+                serde_json::json!({"provider_id":"*", "id":id, "disabled":true, "available":false}),
+            );
+        }
+    }
     if json {
         print_json(&serde_json::json!({
             "schema_version":result.schema_version,
             "scope":result.scope,
             "models":enriched,
+            "disabled_models":result.disabled_models,
             "errors":result.errors,
             "complete":result.complete
         }))?;
@@ -1492,6 +1578,11 @@ async fn show_provider_models(
                 vec![
                     model["provider_id"].as_str().unwrap_or("-").into(),
                     model["id"].as_str().unwrap_or("-").into(),
+                    if model["disabled"] == true {
+                        "不可用（已禁用）".into()
+                    } else {
+                        "可用".into()
+                    },
                     format_token_limit(model["max_input_tokens"].as_u64()),
                     format_token_limit(model["max_output_tokens"].as_u64()),
                     model["protocols"]
@@ -1511,6 +1602,7 @@ async fn show_provider_models(
                 &[
                     "PROVIDER",
                     "MODEL",
+                    "状态",
                     "输入上限",
                     "输出上限",
                     "协议",
@@ -1613,8 +1705,18 @@ async fn show_provider_model_resolution(
             .find(|candidate| candidate.id == target)
             .map(|candidate| candidate.id.clone())
     };
-    let available =
-        provider_config.enabled && resolved_provider_config.enabled && resolved_model.is_some();
+    let disabled = [
+        Some(model),
+        Some(route.mapped.as_str()),
+        resolved_model.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|model| config.is_model_disabled(model));
+    let available = !disabled
+        && provider_config.enabled
+        && resolved_provider_config.enabled
+        && resolved_model.is_some();
     let value = serde_json::json!({
         "provider_id":provider,
         "input_model":model,
@@ -1623,6 +1725,7 @@ async fn show_provider_model_resolution(
         "resolved_provider_id":resolved_provider,
         "resolved_model":available.then_some(resolved_model).flatten(),
         "available":available,
+        "disabled":disabled,
         "provider_enabled":provider_config.enabled,
         "resolved_provider_enabled":resolved_provider_config.enabled,
         "catalog_size":catalog.models.len(),
@@ -1725,7 +1828,7 @@ fn print_status(status: &StatusResult) {
             .map(|provider| {
                 vec![
                     provider.id.clone(),
-                    provider.kind.clone(),
+                    cli::scope::kind_name(&provider.kind).to_owned(),
                     provider.status.clone(),
                     format!("{}/{}", provider.account_available, provider.account_total),
                     provider.error.clone().unwrap_or_default(),
@@ -1734,7 +1837,10 @@ fn print_status(status: &StatusResult) {
             .collect::<Vec<_>>();
         println!(
             "{}",
-            render_table(&["提供源", "驱动", "状态", "可用/账号", "错误"], &rows)
+            render_table(
+                &["实例 ID", "类型 (kind)", "状态", "可用/账号", "错误"],
+                &rows
+            )
         );
     }
     println!(
@@ -1804,6 +1910,98 @@ fn print_status(status: &StatusResult) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn provider_selector_is_shared_at_every_command_depth() {
+        for args in [
+            vec![
+                "kproxy",
+                "--provider",
+                "copilot",
+                "account",
+                "tag",
+                "acc_test",
+                "--add",
+                "prod",
+            ],
+            vec![
+                "kproxy",
+                "account",
+                "--provider",
+                "copilot",
+                "tag",
+                "acc_test",
+                "--add",
+                "prod",
+            ],
+            vec![
+                "kproxy",
+                "account",
+                "tag",
+                "acc_test",
+                "--add",
+                "prod",
+                "--provider",
+                "copilot",
+            ],
+        ] {
+            let cli = super::Cli::try_parse_from(args).unwrap();
+            let Some(super::Command::Account {
+                command: Some(crate::commands::account::AccountCommand::Tag { provider, .. }),
+            }) = cli.command
+            else {
+                panic!("tag");
+            };
+            assert_eq!(provider.as_deref(), Some("copilot"));
+        }
+        let cli = super::Cli::try_parse_from(["kproxy", "--provider", "copilot", "models", "list"])
+            .unwrap();
+        let Some(super::Command::Models {
+            command: Some(super::ModelsCommand::List { provider, .. }),
+        }) = cli.command
+        else {
+            panic!("models");
+        };
+        assert_eq!(provider, "copilot");
+        let cli = super::Cli::try_parse_from([
+            "kproxy",
+            "--provider",
+            "copilot",
+            "service",
+            "create",
+            "--name",
+            "test",
+            "--port",
+            "5581",
+        ])
+        .unwrap();
+        let Some(super::Command::Service {
+            command: Some(crate::commands::runtime::ServiceCommand::Create { providers, .. }),
+        }) = cli.command
+        else {
+            panic!("service");
+        };
+        assert_eq!(providers, ["copilot"]);
+        let cli = super::Cli::try_parse_from([
+            "kproxy",
+            "--provider",
+            "kiro,copilot",
+            "service",
+            "create",
+            "--name",
+            "both",
+            "--port",
+            "5582",
+        ])
+        .unwrap();
+        let Some(super::Command::Service {
+            command: Some(crate::commands::runtime::ServiceCommand::Create { providers, .. }),
+        }) = cli.command
+        else {
+            panic!("service");
+        };
+        assert_eq!(providers, ["kiro", "copilot"]);
+    }
+
     use super::*;
 
     #[test]
@@ -2080,7 +2278,7 @@ mod tests {
         assert!(matches!(
             services.command,
             Some(Command::Account {
-                command: Some(crate::commands::account::AccountCommand::Services { id })
+                command: Some(crate::commands::account::AccountCommand::Services { id, .. })
             }) if id == "alice@example.com"
         ));
 

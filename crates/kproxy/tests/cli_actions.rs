@@ -15,6 +15,351 @@ async fn run(args: &[&str], results: Vec<Value>) -> (std::process::Output, Vec<R
     run_in_workspace(workspace.path(), args, results).await
 }
 
+#[tokio::test]
+async fn short_provider_selector_reaches_rpc_at_every_depth_and_overrides_environment() {
+    for args in [
+        &[
+            "-p", "work-cp", "account", "tag", "acc_test", "--add", "prod",
+        ][..],
+        &[
+            "account", "-p", "work-cp", "tag", "acc_test", "--add", "prod",
+        ][..],
+        &[
+            "account", "tag", "acc_test", "--add", "prod", "-p", "work-cp",
+        ][..],
+        &[
+            "-p", "kiro", "account", "tag", "acc_test", "--add", "prod", "-p", "work-cp",
+        ][..],
+    ] {
+        let workspace = tempfile::tempdir().unwrap();
+        let (output, requests) = run_in_workspace_scoped(
+            workspace.path(),
+            args,
+            vec![json!({"id":"acc_test","tags":["prod"],"changed":true})],
+            true,
+            Some("wrong-id"),
+        )
+        .await;
+        assert_success(&output);
+        assert_eq!(requests[0].method, method::V2_ACCOUNT_TAG);
+        assert_eq!(requests[0].params["provider"], "work-cp");
+    }
+}
+
+#[tokio::test]
+async fn service_apikey_defaults_to_full_key_and_retains_redaction_and_old_flags() {
+    for json_output in [true, false] {
+        for (args, reveal) in [
+            (&["service", "apikey", "main"][..], true),
+            (&["service", "apikeys", "main"][..], true),
+            (&["service", "apikey", "main", "--show-secret"][..], true),
+            (&["service", "apikey", "main", "--show-secrets"][..], true),
+            (&["service", "apikey", "main", "--redact"][..], false),
+        ] {
+            let workspace = tempfile::tempdir().unwrap();
+            let result = json!({"service_id":"svc_test","service_name":"main","api_keys":[{
+                "id":"ak_test","name":"test","format":"sk","enabled":true,
+                "key":if reveal {Some("sk-local-fixture-only")} else {None}
+            }]});
+            let (output, requests) = run_in_workspace_scoped(
+                workspace.path(),
+                args,
+                vec![result],
+                json_output,
+                Some("work-cp"),
+            )
+            .await;
+            assert_success(&output);
+            assert_eq!(requests[0].method, method::SERVICE_APIKEYS);
+            assert_eq!(
+                requests[0].params,
+                json!({"service":"main","show_secret":reveal})
+            );
+            let text = String::from_utf8(output.stdout).unwrap();
+            assert_eq!(
+                text.contains("sk-local-fixture-only"),
+                reveal,
+                "{args:?}: {text}"
+            );
+            assert!(!text.contains("--show-secret"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn provider_list_scopes_and_next_steps_keep_custom_ids() {
+    let provider = json!({"id":"work-cp","kind":"copilot","enabled":true,
+        "status":"ready","capabilities":{"protocols":[],"device_flow":true,"token_import":true}});
+    let (output, requests) = run_human(
+        &["provider", "list", "-p", "work-cp"],
+        vec![json!({"providers":[provider.clone()]})],
+    )
+    .await;
+    assert_success(&output);
+    assert_eq!(requests[0].method, method::V2_PROVIDER_LIST);
+    assert_eq!(requests[0].params["provider"], "work-cp");
+    let list = String::from_utf8(output.stdout).unwrap();
+    assert!(list.contains("实例 ID (--provider)"));
+    assert!(list.contains("GitHub Copilot (copilot)"));
+    let (output, _) = run_human(&["provider", "show", "work-cp"], vec![provider]).await;
+    assert_success(&output);
+    let detail = String::from_utf8(output.stdout).unwrap();
+    assert!(detail.contains("account add --provider work-cp --auth device-flow"));
+    assert!(detail.contains("model list --provider work-cp"));
+    assert!(!detail.contains("--provider copilot"));
+    assert!(!detail.contains("--provider github-copilot"));
+}
+
+#[tokio::test]
+async fn task_scope_is_enforced_and_shown_without_changing_json_contracts() {
+    for (task, selected, expected) in [
+        ("status_check", "kiro", Value::Null),
+        ("stats_persist", "work-cp", Value::Null),
+        ("model_cache_refresh", "work-cp", json!("work-cp")),
+    ] {
+        let workspace = tempfile::tempdir().unwrap();
+        let (output, requests) = run_in_workspace_scoped(
+            workspace.path(),
+            &["tasks", "run", task],
+            vec![json!({"ok":true})],
+            true,
+            Some(selected),
+        )
+        .await;
+        assert_success(&output);
+        assert_eq!(requests[0].params["provider"], expected);
+    }
+    let (output, requests) = run(&["tasks", "run", "status_check", "-p", "work-cp"], vec![]).await;
+    assert_eq!(output.status.code(), Some(2));
+    assert!(requests.is_empty());
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("Kiro 任务只接受 --provider kiro"));
+    let tasks = json!({
+        "token_refresh":{"interval_ms":30000,"run":null},
+        "model_cache_refresh":{"interval_ms":60000,"run":null},
+        "stats_persist":{"interval_ms":10000,"run":null}
+    });
+    let (output, _) = run_human(&["tasks", "list"], vec![tasks.clone()]).await;
+    assert_success(&output);
+    let text = String::from_utf8(output.stdout).unwrap();
+    for label in ["适用范围", "仅 Kiro", "Kiro / GitHub Copilot", "全局"] {
+        assert!(text.contains(label), "{text}");
+    }
+    let (output, _) = run(&["tasks", "list"], vec![tasks.clone()]).await;
+    assert_success(&output);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        tasks
+    );
+}
+
+#[tokio::test]
+async fn editing_resources_does_not_take_permission_changes_from_shell_defaults() {
+    let initial = r#"
+[[provider]]
+id = "kiro"
+kind = "kiro"
+[[provider]]
+id = "copilot"
+kind = "copilot"
+[[api_key]]
+id = "ak_team"
+name = "team"
+key = "sk-test"
+allowed_providers = ["kiro", "copilot"]
+[[proxy_service]]
+id = "svc_team"
+name = "team"
+host = "127.0.0.1"
+port = 6201
+api_key_ids = ["ak_team"]
+allowed_providers = ["kiro", "copilot"]
+default_provider = "kiro"
+[[model_mapping]]
+name = "team"
+type = "alias"
+source_models = ["fast"]
+target_models = ["gpt-test"]
+providers = ["kiro", "copilot"]
+"#;
+    for args in [
+        &["service", "edit", "team", "--rename", "renamed"][..],
+        &["apikey", "edit", "team", "--skip-user-agent-check", "true"][..],
+        &["model-map", "edit", "team", "--priority", "10"][..],
+    ] {
+        let workspace = tempfile::tempdir().unwrap();
+        let file = workspace.path().join("config.toml");
+        fs::write(&file, initial).unwrap();
+        let (output, requests) = run_in_workspace_scoped(
+            workspace.path(), args,
+            vec![json!({"config_file":file,"accounts_file":"","daily_file":"","stats_file":"","admin_socket":""}),
+                 json!({"applied":true,"needs_restart":[]})],
+            false, Some("copilot"),
+        ).await;
+        assert_success(&output);
+        assert_eq!(requests.len(), 2);
+        let config: Value = serde_json::to_value(
+            toml::from_str::<toml::Value>(&fs::read_to_string(&file).unwrap()).unwrap(),
+        )
+        .unwrap();
+        for (section, field) in [
+            ("api_key", "allowed_providers"),
+            ("proxy_service", "allowed_providers"),
+            ("model_mapping", "providers"),
+        ] {
+            assert_eq!(
+                config[section][0][field],
+                json!(["kiro", "copilot"]),
+                "{args:?}: {section}"
+            );
+        }
+        assert_eq!(config["proxy_service"][0]["default_provider"], "kiro");
+    }
+}
+
+#[tokio::test]
+async fn contradictory_provider_edits_and_multi_provider_tasks_fail_before_rpc() {
+    for args in [
+        &[
+            "service",
+            "edit",
+            "team",
+            "-p",
+            "copilot",
+            "--clear-providers",
+        ][..],
+        &[
+            "-p",
+            "copilot",
+            "apikey",
+            "edit",
+            "team",
+            "--clear-providers",
+        ][..],
+        &[
+            "model-map",
+            "edit",
+            "team",
+            "--clear-providers",
+            "-p",
+            "copilot",
+        ][..],
+        &["tasks", "run", "status_check", "-p", "copilot,kiro"][..],
+    ] {
+        let (output, requests) = run(args, vec![]).await;
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+        assert!(requests.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn aggregate_pool_reports_partial_discovery_in_text_and_json() {
+    for json_output in [false, true] {
+        let workspace = tempfile::tempdir().unwrap();
+        let (output, _) = run_in_workspace_scoped(
+            workspace.path(),
+            &["pool", "-p", "all"],
+            vec![json!({"accounts":[],"complete":false,"errors":{"work-cp":"unavailable"}})],
+            json_output,
+            None,
+        )
+        .await;
+        assert!(!output.status.success());
+        if json_output {
+            let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(result["complete"], false);
+            assert_eq!(result["errors"]["work-cp"], "unavailable");
+        } else {
+            assert!(stderr(&output).contains("work-cp: unavailable"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn disabled_models_cli_persists_global_rules_preserves_comments_and_enables_aliases() {
+    for (command, input, expected) in [
+        ("disable", "gpt-test", vec!["claude-sonnet-4.6", "gpt-test"]),
+        ("enable", "sonnet4.6", vec![]),
+    ] {
+        let workspace = tempfile::tempdir().unwrap();
+        let file = workspace.path().join("config.toml");
+        fs::write(&file, "# policy comment\n[models]\ndisabled = [\"claude-sonnet-4.6\"]\ncache_ttl_ms = 60000\n").unwrap();
+        let (output, requests) = run_in_workspace(workspace.path(), &["model", command, input], vec![
+            json!({"features":[kproxy_ipc::protocol::GLOBAL_MODEL_DISABLE_FEATURE]}),
+            json!({"config_file":file,"accounts_file":"","daily_file":"","stats_file":"","admin_socket":""}),
+            json!({"applied":true,"needs_restart":[]}),
+        ]).await;
+        assert_success(&output);
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.method.as_str())
+                .collect::<Vec<_>>(),
+            [
+                method::V2_CAPABILITIES,
+                method::CONFIG_PATH,
+                method::CONFIG_RELOAD
+            ]
+        );
+        let raw = fs::read_to_string(file).unwrap();
+        assert!(raw.contains("# policy comment"));
+        let config: kproxy_core::config::Config = toml::from_str(&raw).unwrap();
+        assert_eq!(config.models.disabled, expected);
+        assert_eq!(config.models.cache_ttl_ms, 60000);
+    }
+}
+
+#[tokio::test]
+async fn disabled_models_cli_rejects_old_daemons_without_mutating_configuration() {
+    let workspace = tempfile::tempdir().unwrap();
+    let file = workspace.path().join("config.toml");
+    let raw = "[models]\ndisabled = []\n";
+    fs::write(&file, raw).unwrap();
+    let (output, requests) = run_in_workspace(
+        workspace.path(),
+        &["model", "disable", "gpt-test"],
+        vec![json!({"features":[]})],
+    )
+    .await;
+    assert!(!output.status.success());
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("不支持全局模型禁用"));
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, method::V2_CAPABILITIES);
+    assert_eq!(fs::read_to_string(file).unwrap(), raw);
+}
+
+#[tokio::test]
+async fn disabled_models_cli_list_marks_catalog_and_missing_entries() {
+    let result = json!({"schema_version":2,"scope":{"provider":"all"},"models":[
+        {"provider_id":"copilot","id":"gpt-test","display_name":"Test","protocols":[],"capabilities":{}}
+    ],"disabled_models":["gpt-test","retired-model"],"errors":{},"complete":true});
+    let (output, _) = run(&["model", "list"], vec![result.clone()]).await;
+    assert_success(&output);
+    let body: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(body["models"].as_array().unwrap().len(), 2);
+    for model in body["models"].as_array().unwrap() {
+        assert_eq!(model["disabled"], true);
+        assert_eq!(model["available"], false);
+    }
+    let (output, _) = run_human(&["models", "list"], vec![result]).await;
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .matches("不可用（已禁用）")
+            .count(),
+        2
+    );
+}
+
 async fn run_human(args: &[&str], results: Vec<Value>) -> (std::process::Output, Vec<Request>) {
     let workspace = tempfile::tempdir().expect("tempdir");
     run_in_workspace_mode(workspace.path(), args, results, false).await
@@ -33,6 +378,16 @@ async fn run_in_workspace_mode(
     args: &[&str],
     results: Vec<Value>,
     json_output: bool,
+) -> (std::process::Output, Vec<Request>) {
+    run_in_workspace_scoped(workspace, args, results, json_output, None).await
+}
+
+async fn run_in_workspace_scoped(
+    workspace: &Path,
+    args: &[&str],
+    results: Vec<Value>,
+    json_output: bool,
+    provider: Option<&str>,
 ) -> (std::process::Output, Vec<Request>) {
     let socket = workspace.join("admin.sock");
     let listener = UnixListener::bind(&socket).expect("bind mock admin socket");
@@ -71,7 +426,11 @@ async fn run_in_workspace_mode(
         .arg("--socket")
         .arg(&socket)
         .args(args)
-        .env_remove("KPROXY_ADMIN_SOCKET");
+        .env_remove("KPROXY_ADMIN_SOCKET")
+        .env_remove("KPROXY_PROVIDER");
+    if let Some(provider) = provider {
+        command.env("KPROXY_PROVIDER", provider);
+    }
     let output = tokio::time::timeout(Duration::from_secs(5), command.output())
         .await
         .expect("CLI timeout")
@@ -81,6 +440,65 @@ async fn run_in_workspace_mode(
         .expect("mock server timeout")
         .expect("mock server task");
     (output, requests)
+}
+
+#[tokio::test]
+async fn provider_environment_and_explicit_scope_reach_the_same_tag_rpc() {
+    for (args, expected) in [
+        (
+            vec!["account", "tag", "acc_b85b28b7", "--add", "copilot-test"],
+            "copilot",
+        ),
+        (
+            vec![
+                "--provider",
+                "kiro",
+                "account",
+                "tag",
+                "acc_test",
+                "--add",
+                "prod",
+            ],
+            "kiro",
+        ),
+        (
+            vec![
+                "account",
+                "--provider",
+                "kiro",
+                "tag",
+                "acc_test",
+                "--add",
+                "prod",
+            ],
+            "kiro",
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let (output, requests) = run_in_workspace_scoped(
+            directory.path(),
+            &args,
+            vec![json!({"id":"acc_test","tags":["prod"]})],
+            true,
+            Some("copilot"),
+        )
+        .await;
+        assert_success(&output);
+        assert_eq!(requests[0].method, method::V2_ACCOUNT_TAG);
+        assert_eq!(requests[0].params["provider"], expected);
+    }
+}
+
+#[tokio::test]
+async fn copilot_scope_cannot_execute_kiro_only_account_commands() {
+    let output = Command::new(env!("CARGO_BIN_EXE_kproxy"))
+        .args(["--provider", "copilot", "account", "overage", "disable"])
+        .env_remove("KPROXY_PROVIDER")
+        .output()
+        .await
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("仅适用于 Kiro"));
 }
 
 fn stderr(output: &std::process::Output) -> String {
@@ -595,6 +1013,24 @@ async fn edit_commands_reject_empty_changes_without_rpc_calls() {
         assert!(!output.status.success(), "{args:?}");
         assert!(requests.is_empty(), "{args:?}");
         assert!(stderr(&output).contains("没有指定修改项"), "{args:?}");
+    }
+    for resource in ["service", "apikey", "model-map"] {
+        let workspace = tempfile::tempdir().unwrap();
+        let (output, requests) = run_in_workspace_scoped(
+            workspace.path(),
+            &[resource, "edit", "team"],
+            vec![],
+            true,
+            Some("copilot"),
+        )
+        .await;
+        assert!(!output.status.success());
+        assert!(requests.is_empty());
+        assert!(
+            stderr(&output).contains("没有指定修改项"),
+            "{resource}: {}",
+            stderr(&output)
+        );
     }
 }
 

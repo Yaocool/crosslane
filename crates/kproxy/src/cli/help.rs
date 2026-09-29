@@ -2,10 +2,10 @@
 
 use anyhow::Result;
 use clap::error::ErrorKind;
-use clap::{Command as ClapCommand, CommandFactory};
+use clap::Command as ClapCommand;
 use std::ffi::OsString;
 
-use crate::{Cli, Command};
+use crate::Command;
 
 pub fn empty_group_path(command: &Command) -> Option<&'static str> {
     match command {
@@ -38,7 +38,7 @@ pub fn print_command_help(path: &[String]) -> Result<()> {
     args.push(OsString::from("kproxy"));
     args.extend(path.iter().map(OsString::from));
     args.push(OsString::from("--help"));
-    match Cli::command().try_get_matches_from(args) {
+    match super::command().try_get_matches_from(args) {
         Err(error) if error.kind() == ErrorKind::DisplayHelp => {
             error.print()?;
             Ok(())
@@ -49,7 +49,7 @@ pub fn print_command_help(path: &[String]) -> Result<()> {
 }
 
 pub fn print_all_commands() {
-    let mut root = Cli::command();
+    let mut root = super::command();
     root.build();
     println!("kproxy 公开命令：");
     print_children(&root, "", 0);
@@ -58,7 +58,7 @@ pub fn print_all_commands() {
 
 pub fn exit_missing_action(path: &str) -> ! {
     let path = vec![path.to_owned()];
-    let mut command = command_at_path(&path).unwrap_or_else(Cli::command);
+    let mut command = command_at_path(&path).unwrap_or_else(super::command);
     let hint = match path[0].as_str() {
         "logs" => "请改用 `kproxy logs show`".to_owned(),
         "models" => "请改用 `kproxy models list`".to_owned(),
@@ -75,7 +75,7 @@ pub fn exit_missing_action(path: &str) -> ! {
 }
 
 fn command_at_path(path: &[String]) -> Option<ClapCommand> {
-    let mut command = Cli::command();
+    let mut command = super::command();
     command.build();
     let mut bin_name = String::from("kproxy");
     for segment in path {
@@ -109,7 +109,8 @@ fn print_children(command: &ClapCommand, prefix: &str, depth: usize) {
             .get_about()
             .map(ToString::to_string)
             .unwrap_or_default();
-        println!("{indent}{display_path:<36} {about}");
+        let scope = super::scope::for_path(&path.split_whitespace().collect::<Vec<_>>());
+        println!("{indent}{display_path:<36} [{}] {about}", scope.label());
         print_children(child, &path, depth + 1);
     }
 }
@@ -127,7 +128,7 @@ mod tests {
 
     #[test]
     fn help_surfaces_both_provider_workflows() {
-        let mut root = Cli::command();
+        let mut root = super::super::command();
         let root_help = root.render_long_help().to_string();
         assert!(root_help.contains("guide kiro"));
         assert!(root_help.contains("guide copilot"));
@@ -135,7 +136,8 @@ mod tests {
         let mut account = command_at_path(&["account".into()]).unwrap();
         let account_help = account.render_long_help().to_string();
         assert!(account_help.contains("account add-sso"));
-        assert!(account_help.contains("account add --provider copilot"));
+        assert!(account_help.contains("account add --provider <ID>"));
+        assert!(account_help.contains("Copilot 使用 --auth device-flow"));
 
         let mut service_create = command_at_path(&["service".into(), "create".into()]).unwrap();
         let service_help = service_create.render_long_help().to_string();

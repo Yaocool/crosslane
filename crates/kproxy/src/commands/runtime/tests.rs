@@ -272,15 +272,18 @@ fn model_context_windows_use_compact_decimal_units() {
 
 #[test]
 fn model_list_table_displays_input_output_limits_and_unknown_metadata() {
-    let output = render_model_list(&[
-        model_fixture(
-            "claude-opus-5",
-            "Claude Opus 5",
-            Some(1_000_000),
-            Some(64_000),
-        ),
-        model_fixture("unknown-model", "", None, None),
-    ]);
+    let output = render_model_list(
+        &[
+            model_fixture(
+                "claude-opus-5",
+                "Claude Opus 5",
+                Some(1_000_000),
+                Some(64_000),
+            ),
+            model_fixture("unknown-model", "", None, None),
+        ],
+        &Default::default(),
+    );
 
     assert!(output.contains("模型"));
     assert!(output.contains("输入上下文"));
@@ -297,6 +300,7 @@ fn model_list_table_displays_input_output_limits_and_unknown_metadata() {
 #[test]
 fn mapped_model_list_displays_the_target_context_window() {
     let output = render_mapped_model_list(&[ModelListRoute {
+        disabled: false,
         input: "client-alias".into(),
         mapped: "claude-sonnet-5".into(),
         rule: Some("alias-to-sonnet".into()),
@@ -493,7 +497,6 @@ fn config_module_scopes_distinguish_kiro_provider_and_global_settings() {
         "upstream",
         "pool",
         "features",
-        "models",
         "context",
         "storage",
         "sso",
@@ -518,6 +521,7 @@ fn config_module_scopes_distinguish_kiro_provider_and_global_settings() {
         );
     }
     assert_eq!(resolve_config_module("tasks").unwrap().scope, "mixed");
+    assert_eq!(resolve_config_module("models").unwrap().scope, "mixed");
 }
 
 #[test]
@@ -920,4 +924,41 @@ fn timestamps_reject_ambiguous_or_invalid_values() {
     assert!(parse_timestamp("2026-08-27T10:00:00").is_err());
     assert!(parse_timestamp("2026-02-29T10:00:00Z").is_err());
     assert!(parse_timestamp("2026-08-27T25:00:00+08:00").is_err());
+}
+#[test]
+fn disabled_models_survive_config_resets() {
+    let raw = "[models]\ndisabled = [\"gpt-test\"]\ncache_ttl_ms = 1000\n";
+    for output in [
+        render_reset_config_preserving_resources_and_alerts(raw).unwrap(),
+        render_config_module_reset(raw, resolve_config_module("models").unwrap()).unwrap(),
+    ] {
+        let config: kproxy_core::config::Config = toml::from_str(&output).unwrap();
+        assert_eq!(config.models.disabled, ["gpt-test"]);
+        assert_eq!(
+            config.models.cache_ttl_ms,
+            kproxy_core::config::ModelsConfig::default().cache_ttl_ms
+        );
+    }
+}
+#[test]
+fn switching_service_provider_scope_keeps_the_default_valid() {
+    let mut table = toml::map::Map::new();
+    table.insert(
+        "default_provider".into(),
+        toml::Value::String("kiro".into()),
+    );
+    update_service_provider_scope(&mut table, &["work-cp".into()], false, None);
+    assert_eq!(table["default_provider"].as_str(), Some("work-cp"));
+    update_service_provider_scope(&mut table, &["kiro".into(), "work-cp".into()], false, None);
+    assert_eq!(table["default_provider"].as_str(), Some("work-cp"));
+    update_service_provider_scope(&mut table, &[], true, None);
+    assert_eq!(table["default_provider"].as_str(), Some("kiro"));
+    assert!(!table.contains_key("allowed_providers"));
+    update_service_provider_scope(
+        &mut table,
+        &["work-cp".into(), "personal-cp".into()],
+        false,
+        Some("personal-cp"),
+    );
+    assert_eq!(table["default_provider"].as_str(), Some("personal-cp"));
 }
