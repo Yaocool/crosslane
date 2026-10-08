@@ -1,6 +1,6 @@
 # Contributing
 
-[Documentation](README.md#documentation) · [Architecture](CLAUDE.md) · [Release plan](docs/release-readiness-1.0.0.zh-CN.md)
+[Documentation](README.md#documentation) · [Architecture](CLAUDE.md) · [Changelog](CHANGELOG.md)
 
 Use the pinned Rust 1.97.1 toolchain and commit `Cargo.lock` changes when dependencies
 or workspace versions change. Dependencies are pinned in the root workspace;
@@ -12,12 +12,12 @@ not a native Windows service.
 ```bash
 cp .env.example .env  # First setup only
 cargo build --workspace --locked
-cargo run -p kproxyd
+cargo run -p crosslaned
 ```
 
-In another terminal at the same repository root, use `cargo run -p kproxy -- health`
-and `cargo run -p kproxy -- help --all`. The example isolates development files in
-`.kproxy-dev`; use an absolute `KPROXY_HOME` if working from multiple directories.
+In another terminal at the same repository root, use `cargo run -p crosslane -- health`
+and `cargo run -p crosslane -- help --all`. The example isolates development files in
+`.crosslane-dev`; use an absolute `CROSSLANE_HOME` if working from multiple directories.
 Do not run development commands against a production data directory.
 
 The default daemon enables the `sso` feature. Code requiring browser login must
@@ -37,7 +37,7 @@ cargo test --workspace --no-default-features --locked
 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps --locked
 docker compose config --quiet
 docker compose -f docker-compose.yml -f docker-compose.build.yml config --quiet
-sh -n deploy/entrypoint.sh deploy/docker-setup.sh deploy/docker-upgrade.sh deploy/kproxy-docker deploy/install-kproxy-wrapper.sh
+sh -n deploy/entrypoint.sh deploy/docker-setup.sh deploy/docker-upgrade.sh deploy/crosslane-docker deploy/install-crosslane-wrapper.sh
 git diff --check
 ```
 
@@ -45,9 +45,9 @@ Workspace tests include integration targets automatically; use `--test` to selec
 one target when narrowing the scope:
 
 ```bash
-cargo test -p kproxy --test cli_help --locked
-cargo test -p kproxy-translate --test compatibility_controls --locked
-cargo test -p kproxyd --test end_to_end responses:: --locked
+cargo test -p crosslane --test cli_help --locked
+cargo test -p crosslane-translate --test compatibility_controls --locked
+cargo test -p crosslaned --test end_to_end responses:: --locked
 ```
 
 Tests use temporary directories, Unix sockets, and loopback HTTP listeners.
@@ -55,9 +55,9 @@ The standard suite uses simulated upstream responses and does not need real
 credentials. Compaction regressions can be selected separately:
 
 ```bash
-cargo test -p kproxy-translate tokenizer --locked
-cargo test -p kproxyd --test end_to_end manual_compaction:: --locked
-cargo test -p kproxyd --test end_to_end warning_regressions:: --locked
+cargo test -p crosslane-translate tokenizer --locked
+cargo test -p crosslaned --test end_to_end manual_compaction:: --locked
+cargo test -p crosslaned --test end_to_end warning_regressions:: --locked
 ```
 
 One real Claude Code checkpoint test is ignored by default. After installing a
@@ -65,7 +65,7 @@ Claude Code version supporting `--bare`, run it with isolated configuration and
 the test's local simulated upstream:
 
 ```bash
-cargo test -p kproxyd --test end_to_end real_claude_code_retains_the_compaction_checkpoint --locked -- --ignored
+cargo test -p crosslaned --test end_to_end real_claude_code_retains_the_compaction_checkpoint --locked -- --ignored
 ```
 
 Passing mocks does not establish production SSO, upstream availability, latency,
@@ -73,7 +73,7 @@ or usage accuracy. Record those checks separately during release qualification.
 
 The repository currently has a tag-triggered Docker publishing workflow, not a
 PR test gate. The commands above describe required validation, not existing CI
-coverage. Current audit results are in the [1.0.0 assessment](docs/release-readiness-1.0.0.zh-CN.md).
+coverage. Record validation results for the exact source being released.
 
 ## Change boundaries
 
@@ -116,5 +116,5 @@ Keep one logical change per commit. Call out incompatible behavior with `!` or a
 `BREAKING CHANGE` footer and a migration note.
 
 Describe the user-visible problem, resulting behavior, validation and remaining
-limitations in the review. Version changes and publishing follow the
-[release plan](docs/release-readiness-1.0.0.zh-CN.md); pushing a `v*` tag triggers image publication.
+limitations in the review. Update the workspace version, lockfile and changelog
+together before releasing; pushing a matching `v*` tag triggers image publication.

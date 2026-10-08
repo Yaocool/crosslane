@@ -8,8 +8,20 @@ they must receive a new version rather than replacing that tag or its image.
 
 ### Breaking changes and migration
 
-- `service apikey` / `service apikeys` now display full API keys by default in
-  text and JSON; use `--redact` to hide them. Old secret-display flags still work.
+- Renamed `kiro-proxy` to `crosslane` across workspace crates, binaries
+  (`crosslane` / `crosslaned`), file paths, CLI help/completion, `CROSSLANE_*`
+  environment variables, state/socket/log defaults, HTTP diagnostic headers,
+  Docker images/labels/volumes, systemd and deployment scripts. Provider IDs and
+  account/API-key data formats are unchanged. New Web Search replay records use
+  the Crosslane identity; authenticated pre-rename records remain readable with
+  the original replay key. Existing state must be migrated explicitly; see the
+  [English guide](docs/startup-and-debugging.md#crosslane-rename-migration) or
+  [中文说明](docs/startup-and-debugging.zh-CN.md#crosslane-改名迁移).
+- `service apikey` / `service apikeys`, `account export`, and `config show` now
+  redact credentials by default in text and JSON. Use `--show-secret`,
+  `--include-secrets`, or `--show-secrets`, respectively, for complete output.
+  Existing `--redact` options remain accepted. Redacted `config show` output
+  omits source comments.
 - Explicit `--provider` on global or resource-ID-selected commands now fails
   instead of being ignored. Shell provider defaults do not affect those commands;
   global model policy retains its explicit `--provider all` override requirement.
@@ -31,11 +43,23 @@ they must receive a new version rather than replacing that tag or its image.
 
 ### Added
 
+- `service create` without `--port` uses `server.port` for the first service,
+  then one above the highest effective service port, including disabled
+  services and any `CROSSLANE_HTTP_PORT` override. Service views report the
+  effective port, and creation reports when HTTP listening is disabled.
+  Explicit `--port` remains available.
+- `config reload` exits nonzero when a configuration was not applied; task
+  help distinguishes scheduler-only tasks, and `stats --recent` accepts 0–1000.
+- `config show --effective` reads the last applied configuration even if the
+  on-disk TOML is currently invalid; its JSON output omits raw TOML.
+  `config edit --json` returns a result object. `status/pool --watch --json`
+  emit one compact JSON snapshot per line. Admin RPC calls now time out.
+
 - Provider ID/type columns, actual-instance next-step hints, per-command scope
   labels, task scope summaries, `-p` at every command depth, scoped provider lists,
   and custom-ID setup guides. Missing-provider errors list configured IDs. Service
   scope edits retain a valid default or select the first newly allowed provider.
-- Docker wrapper forwarding for `KPROXY_PROVIDER` and host CSV batches with a
+- Docker wrapper forwarding for `CROSSLANE_PROVIDER` and host CSV batches with a
   provider option at any command depth. Update the installed wrapper with the CLI.
 
 - Persistent global model disabling with `model disable/enable` (`models` remains
@@ -44,7 +68,7 @@ they must receive a new version rather than replacing that tag or its image.
   defaults, fallback, retries, stream continuations and internal probes, including
   clients created before a hot reload. Configuration resets preserve deny rules.
 
-- Global `--provider` at any command depth and `KPROXY_PROVIDER` shell defaults;
+- Global `--provider` at any command depth and `CROSSLANE_PROVIDER` shell defaults;
   a shared `account add` entry point for Kiro SSO/API keys and Copilot Device Flow.
   Existing provider-specific authentication commands remain available.
 - Chat Completions, Responses and Messages JSON/SSE adaptation for every
@@ -75,7 +99,7 @@ they must receive a new version rather than replacing that tag or its image.
 
 ### Fixed
 
-- Preserve existing resource permissions when editing under `KPROXY_PROVIDER`;
+- Preserve existing resource permissions when editing under `CROSSLANE_PROVIDER`;
   require explicit scope changes and reject contradictory provider flags.
 - Report partial provider-pool discovery as a failure with retained error details;
   exclude globally disabled models from operational account/pool availability.
@@ -128,7 +152,8 @@ they must receive a new version rather than replacing that tag or its image.
 - Reorganize bilingual quick starts, startup/configuration references, CLI
   migration and protocol limits; replace historical design prose with current
   compaction behavior and explicitly labelled remaining work.
-- Add contributor/release guidance and a dated [1.0.0 readiness assessment](docs/release-readiness-1.0.0.zh-CN.md).
+- Add contributor/release guidance and a dated 1.0.0 readiness assessment
+  (the historical assessment is no longer part of the maintained documentation).
 - Consolidate operations, CLI migration, compatibility and release guidance into six maintained references; remove duplicate indexes and design documents.
 
 ## Earlier releases

@@ -1,21 +1,21 @@
-# kiro-proxy
+# crosslane
 
 [English](README.md) | [简体中文](README.zh-CN.md) | [Documentation](#documentation)
 
-`kiro-proxy` exposes Claude Messages, OpenAI Chat Completions, and OpenAI Responses
+`crosslane` exposes Claude Messages, OpenAI Chat Completions, and OpenAI Responses
 compatible APIs through a multi-provider architecture with built-in Kiro and GitHub
-Copilot adapters. The Rust daemon `kproxyd` handles routing, generation, and account
-scheduling; `kproxy` manages all providers, or one provider, through a local Unix socket.
+Copilot adapters. The Rust daemon `crosslaned` handles routing, generation, and account
+scheduling; `crosslane` manages all providers, or one provider, through a local Unix socket.
 
 Kiro supports enterprise SSO credentials (AWS IAM Identity Center/IdC) and imported
 headless API keys (`ksk_...`). Copilot supports GitHub Device Flow or token import from
 standard input. Upstream credentials and the proxy's client API keys are separate.
 The project has no GUI, MITM, or local client configuration rewriting.
 
-> Documentation follows the current source, whose workspace version is `0.2.4`.
-> It includes **unreleased changes after the `v0.2.4` tag**, including the CLI
-> migration. A prebuilt `v0.2.4` image does not include those changes. See the
-> [changelog](CHANGELOG.md) and [1.0.0 assessment](docs/release-readiness-1.0.0.zh-CN.md).
+> The workspace version is `1.2.0`. The Crosslane rename is unreleased; build from
+> source until an image containing it has been published. Existing installations
+> must follow the [rename migration](docs/startup-and-debugging.md#crosslane-rename-migration)
+> before switching binaries or Compose projects. See the [changelog](CHANGELOG.md).
 
 ## Capabilities and limits
 
@@ -45,20 +45,21 @@ Docker workflow targets **Linux amd64** with the full SSO image.
 With Docker Engine and a working `docker compose` command:
 
 ```bash
-./deploy/docker-setup.sh
-kproxy health
+./deploy/docker-setup.sh --build
+crosslane health
 ```
 
-The setup script pulls the image before replacing the container, checks daemon
-health, attempts image rollback on deployment failure, and installs the matching
-host CLI wrapper. State lives in the `kproxy-data` volume. The default wrapper
-path is `/usr/local/bin/kproxy`; use `--target "$HOME/.local/bin/kproxy"` for a
+The Crosslane image has not been published yet, so build the current checkout.
+The setup script checks daemon health and installs the matching host CLI wrapper;
+pull deployments also attempt image rollback on failure. State lives in the
+`crosslane-data` volume. The default wrapper
+path is `/usr/local/bin/crosslane`; use `--target "$HOME/.local/bin/crosslane"` for a
 user-owned location and include that directory in `PATH`.
 
-Fresh setup uses `latest`; subsequent setup reuses the saved image reference.
-Use `./deploy/docker-upgrade.sh` to follow `latest`, or `--image` to choose a
-published tag/digest. Use `./deploy/docker-setup.sh --build` to run the current
-checkout, including unreleased features. Private GHCR packages require login.
+After a Crosslane image is published, setup without `--build` uses `latest` for
+fresh installs and reuses the saved image reference later. Use
+`./deploy/docker-upgrade.sh` to follow `latest`, or `--image` to choose a
+published tag/digest. Private GHCR packages require login.
 
 Compose uses host networking. Linux supports it directly; Docker Desktop needs
 host networking enabled. A newly created service defaults to `0.0.0.0:5580`;
@@ -75,21 +76,21 @@ requires an installed Chrome/Chromium.
 ```bash
 cp .env.example .env             # First setup only; keep an existing .env
 cargo build --release --locked
-./target/release/kproxyd
+./target/release/crosslaned
 ```
 
 In another terminal at the repository root:
 
 ```bash
 export PATH="$PWD/target/release:$PATH"
-kproxy health
-kproxy config path
+crosslane health
+crosslane config path
 ```
 
-The example `.env` stores development state under `.kproxy-dev`. The daemon and
+The example `.env` stores development state under `.crosslane-dev`. The daemon and
 CLI business commands load the nearest `.env` upward from the working directory;
 existing environment variables win. CLI help, guides, completion, and version
-work without `.env` or a daemon. Use an absolute `KPROXY_HOME` when invoking the
+work without `.env` or a daemon. Use an absolute `CROSSLANE_HOME` when invoking the
 programs from different directories. See [environment and paths](docs/startup-and-debugging.md#2-environment-loading).
 
 ### Add credentials and create a service
@@ -97,18 +98,18 @@ programs from different directories. See [environment and paths](docs/startup-an
 A fresh daemon has no business listener. Choose one credential import method:
 
 ```bash
-kproxy account import --stdin < /secure/accounts.json
+crosslane account import --stdin < /secure/accounts.json
 # Alternative: reads KIRO_API_KEY from the CLI environment
-kproxy account add-api-key --email ci@example.com --region us-east-1
+crosslane account add-api-key --email ci@example.com --region us-east-1
 ```
 
 Then create a service and save its printed client key:
 
 ```bash
-kproxy service create --name main --host 127.0.0.1 --port 5580
-kproxy account list
-kproxy models list
-kproxy ready
+crosslane service create --name main --host 127.0.0.1
+crosslane account list
+crosslane models list
+crosslane ready
 ```
 
 Do not reuse a `ksk_...` upstream key as the proxy client key. Import schemas,
@@ -122,9 +123,9 @@ Disable models globally across Kiro/Copilot, every protocol, default routing,
 fallback, retries, and internal probes:
 
 ```bash
-kproxy model disable claude-sonnet-4.6 gpt-4.1
-kproxy model list                         # retained, marked unavailable/disabled
-kproxy model enable claude-sonnet-4.6      # takes effect without restarting
+crosslane model disable claude-sonnet-4.6 gpt-4.1
+crosslane model list                         # retained, marked unavailable/disabled
+crosslane model enable claude-sonnet-4.6      # takes effect without restarting
 ```
 
 Rules persist in `[models].disabled` and survive configuration resets. Public
@@ -140,23 +141,23 @@ command:
 
 ```bash
 # Enable overage with a 500-credit maximum for each account
-kproxy account overage enable --max-credits 500
+crosslane account overage enable --max-credits 500
 
 # Show the policy and per-account proxy/Kiro limits
-kproxy account overage
+crosslane account overage
 
 # Refresh Kiro usage before displaying it
-kproxy account overage show --refresh
+crosslane account overage show --refresh
 
 # Disable overage while retaining the configured maximum
-kproxy account overage disable
+crosslane account overage disable
 ```
 
 `enable` and `disable` update the configuration atomically and reload it.
 `enable` also refreshes Kiro usage by default. Use
-`kproxy account overage enable --kiro-limit` to rely entirely on Kiro's
+`crosslane account overage enable --kiro-limit` to rely entirely on Kiro's
 reported cap. You can also edit the equivalent settings in the `config.toml`
-shown by `kproxy config path`:
+shown by `crosslane config path`:
 
 ```toml
 [pool]
@@ -177,9 +178,9 @@ cap and a 500 credit proxy maximum has an effective limit of 10,500.
 The proxy uses the latest known usage when admitting requests, so requests
 already in flight can exceed this maximum. Upstream quota rejections and the
 service daily credit limit still apply. After manually editing TOML, run
-`kproxy config reload`, then `kproxy tasks run status_check` to refresh Kiro's
-overage values. Inspect `kproxy config show pool --effective` and
-`kproxy pool --model claude-sonnet-4.6 --explain`. In `kproxy account list`,
+`crosslane config reload`, then `crosslane tasks run status_check` to refresh Kiro's
+overage values. Inspect `crosslane config show pool --effective` and
+`crosslane pool --model claude-sonnet-4.6 --explain`. In `crosslane account list`,
 the quota column shows current usage, the proxy's configured total, and Kiro's
 server total, for example `10000.01/10500.00/20000.00`. The
 `Overage(configured/Kiro)` column shows the per-account proxy maximum and
@@ -204,20 +205,20 @@ For Claude Code, set `ANTHROPIC_BASE_URL` to `http://127.0.0.1:5580` and
 For Codex, use `http://127.0.0.1:5580/v1` and `wire_api = "responses"`. The
 [Codex setup guide](docs/openai-responses.md) includes the provider configuration,
 state limits, unsupported controls, and stream errors. Select an available model
-from `kproxy models list`; aliases do not enlarge an actual model's input window.
+from `crosslane models list`; aliases do not enlarge an actual model's input window.
 
 ## Daily operations
 
 ```bash
-kproxy status
-kproxy stats --since 1h
-kproxy logs show --tail 100
-kproxy logs trace <TRACE_ID>
-kproxy config show --effective
-kproxy service list
-kproxy help --all
-kproxy help logs trace
-kproxy guide balance
+crosslane status
+crosslane stats --since 1h
+crosslane logs show --tail 100
+crosslane logs trace <TRACE_ID>
+crosslane config show --effective
+crosslane service list
+crosslane help --all
+crosslane help logs trace
+crosslane guide balance
 ```
 
 Bare command groups show help. Scripts must use explicit actions such as
@@ -234,7 +235,6 @@ for configuration, log retention, Docker lifecycle commands and systemd.
 | Protocol limits, model controls and compaction | [English](docs/protocol-compatibility.md) · [中文](docs/protocol-compatibility.zh-CN.md) |
 | Responses, Codex and stateful continuation | [Integration guide (中文)](docs/openai-responses.md) |
 | Multi-provider routing and GitHub Copilot | [Integration guide (中文)](docs/providers-and-copilot.zh-CN.md) |
-| 1.0 readiness, remediation and release procedure | [Release plan (中文)](docs/release-readiness-1.0.0.zh-CN.md) |
 
 ## Development
 
@@ -249,6 +249,6 @@ cargo test --workspace --all-features --locked
 ```
 
 These are required checks, not a claim that the current checkout passes them.
-The [release assessment](docs/release-readiness-1.0.0.zh-CN.md) records the audited
-results and remaining gates; its [release checklist](docs/release-readiness-1.0.0.zh-CN.md#发布执行清单) explains tag
-and image behavior. The project is licensed under [MIT](LICENSE).
+See [validation and releases](CONTRIBUTING.md#validation) for the full checks.
+Pushing a matching `v*` tag triggers the Docker image publishing workflow.
+The project is licensed under [MIT](LICENSE).

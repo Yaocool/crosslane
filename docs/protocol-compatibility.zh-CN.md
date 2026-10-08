@@ -15,7 +15,7 @@
 结束原因、usage/cache 和原始 `copilot_usage`。流式处理支持 UTF-8 分片、CRLF、多行 SSE、
 稳定工具索引与尾部用量；错误或断流不会补发成功事件。转换路径限制单个 SSE 事件 8 MiB、
 完整响应/累计流 64 MiB。
-协议要求的初始零用量用 `kproxy_usage_source: unreported` 标记，收到真实 usage 后才
+协议要求的初始零用量用 `crosslane_usage_source: unreported` 标记，收到真实 usage 后才
 按 provider 用量记录，避免把“未报告”误记为“报告了零”。
 拒绝回答会保留正文和 OpenAI refusal 字段。输出长度耗尽时保留工具参数片段和未完成的
 结束原因，Responses 输出项也标记为 incomplete，不将正常截断误报成传输失败。
@@ -30,7 +30,7 @@ JSON Schema 在 Chat `response_format`、Responses `text.format` 和 Messages
 协议转换不为模型增加视觉/推理能力，也不保证结构化输出；不透明思考签名无法跨协议通用回放。
 已知 Claude 家族按版本选择 manual/adaptive thinking，未知模型不强加 Claude 思考参数。
 `count_tokens` 对原生 Messages 模型透传，其他模型返回带 `estimated: true` 和
-`x-kproxy-token-count-source: estimate` 的本地估算，不计为上游生成用量。
+`x-crosslane-token-count-source: estimate` 的本地估算，不计为上游生成用量。
 
 本次独立 Rust 实现参考了高关注度项目
 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI/tree/main/internal/translator) 的双向转换与流式生命周期、
@@ -57,7 +57,7 @@ CLI 标识 `2.10.0` 已高于门槛，仍一起更新到核验过的稳定版本
 | CLI / V2 生成 | `2.21.4` | `aws-sdk-rust/1.3.15`、`codewhispererstreaming/0.1.17975` |
 | CLI / Management 模型目录 | `2.21.4` | `aws-sdk-rust/1.3.15`、`codewhispererruntime/0.1.17975` |
 
-版本和 UA 统一在 `crates/kproxy-kiro/src/identity.rs` 定义。IDE 生成、模型、订阅、
+版本和 UA 统一在 `crates/crosslane-kiro/src/identity.rs` 定义。IDE 生成、模型、订阅、
 额度、Profile 发现及 MCP Web Search 共用版本；Social Token 刷新也使用同一个
 `KiroIDE-<version>-<machine_id>`。CLI 生成和 Management 分别使用对应的服务标识，
 同时发送 `User-Agent` 和 `x-amz-user-agent`。保留原有 IDE Windows / CLI macOS
@@ -66,7 +66,7 @@ CLI 标识 `2.10.0` 已高于门槛，仍一起更新到核验过的稳定版本
 这套基线对应当前已实现的 V2/CodeWhisperer 协议。新版客户端的 KiroRuntimeService、
 V3/KAS 是其他请求路径，不能只更换 UA 中的 service 名称就完成迁移。
 
-部署时必须重新构建并替换 `kproxyd` 二进制或镜像，再重启服务；配置热加载不会更新
+部署时必须重新构建并替换 `crosslaned` 二进制或镜像，再重启服务；配置热加载不会更新
 编译进二进制的版本。启动日志 `Kiro upstream client identity` 应显示
 `ide_version=1.0.437`、`cli_version=2.21.4`。升级后按
 [启动与排障](startup-and-debugging.zh-CN.md) 核对 `ready`、一次真实生成及适用的 Token
@@ -174,7 +174,7 @@ context-management 执行和托管工具、精确 prefill、logprobs 与严格 J
 ANTHROPIC_BASE_URL=http://127.0.0.1:5580 ENABLE_TOOL_SEARCH=auto claude
 ```
 
-`kiro-proxy` 现已兼容 Anthropic 的 `defer_loading`、regex/BM25 Tool Search 和
+`crosslane` 现已兼容 Anthropic 的 `defer_loading`、regex/BM25 Tool Search 和
 `tool_reference` 历史块。由于 Kiro 没有原生 Tool Search server tool，代理会在本地执行搜索，
 并在同一个响应中继续生成。官方 Tool Search 输入包含 `pattern` 或 `query`，并支持可选
 `limit`（1–10000，默认 5）。代理会先遵守请求的 limit，再按剩余工具数、tool token、上下文和
@@ -219,7 +219,7 @@ Claude 响应首部的 `compaction` 边界。摘要超时会立即释放主请�
 后缀不会扩大目标模型容量。压缩目标通常预留安全窗口的 25% 余量；固定部分超过目标但低于
 硬上限时可以放宽目标，超过硬上限则拒绝。输入与输出遵循各自模型上限，不假设共享窗口。
 
-配置默认值来自 [ContextConfig](../crates/kproxy-core/src/config.rs)：
+配置默认值来自 [ContextConfig](../crates/crosslane-core/src/config.rs)：
 
 ```toml
 [context]
@@ -315,10 +315,10 @@ Claude 顶层 `input_tokens`/`output_tokens` 表示主生成；`usage.iterations
 摘要成功后主生成仍可能因额度不足失败，两次上游操作不能原子结算。
 
 跨段滚动归并尚未实现；新的有效压缩会替换同一会话的旧 checkpoint，二次摘要仍可能损失信息。
-实现见[请求准备](../crates/kproxyd/src/http/handlers/request.rs)、
-[摘要执行](../crates/kproxyd/src/http/handlers/compaction.rs)、
-[摘要规划](../crates/kproxy-translate/src/tokenizer/compaction.rs)和
-[客户端识别](../crates/kproxy-translate/src/context/claude_code.rs)。
+实现见[请求准备](../crates/crosslaned/src/http/handlers/request.rs)、
+[摘要执行](../crates/crosslaned/src/http/handlers/compaction.rs)、
+[摘要规划](../crates/crosslane-translate/src/tokenizer/compaction.rs)和
+[客户端识别](../crates/crosslane-translate/src/context/claude_code.rs)。
 回归命令及默认忽略的真实客户端测试见[贡献指南](../CONTRIBUTING.md#validation)。
 
 ## 工具检索的续轮限制
@@ -330,8 +330,8 @@ Claude 顶层 `input_tokens`/`output_tokens` 表示主生成；`usage.iterations
 `features.enable_tool_search=false` 作为回滚开关时，代理会明确拒绝原生 Tool Search 请求，
 不会把 deferred 工具重新全量塞给上游。持久化请求日志会保存 Catalog/Working Set 大小、搜索
 limit 与预算截断、Client/Upstream Status 和稳定错误码。错误响应保持原有 Claude/OpenAI body，
-并通过 `request-id`、`x-kproxy-error-code`、`x-kproxy-error-stage`、
-`x-kproxy-upstream-status`、`x-kproxy-account-error` 响应头提供诊断信息。
+并通过 `request-id`、`x-crosslane-error-code`、`x-crosslane-error-stage`、
+`x-crosslane-upstream-status`、`x-crosslane-account-error` 响应头提供诊断信息。
 
 ## Web Search
 
@@ -347,13 +347,13 @@ server call 会保持 pending，等客户端回传 client tool 结果后再按�
 明确拒绝，不再静默截断。Claude Web Fetch 在兼容的服务端执行器完成前会被明确拒绝。
 
 默认 MCP 地址是 `https://runtime.{region}.kiro.dev/mcp`。可通过
-`upstream.web_search_endpoint`（支持 `{region}`）或临时环境变量 `KPROXY_MCP_URL` 覆盖；
+`upstream.web_search_endpoint`（支持 `{region}`）或临时环境变量 `CROSSLANE_MCP_URL` 覆盖；
 `upstream.web_search_timeout_ms` 默认为 60000。每个 MCP 请求都会携带 Kiro 必需的
 `x-amzn-kiro-profile-arn` 请求头。导入账号缺少 profile ARN 时，代理会通过
 `ListAvailableProfiles` 自动发现，并发请求会按同一 token 合并，发现结果会写回账号文件；
 本文覆盖企业 SSO 与 headless API key 的受支持接入方式；底层兼容分支不代表实现个人/社交 OAuth 登录。domain/location 过滤和
 code-execution caller 仍需兼容执行器支持；strict 和 eager streaming 作为兼容提示接收并忽略。代理生成
-的加密字段明确属于 kproxy 自有格式，不宣称与 Anthropic 托管搜索的 ciphertext 互通。
+的加密字段明确属于 crosslane 自有格式，不宣称与 Anthropic 托管搜索的 ciphertext 互通。
 
 ## 文档、上下文编辑与兼容边界
 
@@ -452,8 +452,8 @@ Schema；无法解析或超过遍历预算时保留原 XML，不等同于完整 
 | pinealctx/kiro-gateway | [Model aliases · 9f614d4](https://github.com/pinealctx/kiro-gateway/tree/9f614d4b270e8e80e13c7d3603cbb1b090f327c4) |
 
 ```bash
-cargo test -p kproxy-translate --test compatibility_controls --locked
-cargo test -p kproxy-translate --test claude_gateway_controls --locked
-cargo test -p kproxyd --test end_to_end compatibility_controls:: --locked
-cargo test -p kproxyd --test end_to_end claude_gateway:: --locked
+cargo test -p crosslane-translate --test compatibility_controls --locked
+cargo test -p crosslane-translate --test claude_gateway_controls --locked
+cargo test -p crosslaned --test end_to_end compatibility_controls:: --locked
+cargo test -p crosslaned --test end_to_end claude_gateway:: --locked
 ```

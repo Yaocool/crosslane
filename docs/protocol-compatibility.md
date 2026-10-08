@@ -18,7 +18,7 @@ parallel tools, images/inline files, text/reasoning deltas, finish reasons and
 usage. It handles split UTF-8, CRLF and multiline SSE, stable tool indexes, late
 usage and raw `copilot_usage`. Truncated/error streams stay failed. Adapted SSE
 events are bounded at 8 MiB and full responses/streams at 64 MiB.
-Required numeric usage scaffolding carries `kproxy_usage_source: unreported`
+Required numeric usage scaffolding carries `crosslane_usage_source: unreported`
 until upstream usage arrives, and is not recorded as provider-reported zero usage.
 Refusals retain their content and OpenAI refusal fields. An output-length stop
 retains partial tool arguments and the incomplete finish reason; it is not
@@ -40,7 +40,7 @@ families use their manual/adaptive dialect; unknown models receive no invented
 Claude thinking controls.
 
 Messages token counting stays native where available. Other models return a
-local estimate (`estimated: true`, `x-kproxy-token-count-source: estimate`);
+local estimate (`estimated: true`, `x-crosslane-token-count-source: estimate`);
 estimates do not become provider-reported generation usage.
 
 Reference implementations reviewed for the independent Rust bridge:
@@ -71,7 +71,7 @@ and [changelog](https://kiro.dev/changelog/):
 | CLI / V2 generation | `2.21.4` | `aws-sdk-rust/1.3.15`, `codewhispererstreaming/0.1.17975` |
 | CLI / Management model catalog | `2.21.4` | `aws-sdk-rust/1.3.15`, `codewhispererruntime/0.1.17975` |
 
-`crates/kproxy-kiro/src/identity.rs` owns all versions and UA construction.
+`crates/crosslane-kiro/src/identity.rs` owns all versions and UA construction.
 IDE generation, model/subscription/usage queries, profile discovery and MCP web
 search share the same version, including the `KiroIDE-<version>-<machine_id>`
 used for Social token refresh. CLI generation and Management send both
@@ -83,7 +83,7 @@ This baseline targets the implemented V2/CodeWhisperer protocol. Newer
 KiroRuntimeService and V3/KAS paths need separate protocol integration; changing
 the service name in a UA does not migrate the request protocol.
 
-Rebuild and replace the `kproxyd` binary or image, then restart it. Configuration
+Rebuild and replace the `crosslaned` binary or image, then restart it. Configuration
 hot reload cannot update compiled identities. The startup log
 `Kiro upstream client identity` must show `ide_version=1.0.437` and
 `cli_version=2.21.4`. Follow [startup and debugging](startup-and-debugging.md) to
@@ -222,11 +222,11 @@ catalogs, start Claude Code with:
 ANTHROPIC_BASE_URL=http://127.0.0.1:5580 ENABLE_TOOL_SEARCH=auto claude
 ```
 
-`kiro-proxy` accepts Anthropic `defer_loading`, regex/BM25 Tool Search, and
+`crosslane` accepts Anthropic `defer_loading`, regex/BM25 Tool Search, and
 `tool_reference` history blocks. Because Kiro has no native Tool Search server
 tool, the proxy executes the search locally and continues the same response.
 The official Tool Search input contains `pattern` or `query` plus an optional
-`limit` from 1 to 10,000 (default 5). `kiro-proxy` honors that requested limit
+`limit` from 1 to 10,000 (default 5). `crosslane` honors that requested limit
 and then packs results against the remaining tool-count, tool-token, context,
 and payload-byte budgets; there is no fixed five-tool working set. Deferred
 definitions remain outside the Kiro context and payload until discovered. The
@@ -287,7 +287,7 @@ The compaction target normally reserves 25% of the safe window. Protected conten
 may relax the target if it still fits the hard maximum; exceeding that maximum
 fails. Input and output follow separate model limits, without an assumed shared window.
 
-Defaults come from [ContextConfig](../crates/kproxy-core/src/config.rs):
+Defaults come from [ContextConfig](../crates/crosslane-core/src/config.rs):
 
 ```toml
 [context]
@@ -354,10 +354,10 @@ background settlement has a bounded grace period before canceling the stream and
 settling decoded usage. One WARN records timeout fallback; subsequent settlement
 uses INFO with the same trace. `compaction_mode` distinguishes semantic/extractive_fallback.
 
-See [request preparation](../crates/kproxyd/src/http/handlers/request.rs),
-[summary execution](../crates/kproxyd/src/http/handlers/compaction.rs),
-[summary planning](../crates/kproxy-translate/src/tokenizer/compaction.rs) and
-[Claude Code recognition](../crates/kproxy-translate/src/context/claude_code.rs).
+See [request preparation](../crates/crosslaned/src/http/handlers/request.rs),
+[summary execution](../crates/crosslaned/src/http/handlers/compaction.rs),
+[summary planning](../crates/crosslane-translate/src/tokenizer/compaction.rs) and
+[Claude Code recognition](../crates/crosslane-translate/src/context/claude_code.rs).
 Mock regressions and the real-client command are in [CONTRIBUTING.md](../CONTRIBUTING.md#validation).
 
 ## Tool Search continuation limits
@@ -373,8 +373,8 @@ requests are then rejected explicitly instead of expanding deferred tools into
 the upstream payload. Request logs retain catalog/working-set sizes, search
 limits and truncation, client/upstream status, and a stable error code. Error
 responses keep the normal Claude/OpenAI body and expose diagnostics through
-`request-id`, `x-kproxy-error-code`, `x-kproxy-error-stage`,
-`x-kproxy-upstream-status`, and `x-kproxy-account-error` headers.
+`request-id`, `x-crosslane-error-code`, `x-crosslane-error-stage`,
+`x-crosslane-upstream-status`, and `x-crosslane-account-error` headers.
 
 ## Web Search
 
@@ -400,7 +400,7 @@ implemented.
 
 The default MCP URL is `https://runtime.{region}.kiro.dev/mcp`. Override it with
 `upstream.web_search_endpoint` (the `{region}` placeholder is supported) or the
-temporary `KPROXY_MCP_URL` environment variable. The default
+temporary `CROSSLANE_MCP_URL` environment variable. The default
 `upstream.web_search_timeout_ms` is 60,000. Every MCP request carries Kiro's
 required `x-amzn-kiro-profile-arn` header. When an imported account has no
 profile ARN, the proxy discovers it through `ListAvailableProfiles`, collapses
@@ -544,8 +544,8 @@ These historical snapshots do not establish current behavior in those projects; 
 | pinealctx/kiro-gateway | [Model aliases · 9f614d4](https://github.com/pinealctx/kiro-gateway/tree/9f614d4b270e8e80e13c7d3603cbb1b090f327c4) |
 
 ```bash
-cargo test -p kproxy-translate --test compatibility_controls --locked
-cargo test -p kproxy-translate --test claude_gateway_controls --locked
-cargo test -p kproxyd --test end_to_end compatibility_controls:: --locked
-cargo test -p kproxyd --test end_to_end claude_gateway:: --locked
+cargo test -p crosslane-translate --test compatibility_controls --locked
+cargo test -p crosslane-translate --test claude_gateway_controls --locked
+cargo test -p crosslaned --test end_to_end compatibility_controls:: --locked
+cargo test -p crosslaned --test end_to_end claude_gateway:: --locked
 ```

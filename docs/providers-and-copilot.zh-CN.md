@@ -1,13 +1,13 @@
 # 多提供源与 GitHub Copilot 接入
 
-`kproxyd` 现在通过 provider registry 管理模型来源。未配置 `[[provider]]` 时仍自动创建
+`crosslaned` 现在通过 provider registry 管理模型来源。未配置 `[[provider]]` 时仍自动创建
 `kiro`，已有配置和请求行为不变；一旦显式配置 provider，需要把仍要使用的 Kiro 实例也保留为
 `id = "kiro"`、`kind = "kiro"`。内置 Kiro 的实例 ID 固定为 `kiro`，Copilot 可以创建多个实例，
 例如 `copilot-personal`、`copilot-team`，各自拥有独立账号文件、token 缓存、并发限制和模型缓存。
 
 ## 命令与配置的适用范围
 
-`kproxy guide provider` 按命令列出来源边界；`kproxy config list` 的“适用来源”列按配置模块标注范围。
+`crosslane guide provider` 按命令列出来源边界；`crosslane config list` 的“适用来源”列按配置模块标注范围。
 全局配置无需为两种来源各建一份。
 
 | 范围 | 命令 | 配置 |
@@ -30,21 +30,21 @@
 `provider list` 的“实例 ID”用于 `--provider`（简写 `-p`）；“类型 (kind)”只用于驱动选择。
 例如实例 ID 为 `work-cp`、kind 为 `copilot`，后续命令必须用 `-p work-cp`。
 `provider show work-cp` 会给出该实例的下一步命令；`guide copilot -p work-cp` 可生成对应示例。
-也可 `export KPROXY_PROVIDER=work-cp` 省略重复参数，显式 `-p` 优先；全局和按资源 ID
+也可 `export CROSSLANE_PROVIDER=work-cp` 省略重复参数，显式 `-p` 优先；全局和按资源 ID
 定位的操作不使用这个默认值。`help --all` 和各层 `--help` 都标明操作范围。
 
 先添加 provider。此命令创建一个 Copilot 模型来源实例（账号池、模型发现和路由的配置范围），
 不会添加或授权 GitHub 用户账号。新建实例会将默认公开 OAuth Client ID 写入配置文件；
-用 `kproxy config path` 查看配置文件位置：
+用 `crosslane config path` 查看配置文件位置：
 
 ```bash
-kproxy provider add \
+crosslane provider add \
   --id copilot \
   --kind copilot \
   --max-concurrent-per-account 2
 
-kproxy provider show copilot
-kproxy config path
+crosslane provider show copilot
+crosslane config path
 ```
 
 新增的实例包含可直接编辑的设置：
@@ -60,9 +60,9 @@ client_id = "Iv1.b507a08c87ecfe98"
 ```
 
 如果企业组织只允许自有 OAuth App，可通过 `--setting 'client_id="Iv1.your-app"'` 覆盖默认值；
-已有实例使用 `kproxy provider edit copilot --setting 'client_id="Iv1.your-app"'`。
+已有实例使用 `crosslane provider edit copilot --setting 'client_id="Iv1.your-app"'`。
 要恢复默认值且仍让它显示在配置文件中，可用
-`kproxy provider edit copilot --setting 'client_id="Iv1.b507a08c87ecfe98"'`。
+`crosslane provider edit copilot --setting 'client_id="Iv1.b507a08c87ecfe98"'`。
 旧配置未写 `client_id` 时仍会使用相同的运行时默认值；如需显式显示，也可执行上述命令。
 `--setting` 接受 `KEY=TOML_VALUE`，字符串值需保留 TOML 引号。
 Client ID 与已签发的 OAuth token 关联；如果已有账号通过自有应用登录，不要直接切换或移除该设置，
@@ -71,11 +71,11 @@ Client ID 与已签发的 OAuth token 关联；如果已有账号通过自有应
 也可以跳过 Device Flow，从标准输入导入已有 GitHub token，避免凭证出现在命令行参数和 shell 历史中：
 
 ```bash
-kproxy account add --provider copilot --auth device-flow
+crosslane account add --provider copilot --auth device-flow
 
 # 或者
 printf '%s\n' "$GITHUB_TOKEN" | \
-  kproxy account add --provider copilot --token-stdin
+  crosslane account add --provider copilot --token-stdin
 ```
 
 `--provider` 是实例 ID：本页示例创建的是 `copilot`，后续也使用 `--provider copilot`；
@@ -96,7 +96,7 @@ full 镜像或启用了 `sso` feature 的 daemon 可以在服务器上启动独�
 交互添加（命令中的 provider ID 按实际配置填写）：
 
 ```bash
-kproxy account add --provider copilot --auth device-flow --headless
+crosslane account add --provider copilot --auth device-flow --headless
 ```
 
 在终端填写完整 GitHub 用户名，选择 Azure SSO、GitHub 密码或两套凭证；密码输入不回显。
@@ -107,7 +107,7 @@ CSV 批量添加按顺序逐个完成远端无痕登录，先校验整个文件�
 
 ```bash
 chmod 600 /secure/copilot.csv
-kproxy account add --provider copilot --batch /secure/copilot.csv
+crosslane account add --provider copilot --batch /secure/copilot.csv
 ```
 
 ```csv
@@ -125,7 +125,7 @@ complete、cancelled 和 skipped 的单个结果，进度输出到 stderr。
 Enterprise Managed User 非交互示例：
 
 ```bash
-printf '%s\n' "$AZURE_PASSWORD" | kproxy account add \
+printf '%s\n' "$AZURE_PASSWORD" | crosslane account add \
   --provider copilot --auth device-flow \
   --username USER_SHORTCODE --sso-username user@example.com --password-stdin
 ```
@@ -152,7 +152,7 @@ GitHub 个人账号和 Azure 各有一套密码时，使用 `--credentials-stdin
 ```
 
 ```bash
-kproxy account add --provider copilot --auth device-flow \
+crosslane account add --provider copilot --auth device-flow \
   --credentials-stdin < /secure/copilot-login.json
 ```
 
@@ -161,7 +161,7 @@ Azure 密码；暂不支持的外部联邦身份提供商会明确报错。MFA �
 验证码时，原命令会显示任务 ID，可在另一个远端终端输入：
 
 ```bash
-printf '%s\n' "$MFA_CODE" | kproxy account login-code \
+printf '%s\n' "$MFA_CODE" | crosslane account login-code \
   --provider copilot --task login_TASK_ID --code-stdin
 ```
 
@@ -180,7 +180,7 @@ CAPTCHA、Passkey、安全密钥、强制改密和受管设备要求不会被自
 
 排查时可在账号添加命令增加 `--capture-headers`。浏览器导航之前即开始记录请求、响应、重定向和
 CDP `requestWillBeSentExtraInfo` / `responseReceivedExtraInfo`，包括实际发送的 Cookie 和其它请求头。
-记录位于服务器 `$KPROXY_HOME/providers/<ID>/login-traces/<任务ID>.headers.jsonl`，目录权限 `0700`、
+记录位于服务器 `$CROSSLANE_HOME/providers/<ID>/login-traces/<任务ID>.headers.jsonl`，目录权限 `0700`、
 文件权限 `0600`。它包含可用的会话凭证，不记录密码表单正文，不进入普通日志；仅在诊断期间开启。
 Cookie、CSRF token、nonce、Origin、Referer 和客户端提示由当前远端浏览器及页面自行生成，
 不把一次本地登录的 header 固定重放到另一会话。
@@ -188,7 +188,7 @@ Cookie、CSRF token、nonce、Origin、Referer 和客户端提示由当前远端
 Device Flow 会先取得 GitHub 用户 token，再通过
 `GET /copilot_internal/v2/token` 交换短期 Copilot API token。动态返回的 API endpoint 会校验
 HTTPS 与主机名。账号 token、刷新 token 和探测结果保存在
-`$KPROXY_HOME/providers/<provider-id>/accounts.json`，使用原子写入和 `0600` 权限；逐账号模型目录
+`$CROSSLANE_HOME/providers/<provider-id>/accounts.json`，使用原子写入和 `0600` 权限；逐账号模型目录
 持久化到同目录的 `models.json`，成功返回空目录时也会清除旧缓存，失败时只在配置的 stale 窗口内
 使用最后一次成功结果。
 
@@ -201,7 +201,7 @@ GitHub.com 上通过 Azure SSO 登录、并逐用户分配 Copilot Enterprise �
 该字段时，可以为企业专用 provider 配置回退地址：
 
 ```bash
-kproxy provider edit copilot \
+crosslane provider edit copilot \
   --setting 'api_endpoint_fallback="https://api.enterprise.githubcopilot.com"'
 ```
 
@@ -214,13 +214,13 @@ Device Flow 签发的 expiring user token 可使用返回的 refresh token 轮�
 `client_secret`。只有自有 OAuth 应用确实要求时，才应与其 `client_id` 成对配置：
 
 ```bash
-kproxy provider edit copilot \
+crosslane provider edit copilot \
   --setting 'client_secret="replace-me"'
 ```
 
 生产环境不要启用 `allow_insecure_http`。独立的 GitHub Enterprise 站点或自建测试端点可配置
 `github_host`、`github_api_base`、`oauth_base` 和 `allowed_endpoint_hosts`；完整字段和默认值见
-`kproxy config show provider` 或生成的默认配置文件。
+`crosslane config show provider` 或生成的默认配置文件。
 
 adapter 会发送 Copilot 要求的 `Editor-Version`、`Editor-Plugin-Version`、
 `Copilot-Integration-Id` 和 `User-Agent` 身份头。Claude 原生请求只转发已经验证可用的 beta，
@@ -232,10 +232,9 @@ adapter 会发送 Copilot 要求的 `Editor-Version`、`Editor-Plugin-Version`�
 创建 Copilot-only 服务时，服务与自动生成的 API key 会使用相同 provider 范围：
 
 ```bash
-kproxy service create \
+crosslane service create \
   --name copilot \
   --host 127.0.0.1 \
-  --port 5581 \
   --provider copilot \
   --default-provider copilot
 ```
@@ -243,10 +242,9 @@ kproxy service create \
 一个监听也可以同时开放 Kiro 和 Copilot：
 
 ```bash
-kproxy service create \
+crosslane service create \
   --name unified \
   --host 127.0.0.1 \
-  --port 5580 \
   --provider kiro \
   --provider copilot \
   --default-provider kiro
@@ -257,7 +255,7 @@ kproxy service create \
 provider 范围同时受服务和 API key 限制，取两者交集。API key 还可限制模型 glob：
 
 ```bash
-kproxy apikey edit <KEY_ID> \
+crosslane apikey edit <KEY_ID> \
   --provider copilot \
   --model 'copilot/claude-*' \
   --model 'copilot/gpt-*'
@@ -280,7 +278,7 @@ Copilot 的所有非 embedding 生成模型均提供以下三种接口，支持 
 转换覆盖完整会话、system/developer、函数工具及并行结果、图片/内联文件、文本和思考流、
 结束原因、usage/cache 与原始 `copilot_usage`。SSE 分片、UTF-8、工具索引及终止事件均增量处理；
 中途断流或上游错误不会补发成功结束。`count_tokens` 对 Messages 原生模型使用原生接口，
-其他模型返回本地估算，并以 `estimated: true` 和 `x-kproxy-token-count-source: estimate`
+其他模型返回本地估算，并以 `estimated: true` 和 `x-crosslane-token-count-source: estimate`
 标记；估算不作为上游生成用量计费。
 
 协议转换不会为模型增加视觉、推理或托管工具能力。需要转换时，Responses
@@ -292,14 +290,14 @@ Copilot 的所有非 embedding 生成模型均提供以下三种接口，支持 
 模型映射共用同一套规则引擎，可以按 provider、代理服务和 API key 限定：
 
 ```bash
-kproxy model-map add \
+crosslane model-map add \
   --name copilot-fast \
   --provider copilot \
   --service svc_example \
   --source team-fast \
   --target gpt-5-mini
 
-kproxy model-map test team-fast \
+crosslane model-map test team-fast \
   --provider copilot \
   --service svc_example
 ```
@@ -308,8 +306,8 @@ kproxy model-map test team-fast \
 需要在源 provider 上显式开启，再把目标写成 `provider/model`：
 
 ```bash
-kproxy provider edit kiro --allow-cross-provider-fallback true
-kproxy model-map add \
+crosslane provider edit kiro --allow-cross-provider-fallback true
+crosslane model-map add \
   --name kiro-to-copilot \
   --provider kiro \
   --source team-copilot \
@@ -331,7 +329,7 @@ Copilot 映射在 provider adapter 前执行，按服务账号池和账号的原
 
 统一采用“资源 + 动作 + provider 范围”：`account`、`service`、`models`、`apikey`、`stats`
 等共用一棵命令树。`--provider` 可放在根命令、命令组或最终子命令上，也可通过
-`KPROXY_PROVIDER` 设置当前 shell 的默认范围；显式参数优先于环境变量。
+`CROSSLANE_PROVIDER` 设置当前 shell 的默认范围；显式参数优先于环境变量。
 编辑已有 service、API key 或模型映射时，只有显式 `--provider` 才会替换来源权限，
 环境变量不会隐式修改权限；该参数与 `--clear-providers` 互斥。
 
@@ -342,20 +340,20 @@ Copilot 映射在 provider adapter 前执行，按服务账号池和账号的原
 
 ```bash
 # 以下写法均可使用；裸 ID 在唯一匹配时自动定位 provider
-kproxy --provider copilot account tag acc_b85b28b7 --add copilot-test
-kproxy account --provider copilot tag acc_b85b28b7 --add copilot-test
-kproxy account tag --add copilot-test acc_b85b28b7
+crosslane --provider copilot account tag acc_b85b28b7 --add copilot-test
+crosslane account --provider copilot tag acc_b85b28b7 --add copilot-test
+crosslane account tag --add copilot-test acc_b85b28b7
 
-export KPROXY_PROVIDER=copilot
-kproxy account list
-kproxy models list
-kproxy account refresh --all
-unset KPROXY_PROVIDER
+export CROSSLANE_PROVIDER=copilot
+crosslane account list
+crosslane models list
+crosslane account refresh --all
+unset CROSSLANE_PROVIDER
 
 # 共用账号添加入口，原 add-sso/add-api-key 命令继续保留
-kproxy --provider kiro account add --auth sso --email user@example.com --password-stdin
-kproxy --provider kiro account add --auth api-key --email user@example.com --token-stdin
-kproxy --provider copilot account add --auth device-flow
+crosslane --provider kiro account add --auth sso --email user@example.com --password-stdin
+crosslane --provider kiro account add --auth api-key --email user@example.com --token-stdin
+crosslane --provider copilot account add --auth device-flow
 ```
 
 服务标签池对两种 provider 都生效，规则为“标签并集/全局池 + 手工加入 − 排除”。
@@ -364,10 +362,10 @@ Copilot 删除绑定账号、使账号退出现有标签池的改标操作会提
 绑定账号增加标签可直接执行。Kiro 保持原有绑定保护规则。
 
 ```bash
-kproxy service accounts <SERVICE> --provider copilot
-kproxy service add-account <SERVICE> copilot/acc_b85b28b7
-kproxy service remove-account <SERVICE> copilot/acc_b85b28b7
-kproxy account services copilot/acc_b85b28b7
+crosslane service accounts <SERVICE> --provider copilot
+crosslane service add-account <SERVICE> copilot/acc_b85b28b7
+crosslane service remove-account <SERVICE> copilot/acc_b85b28b7
+crosslane account services copilot/acc_b85b28b7
 ```
 
 其他常用命令：
@@ -375,13 +373,13 @@ kproxy account services copilot/acc_b85b28b7
 全局模型开关适用于全部来源：
 
 ```bash
-kproxy model disable claude-sonnet-4.6 gpt-4.1
-kproxy model list
-kproxy model enable gpt-4.1
+crosslane model disable claude-sonnet-4.6 gpt-4.1
+crosslane model list
+crosslane model enable gpt-4.1
 ```
 
 使用模型列表中的 ID，不带 `kiro/`、`copilot/` 等来源前缀；支持一次指定多个模型，
-不支持通配符。`model` 是 `models` 的别名。若设置了 `KPROXY_PROVIDER`，全局开关可显式
+不支持通配符。`model` 是 `models` 的别名。若设置了 `CROSSLANE_PROVIDER`，全局开关可显式
 加 `--provider all`。CLI 的人类可读列表标记“不可用（已禁用）”，JSON 条目带
 `disabled: true`、`available: false`；上游不再提供的禁用 ID 仍作为全局规则展示。
 
@@ -395,27 +393,27 @@ kproxy model enable gpt-4.1
 已发送的请求无法撤回，其响应可以结束；后续重试或续接必须重新通过检查。
 
 ```bash
-kproxy provider list
-kproxy status --provider all
-kproxy ready --provider copilot
-kproxy account list --provider all
-kproxy account list --provider copilot
-kproxy account show copilot/<ACCOUNT_ID>
-kproxy account tag --provider copilot <ACCOUNT_ID> --add team-a
-kproxy account probe --provider copilot <ACCOUNT_ID>
-kproxy account reset-health --provider copilot <ACCOUNT_ID>
-kproxy account refresh --provider copilot --all
-kproxy account export --provider all --redact
-kproxy models list --provider all
-kproxy models list --provider copilot --refresh
-kproxy tasks run model_cache_refresh --provider copilot
-kproxy pool --provider copilot --model gpt-5-mini
-kproxy service list --provider copilot
-kproxy apikey list --provider copilot
-kproxy apikey usage <KEY_ID> --provider copilot
-kproxy stats --provider copilot --detail --by model
-kproxy logs show --provider copilot
-kproxy subscriptions --provider all
+crosslane provider list
+crosslane status --provider all
+crosslane ready --provider copilot
+crosslane account list --provider all
+crosslane account list --provider copilot
+crosslane account show copilot/<ACCOUNT_ID>
+crosslane account tag --provider copilot <ACCOUNT_ID> --add team-a
+crosslane account probe --provider copilot <ACCOUNT_ID>
+crosslane account reset-health --provider copilot <ACCOUNT_ID>
+crosslane account refresh --provider copilot --all
+crosslane account export --provider all --redact
+crosslane models list --provider all
+crosslane models list --provider copilot --refresh
+crosslane tasks run model_cache_refresh --provider copilot
+crosslane pool --provider copilot --model gpt-5-mini
+crosslane service list --provider copilot
+crosslane apikey list --provider copilot
+crosslane apikey usage <KEY_ID> --provider copilot
+crosslane stats --provider copilot --detail --by model
+crosslane logs show --provider copilot
+crosslane subscriptions --provider all
 ```
 
 provider 本身可通过 `add`、`edit`、`enable`、`disable`、`delete` 管理。删除 provider 只删除配置，

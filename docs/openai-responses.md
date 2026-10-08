@@ -11,8 +11,8 @@
 
 ## Codex 配置
 
-先创建代理服务并导入可用账号，使用 `kproxy ready` 和 `kproxy models list` 核对服务与模型。
-base URL 必须包含 `/v1`；`KPROXY_API_KEY` 是代理服务允许的客户端 Key，不是上游 `ksk_...`。
+先创建代理服务并导入可用账号，使用 `crosslane ready` 和 `crosslane models list` 核对服务与模型。
+base URL 必须包含 `/v1`；`CROSSLANE_API_KEY` 是代理服务允许的客户端 Key，不是上游 `ksk_...`。
 
 在用户级 `~/.codex/config.toml` 中配置 provider；请保留已有的其他配置：
 
@@ -21,26 +21,26 @@ model = "claude-sonnet-4.5"
 model_provider = "kiro"
 
 [model_providers.kiro]
-name = "Kiro Proxy"
+name = "Crosslane"
 base_url = "http://127.0.0.1:5580/v1"
 wire_api = "responses"
-env_key = "KPROXY_API_KEY"
+env_key = "CROSSLANE_API_KEY"
 requires_openai_auth = false
 ```
 
-将 `KPROXY_API_KEY` 设置为该代理服务生成或允许的 API key，然后启动 Codex。
+将 `CROSSLANE_API_KEY` 设置为该代理服务生成或允许的 API key，然后启动 Codex。
 服务地址和 model 按实际部署及账号可用模型调整。配置字段见
 [Codex 官方配置参考](https://learn.chatgpt.com/docs/config-file/config-reference)。
 
 ## 最小请求
 
-将 `KPROXY_API_KEY` 设置为客户端 Key 后，可用以下请求检查协议。示例携带 Codex 产品标识，
+将 `CROSSLANE_API_KEY` 设置为客户端 Key 后，可用以下请求检查协议。示例携带 Codex 产品标识，
 用于冒烟检查；实际第三方客户端可配置单个服务或 Key 的 User-Agent 豁免。
 生成请求会调用真实上游并消耗额度；把 model 改为账号可用值。
 
 ```bash
 curl -sS http://127.0.0.1:5580/v1/responses \
-  -H "authorization: Bearer $KPROXY_API_KEY" \
+  -H "authorization: Bearer $CROSSLANE_API_KEY" \
   -H 'content-type: application/json' \
   -H 'user-agent: codex_cli_rs/0.144.0' \
   -d '{"model":"claude-sonnet-4.5","input":"Reply with hello.","store":false,"max_output_tokens":64}'
@@ -67,7 +67,7 @@ curl -sS http://127.0.0.1:5580/v1/responses \
 
 需要对所有服务开放其他协议客户端时，可将此开关设为 `false` 并重载配置。只豁免一个
 服务或 API Key 时，分别在对应的 `[[proxy_service]]` 或 `[[api_key]]` 中设置
-`skip_user_agent_check = true`，也可以使用 `kproxy service edit` 或 `kproxy apikey edit`
+`skip_user_agent_check = true`，也可以使用 `crosslane service edit` 或 `crosslane apikey edit`
 修改。全局关闭、service 豁免、API Key 豁免依次决定最终策略；任一层豁免都会跳过检查。
 API key 认证、服务级 key 白名单、额度和并发限制继续生效。
 
@@ -160,7 +160,7 @@ session-affinity 请求头影响。
 | 隔离 | 按代理 service 和已认证 API key 隔离；重启全部清空，多副本不共享。 |
 | 无效引用 | 未知、过期、淘汰或其他 service/key 的 `previous_response_id` 返回 HTTP 400。 |
 
-这些上限由[状态存储实现](../crates/kproxyd/src/http/responses.rs)固定，当前没有 TOML 调节项。
+这些上限由[状态存储实现](../crates/crosslaned/src/http/responses.rs)固定，当前没有 TOML 调节项。
 无法保存新状态时，非流式请求返回服务端错误，流式请求以 `response.failed` 结束。
 客户端应保留可重放历史；引用失效后移除 `previous_response_id`，提交完整 input 并按需设置
 `store: false`。不能只删引用、仍只发送孤立的工具结果，否则缺少调用配对。
@@ -216,10 +216,10 @@ Responses 不使用 Chat Completions 的 `[DONE]` 结束标记。
 ## 回归验证
 
 ```bash
-cargo test -p kproxy-translate responses:: --locked
-cargo test -p kproxyd http::responses::tests --locked
-cargo test -p kproxyd --test end_to_end responses:: --locked
-cargo test -p kproxyd --test end_to_end compatibility_controls:: --locked
+cargo test -p crosslane-translate responses:: --locked
+cargo test -p crosslaned http::responses::tests --locked
+cargo test -p crosslaned --test end_to_end responses:: --locked
+cargo test -p crosslaned --test end_to_end compatibility_controls:: --locked
 ```
 
 这些用例使用本地模拟上游，验证转换、状态隔离/过期、工具配对和 JSON/SSE 输出；

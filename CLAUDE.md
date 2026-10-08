@@ -5,7 +5,7 @@ Start with [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow and [the README d
 
 ## 项目定位
 
-`kiro-proxy` 是无 GUI 的 Rust 常驻服务，把 Kiro 上游（CodeWhisperer / Amazon Q / regional runtime，Web Search 使用 MCP）包装成 Claude Messages、OpenAI Chat Completions 与 Responses 兼容 API。支持 Kiro **企业 SSO（AWS IAM Identity Center / IdC）** 和显式导入的 headless API key（`ksk_...`），不实现个人/社交 OAuth 登录流程。上游凭证与代理客户端 API key 分开管理。
+`crosslane` 是无 GUI 的 Rust 多 provider 代理服务，内置 Kiro 与 GitHub Copilot，统一提供 Claude Messages、OpenAI Chat Completions 与 Responses 兼容 API。Kiro 支持 **企业 SSO（AWS IAM Identity Center / IdC）** 和显式导入的 headless API key（`ksk_...`）；Copilot 支持 GitHub Device Flow 和 token 导入。上游凭证与代理客户端 API key 分开管理。
 
 ## 常用命令
 
@@ -17,35 +17,35 @@ cargo test --workspace --all-features --locked
 docker compose config --quiet
 
 # 缩小范围调试（单 crate / 单测试名）
-cargo test -p kproxy-kiro
-cargo test -p kproxyd http::tests::every_response_has_a_unique_trace_id
-cargo test -p kproxy-pool refresh::tests::successful_refresh_preserves_cooling_and_exhausted_health
+cargo test -p crosslane-kiro
+cargo test -p crosslaned http::tests::every_response_has_a_unique_trace_id
+cargo test -p crosslane-pool refresh::tests::successful_refresh_preserves_cooling_and_exhausted_health
 
 # 按集成测试 target 缩小范围；上方 workspace 全量命令已经包含这些 target
-cargo test -p kproxyd --test end_to_end                              # 全量端到端（wiremock 模拟上游）
-cargo test -p kproxyd --test end_to_end compatibility_controls::     # 端到端子模块
-cargo test -p kproxy-translate --test compatibility_controls
-cargo test -p kproxy-translate --test openai_roundtrip
-cargo test -p kproxy --test dotenv
+cargo test -p crosslaned --test end_to_end                              # 全量端到端（wiremock 模拟上游）
+cargo test -p crosslaned --test end_to_end compatibility_controls::     # 端到端子模块
+cargo test -p crosslane-translate --test compatibility_controls
+cargo test -p crosslane-translate --test openai_roundtrip
+cargo test -p crosslane --test dotenv
 ```
 
-`crates/kproxyd/tests/end_to_end.rs` 用 `end_to_end/` 目录挂子模块（`compatibility_controls` / `responses` /
+`crates/crosslaned/tests/end_to_end.rs` 用 `end_to_end/` 目录挂子模块（`compatibility_controls` / `responses` /
 `thinking_controls` / `claude_gateway` / `manual_compaction` / `warning_regressions`），新增端到端场景加子模块文件而不是继续堆主文件。
 
 工具链由 `rust-toolchain.toml` 钉在 1.97.1（edition 2021），无需手动 `rustup override`。
 
 ### 本地启动
 
-`.env.example` 里的 `KPROXY_HOME=.kproxy-dev` 把配置/数据/日志/admin socket 隔离到仓库内，开发时应保持该约定，避免污染 XDG 目录。
+`.env.example` 里的 `CROSSLANE_HOME=.crosslane-dev` 把配置/数据/日志/admin socket 隔离到仓库内，开发时应保持该约定，避免污染 XDG 目录。
 
 ```bash
 cp .env.example .env
-cargo run -p kproxyd                      # 首次启动生成 config.toml/accounts.json/daily.json/stats.json
-cargo run -p kproxy -- health              # 另一个终端；CLI 通过 Unix socket 连 daemon
-cargo run -p kproxy -- service create --name main
+cargo run -p crosslaned                      # 首次启动生成 config.toml/accounts.json/daily.json/stats.json
+cargo run -p crosslane -- health              # 另一个终端；CLI 通过 Unix socket 连 daemon
+cargo run -p crosslane -- service create --name main
 ```
 
-`kproxyd` 在参数解析前加载 `.env`；`kproxy` 先处理 help/guide/completions/version 和组导航，再为业务命令加载 `.env` 并正式解析参数。两者从当前目录向上查找，已有进程环境优先于 `.env`。相对 `KPROXY_HOME` 仍相对于进程工作目录，跨目录执行应使用绝对路径。常用开关：`KPROXY_HTTP_PORT`（覆盖端口等于 `server.port` 默认值的服务，不创建服务）、`KPROXY_DISABLE_HTTP=1`（只保留管理面）、`KPROXY_ADMIN_SOCKET`（只影响 CLI）、`KPROXY_CODEWHISPERER_URL` / `KPROXY_AMAZONQ_URL` / `KPROXY_MCP_URL` / `KPROXY_RUNTIME_URL` / `KPROXY_MANAGEMENT_URL`（受控上游或 wiremock）。
+`crosslaned` 在参数解析前加载 `.env`；`crosslane` 先处理 help/guide/completions/version 和组导航，再为业务命令加载 `.env` 并正式解析参数。两者从当前目录向上查找，已有进程环境优先于 `.env`。相对 `CROSSLANE_HOME` 仍相对于进程工作目录，跨目录执行应使用绝对路径。常用开关：`CROSSLANE_HTTP_PORT`（覆盖端口等于 `server.port` 默认值的服务，不创建服务）、`CROSSLANE_DISABLE_HTTP=1`（只保留管理面）、`CROSSLANE_ADMIN_SOCKET`（只影响 CLI）、`CROSSLANE_CODEWHISPERER_URL` / `CROSSLANE_AMAZONQ_URL` / `CROSSLANE_MCP_URL` / `CROSSLANE_RUNTIME_URL` / `CROSSLANE_MANAGEMENT_URL`（受控上游或 wiremock）。
 
 wiremock 与端到端测试会绑定临时 loopback 端口，沙箱 CI 必须允许本地监听。
 
@@ -53,27 +53,29 @@ wiremock 与端到端测试会绑定临时 loopback 端口，沙箱 CI 必须允
 
 ### 业务面与管理面
 
-进程只有一个入口 `crates/kproxyd/src/main.rs`，但对外暴露两个互不相通的平面：
+进程只有一个入口 `crates/crosslaned/src/main.rs`，但对外暴露两个互不相通的平面：
 
-- **业务面**：`crates/kproxyd/src/http/`，由 `ProxyServiceManager` 按 `config.toml` 里的 proxy service 列表动态增删 axum listener。每个 service 有独立 host/port 与 API key 白名单，`router_for_service` 为其单独构造 Router，`ServiceHttpState` 携带 `{app, service, allowed_api_key_ids}`。新增/删除 service 无需重启 daemon。
-- **管理面**：`crates/kproxyd/src/admin/`，Unix socket 上的行分隔 JSON-RPC。`kproxy-ipc::protocol` 定义请求/响应与结果 DTO，`admin/handlers.rs` 按 method 分发。新增需要 RPC 的 CLI 能力时，同步 method/DTO、daemon 分发、CLI 定义与执行；复用现有 RPC 或纯本地导航不需要新建 method。CLI 定义分布在 `main.rs` 和 `commands/`，帮助与补全从同一 Clap 命令树生成。
+- **业务面**：`crates/crosslaned/src/http/`，由 `ProxyServiceManager` 按 `config.toml` 里的 proxy service 列表动态增删 axum listener。每个 service 有独立 host/port 与 API key 白名单，`router_for_service` 为其单独构造 Router，`ServiceHttpState` 携带 `{app, service, allowed_api_key_ids}`。新增/删除 service 无需重启 daemon。
+- **管理面**：`crates/crosslaned/src/admin/`，Unix socket 上的行分隔 JSON-RPC。`crosslane-ipc::protocol` 定义请求/响应与结果 DTO，`admin/handlers.rs` 按 method 分发。新增需要 RPC 的 CLI 能力时，同步 method/DTO、daemon 分发、CLI 定义与执行；复用现有 RPC 或纯本地导航不需要新建 method。CLI 定义分布在 `main.rs` 和 `commands/`，帮助与补全从同一 Clap 命令树生成。
 
 ### crate 依赖方向
 
 ```
-kproxy-core  ← 领域模型、默认值、config 校验（无 I/O 依赖）
-kproxy-store ← 原子落盘、.env 加载、bootstrap、config 热重载 watcher
-kproxy-ipc   ← daemon/CLI 共享协议
-kproxy-translate ← Claude/OpenAI ↔ Kiro 转换、校验、token 估算
-kproxy-kiro  ← Kiro HTTP client、Event Stream 解码、endpoint 状态、模型发现（依赖 translate）
-kproxy-pool  ← 账号健康、额度预留、并发、加权调度（依赖 core/translate/kiro/store）
-kproxy-notify← webhook 投递与抑制
-kproxyd / kproxy ← 二进制，组合各自需要的内部 crate
+crosslane-core  ← 领域模型、默认值、config 校验（无 I/O 依赖）
+crosslane-provider ← provider 接口、共享模型禁用策略
+crosslane-copilot ← GitHub Copilot 认证、模型发现和协议转发
+crosslane-store ← 原子落盘、.env 加载、bootstrap、config 热重载 watcher
+crosslane-ipc   ← daemon/CLI 共享协议
+crosslane-translate ← Claude/OpenAI ↔ Kiro 转换、校验、token 估算
+crosslane-kiro  ← Kiro HTTP client、Event Stream 解码、endpoint 状态、模型发现（依赖 translate）
+crosslane-pool  ← 账号健康、额度预留、并发、加权调度（依赖 core/translate/kiro/store）
+crosslane-notify← webhook 投递与抑制
+crosslaned / crosslane ← 二进制，组合各自需要的内部 crate
 ```
 
 ### 单请求链路
 
-业务面热区是 `crates/kproxyd/src/http/`，按阶段拆成子模块，改动前先认准落点：
+业务面热区是 `crates/crosslaned/src/http/`，按阶段拆成子模块，改动前先认准落点：
 
 | 文件 | 职责 |
 | --- | --- |
@@ -94,11 +96,11 @@ kproxyd / kproxy ← 二进制，组合各自需要的内部 crate
 5. `AccountPool::acquire` 加权选号并预留额度，`KiroClient::generate` 打上游，`stream.rs` 转 SSE；多轮工具调用经 `auto_continue_payload` 续接，上限 `features.auto_continue_rounds`（**默认 0 即关闭**，`.min(30)` 硬夹）。
 6. 失败经 `record_failed_request` 计入 `stats` 与 `meter`；账号级错误反馈 `record_error` / `record_quota_error` / `mark_banned`。
 
-`AppState`（`kproxyd/src/state.rs`）是唯一共享状态，内部大量 `RwLock<...>` 字段（pool、kiro、notifier、refresher、tls_config、runtime_config）配合 `account_mutation` / `config_mutation` 两把 `Mutex` 串行化写操作。改动这些字段时优先复用 `apply_config_transaction`，不要新开锁顺序。
+`AppState`（`crosslaned/src/state.rs`）是唯一共享状态，内部大量 `RwLock<...>` 字段（pool、kiro、notifier、refresher、tls_config、runtime_config）配合 `account_mutation` / `config_mutation` 两把 `Mutex` 串行化写操作。改动这些字段时优先复用 `apply_config_transaction`，不要新开锁顺序。
 
 ### 服务端工具的本地执行
 
-Responses 的入站转换位于 `kproxy-translate/src/responses.rs`，复用 OpenAI 请求执行链；出站 JSON/SSE 编码位于 `kproxyd/src/http/responses.rs`。默认存储受限进程内状态，`store=false` 时客户端需传完整历史；续轮按 service/API key 隔离，过期/淘汰/重启后不可恢复。协议范围见 [Responses 文档](docs/openai-responses.md)。默认 Claude 路由仅限 Claude Code，Responses/Chat Completions 仅限 Codex，模型列表接受两者；全局 `server.enforce_user_agent_check` 和 service/API key 的 `skip_user_agent_check` 决定最终策略。
+Responses 的入站转换位于 `crosslane-translate/src/responses.rs`，复用 OpenAI 请求执行链；出站 JSON/SSE 编码位于 `crosslaned/src/http/responses.rs`。默认存储受限进程内状态，`store=false` 时客户端需传完整历史；续轮按 service/API key 隔离，过期/淘汰/重启后不可恢复。协议范围见 [Responses 文档](docs/openai-responses.md)。默认 Claude 路由仅限 Claude Code，Responses/Chat Completions 仅限 Codex，模型列表接受两者；全局 `server.enforce_user_agent_check` 和 service/API key 的 `skip_user_agent_check` 决定最终策略。
 
 Kiro 没有原生 Tool Search / Web Search server tool，代理在本地补齐并**续接同一次模型回合**：
 
@@ -118,16 +120,16 @@ Kiro 没有原生 Tool Search / Web Search server tool，代理在本地补齐�
 
 ### 错误码约定
 
-HTTP `413` / `request_too_large` **只**用于真实入站 body 超过 50 MiB。tool 预算、context 预算、翻译后 payload 超限一律用 `400`，否则 Claude Code 会误报成 32 MB 附件失败。错误响应保持标准 Claude/OpenAI body，诊断信息走 header：`request-id`、`x-kproxy-error-code`、`x-kproxy-error-stage`、`x-kproxy-upstream-status`、`x-kproxy-account-error`。
+HTTP `413` / `request_too_large` **只**用于真实入站 body 超过 50 MiB。tool 预算、context 预算、翻译后 payload 超限一律用 `400`，否则 Claude Code 会误报成 32 MB 附件失败。错误响应保持标准 Claude/OpenAI body，诊断信息走 header：`request-id`、`x-crosslane-error-code`、`x-crosslane-error-stage`、`x-crosslane-upstream-status`、`x-crosslane-account-error`。
 
 ## 编码约定
 
 - **依赖全部精确锁定**（`=1.0.86` 形式）且集中在根 `[workspace.dependencies]`，crate 内只写 `xxx.workspace = true`。升级依赖要连带评估 `Cargo.lock` 与 Docker 缓存层。
 - `chromiumoxide 0.9.1` 与 Chromium 快照 `r1566079` 是**成对**钉住的（CDP 协议兼容），改一个必须同时改另一个并实测。
-- `kproxyd` 的 `sso` feature 默认开启（引入 chromiumoxide）；`--no-default-features` 对应 Docker `runtime-slim` 目标，浏览器 SSO 相关代码必须置于 `#[cfg(feature = "sso")]` 之后。
+- `crosslaned` 的 `sso` feature 默认开启（引入 chromiumoxide）；`--no-default-features` 对应 Docker `runtime-slim` 目标，浏览器 SSO 相关代码必须置于 `#[cfg(feature = "sso")]` 之后。
 - 注释与文档字符串中英混排是既有风格（`//!` 模块头多为英文，行内解释常为中文），跟随所在文件的既有语言，不要统一改写。
-- 配置校验集中在 `kproxy-core/src/config.rs`；新增配置项需同时补默认值、校验分支与热重载路径，非法 TOML 必须保留上一份有效配置而不是崩溃。
-- 账号文件 `accounts.json` 含凭据、以 `0600` 创建；导出默认带凭据，诊断分享前用 `--redact`。测试与日志中不得回显 token。
+- 配置校验集中在 `crosslane-core/src/config.rs`；新增配置项需同时补默认值、校验分支与热重载路径，非法 TOML 必须保留上一份有效配置而不是崩溃。
+- 账号文件 `accounts.json` 含凭据、以 `0600` 创建；导出默认脱敏，仅在受保护的备份场景使用 `--include-secrets`。测试与日志中不得回显 token。
 
 ## 文档
 
@@ -140,5 +142,5 @@ HTTP `413` / `request_too_large` **只**用于真实入站 body 超过 50 MiB。
   手动 `/compact`、流式回放和降级。分段前无损不代表摘要无损；跨段滚动归并尚未实现。
 - [Responses](docs/openai-responses.md)维护 Codex 接入、工具、进程内状态及流式边界。
 - [运维指南](docs/startup-and-debugging.zh-CN.md)维护 CLI 迁移、配置、部署和备份恢复。
-- [1.0 发布方案](docs/release-readiness-1.0.0.zh-CN.md)维护核查快照、修复工作包和发布步骤。
-  不要把历史检查通过或修复方案写好当作当前代码已经通过。
+- [贡献指南](CONTRIBUTING.md#validation)维护验证命令及发布约定。
+  不要把历史检查通过当作当前代码已经通过。

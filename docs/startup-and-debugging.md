@@ -5,11 +5,75 @@
 This guide follows current source, including unreleased changes after `v0.2.4`.
 Start with the project README for initial setup. This reference covers environment,
 accounts, persisted state, Docker/systemd, CLI migration and recovery. Run commands
-from the repository root; `kproxy` means a matching native binary or the installed Docker wrapper.
+from the repository root; `crosslane` means a matching native binary or the installed Docker wrapper.
 
 - [Environment](#2-environment-loading), [accounts](#4-add-or-import-accounts), [configuration](#6-configuration-and-hot-reload)
 - [Docker](#8-docker-compose), [systemd](#9-systemd), [backup and recovery](#back-up-and-restore)
 - [CLI migration](#migration-from-the-old-cli), [logs](#7-logs-and-trace-ids), [troubleshooting](#troubleshooting)
+- [Crosslane rename migration](#crosslane-rename-migration)
+
+## Crosslane rename migration
+
+Crosslane replaces the former `kiro-proxy` project identity. This is a breaking
+deployment rename; the daemon does not automatically move or select old state.
+
+| Previous name | Crosslane name |
+| --- | --- |
+| CLI `kproxy`, daemon `kproxyd` | `crosslane`, `crosslaned` |
+| Crates/directories `kproxy-*` | `crosslane-*` |
+| Environment variables `KPROXY_*` | `CROSSLANE_*` with the same suffix |
+| Development home `.kproxy-dev` | `.crosslane-dev` |
+| XDG config/data/runtime subdirectory `kproxy` | `crosslane` |
+| systemd `kproxyd.service`, user/group `kproxy` | `crosslaned.service`, user/group `crosslane` |
+| `/etc/kproxy`, `/var/lib/kproxy`, `/run/kproxy` | `/etc/crosslane`, `/var/lib/crosslane`, `/run/crosslane` |
+| Compose project `kiro-proxy`, service `kproxyd`, volume `kproxy-data` | `crosslane`, `crosslaned`, `crosslane-data` |
+| Image `ghcr.io/yaocool/kiro-proxy` | `ghcr.io/yaocool/crosslane` |
+| `deploy/kproxy-docker`, `deploy/install-kproxy-wrapper.sh` | `deploy/crosslane-docker`, `deploy/install-crosslane-wrapper.sh` |
+| Saved deployment image `deploy/.kproxy-image` | `deploy/.crosslane-image` |
+| Docker label `io.kiro-proxy.role`, diagnostic headers `x-kproxy-*` | `io.crosslane.role`, `x-crosslane-*` |
+| Unreported-usage marker `kproxy_usage_source` | `crosslane_usage_source` |
+
+1. Stop the old daemon before copying state. For Docker, use the old checkout's
+   Compose file and project name to stop `kproxyd`. Back up the complete config
+   and data directories, including `providers/`, statistics, policies, and
+   `web-search-replay.key`. Do not delete the old Docker volume.
+2. For native development, move `.kproxy-dev` to `.crosslane-dev` and update the
+   existing `.env`, preserving its values. For XDG/systemd installations, copy the
+   config and data into the new directories and grant the new service user access.
+   Change environment variable names and `RUST_LOG` module filters (`kproxyd` →
+   `crosslaned`, `kproxy_*` → `crosslane_*`). `KIRO_API_KEY` is an upstream Kiro
+   credential variable and keeps its name.
+3. Inspect the copied `config.toml`: update `admin.socket`, `log.file_path`, TLS
+   certificate paths and provider-specific file paths that refer to moved
+   directories. Existing configuration is not rewritten by bootstrap. Keep
+   provider IDs, account IDs, model policy, credentials and client API keys intact.
+4. For Docker, restore the full backup into the new project's data volume
+   **before starting** `crosslaned`. The default volume is
+   `crosslane_crosslane-data`, mounted at `/var/lib/crosslane`; custom project
+   names produce different volume names. Read the actual name with
+   `docker compose config`. The container still uses UID/GID `10001`; preserve
+   that ownership. Update old absolute paths in the restored config. Merely
+   changing `--project-name` does not migrate the differently named volume.
+5. Install matching Crosslane binaries or the new Docker wrapper; regenerate
+   shell completion using `crosslane completions`. When reusing a custom wrapper
+   path, `install-crosslane-wrapper.sh --target PATH` recognizes the old managed
+   wrapper without `--force`; the default destination is now `/usr/local/bin/crosslane`.
+   Install and start
+   `crosslaned.service` for systemd. Select a Crosslane image explicitly instead
+   of copying the old saved image reference; pre-rename images lack the new
+   executable names and container paths. Use a source build until the renamed
+   image is published. Image rollback does not migrate state between identities.
+6. Verify `crosslane version`, `crosslane health`, `crosslane config path`,
+   `crosslane provider list`, `crosslane account list --provider all`, and
+   `crosslane model list`. Keep the stopped old deployment and backup until
+   account counts, service/API-key access and disabled-model policy are confirmed.
+
+The API routes and persisted account/key formats retain their existing meanings.
+New Web Search replay records carry `crosslane.v2.`; old `kproxy.v2.` records are
+still authenticated and decrypted with the original replay key. Retaining this
+key is necessary to replay earlier conversations.
+Stable upstream session IDs retain their pre-rename hash namespace so existing
+client conversations keep the same identity after upgrading.
 
 ## 1. Prerequisites
 
@@ -27,7 +91,7 @@ Copy the example before starting a local daemon:
 cp .env.example .env  # First setup only; preserve an existing .env
 ```
 
-`kproxyd` loads `.env` before parsing startup arguments. `kproxy` first parses
+`crosslaned` loads `.env` before parsing startup arguments. `crosslane` first parses
 local navigation such as help, guides, completion, and version; it loads `.env`
 before reparsing and running any business command. Both search from the current
 directory upward, which lets commands launched from a workspace subdirectory
@@ -44,22 +108,22 @@ An existing process variable is never overwritten by `.env`. A missing `.env`
 is allowed; a malformed or unreadable file fails daemon startup and business
 commands, while local CLI navigation remains available.
 
-The example uses `KPROXY_HOME=.kproxy-dev` to isolate development files. The most
+The example uses `CROSSLANE_HOME=.crosslane-dev` to isolate development files. The most
 important process-level variables are:
 
 | Variable | Purpose |
 | --- | --- |
-| `KPROXY_HOME` | Places configuration, data, logs, and the generated admin socket below one directory. |
-| `KPROXY_HTTP_PORT` | Overrides a configured proxy service port that matches the `server.port` default; it does not create a service. |
-| `KPROXY_DISABLE_HTTP=1` | Prevents configured proxy services from listening while leaving their configuration and the Unix administration socket intact. |
-| `KPROXY_ADMIN_SOCKET` | Overrides the socket used by the `kproxy` CLI; it does not reconfigure `kproxyd`. |
-| `KPROXY_CODEWHISPERER_URL` | Overrides the CodeWhisperer upstream URL for integration tests or controlled proxies. |
-| `KPROXY_AMAZONQ_URL` | Overrides the Amazon Q upstream URL for integration tests or controlled proxies. |
+| `CROSSLANE_HOME` | Places configuration, data, logs, and the generated admin socket below one directory. |
+| `CROSSLANE_HTTP_PORT` | Overrides a configured proxy service port that matches the `server.port` default; it does not create a service. |
+| `CROSSLANE_DISABLE_HTTP=1` | Prevents configured proxy services from listening while leaving their configuration and the Unix administration socket intact. |
+| `CROSSLANE_ADMIN_SOCKET` | Overrides the socket used by the `crosslane` CLI; it does not reconfigure `crosslaned`. |
+| `CROSSLANE_CODEWHISPERER_URL` | Overrides the CodeWhisperer upstream URL for integration tests or controlled proxies. |
+| `CROSSLANE_AMAZONQ_URL` | Overrides the Amazon Q upstream URL for integration tests or controlled proxies. |
 | `RUST_LOG` | Sets tracing filters for console and application diagnostics. |
 | `RUST_BACKTRACE` | Enables Rust backtraces when set to `1` or `full`. |
 
-Use an absolute `KPROXY_HOME` when launching from different directories. Loading
-the same `.env` does not rebase relative paths: `.kproxy-dev` is relative to the
+Use an absolute `CROSSLANE_HOME` when launching from different directories. Loading
+the same `.env` does not rebase relative paths: `.crosslane-dev` is relative to the
 process working directory. CLI socket precedence is `--socket`, process environment,
 `.env`, then configuration/defaults. The [environment template](../.env.example)
 also documents MCP/runtime/management overrides and CLI credential input.
@@ -71,22 +135,22 @@ TLS, notification, and logging configuration.
 
 ```bash
 cargo build --workspace --locked
-cargo run -p kproxyd
+cargo run -p crosslaned
 ```
 
-In another terminal at the same root, run `cargo run -p kproxy -- health`.
-For later commands, use `./target/debug/kproxy` or put that directory in `PATH`.
+In another terminal at the same root, run `cargo run -p crosslane -- health`.
+For later commands, use `./target/debug/crosslane` or put that directory in `PATH`.
 Use `cargo build --release --locked` for optimized binaries. Only one daemon may
 own a socket: stale sockets are cleaned up, but reachable sockets are preserved.
-`KPROXY_DISABLE_HTTP=1` disables business listeners while retaining their configuration and the admin socket.
+`CROSSLANE_DISABLE_HTTP=1` disables business listeners while retaining their configuration and the admin socket.
 
 ## 4. Add or import accounts
 
 Import enterprise SSO credentials from a JSON file or stdin:
 
 ```bash
-kproxy account import --file accounts.json --tag team-a
-cat accounts.json | kproxy account import --stdin --tag team-a --tag prod
+crosslane account import --file accounts.json --tag team-a
+cat accounts.json | crosslane account import --stdin --tag team-a --tag prod
 ```
 
 `id`, `machine_id`, and `created_at` may be omitted; the CLI generates them.
@@ -95,7 +159,7 @@ this import; per-account `tags` already present in JSON are preserved.
 To tag accounts that already exist, pass multiple IDs or emails to one command:
 
 ```bash
-kproxy account tag --add test acc_2c36cfad acc_332c7cb2 acc_41c6e3ad
+crosslane account tag --add test acc_2c36cfad acc_332c7cb2 acc_41c6e3ad
 ```
 
 Every target is validated before the batch is saved: if any account does not
@@ -128,9 +192,9 @@ Set `KIRO_API_KEY` securely in the CLI's environment, then import it without
 putting the secret in a command argument:
 
 ```bash
-kproxy account add-api-key --email ci@example.com --region us-east-1 --tag ci
+crosslane account add-api-key --email ci@example.com --region us-east-1 --tag ci
 # Alternatively read the key from standard input:
-kproxy account add-api-key --email ci@example.com --region eu-central-1 --key-stdin < /secure/kiro-key
+crosslane account add-api-key --email ci@example.com --region eu-central-1 --key-stdin < /secure/kiro-key
 ```
 
 The key is stored as `credentials.access_token` with `auth_method: "api_key"`
@@ -149,22 +213,23 @@ OAuth defaults retain the existing regional Q/CodeWhisperer routes; set
 `upstream.preferred_endpoint = "runtime"` to prefer regional Kiro runtime and
 management RPC. GovCloud and API-key credentials use runtime without a legacy
 endpoint fallback. GovCloud profile discovery cannot substitute a commercial
-Builder ID profile. Test/deployment overrides `KPROXY_RUNTIME_URL` and
-`KPROXY_MANAGEMENT_URL` accept `{region}`. Setting `KIRO_API_KEY` on the daemon
+Builder ID profile. Test/deployment overrides `CROSSLANE_RUNTIME_URL` and
+`CROSSLANE_MANAGEMENT_URL` accept `{region}`. Setting `KIRO_API_KEY` on the daemon
 alone does not import an account.
 
-Account exports contain credentials by default. Use `--redact` before sharing
-diagnostic output:
+Account exports now redact credentials by default. Explicitly add
+`--include-secrets` only for a protected credential backup (`--redact` remains
+accepted for older scripts):
 
 ```bash
-kproxy --json account export --redact
+crosslane --json account export
 ```
 
 ### Enterprise SSO authentication
 
-The default `kproxyd` build and Docker Compose enable all features, including the
+The default `crosslaned` build and Docker Compose enable all features, including the
 Chromium-based enterprise IAM Identity Center login. First set a global start
-URL with `kproxy config edit`:
+URL with `crosslane config edit`:
 
 ```toml
 [sso]
@@ -174,15 +239,15 @@ start_url = "https://example.awsapps.com/start"
 Manual account additions can then omit `--start-url`:
 
 ```bash
-printf '%s\n' "$PASSWORD" | kproxy account add-sso \
+printf '%s\n' "$PASSWORD" | crosslane account add-sso \
   --email user@example.com \
   --tag team-a \
   --password-stdin
 
-kproxy account add-sso --batch accounts.csv -c 1 --tag team-a
+crosslane account add-sso --batch accounts.csv -c 1 --tag team-a
 
 # Read explicitly from stdin for pipelines and automation:
-kproxy account add-sso --batch - -c 1 < accounts.csv
+crosslane account add-sso --batch - -c 1 < accounts.csv
 ```
 
 Use `--start-url` to override the global value for one login. When a smaller
@@ -198,7 +263,7 @@ accounts in that batch. Add
 `--headful` when MFA or an upstream page change requires manual interaction.
 Every login uses a dedicated incognito Chromium context and temporary profile,
 which are destroyed before the next account is processed. Before saving an
-account, kproxy records Kiro's stable user ID and refuses to register that same
+account, crosslane records Kiro's stable user ID and refuses to register that same
 identity under another email. Kiro display names are diagnostic only because
 IAM Identity Center names do not always match login email addresses.
 This flow does not add support for non-enterprise or non-SSO accounts.
@@ -210,11 +275,11 @@ accounts, listeners, meter recovery and background-task heartbeats. Neither prov
 that upstream generation works. Save the client API key returned by service creation:
 
 ```bash
-kproxy service create --name main --host 127.0.0.1 --port 5580
-kproxy service list
-kproxy service apikeys main
-kproxy ready
-kproxy models list
+crosslane service create --name main --host 127.0.0.1
+crosslane service list
+crosslane service apikeys main
+crosslane ready
+crosslane models list
 ```
 
 Select an account pool by one or more tags when creating a service. Multiple
@@ -224,16 +289,16 @@ before they become bound to a service; if you created the global-pool `main`
 service above, exclude these accounts from it first:
 
 ```bash
-kproxy service remove-account main alice@example.com bob@example.com
-kproxy account tag alice@example.com --add team-a
-kproxy account tag bob@example.com --add team-b
-kproxy service create --name team-a --host 127.0.0.1 --port 5581 --account-tag team-a team-b
-kproxy service accounts team-a
-kproxy account services alice@example.com
+crosslane service remove-account main alice@example.com bob@example.com
+crosslane account tag alice@example.com --add team-a
+crosslane account tag bob@example.com --add team-b
+crosslane service create --name team-a --host 127.0.0.1 --account-tag team-a team-b
+crosslane service accounts team-a
+crosslane account services alice@example.com
 
 # Explicitly include an account with any tag, or exclude one from this service:
-kproxy service add-account team-a carol@example.com
-kproxy service remove-account team-a alice@example.com
+crosslane service add-account team-a carol@example.com
+crosslane service remove-account team-a alice@example.com
 ```
 
 The effective pool is “any selected tag matches + explicit additions - exclusions”; exclusion
@@ -247,14 +312,17 @@ adding labels to a global/manual pool is allowed. Inspect bindings with
 Stop a service before changing its pool tag:
 
 ```bash
-kproxy service disable team-a
-kproxy service edit team-a --account-tag team-b team-c  # or --clear-account-tag for the global pool
-kproxy service enable team-a
+crosslane service disable team-a
+crosslane service edit team-a --account-tag team-b team-c  # or --clear-account-tag for the global pool
+crosslane service enable team-a
 ```
 
-Omitting `--host` defaults to `0.0.0.0`. `service apikey <service>` (alias of
-`service apikeys`) displays full keys by default, including JSON output. Use
-`--redact` to hide them; the old `--show-secret` flag is still accepted.
+Omitting `--host` defaults to `0.0.0.0`. Omitting `--port` uses `server.port`
+for the first service, then one above the highest configured service port
+(including disabled services). An external listener can still occupy that port;
+use `--port` to override it. `service apikey <service>` (alias of
+`service apikeys`) hides full keys by default, including JSON output. Use
+`--show-secret` to reveal them; `--redact` remains accepted for older scripts.
 Services accept only bound API keys. Messages defaults
 to Claude Code admission; Chat/Responses default to Codex. To allow another client,
 use `service edit` or `apikey edit` with `--skip-user-agent-check true`. Key authentication,
@@ -270,20 +338,20 @@ Use `.env` for startup-path selection and temporary process overrides. Use
 notification settings. See [`.env.example`](../.env.example) for every supported
 example variable and its purpose.
 
-Set `KPROXY_HOME` to place configuration, data, logs, and the administration socket
-under one directory. Without `KPROXY_HOME`, XDG locations are used:
+Set `CROSSLANE_HOME` to place configuration, data, logs, and the administration socket
+under one directory. Without `CROSSLANE_HOME`, XDG locations are used:
 
 | File | Default location | Notes |
 | --- | --- | --- |
-| `config.toml` | `${XDG_CONFIG_HOME:-~/.config}/kproxy/` | Human-edited daemon configuration. |
-| `accounts.json` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | Contains credentials; created with mode `0600`. |
-| `daily.json` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | Daily credit accounting, reset on UTC boundaries. |
-| `stats.json` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | Persisted aggregate request statistics. |
-| `stats-history/` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | One-minute request aggregates split into bounded UTC hourly shards. |
-| `alert-incidents.json` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | Persisted alert incident suppression; include it in backups. |
-| `web-search-replay.key` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | AES-256-GCM replay key; created with mode `0600` and never overwritten. |
-| `admin.sock` | `${XDG_RUNTIME_DIR}/kproxy/` or `/run/kproxy/` | Local administration plane. |
-| Logs | `${XDG_DATA_HOME:-~/.local/share}/kproxy/logs/` | Split by UTC date and severity. |
+| `config.toml` | `${XDG_CONFIG_HOME:-~/.config}/crosslane/` | Human-edited daemon configuration. |
+| `accounts.json` | `${XDG_DATA_HOME:-~/.local/share}/crosslane/` | Contains credentials; created with mode `0600`. |
+| `daily.json` | `${XDG_DATA_HOME:-~/.local/share}/crosslane/` | Daily credit accounting, reset on UTC boundaries. |
+| `stats.json` | `${XDG_DATA_HOME:-~/.local/share}/crosslane/` | Persisted aggregate request statistics. |
+| `stats-history/` | `${XDG_DATA_HOME:-~/.local/share}/crosslane/` | One-minute request aggregates split into bounded UTC hourly shards. |
+| `alert-incidents.json` | `${XDG_DATA_HOME:-~/.local/share}/crosslane/` | Persisted alert incident suppression; include it in backups. |
+| `web-search-replay.key` | `${XDG_DATA_HOME:-~/.local/share}/crosslane/` | AES-256-GCM replay key; created with mode `0600` and never overwritten. |
+| `admin.sock` | `${XDG_RUNTIME_DIR}/crosslane/` or `/run/crosslane/` | Local administration plane. |
+| Logs | `${XDG_DATA_HOME:-~/.local/share}/crosslane/logs/` | Split by UTC date and severity. |
 
 On first startup, missing files are created without overwriting existing data.
 Valid configuration changes are hot-reloaded. Invalid TOML or validation
@@ -299,13 +367,26 @@ envelope plus incremental sidecar updates according to the storage settings.
 ### Configuration commands
 
 ```bash
-kproxy config path
-kproxy config show --effective
-kproxy config validate
-kproxy config edit
-kproxy config reload
-kproxy models resolve claude-sonnet-4.5
+crosslane config path
+crosslane config show --effective
+crosslane config validate
+crosslane config edit
+crosslane config reload
+crosslane models resolve claude-sonnet-4.5
 ```
+
+`config show` redacts credentials and omits source comments by default. Use
+`config show --show-secrets` only when the complete original configuration is
+needed. `config show --effective` uses the daemon's last applied configuration,
+including while the on-disk TOML is invalid. With `--json`, it returns only
+`path` and `effective_json`. `config edit --json` returns a structured result.
+`config reload` exits nonzero when the daemon rejects the new file.
+
+`service list` shows effective ports (the expected port for a stopped service).
+Without `--port`, service creation chooses one above the highest effective port, including a
+`CROSSLANE_HTTP_PORT` override. If `CROSSLANE_DISABLE_HTTP=1`, creation reports
+that the listener is not running. `status --watch --json` and
+`pool --watch --json` produce newline-delimited JSON snapshots.
 
 Configuration edits and service/apikey/alert/model-map mutations share validation,
 transaction locks, atomic writes and hot reload. Change process overrides in the
@@ -313,21 +394,21 @@ environment and restart. Upgrades retain existing values instead of replacing th
 with new defaults. Model discovery runs at startup, after account changes and on
 cache expiry; account status tasks only refresh credits. Conditional model maps use
 the selected account's credits; `--below-credits-percent` rules without a schedule apply all day.
-Alerts use `--platform` and `--webhook-url`; see `kproxy alert platforms` for platform
+Alerts use `--platform` and `--webhook-url`; see `crosslane alert platforms` for platform
 options. `alert edit --event` replaces subscriptions. Ongoing incidents are deduplicated
 until recovery; same-kind account incidents are briefly aggregated.
-Use `kproxy help --all` and `kproxy guide` for the complete command tree and topics.
+Use `crosslane help --all` and `crosslane guide` for the complete command tree and topics.
 
 ## 7. Logs and trace IDs
 
 ```bash
-kproxy logs show --tail 100
-kproxy logs follow --level warn
-kproxy logs trace <TRACE_ID>
-kproxy logs path
-kproxy logs files --level error
-kproxy status --since 30m
-kproxy stats --detail --since 1h --by endpoint
+crosslane logs show --tail 100
+crosslane logs follow --level warn
+crosslane logs trace <TRACE_ID>
+crosslane logs path
+crosslane logs files --level error
+crosslane status --since 30m
+crosslane stats --detail --since 1h --by endpoint
 ```
 
 Response headers `x-trace-id` and `request-id` identify a request across dates and
@@ -345,33 +426,32 @@ Use logs for individual failures; `stats --detail` is not a complete request aud
 
 ## 8. Docker Compose
 
-Published images currently target Linux amd64 full. `v0.2.4` is a version-selection
-example; check registry availability before use. Build current source to validate
-unreleased features. Setup pulls first, replaces the container, waits for health,
-then installs the matching host wrapper:
+The Crosslane image has not been published yet; build the current source on a
+Linux amd64 host. Setup waits for health and installs the matching host wrapper.
+After the first image release, `--image` can select a published tag or digest:
 
 ```bash
-./deploy/docker-setup.sh --image ghcr.io/yaocool/kiro-proxy:v0.2.4
-kproxy version
-kproxy ready
+./deploy/docker-setup.sh --build
+crosslane version
+crosslane ready
 ```
 
-The default wrapper destination is `/usr/local/bin/kproxy`; use
-`--target "$HOME/.local/bin/kproxy"` for a user-owned path. Later,
+The default wrapper destination is `/usr/local/bin/crosslane`; use
+`--target "$HOME/.local/bin/crosslane"` for a user-owned path. Later,
 `./deploy/docker-upgrade.sh` follows `latest`; retain `--image` for version pinning.
-`./deploy/install-kproxy-wrapper.sh` installs only the wrapper and refuses to replace unrelated commands by default.
+`./deploy/install-crosslane-wrapper.sh` installs only the wrapper and refuses to replace unrelated commands by default.
 
 Compose uses host networking, supported directly on Linux Engine; Docker Desktop
 4.34+ needs it enabled in settings. Services bind host ports directly and default
-to `0.0.0.0`; choose `127.0.0.1` for local-only access. The `kproxy-data` volume mounts
-at `/var/lib/kproxy`. Do not mount development `.kproxy-dev` or `.env.example` into it.
+to `0.0.0.0`; choose `127.0.0.1` for local-only access. The `crosslane-data` volume mounts
+at `/var/lib/crosslane`. Do not mount development `.crosslane-dev` or `.env.example` into it.
 Existing bridge deployments need container recreation to adopt the new network mode;
 the volume is retained. Inspect deployment or deliberately build source with:
 
 ```bash
 docker compose config --quiet
 docker compose ps
-docker compose logs -f kproxyd
+docker compose logs -f crosslaned
 # Source build only:
 docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 ```
@@ -382,15 +462,15 @@ browser SSO; CI currently does not publish this target. Local builds default to
 `CARGO_BUILD_JOBS=1`. The image includes vim; `EDITOR` may select another installed editor.
 
 The wrapper requires a working Docker engine and an identifiable deployment. Select
-among multiple deployments with `KPROXY_COMPOSE_PROJECT` or `KPROXY_DOCKER_CONTAINER`.
+among multiple deployments with `CROSSLANE_COMPOSE_PROJECT` or `CROSSLANE_DOCKER_CONTAINER`.
 Stopped-container navigation uses the exact local image without network or business
 mounts. Missing images, ambiguous targets and old images without local navigation
 fail explicitly. Business commands need a running daemon. The wrapper preserves
 exit codes/stdin, allocates a TTY for interactive use, and passes or falls back from `TERM`.
 
-`kproxy restart` waits for health; `kproxy stop` retains the deployment.
-`kproxy uninstall` stops service, backs up state, then deletes the container, volume,
-unshared image and wrapper. Backups default to `~/.kproxy/backups`. Failed backup
+`crosslane restart` waits for health; `crosslane stop` retains the deployment.
+`crosslane uninstall` stops service, backs up state, then deletes the container, volume,
+unshared image and wrapper. Backups default to `~/.crosslane/backups`. Failed backup
 restarts the container and preserves data. `uninstall --yes` retains the backup;
 only explicit `--delete-backup` removes it. `docker compose down` retains volumes;
 `down -v` deletes them.
@@ -411,41 +491,41 @@ Build release binaries and install them with the provided unit:
 ```bash
 cargo build --release --locked
 
-sudo useradd --system --user-group --home-dir /var/lib/kproxy --shell /usr/sbin/nologin kproxy
-sudo install -m 0755 target/release/kproxyd target/release/kproxy /usr/local/bin/
-sudo install -m 0644 deploy/kproxyd.service /etc/systemd/system/kproxyd.service
+sudo useradd --system --user-group --home-dir /var/lib/crosslane --shell /usr/sbin/nologin crosslane
+sudo install -m 0755 target/release/crosslaned target/release/crosslane /usr/local/bin/
+sudo install -m 0644 deploy/crosslaned.service /etc/systemd/system/crosslaned.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now kproxyd
-sudo systemctl status kproxyd
+sudo systemctl enable --now crosslaned
+sudo systemctl status crosslaned
 ```
 
-If the `kproxy` user already exists, skip `useradd`. The unit uses `/etc/kproxy`,
-`/var/lib/kproxy`, and `/run/kproxy` through systemd-managed directories.
+If the `crosslane` user already exists, skip `useradd`. The unit uses `/etc/crosslane`,
+`/var/lib/crosslane`, and `/run/crosslane` through systemd-managed directories.
 
 ```bash
-sudo -u kproxy kproxy --socket /run/kproxy/admin.sock status
-sudo journalctl -u kproxyd -f
-sudo systemctl reload kproxyd
+sudo -u crosslane crosslane --socket /run/crosslane/admin.sock status
+sudo journalctl -u crosslaned -f
+sudo systemctl reload crosslaned
 ```
 
 Reload sends `SIGHUP`. Restart-required settings still need
-`sudo systemctl restart kproxyd`.
+`sudo systemctl restart crosslaned`.
 
-Install Chrome or Chromium on the host before using `kproxy account add-sso`.
+Install Chrome or Chromium on the host before using `crosslane account add-sso`.
 The provided unit supports the default full build: it intentionally leaves user
 namespaces and executable JIT memory available for Chromium, while retaining
 `NoNewPrivileges`, filesystem protection, an empty capability set, and the other
 hardening controls. If the host kernel disables unprivileged user namespaces,
 prefer enabling them. As a last-resort compatibility override, set
-`KPROXY_CHROMIUM_NO_SANDBOX=1` with `systemctl edit kproxyd`; this disables
+`CROSSLANE_CHROMIUM_NO_SANDBOX=1` with `systemctl edit crosslaned`; this disables
 Chromium's own sandbox and should only be used after reviewing the host's
 isolation boundary.
 
 ## Navigation and scripting
 
-`kproxy`, `kproxy help`, and bare groups such as `kproxy logs` display help.
-Use `kproxy help logs trace` for nested options, `kproxy help --all` for the public
-command tree, and `kproxy guide` for operational topics. These commands and
+`crosslane`, `crosslane help`, and bare groups such as `crosslane logs` display help.
+Use `crosslane help logs trace` for nested options, `crosslane help --all` for the public
+command tree, and `crosslane guide` for operational topics. These commands and
 `completions`/`version` work without a daemon or a valid `.env`.
 
 Business output supports global `--json`. A bare group with `--json` exits 2,
@@ -460,10 +540,12 @@ Replace IDs, names, paths and secrets with your own values. `diagnose all` and
 
 ## Migration from the old CLI
 
-Provider scope is shared across the command tree: `kproxy --provider copilot
-account list`, `kproxy account --provider copilot list` and the leaf form are
-equivalent. `-p` is the short form. `KPROXY_PROVIDER` sets the shell default;
-explicit flags override it. The value is the configured instance ID shown by
+Provider scope is shared across the command tree: `crosslane --provider copilot
+account list`, `crosslane account --provider copilot list` and the leaf form are
+equivalent. `-p` is the short form. `CROSSLANE_PROVIDER` sets the shell default;
+native business commands also read it from `.env`, including `account add` and
+`account login-code`. Explicit flags override the process environment, which
+overrides `.env`. The value is the configured instance ID shown by
 `provider list`, not the driver kind or the display name “GitHub Copilot”.
 For example, an instance created with `--id work-cp --kind copilot` uses
 `--provider work-cp`. `provider show work-cp` prints commands using that ID;
@@ -474,7 +556,7 @@ wrapper together with the CLI to use these forms.
 
 Nested help and `help --all` identify shared, Kiro-only, Copilot-only, global and
 resource-selected commands. Global operations and commands that locate a
-resource by positional ID/name ignore `KPROXY_PROVIDER` and reject an explicit
+resource by positional ID/name ignore `CROSSLANE_PROVIDER` and reject an explicit
 `--provider` instead of silently ignoring it. Global model disable/enable retains
 its stricter check: override a shell scope with `--provider all`. Kiro tasks accept
 only `kiro`; model-cache refresh accepts an instance ID; global tasks do not take
@@ -499,12 +581,12 @@ Copilot. Qualify ambiguous account references with `provider/account_id`.
 
 | Previous form | Current form |
 | --- | --- |
-| `kproxy logs --tail 100` | `kproxy logs show --tail 100` |
-| `kproxy logs -f` / `--follow` | `kproxy logs follow` |
-| `kproxy models --refresh --mapped` | `kproxy models list --refresh --mapped` |
-| `kproxy tasks` (data query) | `kproxy tasks list` |
-| `kproxy diagnose` (full diagnosis) | `kproxy diagnose all` |
-| `kproxy help balance` | `kproxy guide balance` |
+| `crosslane logs --tail 100` | `crosslane logs show --tail 100` |
+| `crosslane logs -f` / `--follow` | `crosslane logs follow` |
+| `crosslane models --refresh --mapped` | `crosslane models list --refresh --mapped` |
+| `crosslane tasks` (data query) | `crosslane tasks list` |
+| `crosslane diagnose` (full diagnosis) | `crosslane diagnose all` |
+| `crosslane help balance` | `crosslane guide balance` |
 | `account add-sso-batch --file FILE` | `account add-sso --batch FILE` |
 | `alert add --kind ... --url ...` | `alert add --platform ... --webhook-url ...` |
 | Alert platform `wechat` | `wechat-work` (check `alert platforms` for platform-specific options) |
@@ -532,11 +614,11 @@ copying. Example (run each step after verifying the previous result):
 
 ```bash
 umask 077
-backup_dir="$HOME/kproxy-backups/$(date -u +%Y%m%dT%H%M%SZ)"
+backup_dir="$HOME/crosslane-backups/$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$backup_dir"
-docker compose stop kproxyd
-docker compose cp kproxyd:/var/lib/kproxy/. "$backup_dir/"
-docker compose start kproxyd
+docker compose stop crosslaned
+docker compose cp crosslaned:/var/lib/crosslane/. "$backup_dir/"
+docker compose start crosslaned
 ```
 
 Check the copy exit status and inspect required files before treating it as a
@@ -561,10 +643,10 @@ the wrapper's `uninstall` is also destructive even though it first creates a bac
 | Symptom | Check |
 | --- | --- |
 | Port already in use | Compare `service list` with actual listeners; change the service port, not just the default for new services. |
-| Cannot connect to `admin.sock` | Check daemon, user, absolute `KPROXY_HOME`, `config path` and `--socket`. |
+| Cannot connect to `admin.sock` | Check daemon, user, absolute `CROSSLANE_HOME`, `config path` and `--socket`. |
 | Configuration unchanged | Run `config validate` and `config show --effective`; check environment overrides, retained defaults and restart-only settings. |
 | 401 / client rejected | Check the service's bound key, product User-Agent and exemptions. |
 | 503 | Inspect `ready`, credits/protection thresholds, concurrency, background tasks and `logs trace`. |
 | Stream interrupted | Inspect the protocol's final event and Trace ID; HTTP 200 does not establish success. |
 | Context overflow | Use `models resolve` and `error.context`; see [compaction boundaries](protocol-compatibility.md#automatic-compaction-and-model-windows). |
-| Old container version | Compare actual image ID and `kproxy version`; pull the intended release or deliberately build source. |
+| Old container version | Compare actual image ID and `crosslane version`; pull the intended release or deliberately build source. |
