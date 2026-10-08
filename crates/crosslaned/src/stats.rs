@@ -96,6 +96,8 @@ pub struct RequestLog {
     pub trace_id: String,
     pub request_id: String,
     pub path: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub user_agent: String,
     /// Provider instance that handled the request. Empty legacy records are
     /// interpreted as `kiro` when grouped.
     #[serde(default)]
@@ -1653,6 +1655,7 @@ mod tests {
             trace_id: format!("trace-{id}"),
             request_id: id.into(),
             path: "/v1/messages".into(),
+            user_agent: String::new(),
             provider_id: "kiro".into(),
             model: "mapped".into(),
             original_model: "client".into(),
@@ -1678,6 +1681,7 @@ mod tests {
         let mut value = serde_json::to_value(request("req-old", 42, 502)).expect("serialize");
         let object = value.as_object_mut().expect("request object");
         object.remove("provider_id");
+        object.remove("user_agent");
         object.remove("account_name");
         object.remove("model_path");
         object.remove("model_mapping_rule");
@@ -1685,6 +1689,7 @@ mod tests {
         object.remove("diagnostics");
         let decoded: RequestLog = serde_json::from_value(value).expect("deserialize legacy log");
         assert!(decoded.provider_id.is_empty());
+        assert!(decoded.user_agent.is_empty());
         assert!(decoded.account_name.is_empty());
         assert!(decoded.model_path.is_empty());
         assert!(decoded.model_mapping_rule.is_none());

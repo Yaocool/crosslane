@@ -43,6 +43,10 @@ they must receive a new version rather than replacing that tag or its image.
 
 ### Added
 
+- Record a bounded, sanitized client `user_agent` on business HTTP request and
+  WARN/ERROR failure events, including stream failures, and include it in
+  `logs show/follow` request records so the client version is visible with the
+  trace ID. Older request records remain readable.
 - `service create` without `--port` uses `server.port` for the first service,
   then one above the highest effective service port, including disabled
   services and any `CROSSLANE_HTTP_PORT` override. Service views report the

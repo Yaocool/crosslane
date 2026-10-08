@@ -1,5 +1,5 @@
 use super::{
-    handle_claude, handle_openai, json, log_model, now_secs, request_trace_id,
+    handle_claude, handle_openai, json, log_model, logged_user_agent, now_secs, request_trace_id,
     sanitize_error_message, ApiError, AppState, Arc, BTreeSet, Body, Bytes, Duration, ErrorFormat,
     HeaderMap, Instant, IntoResponse, Json, Request, RequestDiagnostics, RequestLog, Response,
     ServiceHttpState, State, StatusCode, StreamExt, UpstreamAttemptLog, Uuid, Value,
@@ -194,6 +194,7 @@ pub async fn claude_messages(
     let state = Arc::clone(&service.app);
     let path = request.uri().path().to_string();
     let trace_id = request_trace_id(&request);
+    let user_agent = logged_user_agent(request.headers());
     let started = Instant::now();
     let default_provider = state
         .config
@@ -205,7 +206,7 @@ pub async fn claude_messages(
         None => {
             let error =
                 ApiError::overloaded(ErrorFormat::Claude).with_provider_id(&default_provider);
-            record_failed_request(&state, &trace_id, &path, "", started, &error);
+            record_failed_request(&state, &trace_id, &path, &user_agent, "", started, &error);
             return error.with_request_id(&trace_id).into_response();
         }
     };
@@ -214,7 +215,7 @@ pub async fn claude_messages(
         None => {
             let error =
                 ApiError::overloaded(ErrorFormat::Claude).with_provider_id(&default_provider);
-            record_failed_request(&state, &trace_id, &path, "", started, &error);
+            record_failed_request(&state, &trace_id, &path, &user_agent, "", started, &error);
             return error.with_request_id(&trace_id).into_response();
         }
     };
@@ -223,7 +224,7 @@ pub async fn claude_messages(
             Ok(body) => body,
             Err(error) => {
                 let error = error.with_provider_id_if_empty(&default_provider);
-                record_failed_request(&state, &trace_id, &path, "", started, &error);
+                record_failed_request(&state, &trace_id, &path, &user_agent, "", started, &error);
                 return error.with_request_id(&trace_id).into_response();
             }
         };
@@ -248,7 +249,15 @@ pub async fn claude_messages(
     {
         Ok(response) => response,
         Err(error) => {
-            record_failed_request(&state, &trace_id, &path, &model, started, &error);
+            record_failed_request(
+                &state,
+                &trace_id,
+                &path,
+                &user_agent,
+                &model,
+                started,
+                &error,
+            );
             error.with_request_id(&trace_id).into_response()
         }
     }
@@ -258,6 +267,7 @@ pub async fn openai_chat(State(service): State<ServiceHttpState>, request: Reque
     let state = Arc::clone(&service.app);
     let path = request.uri().path().to_string();
     let trace_id = request_trace_id(&request);
+    let user_agent = logged_user_agent(request.headers());
     let started = Instant::now();
     let default_provider = state
         .config
@@ -269,7 +279,7 @@ pub async fn openai_chat(State(service): State<ServiceHttpState>, request: Reque
         None => {
             let error =
                 ApiError::overloaded(ErrorFormat::OpenAi).with_provider_id(&default_provider);
-            record_failed_request(&state, &trace_id, &path, "", started, &error);
+            record_failed_request(&state, &trace_id, &path, &user_agent, "", started, &error);
             return error.with_request_id(&trace_id).into_response();
         }
     };
@@ -278,7 +288,7 @@ pub async fn openai_chat(State(service): State<ServiceHttpState>, request: Reque
         None => {
             let error =
                 ApiError::overloaded(ErrorFormat::OpenAi).with_provider_id(&default_provider);
-            record_failed_request(&state, &trace_id, &path, "", started, &error);
+            record_failed_request(&state, &trace_id, &path, &user_agent, "", started, &error);
             return error.with_request_id(&trace_id).into_response();
         }
     };
@@ -287,7 +297,7 @@ pub async fn openai_chat(State(service): State<ServiceHttpState>, request: Reque
             Ok(body) => body,
             Err(error) => {
                 let error = error.with_provider_id_if_empty(&default_provider);
-                record_failed_request(&state, &trace_id, &path, "", started, &error);
+                record_failed_request(&state, &trace_id, &path, &user_agent, "", started, &error);
                 return error.with_request_id(&trace_id).into_response();
             }
         };
@@ -312,7 +322,15 @@ pub async fn openai_chat(State(service): State<ServiceHttpState>, request: Reque
     {
         Ok(response) => response,
         Err(error) => {
-            record_failed_request(&state, &trace_id, &path, &model, started, &error);
+            record_failed_request(
+                &state,
+                &trace_id,
+                &path,
+                &user_agent,
+                &model,
+                started,
+                &error,
+            );
             error.with_request_id(&trace_id).into_response()
         }
     }
@@ -456,6 +474,7 @@ pub(super) fn record_failed_request(
     state: &Arc<AppState>,
     trace_id: &str,
     path: &str,
+    user_agent: &str,
     model: &str,
     started: Instant,
     error: &ApiError,
@@ -494,6 +513,7 @@ pub(super) fn record_failed_request(
             trace_id,
             request_id,
             http_path = path,
+            user_agent,
             model = %model,
             mapped_model,
             kiro_model,
@@ -524,6 +544,7 @@ pub(super) fn record_failed_request(
             trace_id,
             request_id,
             http_path = path,
+            user_agent,
             model = %model,
             mapped_model,
             kiro_model,
@@ -554,6 +575,7 @@ pub(super) fn record_failed_request(
         trace_id: trace_id.into(),
         request_id,
         path: path.into(),
+        user_agent: user_agent.into(),
         provider_id: if error.log_context.provider_id.is_empty() {
             "kiro".into()
         } else {

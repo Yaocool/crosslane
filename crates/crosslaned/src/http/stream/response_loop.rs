@@ -66,10 +66,12 @@ pub fn response(
         .min(upstream_config.pool.keep_alive_max_ms.max(1));
     let bridge_trace_id = context.trace_id.clone();
     let bridge_request_id = context.request_id.clone();
+    let bridge_user_agent = context.user_agent.clone();
     tracing::info!(
         event = "proxy.stream.started",
         trace_id = %context.trace_id,
         request_id = %context.request_id,
+        user_agent = %context.user_agent,
         protocol = protocol.as_str(),
         account_id = %context.lease.account_id(),
         endpoint,
@@ -109,6 +111,7 @@ pub fn response(
                     failed = Some(web_search_replay_failure(
                         &context.trace_id,
                         &context.request_id,
+                        &context.user_agent,
                         &error,
                     ));
                     Vec::new()
@@ -469,6 +472,7 @@ pub fn response(
                 tracing::warn!(
                     trace_id = %context.trace_id,
                     request_id = %context.request_id,
+                    user_agent = %context.user_agent,
                     account_id = %failed_account_id,
                     endpoint,
                     data_started,
@@ -633,6 +637,7 @@ pub fn response(
                                 tracing::warn!(
                                     trace_id = %context.trace_id,
                                     request_id = %context.request_id,
+                                    user_agent = %context.user_agent,
                                     fallback_model = %resolved,
                                     input_tokens = context.input_tokens,
                                     "skipping stream model fallback because its context window is too small"
@@ -698,6 +703,7 @@ pub fn response(
                         &context.state,
                         &context.trace_id,
                         &context.request_id,
+                        &context.user_agent,
                         &failed_account_id,
                         failure_details,
                     )
@@ -810,6 +816,7 @@ pub fn response(
                             tracing::warn!(
                                 trace_id = %context.trace_id,
                                 request_id = %context.request_id,
+                                user_agent = %context.user_agent,
                                 account_id = %account.id,
                                 resolved_model = %context.kiro_model,
                                 "skipping stream retry account because its resolved model is outside the API key model scope"
@@ -842,6 +849,7 @@ pub fn response(
                             tracing::warn!(
                                 trace_id = %context.trace_id,
                                 request_id = %context.request_id,
+                                user_agent = %context.user_agent,
                                 account_id = %account.id,
                                 resolved_model = %context.kiro_model,
                                 input_tokens = context.input_tokens,
@@ -878,6 +886,7 @@ pub fn response(
                                 let message = web_search_replay_failure(
                                     &context.trace_id,
                                     &context.request_id,
+                                    &context.user_agent,
                                     &error,
                                 );
                                 failed = Some(message.clone());
@@ -931,6 +940,7 @@ pub fn response(
                                 &context.state,
                                 &context.trace_id,
                                 &context.request_id,
+                                &context.user_agent,
                                 &account.id,
                                 classify_stream_failure(&message, None),
                             )
@@ -997,6 +1007,7 @@ pub fn response(
                     tracing::warn!(
                         trace_id = %context.trace_id,
                         request_id = %context.request_id,
+                        user_agent = %context.user_agent,
                         account_id = %context.lease.account_id(),
                         endpoint,
                         retry = empty_tool_result_retries,
@@ -1075,6 +1086,7 @@ pub fn response(
                                 &context.state,
                                 &context.trace_id,
                                 &context.request_id,
+                                &context.user_agent,
                                 &account.id,
                                 classify_stream_failure(&message, None),
                             )
@@ -1101,6 +1113,7 @@ pub fn response(
                     tracing::error!(
                         trace_id = %context.trace_id,
                         request_id = %context.request_id,
+                        user_agent = %context.user_agent,
                         account_id = %context.lease.account_id(),
                         endpoint,
                         "upstream repeated an empty assistant turn after tool results"
@@ -1165,6 +1178,7 @@ pub fn response(
                                     let message = web_search_replay_failure(
                                         &context.trace_id,
                                         &context.request_id,
+                                        &context.user_agent,
                                         &error,
                                     );
                                     failed = Some(message.clone());
@@ -1213,6 +1227,7 @@ pub fn response(
                                     let message = web_search_replay_failure(
                                         &context.trace_id,
                                         &context.request_id,
+                                        &context.user_agent,
                                         &error,
                                     );
                                     failed = Some(message.clone());
@@ -1346,6 +1361,7 @@ pub fn response(
                                 let message = web_search_replay_failure(
                                     &context.trace_id,
                                     &context.request_id,
+                                    &context.user_agent,
                                     &error,
                                 );
                                 failed = Some(message.clone());
@@ -1558,6 +1574,7 @@ pub fn response(
                             &context.state,
                             &context.trace_id,
                             &context.request_id,
+                            &context.user_agent,
                             &account.id,
                             classify_stream_failure(&message, None),
                         )
@@ -1595,6 +1612,7 @@ pub fn response(
                                     let message = web_search_replay_failure(
                                         &context.trace_id,
                                         &context.request_id,
+                                        &context.user_agent,
                                         &error,
                                     );
                                     failed = Some(message.clone());
@@ -1666,6 +1684,7 @@ pub fn response(
                                 let message = web_search_replay_failure(
                                     &context.trace_id,
                                     &context.request_id,
+                                    &context.user_agent,
                                     &error,
                                 );
                                 failed = Some(message.clone());
@@ -1764,6 +1783,7 @@ pub fn response(
                             &context.state,
                             &context.trace_id,
                             &context.request_id,
+                            &context.user_agent,
                             &account.id,
                             classify_stream_failure(&message, None),
                         )
@@ -1874,6 +1894,7 @@ pub fn response(
                         &context.state,
                         &context.trace_id,
                         &context.request_id,
+                        &context.user_agent,
                         &account.id,
                         classify_stream_failure(&message, None),
                     )
@@ -1932,6 +1953,7 @@ pub fn response(
                     let message = web_search_replay_failure(
                         &context.trace_id,
                         &context.request_id,
+                        &context.user_agent,
                         &error,
                     );
                     failed = Some(message.clone());
@@ -2020,6 +2042,7 @@ pub fn response(
                     tracing::warn!(
                         trace_id = %bridge_trace_id,
                         request_id = %bridge_request_id,
+                        user_agent = %bridge_user_agent,
                         "client disconnected before stream completed"
                     );
                     break;
@@ -2028,6 +2051,7 @@ pub fn response(
                     tracing::warn!(
                         trace_id = %bridge_trace_id,
                         request_id = %bridge_request_id,
+                        user_agent = %bridge_user_agent,
                         "client stream write timed out"
                     );
                     break;

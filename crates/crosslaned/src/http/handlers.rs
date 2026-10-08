@@ -42,7 +42,6 @@ use crate::state::AppState;
 use crate::stats::{RequestDiagnostics, RequestLog, UpstreamAttemptLog};
 
 use super::prompt_cache::PromptCacheProfile;
-use super::request_trace_id;
 use super::response::{
     ClaudeServerEvent, CompactionIterationUsage, DecodedResponse, OpenAiToolIdentity,
     StopSequenceFilter, ThinkingContentFilter, ToolLeakFilter,
@@ -50,6 +49,7 @@ use super::response::{
 use super::stream::{self, StreamContext, StreamProtocol};
 use super::usage::{fallback_credits, fill_missing_usage};
 use super::ServiceHttpState;
+use super::{logged_user_agent, request_trace_id};
 
 const MAX_STATS_MODEL_CHARS: usize = 128;
 const MAX_ATTEMPT_LOG_SUMMARY_CHARS: usize = 4_096;
@@ -448,6 +448,7 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
     let state = Arc::clone(&service.app);
     let path = request.uri().path().to_string();
     let trace_id = request_trace_id(&request);
+    let user_agent = logged_user_agent(request.headers());
     let started = Instant::now();
     let default_provider = state
         .config
@@ -459,7 +460,7 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
         None => {
             let error =
                 ApiError::overloaded(ErrorFormat::Claude).with_provider_id(&default_provider);
-            record_failed_request(&state, &trace_id, &path, "", started, &error);
+            record_failed_request(&state, &trace_id, &path, &user_agent, "", started, &error);
             return error.with_request_id(&trace_id).into_response();
         }
     };
@@ -468,7 +469,7 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
         None => {
             let error =
                 ApiError::overloaded(ErrorFormat::Claude).with_provider_id(&default_provider);
-            record_failed_request(&state, &trace_id, &path, "", started, &error);
+            record_failed_request(&state, &trace_id, &path, &user_agent, "", started, &error);
             return error.with_request_id(&trace_id).into_response();
         }
     };
@@ -747,6 +748,7 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
             trace_id: trace_id.clone(),
             request_id: format!("req_{}", Uuid::new_v4().simple()),
             path: path.clone(),
+            user_agent: user_agent.clone(),
             provider_id: "kiro".into(),
             model: route.mapped.clone(),
             original_model: request.model.clone(),
@@ -790,7 +792,7 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
     match result {
         Ok(response) => response,
         Err(error) => {
-            record_failed_request(&state, &trace_id, &path, "", started, &error);
+            record_failed_request(&state, &trace_id, &path, &user_agent, "", started, &error);
             error.with_request_id(&trace_id).into_response()
         }
     }

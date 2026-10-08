@@ -1037,6 +1037,7 @@ mod tests {
             trace_id: "trace-shutdown".into(),
             request_id: "request-shutdown".into(),
             path: "/v1/messages".into(),
+            user_agent: String::new(),
             provider_id: "kiro".into(),
             model: "claude-sonnet-4.6".into(),
             original_model: "claude-sonnet-4.6".into(),

@@ -85,6 +85,7 @@ pub struct StreamContext {
     pub reservation: CreditReservation,
     pub trace_id: String,
     pub request_id: String,
+    pub user_agent: String,
     pub path: String,
     pub service_id: String,
     pub model: String,
@@ -1209,11 +1210,13 @@ fn stream_error(protocol: &StreamProtocol, request_id: &str, message: &str) -> S
 fn web_search_replay_failure(
     trace_id: &str,
     request_id: &str,
+    user_agent: &str,
     error: &WebSearchReplayError,
 ) -> String {
     tracing::error!(
         trace_id,
         request_id,
+        user_agent,
         %error,
         "failed to protect web-search replay data"
     );
@@ -1380,6 +1383,7 @@ async fn finish_accounting(
             event = "proxy.stream.completed",
             trace_id = %context.trace_id,
             request_id = %context.request_id,
+            user_agent = %context.user_agent,
             account_id = %context.lease.account_id(),
             %error,
             "failed to persist stream usage"
@@ -1412,6 +1416,7 @@ async fn finish_accounting(
         tracing::error!(
             trace_id = %context.trace_id,
             request_id = %context.request_id,
+            user_agent = %context.user_agent,
             account_id = %context.lease.account_id(),
             account_name,
             endpoint,
@@ -1449,6 +1454,7 @@ async fn finish_accounting(
             event = "proxy.stream.completed",
             trace_id = %context.trace_id,
             request_id = %context.request_id,
+            user_agent = %context.user_agent,
             account_id = %context.lease.account_id(),
             account_name,
             endpoint,
@@ -1467,6 +1473,7 @@ async fn finish_accounting(
         trace_id: context.trace_id,
         request_id: context.request_id,
         path: context.path,
+        user_agent: context.user_agent,
         provider_id: "kiro".into(),
         model: context.mapped_model,
         original_model: context.original_model,
@@ -1658,6 +1665,7 @@ async fn record_account_scoped_stream_failure(
     state: &Arc<AppState>,
     trace_id: &str,
     request_id: &str,
+    user_agent: &str,
     account_id: &str,
     details: StreamFailureDetails,
 ) {
@@ -1673,6 +1681,7 @@ async fn record_account_scoped_stream_failure(
                 tracing::error!(
                     trace_id,
                     request_id,
+                    user_agent,
                     account_id,
                     %error,
                     "failed to persist stream quota exhaustion"

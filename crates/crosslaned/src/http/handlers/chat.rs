@@ -231,6 +231,7 @@ impl CandidateRequest {
                     state,
                     &trace,
                     &self.path,
+                    &super::logged_user_agent(&self.headers),
                     &self.model,
                     started,
                     error,

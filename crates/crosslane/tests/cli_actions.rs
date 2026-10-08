@@ -1214,6 +1214,26 @@ async fn explicit_log_action_preserves_the_existing_query_parameters() {
     .await;
     assert_success(&output);
     assert_eq!(requests[0].params["level"], Value::Null);
+
+    let (output, _) = run_human(
+        &["logs", "show"],
+        vec![json!({"entries": [{
+            "timestamp": 1,
+            "status": 400,
+            "duration_ms": 1,
+            "path": "/v1/messages",
+            "trace_id": "trace_client_error",
+            "request_id": "req_client_error",
+            "user_agent": "claude-cli/2.1.260 (external, test)"
+        }]})],
+    )
+    .await;
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("user_agent=claude-cli/2.1.260 (external, test)"),
+        "{stdout}"
+    );
 }
 
 #[tokio::test]

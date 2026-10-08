@@ -545,6 +545,13 @@ pub async fn show_logs(
                         .filter(|value| !value.is_empty())
                         .unwrap_or("-"),
                 );
+                println!(
+                    "  client user_agent={}",
+                    request["user_agent"]
+                        .as_str()
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or("-"),
+                );
                 if let Some(error) = request["error"].as_str().filter(|value| !value.is_empty()) {
                     println!("  error: {error}");
                 }

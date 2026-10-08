@@ -1258,6 +1258,7 @@ pub(super) async fn nonstream_claude(
     trace_id: String,
     request_id: String,
     path: String,
+    user_agent: String,
     request: ClaudeRequest,
     thinking_enabled: bool,
     mapped_model: String,
@@ -1357,7 +1358,7 @@ pub(super) async fn nonstream_claude(
                 ErrorFormat::Claude,
             )
         })?;
-    state.stats.record(request_log(
+    let mut log = request_log(
         &trace_id,
         &request_id,
         &path,
@@ -1374,7 +1375,9 @@ pub(super) async fn nonstream_claude(
         diagnostics,
         &decoded,
         credits,
-    ));
+    );
+    log.user_agent = user_agent;
+    state.stats.record(log);
     tracing::info!(
         event = "proxy.response.completed",
         trace_id,
@@ -1404,6 +1407,7 @@ pub(super) async fn nonstream_openai(
     trace_id: String,
     request_id: String,
     path: String,
+    user_agent: String,
     request: OpenAiRequest,
     thinking_enabled: bool,
     mapped_model: String,
@@ -1464,7 +1468,7 @@ pub(super) async fn nonstream_openai(
         ))
         .await
         .map_err(|error| meter_error(error, ErrorFormat::OpenAi))?;
-    state.stats.record(request_log(
+    let mut log = request_log(
         &trace_id,
         &request_id,
         &path,
@@ -1481,7 +1485,9 @@ pub(super) async fn nonstream_openai(
         diagnostics,
         &decoded,
         credits,
-    ));
+    );
+    log.user_agent = user_agent;
+    state.stats.record(log);
     tracing::info!(
         event = "proxy.response.completed",
         trace_id,
@@ -1654,6 +1660,7 @@ pub(super) fn request_log(
         trace_id: trace_id.into(),
         request_id: request_id.into(),
         path: path.into(),
+        user_agent: String::new(),
         provider_id: "kiro".into(),
         model: model.into(),
         original_model: original_model.into(),

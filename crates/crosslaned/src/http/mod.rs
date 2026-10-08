@@ -29,6 +29,7 @@ use crate::state::AppState;
 
 pub(crate) const TRACE_ID_HEADER: &str = "x-trace-id";
 pub(crate) const REQUEST_ID_HEADER: &str = "request-id";
+const MAX_LOGGED_USER_AGENT_CHARS: usize = 256;
 
 #[derive(Clone)]
 pub(crate) struct RequestTrace {
@@ -80,6 +81,37 @@ pub(crate) fn request_trace_id(request: &axum::extract::Request) -> String {
         .get::<RequestTrace>()
         .map(|trace| trace.id.clone())
         .unwrap_or_else(|| format!("trace_{}", Uuid::new_v4().simple()))
+}
+
+pub(crate) fn logged_user_agent(headers: &axum::http::HeaderMap) -> String {
+    let Some(value) = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return "unknown".into();
+    };
+    let mut chars = value.chars();
+    let mut agent = chars
+        .by_ref()
+        .take(MAX_LOGGED_USER_AGENT_CHARS)
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>();
+    if chars.next().is_some() {
+        agent.pop();
+        agent.push('…');
+    }
+    // User-Agent is client-controlled. Avoid echoing credentials accidentally
+    // placed in it while retaining the product/version for ordinary clients.
+    let lower = agent.to_ascii_lowercase();
+    if ["sk-", "ksk_", "bearer ", "token=", "api_key="]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return "[redacted]".into();
+    }
+    agent
 }
 
 #[cfg(test)]
@@ -196,6 +228,7 @@ async fn trace_requests(
     let method = request.method().clone();
     let path = request.uri().path().to_string();
     let http_version = format!("{:?}", request.version());
+    let user_agent = logged_user_agent(request.headers());
     let content_length = request
         .headers()
         .get(axum::http::header::CONTENT_LENGTH)
@@ -216,6 +249,7 @@ async fn trace_requests(
         http_method = %method,
         http_path = %path,
         http_version,
+        user_agent = %user_agent,
         content_length,
         "client request received"
     );
@@ -226,7 +260,8 @@ async fn trace_requests(
         service_name = %service_name,
         http_method = %method,
         http_path = %path,
-        http_version = %http_version
+        http_version = %http_version,
+        user_agent = %user_agent
     );
     let mut response = next.run(request).instrument(span).await;
     let status = response.status();
@@ -271,6 +306,7 @@ async fn trace_requests(
             request_id = %response_request_id,
             http_method = %method,
             http_path = %path,
+            user_agent = %user_agent,
             http_status = status.as_u16(),
             error_code = %error_code,
             error_stage = %error_stage,
@@ -288,6 +324,7 @@ async fn trace_requests(
             request_id = %response_request_id,
             http_method = %method,
             http_path = %path,
+            user_agent = %user_agent,
             http_status = status.as_u16(),
             error_code = %error_code,
             error_stage = %error_stage,
@@ -305,6 +342,7 @@ async fn trace_requests(
             request_id = %response_request_id,
             http_method = %method,
             http_path = %path,
+            user_agent = %user_agent,
             http_status = status.as_u16(),
             duration_ms,
             "client response headers ready"
@@ -389,6 +427,7 @@ async fn catch_panics(request: axum::extract::Request, next: Next) -> Response {
     let request_id = request_trace_id(&request);
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
+    let user_agent = logged_user_agent(request.headers());
     match std::panic::AssertUnwindSafe(next.run(request))
         .catch_unwind()
         .await
@@ -400,6 +439,7 @@ async fn catch_panics(request: axum::extract::Request, next: Next) -> Response {
                 trace_id = %request_id,
                 http_method = %method,
                 http_path = %path,
+                user_agent = %user_agent,
                 http_status = 500u16,
                 error_code = "internal_panic",
                 error_stage = "request_handler",
@@ -690,6 +730,9 @@ fn write_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+    use std::sync::Mutex;
+
     use axum::body::{to_bytes, Body};
     use axum::http::{header, Method, Request, StatusCode};
     use crosslane_core::account::{Account, AuthMethod, Credentials, Usage};
@@ -700,6 +743,23 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    #[derive(Clone)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for LogCapture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("capture lock")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     async fn test_state(mut config: Config) -> (tempfile::TempDir, Arc<AppState>) {
         config.server.port = 5580;
@@ -866,6 +926,98 @@ mod tests {
             trace_ids.push(trace_id);
         }
         assert_ne!(trace_ids[0], trace_ids[1]);
+    }
+
+    #[test]
+    fn logged_user_agent_is_bounded_and_redacts_key_like_values() {
+        let mut headers = axum::http::HeaderMap::new();
+        assert_eq!(logged_user_agent(&headers), "unknown");
+
+        headers.insert(
+            header::USER_AGENT,
+            format!("client/1.0 {}", "x".repeat(300))
+                .parse()
+                .expect("header value"),
+        );
+        let agent = logged_user_agent(&headers);
+        assert_eq!(agent.chars().count(), MAX_LOGGED_USER_AGENT_CHARS);
+        assert!(agent.starts_with("client/1.0 "));
+        assert!(agent.ends_with('…'));
+
+        headers.insert(
+            header::USER_AGENT,
+            "client/1.0 token=secret".parse().expect("header value"),
+        );
+        assert_eq!(logged_user_agent(&headers), "[redacted]");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn request_failures_log_client_user_agent_at_warn_and_error() {
+        let mut config = Config::default();
+        config.server.max_connections = 1;
+        let (_directory, state) = test_state(config).await;
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let writer = Arc::clone(&captured);
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(move || LogCapture(Arc::clone(&writer)))
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        let rejected = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/v1/messages")
+                    .header(header::USER_AGENT, "claude-cli/2.1.260 (external, test)")
+                    .body(Body::from("{"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+        let _held_connection = state.connections.try_acquire().expect("connection slot");
+        let failed = router(state)
+            .oneshot(
+                Request::post("/v1/messages")
+                    .header(header::USER_AGENT, "claude-cli/2.1.261 (external, test)")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hello"}]}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        drop(guard);
+        let output =
+            String::from_utf8(captured.lock().expect("capture lock").clone()).expect("utf8 logs");
+        let entries = output
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json log"))
+            .collect::<Vec<_>>();
+        for (level, event, agent) in [
+            (
+                "WARN",
+                "proxy.request.rejected",
+                "claude-cli/2.1.260 (external, test)",
+            ),
+            (
+                "ERROR",
+                "proxy.request.failed",
+                "claude-cli/2.1.261 (external, test)",
+            ),
+        ] {
+            assert!(
+                entries.iter().any(|entry| {
+                    entry["level"] == level
+                        && entry["fields"]["event"] == event
+                        && entry["fields"]["user_agent"] == agent
+                }),
+                "missing {level} event for {agent}: {output}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -352,6 +352,9 @@ crosslane stats --detail --since 1h --by endpoint
 默认每片 100 MB、保留三天；`info.log` 不包含 WARN/ERROR。`logs trace` 有扫描和输出上限。
 Docker wrapper 会为卷内日志增加宿主机路径，卷外自定义路径无法映射。
 `RUST_LOG` 或 `log.level` 可提高诊断级别；应用日志不记录提示词、回复正文或 Key 值。
+业务 HTTP 请求的日志包含 `user_agent` 字段，WARN/ERROR 的请求失败与流式失败记录也会直接带上；
+`logs show/follow` 的文本及 JSON 请求记录也包含该字段。缺失时为 `unknown`，值最多保留 256 个字符。
+它来自客户端请求头，可用于查看客户端版本，但不能用于认证客户端身份。
 
 `status` 统计本次启动以来的数据；`stats` 默认使用跨重启累计值。两者支持 `--since` 或带时区的
 `--start/--end`。分钟级历史按 UTC 小时写入 `stats-history/`，持续保留，应监控磁盘增长；

@@ -801,6 +801,7 @@ async fn copilot_provider_routes_native_chat_models_mapping_and_usage_end_to_end
     let response = client
         .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
         .bearer_auth(daemon.api_key.as_deref().expect("API key"))
+        .header("user-agent", "codex_cli_rs/0.147.0 (e2e)")
         .json(&serde_json::json!({
             "model": "team-fast",
             "messages": [{"role": "user", "content": "hello"}],
@@ -831,6 +832,7 @@ async fn copilot_provider_routes_native_chat_models_mapping_and_usage_end_to_end
     assert_eq!(entry["original_model"], "team-fast");
     assert_eq!(entry["model"], "gpt-test");
     assert_eq!(entry["model_mapping_rule"], "copilot-fast");
+    assert_eq!(entry["user_agent"], "codex_cli_rs/0.147.0 (e2e)");
 
     let stats = expect_ok(
         daemon

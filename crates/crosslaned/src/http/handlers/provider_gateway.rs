@@ -398,6 +398,7 @@ pub(super) async fn execute_provider(
     count_tokens: bool,
 ) -> Result<Response, ApiError> {
     let started = Instant::now();
+    let user_agent = super::logged_user_agent(&headers);
     let error_provider = route.provider_id.to_string();
     let reservation = service
         .app
@@ -477,6 +478,7 @@ pub(super) async fn execute_provider(
         path,
         trace_id,
         request_id,
+        user_agent,
         status: status.as_u16(),
         started,
         api_key_id,
@@ -538,6 +540,7 @@ struct ProviderRequestMetadata {
     path: String,
     trace_id: String,
     request_id: String,
+    user_agent: String,
     status: u16,
     started: Instant,
     api_key_id: Option<String>,
@@ -855,6 +858,7 @@ async fn record_provider_request(
         tracing::error!(
             provider_id = %metadata.provider_id,
             api_key_id = metadata.api_key_id.as_deref().unwrap_or("anonymous"),
+            user_agent = %metadata.user_agent,
             %error,
             "failed to persist provider usage"
         );
@@ -864,6 +868,7 @@ async fn record_provider_request(
         trace_id: metadata.trace_id.clone(),
         request_id: metadata.request_id.clone(),
         path: metadata.path.clone(),
+        user_agent: metadata.user_agent.clone(),
         provider_id: metadata.provider_id.clone(),
         model: metadata.model.clone(),
         original_model: metadata.original_model.clone(),

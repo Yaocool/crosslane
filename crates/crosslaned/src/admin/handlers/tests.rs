@@ -637,6 +637,7 @@ async fn stats_default_is_compact_and_detail_restores_recent_requests() {
         trace_id: "trace_stats".into(),
         request_id: "req_stats".into(),
         path: "/v1/messages".into(),
+        user_agent: "claude-cli/2.1.260 (external, test)".into(),
         provider_id: "kiro".into(),
         model: "claude-sonnet-4.6".into(),
         original_model: "claude-4.6-sonnet".into(),
@@ -684,6 +685,10 @@ async fn stats_default_is_compact_and_detail_restores_recent_requests() {
     assert_eq!(
         detail["stats"]["recent_requests"][0]["account_name"],
         "Enterprise stats"
+    );
+    assert_eq!(
+        detail["stats"]["recent_requests"][0]["user_agent"],
+        "claude-cli/2.1.260 (external, test)"
     );
     assert_eq!(detail["grouped"]["claude-sonnet-4.6"]["requests"], 1);
 

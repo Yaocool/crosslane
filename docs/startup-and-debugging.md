@@ -417,6 +417,11 @@ size and three-day retention; `info.log` excludes WARN/ERROR. Trace queries have
 scan/output limits. The Docker wrapper adds host paths for logs within the data
 volume. Use `RUST_LOG` or `log.level` for more detail; application logs omit prompt,
 response and key values.
+Business HTTP logs include a `user_agent` field directly on request and stream
+failure events, including WARN/ERROR records. `logs show/follow` also print it
+for each request and include it in JSON output. Missing values are `unknown`,
+and values are capped at 256 characters. This client-supplied field helps
+identify a version but does not authenticate the client.
 
 `status` covers the current daemon run; `stats` defaults to persisted totals.
 Both accept `--since` or timezone-qualified `--start/--end`. Minute aggregates are
