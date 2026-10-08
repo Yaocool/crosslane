@@ -1,8 +1,7 @@
 //! Shared Kiro client identities for upstream requests and token refresh.
 //!
-//! Verified against official stable releases on 2026-09-14. Keep application,
-//! SDK and generated service versions together when updating this baseline.
-//! See docs/protocol-compatibility.md for sources and the 2026-11-09 cutoff.
+//! Keep application, SDK and generated service versions together when updating
+//! this baseline, and validate the emitted upstream headers after rebuilding.
 //! These are the existing desktop/CLI platform profiles, not the proxy host OS.
 
 pub const IDE_VERSION: &str = "1.0.437";

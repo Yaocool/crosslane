@@ -3,7 +3,7 @@
 **/*.rs.bk
 *.pdb
 .crosslane-dev/
-# Keep credentials from pre-rename checkouts ignored during migration.
+# Keep legacy credential directories ignored.
 .kproxy-dev/
 
 # Local environment files (keep documented templates in version control)
@@ -26,7 +26,7 @@ Thumbs.db
 .vscode/
 
 # AI-assisted development: local settings, indexes, caches, and session state.
-# Keep shareable project instructions such as AGENTS.md and CLAUDE.md tracked.
+# Keep CONTRIBUTING.md and docs/ tracked as project guidance.
 .claude/*
 .cursor/
 .windsurf/

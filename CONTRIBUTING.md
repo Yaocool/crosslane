@@ -1,33 +1,32 @@
 # Contributing
 
-[Documentation](README.md#documentation) · [Architecture](CLAUDE.md) · [Changelog](CHANGELOG.md)
+[Project overview](README.md) | [Operations guide](docs/startup-and-debugging.md)
 
-Use the pinned Rust 1.97.1 toolchain and commit `Cargo.lock` changes when dependencies
-or workspace versions change. Dependencies are pinned in the root workspace;
-crate manifests inherit them. This workspace builds Unix-socket applications,
-not a native Windows service.
+Crosslane uses the Rust toolchain selected by `rust-toolchain.toml`. Run commands
+from the repository root. Keep local credentials and state out of commits.
 
-## Local development
+## Build and run locally
 
 ```bash
-cp .env.example .env  # First setup only
+cp .env.example .env
 cargo build --workspace --locked
 cargo run -p crosslaned
 ```
 
-In another terminal at the same repository root, use `cargo run -p crosslane -- health`
-and `cargo run -p crosslane -- help --all`. The example isolates development files in
-`.crosslane-dev`; use an absolute `CROSSLANE_HOME` if working from multiple directories.
-Do not run development commands against a production data directory.
+In another terminal:
 
-The default daemon enables the `sso` feature. Code requiring browser login must
-remain feature-gated, and the no-default-features build must keep working.
-The full Docker image pairs `chromiumoxide 0.9.1` with Chromium revision `1566079`;
-update and validate the pair together. Native SSO additionally needs a browser.
+```bash
+cargo run -p crosslane -- health
+cargo run -p crosslane -- help --all
+```
 
-## Validation
+The example environment uses `.crosslane-dev`. Set an absolute
+`CROSSLANE_HOME` for work across directories, and never point development
+commands at a production data directory.
 
-Run checks appropriate to the change, and run the full set before a release:
+## Validate changes
+
+Select checks relevant to the change. Before a release, run the complete set:
 
 ```bash
 cargo fmt --all -- --check
@@ -41,80 +40,23 @@ sh -n deploy/entrypoint.sh deploy/docker-setup.sh deploy/docker-upgrade.sh deplo
 git diff --check
 ```
 
-Workspace tests include integration targets automatically; use `--test` to select
-one target when narrowing the scope:
+Use `cargo test -p <PACKAGE>` or `--test <TARGET>` to narrow a local test run.
+Automated tests use simulated upstream responses and do not establish that a
+real account, model, or client version works. Check those separately when a
+change depends on them.
 
-```bash
-cargo test -p crosslane --test cli_help --locked
-cargo test -p crosslane-translate --test compatibility_controls --locked
-cargo test -p crosslaned --test end_to_end responses:: --locked
-```
+## Documentation and review
 
-Tests use temporary directories, Unix sockets, and loopback HTTP listeners.
-The standard suite uses simulated upstream responses and does not need real
-credentials. Compaction regressions can be selected separately:
+Keep README files focused on setup and navigation. Put operational instructions
+in the paired English and Chinese guides. Document user-visible commands,
+configuration, API behavior, and limitations; keep investigations and
+implementation notes in the code review or Git history. Update paired guides
+together, and check local links, examples, and commands before submitting.
 
-```bash
-cargo test -p crosslane-translate tokenizer --locked
-cargo test -p crosslaned --test end_to_end manual_compaction:: --locked
-cargo test -p crosslaned --test end_to_end warning_regressions:: --locked
-```
-
-One real Claude Code checkpoint test is ignored by default. After installing a
-Claude Code version supporting `--bare`, run it with isolated configuration and
-the test's local simulated upstream:
-
-```bash
-cargo test -p crosslaned --test end_to_end real_claude_code_retains_the_compaction_checkpoint --locked -- --ignored
-```
-
-Passing mocks does not establish production SSO, upstream availability, latency,
-or usage accuracy. Record those checks separately during release qualification.
-
-The repository currently has a tag-triggered Docker publishing workflow, not a
-PR test gate. The commands above describe required validation, not existing CI
-coverage. Record validation results for the exact source being released.
-
-## Change boundaries
-
-- Keep CLI definitions, help and completion on the same Clap command tree. New
-  RPC behavior must update the shared protocol, daemon dispatch and CLI together.
-- For protocol changes, read the [compatibility rules](docs/protocol-compatibility.md#compatibility-maintenance-rules)
-  before adding rejection conditions. Test translated payloads and client-visible
-  behavior, including streaming and non-streaming errors where relevant.
-- Add configuration defaults, validation and reload handling together. Invalid
-  reloads must leave the last valid state active. Reuse existing transaction locks.
-- Preserve system instructions and tool pairing during compaction; verify the
-  next client turn as well as the first response. Keep summary accounting separate.
-- Keep credentials out of fixtures and diagnostics. Account export includes
-  credentials by default; use `--redact` before sharing it.
-
-## Documentation changes
-
-Keep the main READMEs focused on setup and navigation. Detailed behavior belongs
-in the six references linked from the READMEs. Update paired English/Chinese commands,
-defaults, limits and authentication requirements together. Merge overlapping topics
-and remove obsolete design notes; update all links when deleting a document.
-Keep the complete CLI command tree in generated help instead of duplicating it in Markdown.
-
-Verify commands against the current CLI, local links and heading anchors, fenced
-JSON/TOML examples, and the actual Compose build/pull paths. Help invocation is
-enough to inspect destructive commands; do not execute deletion, upgrades, real
-diagnosis or webhook delivery merely to validate documentation.
-
-Separate current implementation, historical observations, and proposed work.
-Record audit date, commit, platform, features and skipped checks with test results.
-Use explicit release examples; a source version string alone does not prove that
-a matching image contains untagged commits. Update [CHANGELOG.md](CHANGELOG.md)
-for externally visible changes and migrations.
-
-## Commits and reviews
+Do not commit credentials, raw requests, or unsanitized test captures. Account
+exports are redacted by default; only include secrets in a protected backup.
 
 Use concise English Angular-style commit messages, such as
-`docs(cli): clarify command migration` or `fix(proxy): preserve tool replay`.
-Keep one logical change per commit. Call out incompatible behavior with `!` or a
-`BREAKING CHANGE` footer and a migration note.
-
-Describe the user-visible problem, resulting behavior, validation and remaining
-limitations in the review. Update the workspace version, lockfile and changelog
-together before releasing; pushing a matching `v*` tag triggers image publication.
+`docs(usage): clarify service setup`. Describe the user-visible result, checks
+run, and remaining limitations in the review. Mark incompatible behavior with
+`!` or a `BREAKING CHANGE` footer and include the required user action.
