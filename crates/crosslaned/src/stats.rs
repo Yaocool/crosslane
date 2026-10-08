@@ -922,23 +922,35 @@ impl StatsStore {
     ) -> Vec<RequestLog> {
         let entries = {
             let state = lock(&self.state);
-            let start = after_request_id
-                .and_then(|id| {
-                    state
-                        .recent_requests
-                        .iter()
-                        .position(|request| request.request_id == id)
-                        .map(|index| index + 1)
-                })
-                .unwrap_or_else(|| state.recent_requests.len().saturating_sub(tail));
-            state
-                .recent_requests
-                .iter()
-                .skip(start)
-                .filter(|request| matches_log(request, level, account, provider))
-                .take(tail.min(1_000))
-                .cloned()
-                .collect::<Vec<_>>()
+            let start = after_request_id.and_then(|id| {
+                state
+                    .recent_requests
+                    .iter()
+                    .position(|request| request.request_id == id)
+                    .map(|index| index + 1)
+            });
+            let tail = tail.min(1_000);
+            if let Some(start) = start {
+                state
+                    .recent_requests
+                    .iter()
+                    .skip(start)
+                    .filter(|request| matches_log(request, level, account, provider))
+                    .take(tail)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                let mut entries = state
+                    .recent_requests
+                    .iter()
+                    .rev()
+                    .filter(|request| matches_log(request, level, account, provider))
+                    .take(tail)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                entries.reverse();
+                entries
+            }
         };
         entries
             .into_iter()
@@ -1872,6 +1884,38 @@ mod tests {
         let entries = follower.await.expect("join");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].request_id, "failed");
+    }
+
+    #[tokio::test]
+    async fn log_tail_is_applied_after_level_and_provider_filters() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = StatsStore::empty(&directory.path().join("stats.json"));
+        let mut first = request("failed-kiro", 1, 400);
+        first.provider_id = "kiro".into();
+        store.record(first);
+        for index in 0..20 {
+            store.record(request(&format!("ok-{index}"), index + 2, 200));
+        }
+        let mut last = request("failed-copilot", 23, 502);
+        last.provider_id = "copilot".into();
+        store.record(last);
+
+        let failures = store.follow(None, 2, 0, Some("warn"), None, None).await;
+        assert_eq!(
+            failures
+                .iter()
+                .map(|entry| entry.request_id.as_str())
+                .collect::<Vec<_>>(),
+            ["failed-kiro", "failed-copilot"]
+        );
+        let kiro = store
+            .follow(None, 1, 0, Some("warn"), None, Some("kiro"))
+            .await;
+        assert_eq!(kiro[0].request_id, "failed-kiro");
+        let after_first = store
+            .follow(Some("failed-kiro"), 1, 0, Some("warn"), None, None)
+            .await;
+        assert_eq!(after_first[0].request_id, "failed-copilot");
     }
 
     #[tokio::test]

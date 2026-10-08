@@ -423,6 +423,14 @@ for each request and include it in JSON output. Missing values are `unknown`,
 and values are capped at 256 characters. This client-supplied field helps
 identify a version but does not authenticate the client.
 
+Classified API errors use `proxy.request.rejected` or `proxy.request.failed` at
+WARN/ERROR; other HTTP 4xx/5xx responses use `http.response.ready`. Failed model
+discovery and unknown routes also appear in `logs show`; its `--tail` count is
+applied after `--level` and provider filters. `logs show/follow` read the latest
+1,000 in-memory request records; use `logs trace` or the dated files for older
+events. For request records, `--level warn` includes 4xx and 5xx, while
+`--level error` includes only 5xx.
+
 `status` covers the current daemon run; `stats` defaults to persisted totals.
 Both accept `--since` or timezone-qualified `--start/--end`. Minute aggregates are
 stored in UTC hourly shards under `stats-history/` and retained indefinitely, so

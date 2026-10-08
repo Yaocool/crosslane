@@ -356,6 +356,12 @@ Docker wrapper 会为卷内日志增加宿主机路径，卷外自定义路径�
 `logs show/follow` 的文本及 JSON 请求记录也包含该字段。缺失时为 `unknown`，值最多保留 256 个字符。
 它来自客户端请求头，可用于查看客户端版本，但不能用于认证客户端身份。
 
+已分类的 API 错误用 WARN/ERROR 级别的 `proxy.request.rejected` 或 `proxy.request.failed` 记录；
+其他 HTTP 4xx/5xx 响应用 `http.response.ready` 记录。模型列表请求失败及未知路由也会进入
+`logs show`；`--tail` 在 `--level`、provider 筛选之后计算。
+`logs show/follow` 读取内存中最近 1,000 条请求记录；更早的事件用 `logs trace` 或按日期的日志文件查询。
+请求记录的 `--level warn` 包含 4xx 和 5xx，`--level error` 只包含 5xx。
+
 `status` 统计本次启动以来的数据；`stats` 默认使用跨重启累计值。两者支持 `--since` 或带时区的
 `--start/--end`。分钟级历史按 UTC 小时写入 `stats-history/`，持续保留，应监控磁盘增长；
 旧版本已淘汰的历史不能恢复。逐条故障仍查日志，`stats --detail` 不是完整请求审计。

@@ -1020,6 +1020,94 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn claude_client_errors_are_visible_in_request_logs_and_warn_events() {
+        let (_directory, state) = test_state(Config::default()).await;
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let writer = Arc::clone(&captured);
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(move || LogCapture(Arc::clone(&writer)))
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let user_agent = "claude-cli/2.1.260 (external, test)";
+        let requests = [
+            Request::post("/v1/messages")
+                .header(header::USER_AGENT, user_agent)
+                .body(Body::from("{"))
+                .expect("invalid JSON request"),
+            Request::get("/v1/models?limit=bad")
+                .header(header::USER_AGENT, user_agent)
+                .body(Body::empty())
+                .expect("invalid model query"),
+            Request::get("/v1/messages")
+                .header(header::USER_AGENT, user_agent)
+                .body(Body::empty())
+                .expect("wrong method"),
+            Request::get("/v1/messages/unknown")
+                .header(header::USER_AGENT, user_agent)
+                .body(Body::empty())
+                .expect("unknown route"),
+        ];
+        let mut trace_ids = Vec::new();
+        for (request, expected_status) in requests.into_iter().zip([
+            StatusCode::BAD_REQUEST,
+            StatusCode::BAD_REQUEST,
+            StatusCode::METHOD_NOT_ALLOWED,
+            StatusCode::NOT_FOUND,
+        ]) {
+            let response = router(Arc::clone(&state))
+                .oneshot(request)
+                .await
+                .expect("response");
+            assert_eq!(response.status(), expected_status);
+            trace_ids.push(
+                response
+                    .headers()
+                    .get(TRACE_ID_HEADER)
+                    .expect("trace header")
+                    .to_str()
+                    .expect("trace ID")
+                    .to_owned(),
+            );
+        }
+        drop(guard);
+        let request_logs = state.stats.snapshot(None).recent_requests;
+        let output =
+            String::from_utf8(captured.lock().expect("capture lock").clone()).expect("utf8 logs");
+        let entries = output
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json log"))
+            .collect::<Vec<_>>();
+        for trace_id in trace_ids {
+            assert!(
+                request_logs
+                    .iter()
+                    .any(|request| request.trace_id == trace_id && request.user_agent == user_agent),
+                "missing request record for {trace_id}"
+            );
+            assert!(
+                entries.iter().any(|entry| {
+                    entry["level"] == "WARN"
+                        && entry["fields"]["event"] == "proxy.request.rejected"
+                        && entry["fields"]["trace_id"] == trace_id
+                        && entry["fields"]["user_agent"] == user_agent
+                }),
+                "missing WARN rejection event for {trace_id}: {output}"
+            );
+            assert_eq!(
+                entries
+                    .iter()
+                    .filter(|entry| {
+                        entry["level"] == "WARN" && entry["fields"]["trace_id"] == trace_id
+                    })
+                    .count(),
+                1,
+                "duplicate WARN events for {trace_id}: {output}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn readiness_degrades_without_making_liveness_fail() {
         let (_directory, state) = test_state(Config::default()).await;

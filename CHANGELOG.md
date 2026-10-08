@@ -103,6 +103,9 @@ they must receive a new version rather than replacing that tag or its image.
 
 ### Fixed
 
+- Record failed Claude model-discovery and route requests in the request log,
+  retain one WARN/ERROR event per classified failure, and apply `logs show`
+  filters before selecting the requested tail.
 - Preserve existing resource permissions when editing under `CROSSLANE_PROVIDER`;
   require explicit scope changes and reject contradictory provider flags.
 - Report partial provider-pool discovery as a failure with retained error details;

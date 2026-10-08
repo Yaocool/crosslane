@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
-use axum::extract::{OriginalUri, RawQuery, Request, State};
+use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -798,12 +798,14 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
     }
 }
 
-pub async fn models(
-    State(service): State<ServiceHttpState>,
-    headers: HeaderMap,
-    RawQuery(raw_query): RawQuery,
-) -> Response {
+pub async fn models(State(service): State<ServiceHttpState>, request: Request) -> Response {
     let state = Arc::clone(&service.app);
+    let trace_id = request_trace_id(&request);
+    let path = request.uri().path().to_owned();
+    let raw_query = request.uri().query().map(str::to_owned);
+    let headers = request.headers().clone();
+    let user_agent = logged_user_agent(&headers);
+    let started = Instant::now();
     let protocol = model_list_protocol(&headers);
     let format = protocol.error_format();
     let result = async {
@@ -942,7 +944,16 @@ pub async fn models(
         model_list(models, protocol, query.as_ref())
     }
     .await;
-    result.unwrap_or_else(IntoResponse::into_response)
+    result.unwrap_or_else(|error| {
+        let default_provider = state
+            .config
+            .current()
+            .default_provider_for_service(&service.service)
+            .to_owned();
+        let error = error.with_provider_id_if_empty(&default_provider);
+        record_failed_request(&state, &trace_id, &path, &user_agent, "", started, &error);
+        error.into_response()
+    })
 }
 
 async fn service_catalog_status(
@@ -1479,40 +1490,107 @@ fn model_cursor_index<T>(
         })
 }
 
-pub async fn event_logging(
-    State(service): State<ServiceHttpState>,
-    headers: HeaderMap,
-) -> Response {
+pub async fn event_logging(State(service): State<ServiceHttpState>, request: Request) -> Response {
+    let trace_id = request_trace_id(&request);
+    let path = request.uri().path().to_owned();
+    let headers = request.headers();
+    let user_agent = logged_user_agent(headers);
+    let started = Instant::now();
     match authenticate(
         &service.app,
         &service.allowed_api_key_ids,
-        &headers,
+        headers,
         ErrorFormat::OpenAi,
     ) {
         Ok(_) => Json(json!({"status":"ok"})).into_response(),
-        Err(error) => error.into_response(),
+        Err(error) => {
+            let default_provider = service
+                .app
+                .config
+                .current()
+                .default_provider_for_service(&service.service)
+                .to_owned();
+            let error = error.with_provider_id_if_empty(&default_provider);
+            record_failed_request(
+                &service.app,
+                &trace_id,
+                &path,
+                &user_agent,
+                "",
+                started,
+                &error,
+            );
+            error.into_response()
+        }
     }
 }
 
-pub async fn claude_method_not_allowed() -> Response {
-    ApiError::method_not_allowed(ErrorFormat::Claude, "POST").into_response()
+fn recorded_route_error(service: ServiceHttpState, request: Request, error: ApiError) -> Response {
+    let trace_id = request_trace_id(&request);
+    let user_agent = logged_user_agent(request.headers());
+    let default_provider = service
+        .app
+        .config
+        .current()
+        .default_provider_for_service(&service.service)
+        .to_owned();
+    let error = error.with_provider_id_if_empty(&default_provider);
+    record_failed_request(
+        &service.app,
+        &trace_id,
+        request.uri().path(),
+        &user_agent,
+        "",
+        Instant::now(),
+        &error,
+    );
+    error.into_response()
 }
 
-pub async fn openai_method_not_allowed() -> Response {
-    ApiError::method_not_allowed(ErrorFormat::OpenAi, "POST").into_response()
+pub async fn claude_method_not_allowed(
+    State(service): State<ServiceHttpState>,
+    request: Request,
+) -> Response {
+    recorded_route_error(
+        service,
+        request,
+        ApiError::method_not_allowed(ErrorFormat::Claude, "POST"),
+    )
 }
 
-pub async fn openai_models_method_not_allowed() -> Response {
-    ApiError::method_not_allowed(ErrorFormat::OpenAi, "GET").into_response()
+pub async fn openai_method_not_allowed(
+    State(service): State<ServiceHttpState>,
+    request: Request,
+) -> Response {
+    recorded_route_error(
+        service,
+        request,
+        ApiError::method_not_allowed(ErrorFormat::OpenAi, "POST"),
+    )
 }
 
-pub async fn not_found(OriginalUri(uri): OriginalUri) -> Response {
-    let format = if uri.path().contains("messages") {
+pub async fn openai_models_method_not_allowed(
+    State(service): State<ServiceHttpState>,
+    request: Request,
+) -> Response {
+    recorded_route_error(
+        service,
+        request,
+        ApiError::method_not_allowed(ErrorFormat::OpenAi, "GET"),
+    )
+}
+
+pub async fn not_found(State(service): State<ServiceHttpState>, request: Request) -> Response {
+    let format = if request.uri().path().contains("messages") {
         ErrorFormat::Claude
     } else {
         ErrorFormat::OpenAi
     };
-    ApiError::new(StatusCode::NOT_FOUND, "not found", format).into_response()
+    recorded_route_error(
+        service,
+        request,
+        ApiError::new(StatusCode::NOT_FOUND, "not found", format),
+    )
 }
 
 pub(crate) fn fallback_models(
