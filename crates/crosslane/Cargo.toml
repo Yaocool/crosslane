@@ -1,0 +1,31 @@
+[package]
+name = "crosslane"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "crosslane"
+path = "src/main.rs"
+
+[dependencies]
+crosslane-core.workspace = true
+crosslane-store.workspace = true
+crosslane-ipc.workspace = true
+crosslane-translate.workspace = true
+crosslane-kiro.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+futures.workspace = true
+rand.workspace = true
+sha2.workspace = true
+shlex.workspace = true
+tempfile.workspace = true
+toml.workspace = true
+toml_edit.workspace = true
+libc.workspace = true

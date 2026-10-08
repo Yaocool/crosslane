@@ -1,0 +1,44 @@
+[Unit]
+Description=crosslane daemon
+Documentation=https://github.com/Yaocool/crosslane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/crosslaned
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+
+User=crosslane
+Group=crosslane
+
+RuntimeDirectory=crosslane
+RuntimeDirectoryMode=0750
+StateDirectory=crosslane
+StateDirectoryMode=0700
+ConfigurationDirectory=crosslane
+Environment=XDG_CONFIG_HOME=/etc
+Environment=XDG_DATA_HOME=/var/lib
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/etc/crosslane /var/lib/crosslane /run/crosslane
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+# Chromium SSO uses a user-namespace sandbox and V8 JIT executable memory.
+# Keep these capabilities available while the remaining unit hardening contains
+# the unprivileged crosslane process.
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

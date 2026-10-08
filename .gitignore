@@ -2,6 +2,8 @@
 /target/
 **/*.rs.bk
 *.pdb
+.crosslane-dev/
+# Keep credentials from pre-rename checkouts ignored during migration.
 .kproxy-dev/
 
 # Local environment files (keep documented templates in version control)
@@ -9,6 +11,8 @@
 .env.*
 !.env.example
 !.env.*.example
+/deploy/.crosslane-image
+/deploy/.crosslane-image.tmp.*
 /deploy/.kproxy-image
 /deploy/.kproxy-image.tmp.*
 

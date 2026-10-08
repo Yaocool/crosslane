@@ -1,0 +1,24 @@
+[package]
+name = "crosslane-pool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+crosslane-core.workspace = true
+crosslane-translate.workspace = true
+crosslane-kiro.workspace = true
+crosslane-store.workspace = true
+indexmap.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true
+wiremock.workspace = true

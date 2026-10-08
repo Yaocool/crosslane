@@ -1,6 +1,6 @@
 services:
-  kproxyd:
-    image: "${KPROXY_BUILD_IMAGE:-kiro-proxy:latest}"
+  crosslaned:
+    image: "${CROSSLANE_BUILD_IMAGE:-crosslane:latest}"
     build:
       context: .
       target: runtime-full # Includes all features and the SSO browser.

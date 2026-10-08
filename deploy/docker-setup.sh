@@ -6,14 +6,14 @@ script_dir="$(CDPATH= cd "$(dirname "$0")" && pwd)"
 repo_root="$(CDPATH= cd "$script_dir/.." && pwd)"
 compose_file="$repo_root/docker-compose.yml"
 build_compose_file="$repo_root/docker-compose.build.yml"
-image_state_file="${KPROXY_IMAGE_STATE_FILE:-$script_dir/.kproxy-image}"
-default_image="ghcr.io/yaocool/kiro-proxy:latest"
+image_state_file="${CROSSLANE_IMAGE_STATE_FILE:-$script_dir/.crosslane-image}"
+default_image="ghcr.io/yaocool/crosslane:latest"
 
-target="/usr/local/bin/kproxy"
+target="/usr/local/bin/crosslane"
 project_name=""
 health_timeout=60
 deployment_mode="pull"
-requested_image="${KPROXY_IMAGE:-}"
+requested_image="${CROSSLANE_IMAGE:-}"
 force=0
 repair_volume=0
 
@@ -21,11 +21,11 @@ usage() {
   cat <<EOF
 Usage: $script_name [OPTIONS]
 
-Set up kiro-proxy with Docker Compose and install a Docker-backed kproxy command
+Set up crosslane with Docker Compose and install a Docker-backed crosslane command
 on the host.
 
 Options:
-  --target PATH         Host command path (default: /usr/local/bin/kproxy)
+  --target PATH         Host command path (default: /usr/local/bin/crosslane)
   --project-name NAME   Override the Docker Compose project name
   --timeout SECONDS     Health-check timeout (default: 60)
   --image IMAGE         Pull and deploy an image reference (default: saved image
@@ -39,8 +39,8 @@ Options:
 
 Examples:
   ./deploy/$script_name
-  ./deploy/$script_name --image ghcr.io/yaocool/kiro-proxy:v0.1.3
-  ./deploy/$script_name --target "\$HOME/.local/bin/kproxy"
+  ./deploy/$script_name --image ghcr.io/yaocool/crosslane:<published-tag>
+  ./deploy/$script_name --target "\$HOME/.local/bin/crosslane"
   ./deploy/$script_name --build
   ./deploy/$script_name --no-pull --repair-volume
 EOF
@@ -117,19 +117,19 @@ fi
 case "$requested_image" in
   *[!A-Za-z0-9_./:@+-]*) fail "invalid image reference: $requested_image" ;;
 esac
-export KPROXY_IMAGE="$requested_image"
+export CROSSLANE_IMAGE="$requested_image"
 
-build_image="${KPROXY_BUILD_IMAGE:-kiro-proxy:latest}"
+build_image="${CROSSLANE_BUILD_IMAGE:-crosslane:latest}"
 case "$build_image" in
-  ''|*[!A-Za-z0-9_./:@+-]*) fail "invalid KPROXY_BUILD_IMAGE: $build_image" ;;
+  ''|*[!A-Za-z0-9_./:@+-]*) fail "invalid CROSSLANE_BUILD_IMAGE: $build_image" ;;
 esac
-export KPROXY_BUILD_IMAGE="$build_image"
+export CROSSLANE_BUILD_IMAGE="$build_image"
 
 command -v docker >/dev/null 2>&1 || fail "docker command not found"
 docker compose version >/dev/null 2>&1 || fail "Docker Compose v2 is required (docker compose)"
 docker info >/dev/null 2>&1 || fail "cannot connect to Docker; start Docker and check your permissions"
 
-installer="$script_dir/install-kproxy-wrapper.sh"
+installer="$script_dir/install-crosslane-wrapper.sh"
 [ -x "$installer" ] || fail "wrapper installer is not executable: $installer"
 target_dir="$(dirname "$target")"
 
@@ -152,7 +152,7 @@ invoke_wrapper_installer() {
   fi
 }
 
-echo "==> Checking the host kproxy command target $target"
+echo "==> Checking the host crosslane command target $target"
 invoke_wrapper_installer check
 
 compose_base() {
@@ -226,7 +226,7 @@ create_data_volume() {
   docker volume create \
     --driver local \
     --label "com.docker.compose.project=$selected_project" \
-    --label "com.docker.compose.volume=kproxy-data" \
+    --label "com.docker.compose.volume=crosslane-data" \
     "$data_volume_name" >/dev/null
 }
 
@@ -284,7 +284,7 @@ prepare_data_volume() {
 
   volume_project="$(docker volume inspect --format '{{index .Labels "com.docker.compose.project"}}' "$data_volume_name")"
   volume_logical_name="$(docker volume inspect --format '{{index .Labels "com.docker.compose.volume"}}' "$data_volume_name")"
-  if [ "$volume_project" != "$selected_project" ] || [ "$volume_logical_name" != "kproxy-data" ]; then
+  if [ "$volume_project" != "$selected_project" ] || [ "$volume_logical_name" != "crosslane-data" ]; then
     fail "volume $data_volume_name has a missing data path but is not owned by this Compose project; refusing to remove it"
   fi
 
@@ -327,7 +327,7 @@ selected_project="$(printf '%s\n' "$resolved_config" | awk '
 ')"
 data_volume_name="$(printf '%s\n' "$resolved_config" | awk '
   $0 == "volumes:" { in_volumes = 1; next }
-  in_volumes && $0 == "  kproxy-data:" { in_data_volume = 1; next }
+  in_volumes && $0 == "  crosslane-data:" { in_data_volume = 1; next }
   in_data_volume && /^    name:[[:space:]]/ {
     sub(/^    name:[[:space:]]*/, "")
     print
@@ -335,7 +335,7 @@ data_volume_name="$(printf '%s\n' "$resolved_config" | awk '
   }
 ')"
 [ -n "$selected_project" ] || fail "could not resolve the Docker Compose project name"
-[ -n "$data_volume_name" ] || fail "could not resolve the kproxy-data Docker volume name"
+[ -n "$data_volume_name" ] || fail "could not resolve the crosslane-data Docker volume name"
 prepare_data_volume
 
 install_host_command() {
@@ -352,15 +352,15 @@ install_host_command() {
     fi
   fi
 
-  echo "==> Installing the host kproxy command at $target"
+  echo "==> Installing the host crosslane command at $target"
   invoke_wrapper_installer install
 }
 
 wait_for_health() {
   elapsed=0
   while :; do
-    # Compose supports -T; --no-tty fails before kproxy health can even run.
-    if health_output="$(compose_base exec -T kproxyd /usr/local/bin/kproxy health 2>&1)"; then
+    # Compose supports -T; --no-tty fails before crosslane health can even run.
+    if health_output="$(compose_base exec -T crosslaned /usr/local/bin/crosslane health 2>&1)"; then
       return 0
     else
       health_status=$?
@@ -375,7 +375,7 @@ wait_for_health() {
   done
 }
 
-previous_container="$(compose_base ps --all --quiet kproxyd 2>/dev/null | awk 'NF { print; exit }')"
+previous_container="$(compose_base ps --all --quiet crosslaned 2>/dev/null | awk 'NF { print; exit }')"
 previous_image_id=""
 rollback_image=""
 if [ -n "$previous_container" ]; then
@@ -383,7 +383,7 @@ if [ -n "$previous_container" ]; then
 fi
 if [ -n "$previous_image_id" ]; then
   rollback_suffix="$(printf '%s' "$selected_project" | tr -c 'A-Za-z0-9_.-' '-')"
-  rollback_image="kiro-proxy-rollback:${rollback_suffix}"
+  rollback_image="crosslane-rollback:${rollback_suffix}"
   echo "==> Saving the current image as $rollback_image"
   docker image tag "$previous_image_id" "$rollback_image"
 fi
@@ -391,7 +391,7 @@ fi
 deployment_failed=0
 case "$deployment_mode" in
   build)
-    echo "==> Building kiro-proxy locally and starting $build_image"
+    echo "==> Building crosslane locally and starting $build_image"
     if ! compose up --detach --build; then
       deployment_failed=1
     fi
@@ -404,7 +404,7 @@ case "$deployment_mode" in
     ;;
   pull)
     echo "==> Pulling image while the current container keeps running: $requested_image"
-    if ! compose_base pull kproxyd; then
+    if ! compose_base pull crosslaned; then
       fail "could not pull $requested_image; the current container was left untouched"
     fi
     echo "==> Replacing the container without building on this host"
@@ -415,20 +415,20 @@ case "$deployment_mode" in
 esac
 
 if [ "$deployment_failed" -eq 0 ]; then
-  echo "==> Waiting for kproxyd to become healthy"
+  echo "==> Waiting for crosslaned to become healthy"
   wait_for_health || deployment_failed=1
 fi
 
 if [ "$deployment_failed" -ne 0 ]; then
   echo "==> Deployment failed; recent daemon logs follow" >&2
-  compose_base logs --tail 80 kproxyd >&2 || true
+  compose_base logs --tail 80 crosslaned >&2 || true
   if [ -n "$rollback_image" ]; then
     echo "==> Rolling back to $rollback_image" >&2
-    export KPROXY_IMAGE="$rollback_image"
+    export CROSSLANE_IMAGE="$rollback_image"
     if compose_base up --detach --no-build && wait_for_health; then
       fail "new deployment failed; the previous image was restored successfully"
     fi
-    compose_base logs --tail 80 kproxyd >&2 || true
+    compose_base logs --tail 80 crosslaned >&2 || true
     fail "new deployment failed and automatic rollback did not become healthy"
   fi
   fail "deployment failed and no previous image was available for rollback"
@@ -439,7 +439,7 @@ fi
 install_host_command
 
 echo "==> Verifying the host command"
-KPROXY_COMPOSE_PROJECT="$selected_project" "$target" health
+CROSSLANE_COMPOSE_PROJECT="$selected_project" "$target" health
 
 if [ "$deployment_mode" != "build" ]; then
   image_state_tmp="$image_state_file.tmp.$$"
@@ -455,7 +455,7 @@ else
   deployed_image="$requested_image"
 fi
 
-host_command="kproxy"
+host_command="crosslane"
 case ":${PATH}:" in
   *:"$target_dir":*) ;;
   *) host_command="$target" ;;
@@ -463,12 +463,12 @@ esac
 
 cat <<EOF
 
-kiro-proxy is ready.
+crosslane is ready.
 
   Host command:  $target
   Compose stack: $selected_project
   Image:         $deployed_image
-  Persistent data is stored in the kproxy-data Docker volume.
+  Persistent data is stored in the crosslane-data Docker volume.
 
 Next steps:
   $host_command help
@@ -481,5 +481,5 @@ Save the API key printed by 'service create'. To inspect the service:
   $host_command service list
 
 Follow daemon logs:
-  docker compose --project-name "$selected_project" -f "$compose_file" logs -f kproxyd
+  docker compose --project-name "$selected_project" -f "$compose_file" logs -f crosslaned
 EOF

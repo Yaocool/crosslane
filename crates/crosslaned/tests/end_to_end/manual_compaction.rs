@@ -1,0 +1,437 @@
+use super::*;
+use serde_json::{json, Value};
+
+const COMPACT_PROMPT: &str = "Your task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions.\nReturn the summary in <summary> tags.";
+const CLIENT_SUMMARY: &str =
+    "<summary>Manual summary completed: cobalt-731, mango-482, spruce-956.</summary>";
+
+fn summary_response(request: &wiremock::Request) -> ResponseTemplate {
+    let payload: Value = serde_json::from_slice(&request.body).unwrap();
+    let current = payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+        .as_str()
+        .unwrap();
+    let content = if current.contains("durable conversation checkpoint") {
+        "<summary>Preserve governing constraints, complete tool contracts, cobalt-731, mango-482 and spruce-956.</summary>"
+    } else {
+        CLIENT_SUMMARY
+    };
+    ResponseTemplate::new(200)
+        .insert_header("content-type", "application/vnd.amazon.eventstream")
+        .set_body_bytes(generation_body(content))
+}
+
+#[tokio::test]
+async fn manual_compact_after_an_oversized_tool_result_reaches_the_summary_model() {
+    let _http_guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    mount_context_alignment_models(&mock).await;
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(summary_response)
+        .mount(&mock)
+        .await;
+    let port = unused_tcp_port();
+    let daemon =
+        Daemon::start_http(port, &format!("{}/generateAssistantResponse", mock.uri())).await;
+    import_context_alignment_account(&daemon, 0.0).await;
+    let tool_result = format!(
+        "EARLY=cobalt-731\n{}\nMIDDLE=mango-482\n{}\nLATE=spruce-956",
+        "tool output record\n".repeat(25_000),
+        "tool output record\n".repeat(25_000),
+    );
+    let client = reqwest::Client::new();
+    let tokenizer = crosslane_translate::TokenCountCache::new(16).unwrap();
+    let mut seen_payloads = 0;
+    for (stream, merged) in [(false, false), (false, true), (true, false), (true, true)] {
+        let mut request = json!({
+            "model":"mapped-small", "max_tokens":1024, "stream":stream,
+            "system":"You are a helpful AI assistant tasked with summarizing conversations.",
+            "tools":[{"name":"Read","input_schema":{"type":"object"}}],
+            "messages":[
+                {"role":"user","content":"Read the records"},
+                {"role":"assistant","content":[{"type":"tool_use","id":"read-1","name":"Read","input":{}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"read-1","content":tool_result}]}
+            ]
+        });
+        if merged {
+            request["messages"][2]["content"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"type":"text","text":COMPACT_PROMPT}));
+        } else {
+            request["messages"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"role":"user","content":COMPACT_PROMPT}));
+        }
+        if !stream && !merged {
+            let count = client
+                .post(format!("http://127.0.0.1:{port}/v1/messages/count_tokens"))
+                .header("x-api-key", daemon.api_key.as_deref().unwrap())
+                .header("user-agent", "claude-cli/2.1.260 (external, e2e)")
+                .json(&request)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(count.status(), reqwest::StatusCode::OK);
+            let count: Value = count.json().await.unwrap();
+            assert!(
+                count["input_tokens"].as_u64().unwrap() > 128_000,
+                "count_tokens must count the complete source without compacting it"
+            );
+        }
+        let response = client
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .header("x-api-key", daemon.api_key.as_deref().unwrap())
+            .header("user-agent", "claude-cli/2.1.260 (external, e2e)")
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert_eq!(
+            status,
+            reqwest::StatusCode::OK,
+            "stream={stream}, merged={merged}: {body}"
+        );
+        if stream {
+            assert!(body.contains("\"type\":\"compaction\""), "{body}");
+            assert!(body.contains(CLIENT_SUMMARY), "{body}");
+            assert!(
+                body.find("\"type\":\"compaction\"").unwrap() < body.find(CLIENT_SUMMARY).unwrap()
+            );
+            assert!(body.contains("\"type\":\"message_stop\""), "{body}");
+        } else {
+            let body: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(body["content"][0]["type"], "compaction");
+            assert_eq!(body["content"][1]["text"], CLIENT_SUMMARY);
+        }
+
+        let requests = mock.received_requests().await.unwrap();
+        let payloads: Vec<Value> = requests
+            .iter()
+            .filter_map(|request| serde_json::from_slice(&request.body).ok())
+            .filter(|payload: &Value| payload.get("conversationState").is_some())
+            .collect();
+        let new_payloads = &payloads[seen_payloads..];
+        assert!(
+            new_payloads.len() >= 3,
+            "partitioned summaries plus the client's summary request"
+        );
+        let mut parts: Vec<_> = new_payloads[..new_payloads.len() - 1].iter().collect();
+        parts.sort_by_key(|payload| {
+            payload["conversationState"]["conversationId"]
+                .as_str()
+                .unwrap()
+                .rsplit_once("-part-")
+                .unwrap()
+                .1
+                .parse::<usize>()
+                .unwrap()
+        });
+        let mut transcript = String::new();
+        for part in parts {
+            let payload: crosslane_translate::KiroPayload =
+                serde_json::from_value(part.clone()).unwrap();
+            assert!(tokenizer.estimate_kiro_payload(&payload).await.unwrap() <= 95_040);
+            for message in &payload.conversation_state.history {
+                if let Some(user) = &message.user_input_message {
+                    transcript.push_str(&user.content);
+                }
+            }
+        }
+        assert!(
+            transcript.contains(&tool_result),
+            "partitioning lost source text"
+        );
+        let current = &new_payloads.last().unwrap()["conversationState"]["currentMessage"]
+            ["userInputMessage"];
+        assert_eq!(current["content"], COMPACT_PROMPT);
+        assert!(current["userInputMessageContext"]["toolResults"]
+            .as_array()
+            .is_none_or(Vec::is_empty));
+        seen_payloads = payloads.len();
+    }
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn manual_compact_partitions_oversized_system_and_tool_definitions() {
+    let _http_guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    mount_context_alignment_models(&mock).await;
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(summary_response)
+        .mount(&mock)
+        .await;
+    let port = unused_tcp_port();
+    let daemon =
+        Daemon::start_http(port, &format!("{}/generateAssistantResponse", mock.uri())).await;
+    import_context_alignment_account(&daemon, 0.0).await;
+    let config_path = daemon.home().join("config.toml");
+    let mut config: crosslane_core::config::Config =
+        toml::from_str(&tokio::fs::read_to_string(&config_path).await.unwrap()).unwrap();
+    config.context.auto_compact_on_overflow = false;
+    tokio::fs::write(&config_path, toml::to_string(&config).unwrap())
+        .await
+        .unwrap();
+    expect_ok(daemon.call("config.reload", json!({})).await);
+
+    let system = format!(
+        "POLICY_EARLY=cobalt-731\n{}\nPOLICY_LATE=spruce-956",
+        "governing requirement record\n".repeat(25_000)
+    );
+    let docs: Vec<Value> = (0..2)
+        .map(|i| {
+            json!({
+                "name":format!("Read{i}"), "description":"detail record\n".repeat(14_000),
+                "input_schema":{"type":"object","properties":{"path":{"type":"string"}},
+                    "required":["path"],"additionalProperties":false},
+                "input_examples":[{"path":"approved.txt"}]
+            })
+        })
+        .collect();
+    let values: Vec<String> = (0..12_000).map(|i| format!("mode_{i:06}")).collect();
+    let schemas: Vec<Value> = (0..2).map(|i| json!({
+        "name":format!("Mode{i}"), "description":"Select an exact allowed mode.",
+        "input_schema":{"type":"object","properties":{"mode":{"type":"string","enum":values}},
+            "required":["mode"],"additionalProperties":false}
+    })).collect();
+    let client = reqwest::Client::new();
+    let tokenizer = crosslane_translate::TokenCountCache::new(32).unwrap();
+    let mut seen_payloads = 0;
+    for (label, system, tools) in [
+        ("system", system.clone(), vec![]),
+        ("tool_docs", "Keep requirements intact.".into(), docs),
+        ("tool_schemas", "Keep requirements intact.".into(), schemas),
+    ] {
+        for stream in [false, true] {
+            let request = json!({
+                "model":"resolved-small", "max_tokens":1024, "stream":stream,
+                "system":system, "tools":tools,
+                "messages":[{"role":"user","content":"Earlier work"},
+                    {"role":"assistant","content":"Preserve all requirements"},
+                    {"role":"user","content":COMPACT_PROMPT}]
+            });
+            let parsed: crosslane_translate::ClaudeRequest =
+                serde_json::from_value(request.clone()).unwrap();
+            crosslane_translate::validate_claude(&parsed).unwrap();
+            let source = crosslane_translate::claude_to_kiro(
+                &parsed,
+                &crosslane_translate::TranslationOptions::new("resolved-small", "AI_EDITOR"),
+            );
+            assert!(
+                tokenizer
+                    .context_token_breakdown(&source)
+                    .await
+                    .unwrap()
+                    .minimum_input_tokens
+                    > 63_360,
+                "{label} must reproduce an intrinsically oversized request"
+            );
+            let expected_sources: Vec<String> =
+                std::iter::once(parsed.system.clone().unwrap().to_string())
+                    .chain(parsed.tools.iter().map(|tool| json!(tool).to_string()))
+                    .collect();
+
+            if !stream {
+                let counted = client
+                    .post(format!("http://127.0.0.1:{port}/v1/messages/count_tokens"))
+                    .header("x-api-key", daemon.api_key.as_deref().unwrap())
+                    .header("user-agent", "claude-cli/2.1.260 (external, e2e)")
+                    .json(&request)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(counted.status(), reqwest::StatusCode::OK);
+                let counted: Value = counted.json().await.unwrap();
+                assert!(
+                    counted["input_tokens"].as_u64().unwrap() > 63_360,
+                    "{label}: counting must include the full source, not a summary"
+                );
+                let dispatched = mock
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter(|request| request.url.path() == "/generateAssistantResponse")
+                    .count();
+                assert_eq!(
+                    dispatched, seen_payloads,
+                    "counting must not invoke a model"
+                );
+            }
+
+            let response = client
+                .post(format!("http://127.0.0.1:{port}/v1/messages"))
+                .header("x-api-key", daemon.api_key.as_deref().unwrap())
+                .header("user-agent", "claude-cli/2.1.260 (external, e2e)")
+                .json(&request)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = response.text().await.unwrap();
+            assert_eq!(
+                status,
+                reqwest::StatusCode::OK,
+                "{label} stream={stream}: {body}"
+            );
+            if stream {
+                assert!(
+                    body.contains(CLIENT_SUMMARY) && body.contains("\"type\":\"message_stop\""),
+                    "{body}"
+                );
+            } else {
+                let body: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(body["content"][1]["text"], CLIENT_SUMMARY);
+            }
+            let requests = mock.received_requests().await.unwrap();
+            let payloads: Vec<Value> = requests
+                .iter()
+                .filter_map(|request| serde_json::from_slice(&request.body).ok())
+                .filter(|payload: &Value| payload.get("conversationState").is_some())
+                .collect();
+            let new_payloads = &payloads[seen_payloads..];
+            assert!(
+                new_payloads.len() >= 3,
+                "{label}: partitioned source plus the final client summary"
+            );
+            let mut parts: Vec<_> = new_payloads[..new_payloads.len() - 1].iter().collect();
+            parts.sort_by_key(|payload| {
+                payload["conversationState"]["conversationId"]
+                    .as_str()
+                    .unwrap()
+                    .rsplit_once("-part-")
+                    .unwrap()
+                    .1
+                    .parse::<usize>()
+                    .unwrap()
+            });
+            let mut transcript = String::new();
+            for part in parts {
+                let payload: crosslane_translate::KiroPayload =
+                    serde_json::from_value(part.clone()).unwrap();
+                crosslane_translate::validate_kiro_tool_history(&payload).unwrap();
+                assert!(tokenizer.estimate_kiro_payload(&payload).await.unwrap() <= 47_520);
+                assert!(payload
+                    .conversation_state
+                    .current_message
+                    .user_input_message
+                    .user_input_message_context
+                    .is_none());
+                for message in payload.conversation_state.history {
+                    if let Some(user) = message.user_input_message {
+                        transcript.push_str(&user.content);
+                    }
+                }
+            }
+            for source in expected_sources {
+                assert!(
+                    transcript.contains(&source),
+                    "{label}: system/tool source was truncated"
+                );
+            }
+            let main: crosslane_translate::KiroPayload =
+                serde_json::from_value(new_payloads.last().unwrap().clone()).unwrap();
+            assert!(main
+                .conversation_state
+                .current_message
+                .user_input_message
+                .user_input_message_context
+                .is_none());
+            assert_eq!(
+                main.conversation_state
+                    .current_message
+                    .user_input_message
+                    .content,
+                COMPACT_PROMPT
+            );
+            assert!(tokenizer.estimate_kiro_payload(&main).await.unwrap() < 63_360);
+            seen_payloads = payloads.len();
+        }
+        let response = client
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .header("x-api-key", daemon.api_key.as_deref().unwrap())
+            .header("user-agent", "claude-cli/2.1.260 (external, e2e)")
+            .json(
+                &json!({"model":"resolved-small","max_tokens":64,"system":system,"tools":tools,
+                "messages":[{"role":"user","content":"Continue development"}]}),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "ordinary {label}"
+        );
+        let body: Value = response.json().await.unwrap();
+        let component = if label == "tool_schemas" {
+            "tool_definition_tokens"
+        } else {
+            "protected_prefix_tokens"
+        };
+        assert!(
+            body["error"]["context"][component].as_u64().unwrap() > 64_000,
+            "ordinary {label} must retain its full contract: {body}"
+        );
+    }
+
+    // Normal generation cannot silently summarize away its governing system.
+    // Both the direct guard and automatic compaction's minimum guard report
+    // a numerical breakdown, without invoking a model or echoing source text.
+    for auto in [false, true] {
+        config.context.auto_compact_on_overflow = auto;
+        tokio::fs::write(&config_path, toml::to_string(&config).unwrap())
+            .await
+            .unwrap();
+        expect_ok(daemon.call("config.reload", json!({})).await);
+        let response = client
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .header("x-api-key", daemon.api_key.as_deref().unwrap())
+            .header("user-agent", "claude-cli/2.1.260 (external, e2e)")
+            .json(&json!({"model":"resolved-small", "max_tokens":64,
+                "system":system,"messages":[{"role":"user","content":"Continue development"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        let body: Value = response.json().await.unwrap();
+        let context = &body["error"]["context"];
+        assert!(context["protected_prefix_tokens"].as_u64().unwrap() > 64_000);
+        assert!(
+            context["minimum_input_tokens"].as_u64().unwrap()
+                > context["maximum_input_tokens"].as_u64().unwrap()
+        );
+        assert_eq!(context["tool_definition_tokens"], 0);
+        assert!(!body.to_string().contains("POLICY_EARLY"));
+        let stats = expect_ok(
+            daemon
+                .call("stats", json!({"detail":true,"recent":20}))
+                .await,
+        );
+        let rejected = stats["stats"]["recent_requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|request| request["trace_id"] == body["request_id"])
+            .unwrap();
+        assert_eq!(rejected["diagnostics"]["context_overflow"], *context);
+        assert_eq!(rejected["diagnostics"]["account_error"], false);
+    }
+    let dispatched = mock
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|request| request.url.path() == "/generateAssistantResponse")
+        .count();
+    assert_eq!(
+        dispatched, seen_payloads,
+        "ordinary oversized system requests must fail locally"
+    );
+    daemon.stop().await;
+}

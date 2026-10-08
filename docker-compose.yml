@@ -1,30 +1,30 @@
-name: kiro-proxy
+name: crosslane
 
 services:
-  kproxyd:
+  crosslaned:
     # Production deployments pull a prebuilt image. Source builds live in
     # docker-compose.build.yml so a normal `docker compose up` cannot compile
     # on the server by accident.
-    image: "${KPROXY_IMAGE:-ghcr.io/yaocool/kiro-proxy:latest}"
+    image: "${CROSSLANE_IMAGE:-ghcr.io/yaocool/crosslane:latest}"
     # Share the host network so proxy services created on arbitrary ports become
     # reachable from the host immediately, without recreating the container.
     network_mode: host
     restart: unless-stopped
     init: true
     stop_grace_period: 120s
-    mem_limit: "${KPROXY_MEMORY_LIMIT:-1g}"
-    pids_limit: ${KPROXY_PIDS_LIMIT:-512}
+    mem_limit: "${CROSSLANE_MEMORY_LIMIT:-1g}"
+    pids_limit: ${CROSSLANE_PIDS_LIMIT:-512}
     logging:
       driver: json-file
       options:
-        max-size: "${KPROXY_DOCKER_LOG_MAX_SIZE:-10m}"
-        max-file: "${KPROXY_DOCKER_LOG_MAX_FILES:-5}"
+        max-size: "${CROSSLANE_DOCKER_LOG_MAX_SIZE:-10m}"
+        max-file: "${CROSSLANE_DOCKER_LOG_MAX_FILES:-5}"
     labels:
-      io.kiro-proxy.role: daemon
+      io.crosslane.role: daemon
     volumes:
-      - kproxy-data:/var/lib/kproxy
+      - crosslane-data:/var/lib/crosslane
     environment:
       RUST_LOG: info
 
 volumes:
-  kproxy-data:
+  crosslane-data:

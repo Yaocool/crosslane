@@ -1,16 +1,16 @@
 [workspace]
 members = [
-    "crates/kproxy-core",
-    "crates/kproxy-provider",
-    "crates/kproxy-copilot",
-    "crates/kproxy-store",
-    "crates/kproxy-ipc",
-    "crates/kproxy-translate",
-    "crates/kproxy-kiro",
-    "crates/kproxy-pool",
-    "crates/kproxy-notify",
-    "crates/kproxyd",
-    "crates/kproxy",
+    "crates/crosslane-core",
+    "crates/crosslane-provider",
+    "crates/crosslane-copilot",
+    "crates/crosslane-store",
+    "crates/crosslane-ipc",
+    "crates/crosslane-translate",
+    "crates/crosslane-kiro",
+    "crates/crosslane-pool",
+    "crates/crosslane-notify",
+    "crates/crosslaned",
+    "crates/crosslane",
 ]
 resolver = "2"
 
@@ -21,15 +21,15 @@ rust-version = "1.97.1"
 license = "MIT"
 
 [workspace.dependencies]
-kproxy-core = { path = "crates/kproxy-core" }
-kproxy-provider = { path = "crates/kproxy-provider" }
-kproxy-copilot = { path = "crates/kproxy-copilot" }
-kproxy-store = { path = "crates/kproxy-store" }
-kproxy-ipc = { path = "crates/kproxy-ipc" }
-kproxy-translate = { path = "crates/kproxy-translate" }
-kproxy-kiro = { path = "crates/kproxy-kiro" }
-kproxy-pool = { path = "crates/kproxy-pool" }
-kproxy-notify = { path = "crates/kproxy-notify" }
+crosslane-core = { path = "crates/crosslane-core" }
+crosslane-provider = { path = "crates/crosslane-provider" }
+crosslane-copilot = { path = "crates/crosslane-copilot" }
+crosslane-store = { path = "crates/crosslane-store" }
+crosslane-ipc = { path = "crates/crosslane-ipc" }
+crosslane-translate = { path = "crates/crosslane-translate" }
+crosslane-kiro = { path = "crates/crosslane-kiro" }
+crosslane-pool = { path = "crates/crosslane-pool" }
+crosslane-notify = { path = "crates/crosslane-notify" }
 anyhow = "=1.0.86"
 thiserror = "=1.0.63"
 serde = { version = "=1.0.209", features = ["derive"] }

@@ -8,18 +8,18 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
 FROM builder-base AS builder-slim
-RUN --mount=type=cache,id=kproxy-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,id=kproxy-cargo-target,target=/src/target,sharing=locked \
-    cargo build --release --locked -p kproxy -p kproxyd --no-default-features \
-    && install -D -m 0755 /src/target/release/kproxy /out/kproxy \
-    && install -D -m 0755 /src/target/release/kproxyd /out/kproxyd
+RUN --mount=type=cache,id=crosslane-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=crosslane-cargo-target,target=/src/target,sharing=locked \
+    cargo build --release --locked -p crosslane -p crosslaned --no-default-features \
+    && install -D -m 0755 /src/target/release/crosslane /out/crosslane \
+    && install -D -m 0755 /src/target/release/crosslaned /out/crosslaned
 
 FROM builder-base AS builder-full
-RUN --mount=type=cache,id=kproxy-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,id=kproxy-cargo-target,target=/src/target,sharing=locked \
-    cargo build --release --locked -p kproxy -p kproxyd --all-features \
-    && install -D -m 0755 /src/target/release/kproxy /out/kproxy \
-    && install -D -m 0755 /src/target/release/kproxyd /out/kproxyd \
+RUN --mount=type=cache,id=crosslane-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=crosslane-cargo-target,target=/src/target,sharing=locked \
+    cargo build --release --locked -p crosslane -p crosslaned --all-features \
+    && install -D -m 0755 /src/target/release/crosslane /out/crosslane \
+    && install -D -m 0755 /src/target/release/crosslaned /out/crosslaned \
     && touch /out/build-ready
 
 FROM debian:bookworm-slim AS runtime-base
@@ -27,30 +27,30 @@ RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         ca-certificates ncurses-term socat tini vim \
     && rm -rf /var/lib/apt/lists/* \
-    && groupadd --system --gid 10001 kproxy \
-    && useradd --system --uid 10001 --gid kproxy --home /var/lib/kproxy kproxy \
-    && install -d -o kproxy -g kproxy -m 0700 /var/lib/kproxy
-COPY deploy/entrypoint.sh /usr/local/bin/kproxy-entrypoint
+    && groupadd --system --gid 10001 crosslane \
+    && useradd --system --uid 10001 --gid crosslane --home /var/lib/crosslane crosslane \
+    && install -d -o crosslane -g crosslane -m 0700 /var/lib/crosslane
+COPY deploy/entrypoint.sh /usr/local/bin/crosslane-entrypoint
 ENV LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
-    KPROXY_HOME=/var/lib/kproxy
+    CROSSLANE_HOME=/var/lib/crosslane
 EXPOSE 5580
-USER kproxy:kproxy
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/kproxy-entrypoint"]
+USER crosslane:crosslane
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/crosslane-entrypoint"]
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD ["kproxy", "--socket", "/var/lib/kproxy/admin.sock", "health"]
+    CMD ["crosslane", "--socket", "/var/lib/crosslane/admin.sock", "health"]
 
 FROM runtime-base AS runtime-slim
-COPY --from=builder-slim /out/kproxy /usr/local/bin/kproxy
-COPY --from=builder-slim /out/kproxyd /usr/local/bin/kproxyd
+COPY --from=builder-slim /out/crosslane /usr/local/bin/crosslane
+COPY --from=builder-slim /out/crosslaned /usr/local/bin/crosslaned
 
 FROM runtime-base AS runtime-full
 USER root
 # This constant marker serializes the memory-heavy Rust build and Chromium
 # installation. Its stable contents preserve the Chromium package layer cache
 # when only application source code changes.
-COPY --from=builder-full /out/build-ready /tmp/kproxy-build-ready
-ENV KPROXY_CHROMIUM_REVISION=1566079
+COPY --from=builder-full /out/build-ready /tmp/crosslane-build-ready
+ENV CROSSLANE_CHROMIUM_REVISION=1566079
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         ca-certificates curl unzip \
@@ -63,7 +63,7 @@ RUN apt-get update \
         wget xdg-utils \
     && curl --fail --location --retry 3 \
         --output /tmp/chromium-linux.zip \
-        "https://storage.googleapis.com/chromium-browser-snapshots/Linux_x64/${KPROXY_CHROMIUM_REVISION}/chrome-linux.zip" \
+        "https://storage.googleapis.com/chromium-browser-snapshots/Linux_x64/${CROSSLANE_CHROMIUM_REVISION}/chrome-linux.zip" \
     && echo "eafeca49c07daab07d3b8749872811f889e10d44186ebd75771b2fde4e09bca6  /tmp/chromium-linux.zip" \
         | sha256sum --check --strict \
     && unzip -q /tmp/chromium-linux.zip -d /opt \
@@ -75,10 +75,10 @@ RUN apt-get update \
     && rm -rf \
         /var/lib/apt/lists/* \
         /tmp/chromium-linux.zip \
-        /tmp/kproxy-build-ready
-COPY --from=builder-full /out/kproxy /usr/local/bin/kproxy
-COPY --from=builder-full /out/kproxyd /usr/local/bin/kproxyd
-ENV KPROXY_CHROMIUM_NO_SANDBOX=1
-USER kproxy:kproxy
+        /tmp/crosslane-build-ready
+COPY --from=builder-full /out/crosslane /usr/local/bin/crosslane
+COPY --from=builder-full /out/crosslaned /usr/local/bin/crosslaned
+ENV CROSSLANE_CHROMIUM_NO_SANDBOX=1
+USER crosslane:crosslane
 
 FROM runtime-full AS final
