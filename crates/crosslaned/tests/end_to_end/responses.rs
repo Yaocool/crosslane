@@ -648,7 +648,7 @@ async fn responses_fail_after_repeated_empty_tool_result_turns() {
 }
 
 #[tokio::test]
-async fn responses_default_store_preserves_affinity_and_resumes_tool_roundtrips() {
+async fn responses_default_store_resumes_history_and_honors_session_forks() {
     let _http_guard = HTTP_TEST_LOCK.lock().await;
     let mock = MockServer::start().await;
     mount_context_alignment_models(&mock).await;
@@ -693,8 +693,9 @@ async fn responses_default_store_preserves_affinity_and_resumes_tool_roundtrips(
         assert_eq!(first["store"], true);
 
         // Only newly supplied items are sent. Omitted `store` defaults to true,
-        // and the stored response keeps the resolved Kiro conversation ID even
-        // if a continuation drops or changes its affinity header.
+        // and an omitted affinity header inherits the stored conversation.
+        // An explicit different session forks that conversation while reusing
+        // its stored input and tool definitions.
         let continuation = json!({
             "model":"source-large",
             "previous_response_id":first_id,
@@ -731,11 +732,20 @@ async fn responses_default_store_preserves_affinity_and_resumes_tool_roundtrips(
         .map(|request| serde_json::from_slice::<Value>(&request.body).unwrap())
         .collect::<Vec<_>>();
     assert_eq!(payloads.len(), 4);
-    for pair in payloads.chunks_exact(2) {
-        assert_eq!(
-            pair[1]["conversationState"]["conversationId"],
-            pair[0]["conversationState"]["conversationId"]
-        );
+    for (index, pair) in payloads.chunks_exact(2).enumerate() {
+        if index == 0 {
+            assert_eq!(
+                pair[1]["conversationState"]["conversationId"],
+                pair[0]["conversationState"]["conversationId"],
+                "omitted session headers must inherit the stored conversation"
+            );
+        } else {
+            assert_ne!(
+                pair[1]["conversationState"]["conversationId"],
+                pair[0]["conversationState"]["conversationId"],
+                "explicit different sessions must fork the stored conversation"
+            );
+        }
         let context = &pair[1]["conversationState"]["currentMessage"]["userInputMessage"]
             ["userInputMessageContext"];
         assert_eq!(context["tools"].as_array().unwrap().len(), 2);
