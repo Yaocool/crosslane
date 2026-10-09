@@ -661,12 +661,36 @@ impl Default for ProviderConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProviderPoolConfig {
-    /// Optional provider-specific concurrency ceiling. Zero inherits the
-    /// legacy global account-pool limit.
+    /// Optional provider-specific concurrency ceiling. Zero uses the
+    /// adapter default.
     pub max_concurrent_per_account: usize,
+    /// Scheduling weights for provider adapters with account pools.
+    pub balance: ProviderBalanceConfig,
+}
+
+/// Account scheduling for providers without an authoritative credit balance.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProviderBalanceConfig {
+    /// Relative weight of occupied account concurrency slots.
+    pub weight_active: f64,
+    /// Relative weight of how recently the account was selected.
+    pub weight_idle: f64,
+    /// Time after which the recent-use penalty reaches zero.
+    pub idle_window_ms: u64,
+}
+
+impl Default for ProviderBalanceConfig {
+    fn default() -> Self {
+        Self {
+            weight_active: 0.8,
+            weight_idle: 0.2,
+            idle_window_ms: 300_000,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1503,6 +1527,31 @@ impl Config {
                     "provider id 'kiro' is reserved for the built-in Kiro compatibility provider",
                 );
             }
+            for (name, value) in [
+                ("weight_active", provider.pool.balance.weight_active),
+                ("weight_idle", provider.pool.balance.weight_idle),
+            ] {
+                if !value.is_finite() || value < 0.0 {
+                    return invalid_config(
+                        format!("provider.{index}.pool.balance.{name}"),
+                        "must be a finite non-negative number",
+                    );
+                }
+            }
+            let balance_weight_sum =
+                provider.pool.balance.weight_active + provider.pool.balance.weight_idle;
+            if !balance_weight_sum.is_finite() || balance_weight_sum <= 0.0 {
+                return invalid_config(
+                    format!("provider.{index}.pool.balance"),
+                    "at least one scheduling weight must be greater than zero",
+                );
+            }
+            if provider.pool.balance.idle_window_ms == 0 {
+                return invalid_config(
+                    format!("provider.{index}.pool.balance.idle_window_ms"),
+                    "must be greater than zero",
+                );
+            }
             if provider.models.cache_ttl_ms == 0 || provider.models.max_stale_ms == 0 {
                 return invalid_config(
                     format!("provider.{index}.models"),
@@ -1961,6 +2010,12 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# =====================================
 # [provider.pool]
 # 单个账号并发上限；0 使用驱动默认值。
 # max_concurrent_per_account = 2
+
+# [provider.pool.balance]
+# 非 Kiro 账号按并发压力与最近使用时间选号；上游未提供账号额度时不按额度打分。
+# weight_active = 0.8
+# weight_idle = 0.2
+# idle_window_ms = 300000
 
 # [provider.models]
 # 模型发现缓存有效期。

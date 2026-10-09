@@ -91,6 +91,11 @@ crosslane account list --provider copilot
 
 Choose an account method that your GitHub organization permits. `--provider`
 takes the instance ID selected with `provider add --id`.
+Within a service account pool, Copilot selects accounts by active concurrency
+and recent use. Configure `weight_active`, `weight_idle`, and `idle_window_ms`
+under `[provider.pool.balance]` (defaults: `0.8`, `0.2`, `300000`). Copilot does
+not currently expose a reliable per-account remaining-credit balance, so Kiro
+credit scoring does not apply.
 
 ## Services and client access
 

@@ -80,6 +80,10 @@ crosslane account list --provider copilot
 ```
 
 选择组织允许的账号方式。`--provider` 使用 `provider add --id` 指定的实例 ID。
+同一服务账号池内，Copilot 按账号当前并发数和最近使用时间选择账号；
+`[provider.pool.balance]` 可设置 `weight_active`、`weight_idle` 和
+`idle_window_ms`，默认分别为 `0.8`、`0.2` 和 `300000`。
+Copilot 当前没有可靠的单账号剩余额度数据，因此不按 Kiro credits 打分。
 
 ## 服务与客户端访问
 

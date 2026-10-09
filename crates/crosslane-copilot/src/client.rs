@@ -2,10 +2,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use crosslane_core::config::{ProviderConfig, DEFAULT_COPILOT_OAUTH_CLIENT_ID};
+use crosslane_core::config::{
+    ProviderBalanceConfig, ProviderConfig, DEFAULT_COPILOT_OAUTH_CLIENT_ID,
+};
 use crosslane_core::provider::{
     CapabilitySupport, ProviderCapabilities, ProviderDescriptor, ProviderId, ProviderModel,
     ProviderProtocol,
@@ -52,6 +54,7 @@ pub struct CopilotSettings {
     pub client_secret: Option<String>,
     pub refresh_before_secs: i64,
     pub max_concurrent_per_account: usize,
+    pub balance: ProviderBalanceConfig,
     pub model_cache_ttl_secs: i64,
     pub model_max_stale_secs: i64,
     pub allow_insecure_http: bool,
@@ -101,6 +104,7 @@ impl CopilotSettings {
             } else {
                 config.pool.max_concurrent_per_account
             },
+            balance: config.pool.balance.clone(),
             model_cache_ttl_secs: i64::try_from(config.models.cache_ttl_ms.div_ceil(1_000))
                 .unwrap_or(i64::MAX),
             model_max_stale_secs: i64::try_from(config.models.max_stale_ms.div_ceil(1_000))
@@ -131,6 +135,17 @@ impl CopilotSettings {
     }
 
     fn validate(&self) -> Result<(), ProviderError> {
+        let balance_weight_sum = self.balance.weight_active + self.balance.weight_idle;
+        if !self.balance.weight_active.is_finite()
+            || self.balance.weight_active < 0.0
+            || !self.balance.weight_idle.is_finite()
+            || self.balance.weight_idle < 0.0
+            || !balance_weight_sum.is_finite()
+            || balance_weight_sum <= 0.0
+            || self.balance.idle_window_ms == 0
+        {
+            return Err(internal_error("invalid Copilot account balance settings"));
+        }
         if self
             .client_id
             .as_ref()
@@ -293,6 +308,41 @@ struct PersistedModelCache {
     accounts: BTreeMap<String, AccountModelCache>,
 }
 
+struct AccountSlot {
+    semaphore: Arc<Semaphore>,
+    last_selected: StdMutex<Option<Instant>>,
+}
+
+impl AccountSlot {
+    fn new(max_concurrent: usize) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            last_selected: StdMutex::new(None),
+        }
+    }
+
+    fn score(&self, max_concurrent: usize, balance: &ProviderBalanceConfig, now: Instant) -> f64 {
+        let active = max_concurrent.saturating_sub(self.semaphore.available_permits());
+        let active_factor = active as f64 / max_concurrent.max(1) as f64;
+        let last_selected = *self
+            .last_selected
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let idle_factor = last_selected.map_or(0.0, |last| {
+            let idle_ms = now.saturating_duration_since(last).as_millis() as f64;
+            1.0 - (idle_ms / balance.idle_window_ms.max(1) as f64).min(1.0)
+        });
+        balance.weight_active * active_factor + balance.weight_idle * idle_factor
+    }
+
+    fn mark_selected(&self) {
+        *self
+            .last_selected
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
+    }
+}
+
 /// One configured Copilot provider instance with isolated accounts and token
 /// cache.
 pub struct CopilotProvider {
@@ -307,7 +357,7 @@ pub struct CopilotProvider {
     mutation: Mutex<()>,
     token_cache: RwLock<HashMap<String, CachedApiToken>>,
     refresh_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
-    account_limits: StdMutex<HashMap<String, Arc<Semaphore>>>,
+    account_limits: StdMutex<HashMap<String, Arc<AccountSlot>>>,
     next_account: AtomicUsize,
     model_cache: RwLock<ModelCache>,
     model_refresh: Mutex<()>,
@@ -338,7 +388,7 @@ impl CopilotProvider {
             .map(|account| {
                 (
                     account.id.clone(),
-                    Arc::new(Semaphore::new(settings.max_concurrent_per_account)),
+                    Arc::new(AccountSlot::new(settings.max_concurrent_per_account)),
                 )
             })
             .collect();
@@ -507,7 +557,7 @@ impl CopilotProvider {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(
                 account.id.clone(),
-                Arc::new(Semaphore::new(self.settings.max_concurrent_per_account)),
+                Arc::new(AccountSlot::new(self.settings.max_concurrent_per_account)),
             );
         let cache = {
             let mut cache = self.model_cache.write().await;
@@ -1408,7 +1458,7 @@ impl CopilotProvider {
                     let account = accounts[(start + offset) % accounts.len()].clone();
                     limits
                         .get(&account.id)
-                        .map(|limit| (account, Arc::clone(limit)))
+                        .map(|limit| (offset, account, Arc::clone(limit)))
                 })
                 .collect::<Vec<_>>()
         };
@@ -1418,8 +1468,31 @@ impl CopilotProvider {
                 self.id
             )));
         }
-        for (account, limit) in &candidates {
-            if let Ok(permit) = Arc::clone(limit).try_acquire_owned() {
+        // Prefer a less busy account, then one used less recently. The
+        // rotating offset only breaks equal-score ties. Copilot does not
+        // expose a reliable per-account remaining-credit balance.
+        let now = Instant::now();
+        // Snapshot each score once so concurrent requests cannot change the
+        // comparator's ordering while this request is sorting candidates.
+        let mut candidates = candidates
+            .into_iter()
+            .map(|(offset, account, slot)| {
+                let score = slot.score(
+                    self.settings.max_concurrent_per_account,
+                    &self.settings.balance,
+                    now,
+                );
+                (score, offset, account, slot)
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            left.0
+                .total_cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+        });
+        for (_, _, account, slot) in &candidates {
+            if let Ok(permit) = Arc::clone(&slot.semaphore).try_acquire_owned() {
+                slot.mark_selected();
                 return Ok((
                     account.clone(),
                     permit,
@@ -1427,16 +1500,21 @@ impl CopilotProvider {
                 ));
             }
         }
-        let (account, limit) = candidates
-            .into_iter()
-            .next()
-            .expect("non-empty Copilot candidates");
-        let permit = limit.acquire_owned().await.map_err(|_| {
+        // When all slots are occupied, wake for whichever account frees first
+        // instead of queuing behind one long-running stream.
+        let waiters = candidates
+            .iter()
+            .map(|(_, _, _, slot)| Box::pin(Arc::clone(&slot.semaphore).acquire_owned()))
+            .collect::<Vec<_>>();
+        let (permit, index, _) = futures::future::select_all(waiters).await;
+        let (_, _, account, slot) = candidates.swap_remove(index);
+        let permit = permit.map_err(|_| {
             ProviderError::unavailable(format!(
                 "account {} concurrency limiter is closed",
                 account.id
             ))
         })?;
+        slot.mark_selected();
         let model = capable_accounts[&account.id].clone();
         Ok((account, permit, model))
     }
@@ -2566,6 +2644,110 @@ mod tests {
             .expect(1)
             .mount(server)
             .await;
+    }
+
+    #[tokio::test]
+    async fn account_pool_prefers_idle_then_less_busy_account() {
+        let server = MockServer::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        mount_account_exchange(&server, "github-token").await;
+        let provider = mock_provider(&server, directory.path()).await;
+        let first = provider
+            .import_token("github-token".into(), None)
+            .await
+            .unwrap();
+        let mut second = provider.accounts.read().await[0].clone();
+        second.id = "acc_second".into();
+        second.github_user_id += 1;
+        provider.accounts.write().await.push(second.clone());
+        let cached = provider.model_cache.read().await.accounts[&first.id].clone();
+        provider
+            .model_cache
+            .write()
+            .await
+            .accounts
+            .insert(second.id.clone(), cached);
+        let first_slot = {
+            let mut slots = provider
+                .account_limits
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            slots.insert(
+                second.id.clone(),
+                Arc::new(AccountSlot::new(
+                    provider.settings.max_concurrent_per_account,
+                )),
+            );
+            Arc::clone(&slots[&first.id])
+        };
+        let second_slot = {
+            let slots = provider
+                .account_limits
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Arc::clone(&slots[&second.id])
+        };
+        first_slot.mark_selected();
+
+        let (idle, idle_permit, _) = provider
+            .acquire_account(
+                &[],
+                "gpt-test",
+                ProviderProtocol::ClaudeMessages,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(idle.id, second.id);
+        let (less_busy, busy_permit, _) = provider
+            .acquire_account(
+                &[],
+                "gpt-test",
+                ProviderProtocol::ClaudeMessages,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(less_busy.id, first.id);
+        drop((idle_permit, busy_permit));
+
+        let mut first_permits = Vec::new();
+        let mut second_permits = Vec::new();
+        for _ in 0..provider.settings.max_concurrent_per_account {
+            first_permits.push(
+                Arc::clone(&first_slot.semaphore)
+                    .try_acquire_owned()
+                    .unwrap(),
+            );
+            second_permits.push(
+                Arc::clone(&second_slot.semaphore)
+                    .try_acquire_owned()
+                    .unwrap(),
+            );
+        }
+        let waiting = tokio::spawn(async move {
+            provider
+                .acquire_account(
+                    &[],
+                    "gpt-test",
+                    ProviderProtocol::ClaudeMessages,
+                    false,
+                    None,
+                )
+                .await
+                .map(|(account, permit, _)| (account.id, permit))
+        });
+        tokio::task::yield_now().await;
+        drop(second_permits.pop());
+        let (account_id, permit) = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("a free account should wake the queue")
+            .expect("account selection task")
+            .expect("account selection");
+        assert_eq!(account_id, second.id);
+        drop((permit, first_permits, second_permits));
     }
 
     #[tokio::test]

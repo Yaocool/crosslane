@@ -253,6 +253,29 @@ fn documented_default_covers_every_config_field() {
     assert_same_config_shape(&expected, &documented, "config");
 }
 
+#[test]
+fn provider_pool_balance_config_round_trips_and_rejects_invalid_weights() {
+    let mut config: Config = toml::from_str(
+        "[[provider]]\nid = 'copilot'\nkind = 'copilot'\n[provider.pool.balance]\nweight_active = 0.7\nweight_idle = 0.3\nidle_window_ms = 1000\n",
+    )
+    .expect("provider balance config");
+    assert_eq!(config.provider[0].pool.balance.weight_active, 0.7);
+    assert_eq!(config.provider[0].pool.balance.weight_idle, 0.3);
+    config.validate().expect("valid provider balance config");
+
+    config.provider[0].pool.balance.weight_active = f64::NAN;
+    assert!(config.validate().is_err());
+    config.provider[0].pool.balance.weight_active = 1.0e308;
+    config.provider[0].pool.balance.weight_idle = 1.0e308;
+    assert!(config.validate().is_err());
+    config.provider[0].pool.balance.weight_active = 0.0;
+    config.provider[0].pool.balance.weight_idle = 0.0;
+    assert!(config.validate().is_err());
+    config.provider[0].pool.balance.weight_idle = 1.0;
+    config.provider[0].pool.balance.idle_window_ms = 0;
+    assert!(config.validate().is_err());
+}
+
 fn uncomment_documented_settings() -> String {
     DEFAULT_CONFIG_TOML
         .lines()
@@ -277,6 +300,7 @@ fn fully_populated_config() -> Config {
         enabled: true,
         pool: ProviderPoolConfig {
             max_concurrent_per_account: 2,
+            ..ProviderPoolConfig::default()
         },
         models: ProviderModelsConfig {
             cache_ttl_ms: 300_000,
