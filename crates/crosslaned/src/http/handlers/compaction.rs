@@ -717,7 +717,7 @@ pub(super) async fn compaction_operation_target(
     decision: &CompactionDecision,
 ) -> Result<u64, ApiError> {
     let mut minimum_payload = source_payload.clone();
-    minimum_payload.retain_protected_history();
+    minimum_payload.retain_required_history();
     let minimum_tokens = state
         .tokenizer
         .estimate_kiro_payload(&minimum_payload)

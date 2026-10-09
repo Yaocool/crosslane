@@ -47,11 +47,16 @@ impl TokenCountCache {
         let tool_definition_tokens = self.section_tokens(segments, fixed).await?;
         let current_message_tokens = current_tokens.saturating_sub(tool_definition_tokens);
         let overhead_tokens = CONVERSATION_OVERHEAD_TOKENS as u64;
-        let minimum_input_tokens = protected_prefix_tokens
+        let fixed_input_tokens = protected_prefix_tokens
             .saturating_add(current_tokens)
             .saturating_add(overhead_tokens);
+        let required_tail = payload.required_history_tail_len();
+        let minimum_input_tokens = fixed_input_tokens.saturating_add(
+            self.history_tokens(&history[history.len().saturating_sub(required_tail)..])
+                .await?,
+        );
         Ok(ContextTokenBreakdown {
-            total_input_tokens: minimum_input_tokens.saturating_add(history_tokens),
+            total_input_tokens: fixed_input_tokens.saturating_add(history_tokens),
             protected_prefix_tokens,
             tool_definition_tokens,
             current_message_tokens,
@@ -129,7 +134,7 @@ mod tests {
                 && breakdown.current_message_tokens > 0
                 && breakdown.history_tokens > 0
         );
-        payload.retain_protected_history();
+        payload.retain_required_history();
         assert_eq!(
             breakdown.minimum_input_tokens,
             tokenizer.estimate_kiro_payload(&payload).await.unwrap() as u64

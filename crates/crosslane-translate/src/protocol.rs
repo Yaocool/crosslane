@@ -313,6 +313,42 @@ impl KiroPayload {
         self.conversation_state.history.truncate(protected);
     }
 
+    /// The last complete tool chain is required when the current message
+    /// answers a tool call. Removing it would orphan structured tool results.
+    pub fn required_history_tail_len(&self) -> usize {
+        let has_results = self
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .as_ref()
+            .is_some_and(|context| !context.tool_results.is_empty());
+        if !has_results {
+            return 0;
+        }
+        let history = &self.conversation_state.history[self.protected_history_len()..];
+        let start = history
+            .iter()
+            .rposition(|message| {
+                message.user_input_message.as_ref().is_some_and(|user| {
+                    !user
+                        .user_input_message_context
+                        .as_ref()
+                        .is_some_and(|context| !context.tool_results.is_empty())
+                })
+            })
+            .unwrap_or(0);
+        history.len() - start
+    }
+
+    /// Retains both the proxy-owned prefix and the tool turn needed by the
+    /// current results. This is the smallest safe input for compaction.
+    pub fn retain_required_history(&mut self) {
+        let protected = self.protected_history_len();
+        let tail_start = self.conversation_state.history.len() - self.required_history_tail_len();
+        self.conversation_state.history.drain(protected..tail_start);
+    }
+
     /// Applies an internal history bound without discarding the proxy-owned
     /// prefix. Valid Kiro histories and the protected prefix both contain
     /// complete user/assistant pairs, so retaining an even recent capacity

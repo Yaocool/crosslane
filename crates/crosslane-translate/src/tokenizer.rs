@@ -59,6 +59,7 @@ pub struct KiroCompactionPlan {
     summary_max_tokens: u32,
     protected_history: Vec<KiroHistoryMessage>,
     retained_history: Vec<KiroHistoryMessage>,
+    required_history_len: usize,
 }
 
 impl KiroCompactionPlan {
@@ -271,10 +272,12 @@ impl TokenCountCache {
         let protected_len = payload.protected_history_len();
         let protected_history = history[..protected_len].to_vec();
         let compactable_history = &history[protected_len..];
-        if compactable_history.is_empty() {
+        let required_history_len = payload.required_history_tail_len();
+        if compactable_history.len() <= required_history_len {
             return Ok(None);
         }
-        let start = recent_turn_start(compactable_history, preserve_recent_turns);
+        let start = recent_turn_start(compactable_history, preserve_recent_turns)
+            .min(compactable_history.len() - required_history_len);
         let mut retained_history = compactable_history[start..].to_vec();
         let mut candidate = payload.clone();
         candidate.conversation_state.history = protected_history.clone();
@@ -282,7 +285,7 @@ impl TokenCountCache {
             .conversation_state
             .history
             .extend_from_slice(&retained_history);
-        while !retained_history.is_empty()
+        while retained_history.len() > required_history_len
             && self.estimate_kiro_payload(&candidate).await? > history_target
         {
             let remove = oldest_turn_len(&retained_history);
@@ -305,6 +308,7 @@ impl TokenCountCache {
             summary_max_tokens: summary_max_tokens as u32,
             protected_history,
             retained_history,
+            required_history_len,
         }))
     }
 
@@ -343,7 +347,7 @@ impl TokenCountCache {
         // The model output limit is the primary bound. If tokenizer/model
         // accounting differs, first sacrifice optional verbatim duplicates;
         // the semantic checkpoint still covers all compactable source context.
-        while compacted_tokens > target_tokens && !retained.is_empty() {
+        while compacted_tokens > target_tokens && retained.len() > plan.required_history_len {
             let remove = oldest_turn_len(&retained);
             retained.drain(..remove);
             set_compacted_history(
@@ -423,7 +427,7 @@ impl TokenCountCache {
             payload, &source, &plan, &summary, &retained, &model_id, &origin,
         );
         let mut compacted_tokens = self.estimate_kiro_payload(payload).await?;
-        while compacted_tokens > target_tokens && !retained.is_empty() {
+        while compacted_tokens > target_tokens && retained.len() > plan.required_history_len {
             let remove = oldest_turn_len(&retained);
             retained.drain(..remove);
             set_fallback_compacted_history(
@@ -1320,6 +1324,80 @@ mod tests {
             .tool_use_id = "long-tool-use-id-".repeat(1_000);
         let long = cache.estimate_kiro_payload(&expanded).await.expect("long");
         assert!(long > short + 1_000);
+    }
+
+    #[tokio::test]
+    async fn both_compaction_modes_preserve_the_current_tool_chain() {
+        let cache = TokenCountCache::new(8).unwrap();
+        let request: crate::ClaudeRequest = serde_json::from_value(serde_json::json!({
+            "model":"source", "max_tokens":64, "system":"Keep the governing instruction",
+            "tools":[{"name":"Read", "description":"Read records", "input_schema":{"type":"object"}}],
+            "messages":[
+                {"role":"user","content":"old context ".repeat(4000)},
+                {"role":"assistant","content":"Old conclusion"},
+                {"role":"user","content":"Read the records"},
+                {"role":"assistant","content":[{"type":"tool_use","id":"read-1","name":"Read","input":{"path":"first.txt"}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"read-1","content":"First result"}]},
+                {"role":"assistant","content":[{"type":"tool_use","id":"read-2","name":"Read","input":{"path":"second.txt"}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"read-2","content":"Current result"}]}
+            ]
+        })).unwrap();
+        let source =
+            crate::claude_to_kiro(&request, &crate::TranslationOptions::new("target", "CLI"));
+        let required = source.required_history_tail_len();
+        assert_eq!(required, 4, "retain the complete two-call chain");
+        let expected_tail = serde_json::to_value(
+            &source.conversation_state.history
+                [source.conversation_state.history.len() - required..],
+        )
+        .unwrap();
+        let expected_current =
+            serde_json::to_value(&source.conversation_state.current_message).unwrap();
+        let mut minimum = source.clone();
+        minimum.retain_required_history();
+        assert_eq!(
+            cache
+                .context_token_breakdown(&source)
+                .await
+                .unwrap()
+                .minimum_input_tokens,
+            cache.estimate_kiro_payload(&minimum).await.unwrap() as u64,
+        );
+        for semantic in [false, true] {
+            let mut payload = source.clone();
+            let stats = if semantic {
+                let plan = cache
+                    .plan_kiro_compaction(&payload, 1500, 0)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                cache
+                    .apply_semantic_compaction(
+                        &mut payload,
+                        &plan,
+                        "Keep the old conclusion.",
+                        1500,
+                    )
+                    .await
+                    .unwrap()
+            } else {
+                cache
+                    .compact_kiro_payload(&mut payload, 1500, 0)
+                    .await
+                    .unwrap()
+            };
+            assert!(stats.removed_messages > 0);
+            let history = &payload.conversation_state.history;
+            assert_eq!(
+                serde_json::to_value(&history[history.len() - required..]).unwrap(),
+                expected_tail
+            );
+            assert_eq!(
+                serde_json::to_value(&payload.conversation_state.current_message).unwrap(),
+                expected_current
+            );
+            crate::validate_kiro_tool_history(&payload).unwrap();
+        }
     }
 
     #[tokio::test]
