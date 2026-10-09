@@ -45,6 +45,9 @@ mod warning_regressions;
 #[path = "end_to_end/manual_compaction.rs"]
 mod manual_compaction;
 
+#[path = "end_to_end/automatic_compaction.rs"]
+mod automatic_compaction;
+
 struct Daemon {
     child: Child,
     socket: PathBuf,
@@ -339,6 +342,7 @@ struct UpstreamOverflowCompactionResponder {
     main_calls: Arc<AtomicUsize>,
     first_main_body_bytes: Arc<AtomicUsize>,
     summary_body_bytes: Arc<AtomicUsize>,
+    rejection_message: Option<String>,
 }
 
 impl wiremock::Respond for UpstreamOverflowCompactionResponder {
@@ -361,7 +365,8 @@ impl wiremock::Respond for UpstreamOverflowCompactionResponder {
             self.first_main_body_bytes
                 .store(request.body.len(), Ordering::SeqCst);
             ResponseTemplate::new(400).set_body_json(serde_json::json!({
-                "message":"prompt is too long: context length exceeded"
+                "message": self.rejection_message.as_deref()
+                    .unwrap_or("prompt is too long: context length exceeded")
             }))
         } else {
             ResponseTemplate::new(200)

@@ -13,7 +13,7 @@ use bytes::BytesMut;
 use crosslane_core::provider::{ProviderId, ProviderModel, ProviderProtocol};
 use crosslane_kiro::{EventStreamDecoder, KiroError, KiroEvent, KiroResponse};
 use crosslane_pool::{AccountLease, PoolError};
-use crosslane_translate::error::log_model;
+use crosslane_translate::error::{is_context_length_error, log_model};
 use crosslane_translate::model::{
     map_model_for_provider, resolve_dynamic_model, ModelMappingContext, ModelRoute,
 };
@@ -2349,29 +2349,26 @@ fn upstream_bad_request_is_actionable(message: &str, format: ErrorFormat) -> boo
         return false;
     }
     let lower = message.to_ascii_lowercase();
-    [
-        "prompt is too long",
-        "context length exceeded",
-        "input is too long",
-        "maximum context",
-        "invalid request",
-        "validationexception",
-        "validation error",
-        "malformed request",
-        "unsupported model",
-        "too many tools",
-        "too many loaded tools",
-        "tool definitions",
-        "tool schema",
-        "tool search working set",
-        "loaded tools are too large",
-        "payload too large",
-        "payload is too large",
-        "request too large",
-        "request entity too large",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
+    is_context_length_error(message)
+        || [
+            "invalid request",
+            "validationexception",
+            "validation error",
+            "malformed request",
+            "unsupported model",
+            "too many tools",
+            "too many loaded tools",
+            "tool definitions",
+            "tool schema",
+            "tool search working set",
+            "loaded tools are too large",
+            "payload too large",
+            "payload is too large",
+            "request too large",
+            "request entity too large",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
 }
 
 struct ApiError {
@@ -2559,7 +2556,7 @@ impl IntoResponse for ApiError {
 
 fn classify_api_error(status: StatusCode, message: &str) -> (&'static str, &'static str) {
     let lower = message.to_ascii_lowercase();
-    if lower.contains("prompt is too long") || lower.contains("context length") {
+    if is_context_length_error(message) {
         return ("context_length_exceeded", "context_validation");
     }
     if (lower.contains("not supported") || lower.contains("unsupported"))

@@ -159,15 +159,7 @@ pub fn text_is_model_temporarily_unavailable(message: &str) -> bool {
 }
 
 pub fn text_is_context_too_long(message: &str) -> bool {
-    let text = message.to_ascii_lowercase();
-    [
-        "prompt is too long",
-        "context length exceeded",
-        "input is too long",
-        "maximum context",
-    ]
-    .iter()
-    .any(|marker| text.contains(marker))
+    crosslane_translate::error::is_context_length_error(message)
 }
 
 pub fn text_is_request_rejection(message: &str) -> bool {

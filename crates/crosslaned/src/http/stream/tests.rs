@@ -81,6 +81,20 @@ fn error_chain_is_single_line_and_bounded() {
 
 #[test]
 fn stream_failures_keep_real_upstream_status_and_account_scope() {
+    for rejection in [
+        "CONTEXT_LENGTH_EXCEEDED",
+        "INPUT_TOO_LONG",
+        "The context window has been exceeded",
+    ] {
+        let failure = classify_stream_failure(
+            &format!("Kiro Amazon Q returned Some(400): {rejection}"),
+            None,
+        );
+        assert_eq!(failure.upstream_status, Some(400));
+        assert_eq!(failure.error_code, "context_length_exceeded");
+        assert_eq!(failure.scope, StreamFailureScope::Client);
+        assert!(!failure.account_error());
+    }
     let rejected = classify_stream_failure(
         "Kiro Amazon Q returned Some(400): tool schema payload too large",
         None,

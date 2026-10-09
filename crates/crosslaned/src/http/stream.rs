@@ -1602,7 +1602,7 @@ fn classify_stream_failure(
         }
     }
 
-    if lower.contains("prompt is too long") || lower.contains("context length") {
+    if crosslane_translate::error::is_context_length_error(message) {
         return StreamFailureDetails {
             upstream_status,
             error_code: "context_length_exceeded",

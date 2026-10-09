@@ -1240,6 +1240,30 @@ fn usage_limits_include_enabled_overage_capacity() {
 }
 
 #[test]
+fn context_overflow_codes_and_window_errors_are_recoverable() {
+    for message in [
+        r#"{"reason":"CONTEXT_LENGTH_EXCEEDED","message":"ValidationException"}"#,
+        r#"{"reason":"INPUT_TOO_LONG"}"#,
+        "The context window has been exceeded",
+    ] {
+        let error = KiroError {
+            status: Some(400),
+            endpoint: "AmazonQ".into(),
+            message: message.into(),
+        };
+        assert!(error.is_context_too_long(), "{message}");
+        assert!(error.is_request_rejection(), "{message}");
+    }
+    for message in [
+        "ValidationException: tool schema request too large",
+        "request body size exceeds the 8 MiB limit",
+        "Internal Server Error",
+    ] {
+        assert!(!text_is_context_too_long(message), "{message}");
+    }
+}
+
+#[test]
 fn framed_error_text_is_classified_like_http_statuses() {
     let auth = KiroError {
         status: None,

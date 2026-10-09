@@ -8,6 +8,23 @@ pub enum ErrorFormat {
     OpenAi,
 }
 
+/// Shared by upstream recovery and client-facing diagnostics so a context
+/// rejection cannot be displayed as such while skipping compaction recovery.
+pub fn is_context_length_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "prompt is too long",
+        "context length exceeded",
+        "context_length_exceeded",
+        "input is too long",
+        "input_too_long",
+        "maximum context",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+        || lower.contains("context window") && lower.contains("exceed")
+}
+
 // Claude Code's client-side risk system treats these upstream phrases as an
 // account-ban signal. They must never reach a client, even when they appear in
 // an otherwise useful quota/context error. Keep this list synchronized with
@@ -73,11 +90,7 @@ fn normalize_error_message(message: &str) -> String {
     {
         return "service unavailable".into();
     }
-    if lower.contains("prompt is too long")
-        || lower.contains("context length exceeded")
-        || lower.contains("input is too long")
-        || lower.contains("context window") && lower.contains("exceed")
-    {
+    if is_context_length_error(message) {
         if let Some((actual, maximum)) = context_token_counts(message, &lower) {
             // Claude Code recognizes this stable shape and can explain how far
             // the request exceeded the context window. A locally formatted,
@@ -348,6 +361,27 @@ mod tests {
                 sanitize_error_message(text),
                 "Service temporarily unavailable, please retry"
             );
+        }
+    }
+
+    #[test]
+    fn context_error_codes_are_normalized_without_treating_body_limits_as_context() {
+        for message in [
+            r#"{"reason":"CONTEXT_LENGTH_EXCEEDED","message":"ValidationException"}"#,
+            r#"{"reason":"INPUT_TOO_LONG"}"#,
+            "The context window has been exceeded",
+        ] {
+            assert!(is_context_length_error(message), "{message}");
+            assert_eq!(
+                sanitize_error_message(message),
+                "prompt is too long: context length exceeded"
+            );
+        }
+        for message in [
+            "request body size exceeds the 8 MiB limit",
+            "ValidationException: tool schema request too large",
+        ] {
+            assert!(!is_context_length_error(message), "{message}");
         }
     }
 
