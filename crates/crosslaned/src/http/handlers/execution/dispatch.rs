@@ -194,6 +194,7 @@ async fn dispatch_upstream(
     tracing::info!(
         event = "upstream.dispatch.started",
         trace_id,
+        provider_id = "kiro",
         requested_model,
         initial_model = model,
         max_attempts = attempts,
@@ -266,9 +267,10 @@ async fn dispatch_upstream(
             };
             let account = lease.account().await;
             let account_name = account.display_name().to_owned();
-            tracing::debug!(
+            tracing::info!(
                 event = "upstream.account.selected",
                 trace_id,
+                provider_id = "kiro",
                 attempt = attempt + 1,
                 max_attempts = attempts,
                 account_id = %account.id,
@@ -444,6 +446,7 @@ async fn dispatch_upstream(
             tracing::info!(
                 event = "upstream.token.refreshed",
                 trace_id,
+                provider_id = "kiro",
                 account_id = %account.id,
                 "expiring account token refreshed before upstream call"
             );
@@ -454,6 +457,7 @@ async fn dispatch_upstream(
                 tracing::info!(
                     event = "upstream.response.accepted",
                     trace_id,
+                    provider_id = "kiro",
                     attempt = attempt + 1,
                     account_id = %account.id,
                     account_name,
@@ -487,6 +491,7 @@ async fn dispatch_upstream(
                 tracing::warn!(
                     event = "upstream.request.rejected",
                     trace_id,
+                    provider_id = "kiro",
                     attempt = attempt + 1,
                     account_id = %account.id,
                     account_name,
@@ -515,6 +520,7 @@ async fn dispatch_upstream(
                             tracing::info!(
                                 event = "upstream.authentication_retry.succeeded",
                                 trace_id,
+                                provider_id = "kiro",
                                 attempt = attempt + 1,
                                 account_id = %refreshed.id,
                                 account_name = refreshed_name,
@@ -580,6 +586,7 @@ async fn dispatch_upstream(
                 tracing::warn!(
                     event = "upstream.request.retryable_failure",
                     trace_id,
+                    provider_id = "kiro",
                     attempt = attempt + 1,
                     account_id = %account.id,
                     account_name,
@@ -713,6 +720,7 @@ async fn dispatch_upstream(
                                         tracing::info!(
                                             event = "upstream.model_fallback.succeeded",
                                             trace_id,
+                                            provider_id = "kiro",
                                             attempt = attempt + 1,
                                             account_id = %account.id,
                                             account_name,
@@ -820,6 +828,7 @@ async fn dispatch_upstream(
                 tracing::error!(
                     event = "upstream.request.failed",
                     trace_id,
+                    provider_id = "kiro",
                     attempt = attempt + 1,
                     account_id = %account.id,
                     account_name,

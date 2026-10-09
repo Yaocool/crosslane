@@ -138,6 +138,8 @@ crosslane stats --detail --since 1h
 业务请求日志会记录客户端提供的 `user_agent`。可用响应头 `x-trace-id` 或 `request-id`
 查找请求日志。排查失败时同时看响应状态、错误码和 Trace。流式响应也可能在 HTTP 200 后失败，
 应检查最终事件。
+`upstream.account.selected` 和完成事件会记录 `provider_id`、`account_id`；
+用 `trace_id` 可串联同一请求的账号切换记录。
 
 | 现象 | 优先检查 |
 | --- | --- |

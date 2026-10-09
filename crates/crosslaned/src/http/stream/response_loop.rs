@@ -71,6 +71,7 @@ pub fn response(
         event = "proxy.stream.started",
         trace_id = %context.trace_id,
         request_id = %context.request_id,
+        provider_id = "kiro",
         user_agent = %context.user_agent,
         protocol = protocol.as_str(),
         account_id = %context.lease.account_id(),

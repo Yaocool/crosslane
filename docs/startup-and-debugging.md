@@ -155,6 +155,8 @@ Business request logs include the client `user_agent` when supplied. Use the
 `x-trace-id` response header or `request-id` to find request logs. Check the
 response status, error code, and trace when investigating failures. A stream can fail after
 HTTP 200, so inspect its final event.
+`upstream.account.selected` and completion events include `provider_id` and
+`account_id`; use `trace_id` to follow account retries for one request.
 
 ### Anonymous client and conversation attribution
 

@@ -1571,6 +1571,17 @@ impl CopilotProvider {
                 Err(error) => return Err(error),
             };
             excluded.push(account.id.clone());
+            tracing::info!(
+                event = "upstream.account.selected",
+                trace_id = %request.trace_id,
+                service_id = %request.service_id,
+                provider_id = %self.id,
+                account_id = %account.id,
+                model = %request.model,
+                attempt = excluded.len(),
+                max_attempts = account_count.max(1),
+                "upstream account selected"
+            );
             let upstream_protocol = if model.protocols.contains(&request.protocol) {
                 request.protocol
             } else {
@@ -1610,6 +1621,14 @@ impl CopilotProvider {
             let mut token = match self.api_token(&account).await {
                 Ok(token) => token,
                 Err(error) => {
+                    tracing::warn!(
+                        event = "upstream.account.failed",
+                        trace_id = %request.trace_id,
+                        provider_id = %self.id,
+                        account_id = %account.id,
+                        error_kind = ?error.kind,
+                        "upstream account token unavailable"
+                    );
                     self.set_account_runtime_error(&account.id, Some(error.to_string()))
                         .await;
                     last_error = Some(error);
@@ -1645,6 +1664,14 @@ impl CopilotProvider {
                     Ok(response) => response,
                     Err(error) => {
                         let error = transport_error(error);
+                        tracing::warn!(
+                            event = "upstream.account.failed",
+                            trace_id = %request.trace_id,
+                            provider_id = %self.id,
+                            account_id = %account.id,
+                            error_kind = ?error.kind,
+                            "upstream account transport failed"
+                        );
                         self.set_account_runtime_error(&account.id, Some(error.to_string()))
                             .await;
                         last_error = Some(error);
@@ -1672,6 +1699,14 @@ impl CopilotProvider {
                     let error = provider_status_error(
                         status,
                         format!("Copilot upstream returned HTTP {}", status.as_u16()),
+                    );
+                    tracing::warn!(
+                        event = "upstream.account.failed",
+                        trace_id = %request.trace_id,
+                        provider_id = %self.id,
+                        account_id = %account.id,
+                        upstream_status = status.as_u16(),
+                        "upstream account request failed"
                     );
                     self.set_account_runtime_error(&account.id, Some(error.to_string()))
                         .await;
@@ -1934,6 +1969,16 @@ impl ProviderAdapter for CopilotProvider {
             )
             .await?;
         if !model.protocols.contains(&ProviderProtocol::ClaudeMessages) {
+            tracing::info!(
+                event = "upstream.account.selected",
+                trace_id = %request.trace_id,
+                service_id = %request.service_id,
+                provider_id = %self.id,
+                account_id = %account.id,
+                model = %request.model,
+                operation = "count_tokens_estimate",
+                "upstream account selected"
+            );
             let body: Value = serde_json::from_slice(&request.body).map_err(|_| {
                 ProviderError::new(
                     ProviderErrorKind::InvalidRequest,

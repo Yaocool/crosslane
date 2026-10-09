@@ -963,6 +963,19 @@ async fn record_provider_request(
             ..RequestDiagnostics::default()
         },
     });
+    tracing::info!(
+        event = "proxy.response.completed",
+        trace_id = %metadata.trace_id,
+        request_id = %metadata.request_id,
+        provider_id = %metadata.provider_id,
+        account_id = %metadata.account_id,
+        model = %metadata.model,
+        http_status = status,
+        input_tokens = usage.input_tokens,
+        output_tokens = usage.output_tokens,
+        duration_ms = metadata.started.elapsed().as_millis() as u64,
+        "provider response completed"
+    );
 }
 
 fn provider_api_error(

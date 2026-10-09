@@ -1389,6 +1389,7 @@ async fn finish_accounting(
             event = "proxy.stream.completed",
             trace_id = %context.trace_id,
             request_id = %context.request_id,
+            provider_id = "kiro",
             user_agent = %context.user_agent,
             account_id = %context.lease.account_id(),
             %error,
@@ -1422,6 +1423,7 @@ async fn finish_accounting(
         tracing::error!(
             trace_id = %context.trace_id,
             request_id = %context.request_id,
+            provider_id = "kiro",
             user_agent = %context.user_agent,
             account_id = %context.lease.account_id(),
             account_name,
@@ -1460,6 +1462,7 @@ async fn finish_accounting(
             event = "proxy.stream.completed",
             trace_id = %context.trace_id,
             request_id = %context.request_id,
+            provider_id = "kiro",
             user_agent = %context.user_agent,
             account_id = %context.lease.account_id(),
             account_name,
