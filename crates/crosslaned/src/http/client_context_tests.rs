@@ -41,7 +41,16 @@ impl ProviderAdapter for RecordingProvider {
     }
 
     async fn models(&self, _: bool) -> Result<Vec<ProviderModel>, ProviderError> {
-        Ok(Vec::new())
+        Ok(vec![ProviderModel {
+            provider_id: ProviderId::parse("copilot").unwrap(),
+            id: "model".into(),
+            display_name: "Fixture model".into(),
+            vendor: None,
+            max_input_tokens: None,
+            max_output_tokens: None,
+            protocols: self.descriptor().capabilities.protocols,
+            capabilities: Value::Null,
+        }])
     }
 
     async fn execute(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {

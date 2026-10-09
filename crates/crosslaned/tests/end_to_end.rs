@@ -21,6 +21,9 @@ static HTTP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(()
 #[path = "end_to_end/model_policy.rs"]
 mod model_policy;
 
+#[path = "end_to_end/copilot_model_aliases.rs"]
+mod copilot_model_aliases;
+
 #[path = "end_to_end/responses.rs"]
 mod responses;
 

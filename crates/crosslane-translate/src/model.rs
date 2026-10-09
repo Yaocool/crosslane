@@ -3,6 +3,27 @@
 use crosslane_core::config::{ModelMappingRule, ModelMappingSchedule};
 use rand::distributions::{Distribution, WeightedIndex};
 
+/// Resolve an exact ID or an equivalent client alias from a provider catalog.
+/// Unlike dynamic Kiro resolution, this never chooses a different version.
+/// Exact IDs take precedence; an ambiguous alias must be mapped explicitly.
+pub fn resolve_model_alias(model: &str, available: &[String]) -> Option<String> {
+    let model = model.trim();
+    if let Some(exact) = available
+        .iter()
+        .find(|candidate| candidate.eq_ignore_ascii_case(model))
+    {
+        return Some(exact.clone());
+    }
+    let requested = crosslane_core::model_policy::model_key(model);
+    let mut matches = available
+        .iter()
+        .filter(|candidate| crosslane_core::model_policy::model_key(candidate) == requested);
+    let matched = matches.next()?;
+    matches
+        .all(|candidate| candidate == matched)
+        .then(|| matched.clone())
+}
+
 /// Resolve a client model name against the exact IDs returned by one account.
 /// Matching mirrors the TypeScript authority: exact, normalized/prefix, then
 /// highest version in the same model family.
@@ -1189,6 +1210,61 @@ mod tests {
         assert!(schedule_active_at(&human_schedule, 0, 1, 12 * 60));
         assert!(!schedule_active_at(&human_schedule, 0, 3, 12 * 60));
         assert!(!schedule_active_at(&human_schedule, 0, 1, 20 * 60));
+    }
+
+    #[test]
+    fn catalog_aliases_resolve_client_claude_ids_without_changing_versions() {
+        let models = vec![
+            "claude-opus-4.8".into(),
+            "claude-opus-5.5".into(),
+            "claude-sonnet-4.8".into(),
+            "claude-haiku-4.5".into(),
+        ];
+        for alias in [
+            "claude-opus-4-8",
+            " CLAUDE_OPUS_4_8 ",
+            "anthropic.claude-opus-4-8",
+            "claude-opus-4-8-20261001",
+            "claude-opus-4-8-latest",
+            "claude-4-8-opus",
+            "opus4.8",
+        ] {
+            assert_eq!(
+                resolve_model_alias(alias, &models).as_deref(),
+                Some("claude-opus-4.8"),
+                "{alias}"
+            );
+        }
+        assert_eq!(
+            resolve_model_alias("claude-sonnet-4-8", &models).as_deref(),
+            Some("claude-sonnet-4.8")
+        );
+        assert_eq!(
+            resolve_model_alias("claude-haiku-4-5", &models).as_deref(),
+            Some("claude-haiku-4.5")
+        );
+        for unknown in [
+            "claude-opus-4-9",
+            "claude-opus-4",
+            "claude-haiku-4-8",
+            "claude-fable-5",
+        ] {
+            assert!(resolve_model_alias(unknown, &models).is_none(), "{unknown}");
+        }
+    }
+
+    #[test]
+    fn catalog_aliases_preserve_exact_ids_and_reject_ambiguous_matches() {
+        let models: Vec<String> = vec!["claude-opus-4.8".into(), "claude-opus-4-8".into()];
+        for exact in &models {
+            assert_eq!(resolve_model_alias(exact, &models).as_ref(), Some(exact));
+        }
+        assert!(resolve_model_alias("opus4.8", &models).is_none());
+        assert!(resolve_model_alias("claude-opus-4-8", &[]).is_none());
+        assert_eq!(
+            resolve_model_alias("GPT-4.1", &["gpt-4.1".into()]).as_deref(),
+            Some("gpt-4.1")
+        );
     }
 
     #[test]

@@ -569,7 +569,7 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
                 path.clone(),
                 headers,
                 trace_id.clone(),
-                key_id,
+                authenticated_key,
                 _connection_guard,
                 _admission_guard,
                 ErrorFormat::Claude,

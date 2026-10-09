@@ -124,7 +124,12 @@ crosslane pool --model MODEL_ID --explain
 crosslane account overage show
 ```
 
-模型 ID 从列表中选取。禁用模型后，新请求将无法使用。Kiro overage 默认关闭。
+模型 ID 从列表中选取。禁用模型后，新请求将无法使用。
+Copilot 也接受等价的客户端别名，例如将 `claude-opus-4-8` 解析为模型目录中的
+`claude-opus-4.8`。显式模型映射优先执行，权限按解析后的 ID 检查。别名不会选择
+其他版本；未知或有歧义的 ID 需要显式映射。可运行
+`crosslane models resolve claude-opus-4-8 --provider copilot` 查看结果。
+Kiro overage 默认关闭。
 要将每个账号的超额额度上限设为 500 credits，可运行
 `crosslane account overage enable --max-credits 500`；关闭时运行
 `crosslane account overage disable`。上游限制和已在处理中的请求仍可能影响最终用量。

@@ -5,9 +5,11 @@ use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use crosslane_core::config::{Config, ProxyServiceConfig};
-use crosslane_core::provider::{ProviderId, ProviderProtocol};
+use crosslane_core::provider::{ProviderId, ProviderModel, ProviderProtocol};
 use crosslane_provider::{ProviderError, ProviderRequest, ProviderResponseBody};
-use crosslane_translate::model::{map_model_for_provider, ModelMappingContext, ModelRoute};
+use crosslane_translate::model::{
+    map_model_for_provider, resolve_model_alias, ModelMappingContext, ModelRoute,
+};
 use futures::StreamExt;
 use serde_json::Value;
 
@@ -257,7 +259,9 @@ pub(super) fn select_provider_route(
     // Kiro finishes account-aware mapping, alias resolution, and fallback in
     // the legacy executor. Authorize that final wire model there. Adapter
     // providers have already completed routing and can be checked now.
-    if selected.kind != "kiro" {
+    // Kiro resolves after account selection; Copilot resolves against its live
+    // catalog before execution. Authorize the actual model in those paths.
+    if !matches!(selected.kind.as_str(), "kiro" | "copilot") {
         authorize_model(authenticated_key, selected_provider, upstream_model, format)?;
     }
     if !selected.enabled {
@@ -327,6 +331,59 @@ pub(super) fn ensure_model_enabled(
     Ok(())
 }
 
+fn resolve_copilot_route(
+    route: &mut SelectedProviderRoute,
+    models: &[ProviderModel],
+    config: &Config,
+    authenticated_key: Option<&AuthenticatedApiKey>,
+    format: ErrorFormat,
+) -> Result<(), ApiError> {
+    let available = models
+        .iter()
+        .map(|model| model.id.clone())
+        .collect::<Vec<_>>();
+    let resolved = resolve_model_alias(&route.upstream_model, &available).ok_or_else(|| {
+        let mut error = ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "model_not_available: model {} has no unambiguous match in provider {}'s catalog",
+                route.upstream_model, route.provider_id
+            ),
+            format,
+        )
+        .with_provider_id(route.provider_id.as_str());
+        error.error_code = "model_not_available";
+        error.error_stage = "model_resolution";
+        error
+    })?;
+    ensure_model_enabled(config, &resolved, format)?;
+    authorize_model(
+        authenticated_key,
+        route.provider_id.as_str(),
+        &resolved,
+        format,
+    )?;
+    let mut value: Value = serde_json::from_slice(&route.body).map_err(|error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to decode routed request: {error}"),
+            format,
+        )
+    })?;
+    value["model"] = Value::String(resolved.clone());
+    route.body = serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to serialize resolved request: {error}"),
+                format,
+            )
+        })?;
+    route.upstream_model = resolved;
+    Ok(())
+}
+
 fn authorize_provider(
     config: &Config,
     service: &ProxyServiceConfig,
@@ -386,12 +443,12 @@ fn effective_scope(values: &[String]) -> Vec<&str> {
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn execute_provider(
     service: ServiceHttpState,
-    route: SelectedProviderRoute,
+    mut route: SelectedProviderRoute,
     protocol: ProviderProtocol,
     path: String,
     headers: HeaderMap,
     trace_id: String,
-    api_key_id: Option<String>,
+    authenticated_key: Option<AuthenticatedApiKey>,
     connection_guard: AdmissionGuard,
     admission_guard: AdmissionGuard,
     format: ErrorFormat,
@@ -399,6 +456,7 @@ pub(super) async fn execute_provider(
     client_context: crosslane_core::client_context::ClientContext,
 ) -> Result<Response, ApiError> {
     let started = Instant::now();
+    let api_key_id = authenticated_key.as_ref().map(|key| key.id.clone());
     let user_agent = super::logged_user_agent(&headers);
     let error_provider = route.provider_id.to_string();
     let stores_response = protocol == ProviderProtocol::OpenAiResponses
@@ -407,11 +465,6 @@ pub(super) async fn execute_provider(
         service.service.id.clone(),
         api_key_id.clone(),
     );
-    let reservation = service
-        .app
-        .meter
-        .reserve(api_key_id.as_deref(), 0.0)
-        .map_err(|error| super::meter_error(error, format).with_provider_id(&error_provider))?;
     let adapter = service
         .app
         .providers
@@ -426,6 +479,30 @@ pub(super) async fn execute_provider(
             )
             .with_provider_id(&error_provider)
         })?;
+    if route.provider_kind == "copilot" {
+        let models = adapter.models(false).await.map_err(|error| {
+            provider_api_error(
+                error,
+                format,
+                &error_provider,
+                &route.original_model,
+                &route.upstream_model,
+                route.mapping_rule.as_deref(),
+            )
+        })?;
+        resolve_copilot_route(
+            &mut route,
+            &models,
+            &service.app.config.current(),
+            authenticated_key.as_ref(),
+            format,
+        )?;
+    }
+    let reservation = service
+        .app
+        .meter
+        .reserve(api_key_id.as_deref(), 0.0)
+        .map_err(|error| super::meter_error(error, format).with_provider_id(&error_provider))?;
     let request = ProviderRequest {
         protocol,
         model: route.upstream_model.clone(),

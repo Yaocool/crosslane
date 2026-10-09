@@ -1728,19 +1728,19 @@ async fn show_provider_model_resolution(
             serde_json::json!({"provider":resolved_provider,"refresh":refresh}),
         )
         .await?;
-    let resolved_model = if resolved_provider_config.kind == "kiro" {
-        let available = catalog
-            .models
-            .iter()
-            .map(|candidate| candidate.id.clone())
-            .collect::<Vec<_>>();
-        crosslane_translate::model::resolve_dynamic_model(target, &available)
-    } else {
-        catalog
+    let available_models = catalog
+        .models
+        .iter()
+        .map(|candidate| candidate.id.clone())
+        .collect::<Vec<_>>();
+    let resolved_model = match resolved_provider_config.kind.as_str() {
+        "kiro" => crosslane_translate::model::resolve_dynamic_model(target, &available_models),
+        "copilot" => crosslane_translate::model::resolve_model_alias(target, &available_models),
+        _ => catalog
             .models
             .iter()
             .find(|candidate| candidate.id == target)
-            .map(|candidate| candidate.id.clone())
+            .map(|candidate| candidate.id.clone()),
     };
     let disabled = [
         Some(model),

@@ -143,6 +143,11 @@ crosslane account overage show
 ```
 
 Use an ID from the model list. Disabled models are unavailable to new requests.
+Copilot also accepts equivalent client aliases such as `claude-opus-4-8` for
+the discovered ID `claude-opus-4.8`. Explicit model mappings run first, and
+permissions are checked against the resolved ID. Aliases never select another
+version; unknown or ambiguous IDs require an explicit mapping. Inspect the
+result with `crosslane models resolve claude-opus-4-8 --provider copilot`.
 Kiro overage is disabled by default. To set a maximum of 500 overage credits
 per account, run `crosslane account overage enable --max-credits 500`; use
 `crosslane account overage disable` to turn it off. Upstream limits and requests
