@@ -1,10 +1,11 @@
 use super::{
-    attempt_diagnostics, check_context_limit, empty_tool_result_disposition, estimated_credits,
-    fallback_credits, fill_missing_usage, loaded_tool_count, loaded_tool_names, meter_error,
-    now_secs, remaining_tool_search_budget, resolve_dynamic_model, resume_web_search_payload,
-    sanitize_error_message, sanitize_kiro_tool_history, tool_search_continue_payload_batch,
-    upstream_error, validate_kiro_tool_history, web_search_continue_payload_batch, AccountLease,
-    ApiError, AppState, Arc, ClaudeContextEditStats, ClaudeRequest, ClaudeServerEvent,
+    attempt_diagnostics, check_context_limit, compact_tool_search_continuation,
+    empty_tool_result_disposition, estimated_credits, fallback_credits, fill_missing_usage,
+    loaded_tool_count, loaded_tool_names, meter_error, now_secs, resolve_dynamic_model,
+    resume_web_search_payload, sanitize_error_message, sanitize_kiro_tool_history,
+    tool_search_budget_with_compaction, tool_search_continue_payload_batch, upstream_error,
+    validate_kiro_tool_history, web_search_continue_payload_batch, AccountLease, ApiError,
+    AppState, Arc, ClaudeContextEditStats, ClaudeRequest, ClaudeServerEvent,
     ClaudeToolSearchBudget, ClaudeToolSearchCatalog, ClaudeWebSearchTrace,
     CompactionIterationUsage, CreditReservation, DecodedResponse, DispatchFailure,
     EmptyToolResultDisposition, ErrorFormat, ExecuteError, HashSet, Instant, IntoResponse, Json,
@@ -198,7 +199,7 @@ pub(super) async fn collect_nonstream_rounds(
     reservation: &mut CreditReservation,
     mut upstream: KiroResponse,
     mut payload: crosslane_translate::KiroPayload,
-    compact: bool,
+    mut compact: bool,
     max_output_tokens: Option<u32>,
     stop_sequences: &[String],
     thinking_enabled: bool,
@@ -227,6 +228,7 @@ pub(super) async fn collect_nonstream_rounds(
     let mut accumulated_searches = resumed_tool_searches;
     let mut accumulated_web_searches = resumed_web_searches;
     let mut accumulated_server_events = resumed_server_events;
+    let mut compaction_stats: Option<crosslane_translate::ContextCompactionStats> = None;
     let mut round = 0;
     let mut search_round = 0;
     let mut empty_tool_result_retries = 0u8;
@@ -317,6 +319,7 @@ pub(super) async fn collect_nonstream_rounds(
             decoded.claude_server_events = accumulated_server_events;
             merge_round_usage(&mut decoded.usage, &accumulated_usage);
             let total_output_tokens = decoded.usage.output_tokens;
+            decoded.automatic_compaction = compaction_stats;
             return Ok((decoded, endpoint, total_output_tokens));
         }
         let output_exhausted = max_output_tokens.is_some_and(|maximum| {
@@ -444,6 +447,7 @@ pub(super) async fn collect_nonstream_rounds(
                 }
                 merge_round_usage(&mut decoded.usage, &accumulated_usage);
                 let total_output_tokens = decoded.usage.output_tokens;
+                decoded.automatic_compaction = compaction_stats;
                 return Ok((decoded, endpoint, total_output_tokens));
             }
 
@@ -480,10 +484,11 @@ pub(super) async fn collect_nonstream_rounds(
                 }
                 merge_round_usage(&mut decoded.usage, &accumulated_usage);
                 let total_output_tokens = decoded.usage.output_tokens;
+                decoded.automatic_compaction = compaction_stats;
                 return Ok((decoded, endpoint, total_output_tokens));
             }
 
-            let mut budget = remaining_tool_search_budget(state, &payload, compact)
+            let mut budget = tool_search_budget_with_compaction(state, &payload, compact)
                 .await
                 .map_err(|message| {
                     ExecuteError::Upstream(KiroError {
@@ -648,6 +653,31 @@ pub(super) async fn collect_nonstream_rounds(
             debug_assert!(budget_available);
             prepare_kiro_payload(&mut payload, &endpoint, "Tool Search")
                 .map_err(ExecuteError::Upstream)?;
+            if let Some(mut stats) = compact_tool_search_continuation(state, &mut payload, compact)
+                .await
+                .map_err(|message| {
+                    ExecuteError::Upstream(KiroError {
+                        status: None,
+                        endpoint: endpoint.clone(),
+                        message,
+                    })
+                })?
+            {
+                tracing::info!(
+                    trace_id,
+                    compaction_reason = "tool_search_continuation_overflow",
+                    compaction_mode = "extractive_fallback",
+                    original_input_tokens = stats.original_tokens,
+                    compacted_input_tokens = stats.compacted_tokens,
+                    removed_messages = stats.removed_messages,
+                    "Tool Search continuation history compacted locally"
+                );
+                if let Some(previous) = &compaction_stats {
+                    stats.original_tokens = previous.original_tokens;
+                }
+                compaction_stats = Some(stats);
+                compact = true;
+            }
             let next_input_tokens = state
                 .tokenizer
                 .estimate_kiro_payload(&payload)
@@ -783,6 +813,7 @@ pub(super) async fn collect_nonstream_rounds(
                 }
                 merge_round_usage(&mut decoded.usage, &accumulated_usage);
                 let total_output_tokens = decoded.usage.output_tokens;
+                decoded.automatic_compaction = compaction_stats;
                 return Ok((decoded, endpoint, total_output_tokens));
             }
 
@@ -918,6 +949,7 @@ pub(super) async fn collect_nonstream_rounds(
                 tool_count = decoded.tools.len(),
                 "upstream non-stream round decoded"
             );
+            decoded.automatic_compaction = compaction_stats;
             return Ok((decoded, endpoint, total_output_tokens));
         }
         let uses = decoded
@@ -1266,13 +1298,17 @@ pub(super) async fn nonstream_claude(
     model_path: Vec<String>,
     model_mapping_rule: Option<String>,
     attempts: Vec<UpstreamAttemptLog>,
-    input_tokens: u64,
+    mut input_tokens: u64,
     compact: bool,
     started: Instant,
     prompt_cache: Option<PromptCacheProfile>,
-    compaction_summary: Option<String>,
+    mut compaction_summary: Option<String>,
+    compaction_replay: Option<(
+        String,
+        super::super::compaction_replay::CompactionReplaySource,
+    )>,
     compaction_iteration: Option<CompactionIterationUsage>,
-    auto_compaction_original_input_tokens: Option<u64>,
+    mut auto_compaction_original_input_tokens: Option<u64>,
     context_edit_stats: ClaudeContextEditStats,
     tool_search: Option<Arc<ClaudeToolSearchCatalog>>,
     max_tool_search_operations: u32,
@@ -1307,6 +1343,18 @@ pub(super) async fn nonstream_claude(
     )
     .await
     .map_err(|error| upstream_error(error, ErrorFormat::Claude))?;
+    if let Some(stats) = &decoded.automatic_compaction {
+        input_tokens = stats.compacted_tokens as u64;
+        auto_compaction_original_input_tokens.get_or_insert(stats.original_tokens as u64);
+        compaction_summary = stats.summary.clone();
+        if let (Some((scope, source)), Some(summary)) =
+            (compaction_replay, compaction_summary.as_ref())
+        {
+            state
+                .compaction_replay
+                .remember(scope, source, summary.clone());
+        }
+    }
     decoded.restore_tool_names(&web_tool_names);
     let current_round_output_tokens = if current_round_output_tokens == 0 {
         decoded.usage.output_tokens

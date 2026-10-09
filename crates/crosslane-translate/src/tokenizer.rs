@@ -399,6 +399,24 @@ impl TokenCountCache {
         target_tokens: usize,
         preserve_recent_turns: usize,
     ) -> Result<ContextCompactionStats, String> {
+        self.compact_kiro_payload_with_limits(
+            payload,
+            target_tokens,
+            usize::MAX,
+            preserve_recent_turns,
+        )
+        .await
+    }
+
+    /// Local compaction bounded by both the model window and the serialized
+    /// request size. Current input, tools and the required tool pair stay intact.
+    pub async fn compact_kiro_payload_with_limits(
+        &self,
+        payload: &mut KiroPayload,
+        target_tokens: usize,
+        maximum_bytes: usize,
+        preserve_recent_turns: usize,
+    ) -> Result<ContextCompactionStats, String> {
         let Some(plan) = self
             .plan_kiro_compaction(payload, target_tokens, preserve_recent_turns)
             .await?
@@ -427,7 +445,9 @@ impl TokenCountCache {
             payload, &source, &plan, &summary, &retained, &model_id, &origin,
         );
         let mut compacted_tokens = self.estimate_kiro_payload(payload).await?;
-        while compacted_tokens > target_tokens && retained.len() > plan.required_history_len {
+        while (compacted_tokens > target_tokens || payload_exceeds_bytes(payload, maximum_bytes)?)
+            && retained.len() > plan.required_history_len
+        {
             let remove = oldest_turn_len(&retained);
             retained.drain(..remove);
             set_fallback_compacted_history(
@@ -435,7 +455,9 @@ impl TokenCountCache {
             );
             compacted_tokens = self.estimate_kiro_payload(payload).await?;
         }
-        while compacted_tokens > target_tokens && summary_char_budget > 256 {
+        while (compacted_tokens > target_tokens || payload_exceeds_bytes(payload, maximum_bytes)?)
+            && summary_char_budget > 256
+        {
             summary_char_budget = (summary_char_budget.saturating_mul(3) / 4).max(256);
             summary = render_fallback_compaction_summary(
                 &source,
@@ -457,9 +479,10 @@ impl TokenCountCache {
             );
             compacted_tokens = self.estimate_kiro_payload(payload).await?;
         }
-        if compacted_tokens > target_tokens {
+        let compacted_bytes = payload_size(payload)?;
+        if compacted_tokens > target_tokens || compacted_bytes > maximum_bytes {
             return Err(format!(
-                "local compaction did not reach target: {compacted_tokens} > {target_tokens}"
+                "local compaction did not reach target: tokens {compacted_tokens}/{target_tokens}, bytes {compacted_bytes}/{maximum_bytes}"
             ));
         }
         Ok(ContextCompactionStats {
@@ -769,6 +792,12 @@ fn recent_turn_start(history: &[KiroHistoryMessage], preserve_turns: usize) -> u
         .unwrap_or(history.len())
 }
 
+fn payload_size(payload: &KiroPayload) -> Result<usize, String> {
+    serde_json::to_vec(payload)
+        .map(|body| body.len())
+        .map_err(|error| error.to_string())
+}
+
 fn text_chunks(text: &str) -> Vec<&str> {
     let mut chunks = Vec::new();
     let mut start = 0;
@@ -820,6 +849,10 @@ fn estimated_text_tokens(tokenizer: &CoreBPE, text: &str) -> usize {
         total = total.saturating_add(count);
     }
     total
+}
+
+fn payload_exceeds_bytes(payload: &KiroPayload, maximum: usize) -> Result<bool, String> {
+    Ok(maximum != usize::MAX && payload_size(payload)? > maximum)
 }
 
 fn oldest_turn_len(history: &[KiroHistoryMessage]) -> usize {
@@ -1398,6 +1431,47 @@ mod tests {
             );
             crate::validate_kiro_tool_history(&payload).unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn local_compaction_honors_bytes_even_when_tokens_fit() {
+        let cache = TokenCountCache::new(8).unwrap();
+        let request: crate::ClaudeRequest = serde_json::from_value(serde_json::json!({
+            "model":"source", "max_tokens":64, "system":"Keep all governing instructions",
+            "tools":[{"name":"Read", "description":"Read records", "input_schema":{"type":"object"}}],
+            "messages":[
+                {"role":"user","content":"old context ".repeat(10000)},
+                {"role":"assistant","content":"Earlier conclusion"},
+                {"role":"user","content":"Continue the task"}
+            ]
+        })).unwrap();
+        let mut payload =
+            crate::claude_to_kiro(&request, &crate::TranslationOptions::new("target", "CLI"));
+        let current = serde_json::to_value(&payload.conversation_state.current_message).unwrap();
+        let protected = serde_json::to_value(
+            &payload.conversation_state.history[..payload.protected_history_len()],
+        )
+        .unwrap();
+        assert!(cache.estimate_kiro_payload(&payload).await.unwrap() < 30000);
+        assert!(payload_size(&payload).unwrap() > 3072);
+        let stats = cache
+            .compact_kiro_payload_with_limits(&mut payload, 30000, 3072, 3)
+            .await
+            .unwrap();
+        assert!(stats.removed_messages > 0 && stats.compacted_tokens <= 30000);
+        assert!(payload_size(&payload).unwrap() <= 3072);
+        assert_eq!(
+            serde_json::to_value(&payload.conversation_state.current_message).unwrap(),
+            current
+        );
+        assert_eq!(
+            serde_json::to_value(
+                &payload.conversation_state.history[..payload.protected_history_len()]
+            )
+            .unwrap(),
+            protected
+        );
+        crate::validate_kiro_tool_history(&payload).unwrap();
     }
 
     #[tokio::test]

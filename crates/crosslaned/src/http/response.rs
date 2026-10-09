@@ -33,6 +33,8 @@ pub struct DecodedResponse {
     /// before each server call must stay before that call; the final answer is
     /// rendered after the complete timeline.
     pub claude_server_events: Vec<ClaudeServerEvent>,
+    /// Latest local checkpoint produced while resolving server tools.
+    pub automatic_compaction: Option<crosslane_translate::ContextCompactionStats>,
     pub usage: UsageInfo,
     /// Explicit Claude stop reason for proxy-managed server loops (for example
     /// `pause_turn`). When absent the ordinary tool/max/end inference applies.

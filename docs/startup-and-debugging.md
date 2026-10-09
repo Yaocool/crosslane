@@ -158,6 +158,35 @@ HTTP 200, so inspect its final event.
 `upstream.account.selected` and completion events include `provider_id` and
 `account_id`; use `trace_id` to follow account retries for one request.
 
+### Kiro request size and automatic compaction
+
+Anthropic requests have a 50 MiB HTTP body limit. The translated Kiro payload
+defaults to 8 MiB (`context.max_upstream_payload_bytes`). Input windows use the
+selected model's metadata when available, with `safe_input_ratio` (default 0.95)
+for ordinary requests and `compact_safe_input_ratio` (default 0.99) after compaction.
+
+With `context.auto_compact_on_overflow` enabled (the default), oversized history
+is locally compacted before byte-budget rejection, without requiring a client
+compact instruction. Token overflows still use semantic summaries with a local
+extractive fallback. System instructions, loaded tool definitions, current input,
+and the complete tool chain needed by current results remain intact. Indivisible
+input that still exceeds a hard limit receives a specific HTTP 400 error.
+
+Tool Search previews the space recoverable from history before loading tools,
+then checks the complete continuation including new definitions and results.
+Oversized continuations use local compaction without acquiring a second account
+slot for a summary. Streaming checkpoints are followed by references for previously
+loaded tools so later tool results can still use them. Verified history-prefix
+replay caches the latest checkpoint for clients that discard compaction blocks.
+
+Large-text token estimates use bounded UTF-8 chunks with a small boundary
+allowance, avoiding tokenizer exceptions on long whitespace spans. Actual messages
+and tool JSON are unchanged. `/v1/messages/count_tokens` remains a local estimate
+and does not start new compaction or upstream summary requests. Disabling automatic
+compaction preserves limit rejection. Compaction logs identify the stage with
+`payload_budget_overflow`, `pending_server_tools_payload_overflow`, or
+`tool_search_continuation_overflow`.
+
 ### Anonymous client and conversation attribution
 
 Client context is available in every build, independently of the `crs` feature.

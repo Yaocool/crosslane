@@ -1,16 +1,16 @@
 use super::{
     apply_context_management_edits, authenticate, claude_loaded_tools,
     claude_pending_server_tool_uses, claude_to_kiro, claude_validation_error,
-    claude_web_tool_names, compact_trigger_tokens, enforce_claude_user_agent,
-    enforce_codex_user_agent, enforce_context, enforce_payload_budget,
+    claude_web_tool_names, compact_history_for_limits, compact_trigger_tokens,
+    enforce_claude_user_agent, enforce_codex_user_agent, enforce_context, enforce_payload_budget,
     estimate_context_management_input_tokens, estimated_credits, execute_kiro_web_search,
     execute_upstream, initial_compaction_decision, is_claude_user_agent, loaded_tool_bytes,
     loaded_tool_count, loaded_tool_names, logged_user_agent, matches_type_family, nonstream_claude,
     nonstream_openai, normalize_compaction_boundary, openai_to_kiro, openai_tool_identities,
     prepare_kiro_payload, prepare_upstream, prepend_attempt_logs, prepend_execute_error_attempts,
-    reapply_compaction, remaining_tool_search_budget, reserve_credits,
-    resolved_compaction_decision, resume_tool_search_payload, resume_web_search_payload,
-    run_compaction, sanitize_error_message, serialized_payload_bytes, stream, upstream_error,
+    reapply_compaction, reserve_credits, resolved_compaction_decision, resume_tool_search_payload,
+    resume_web_search_payload, run_compaction, sanitize_error_message, serialized_payload_bytes,
+    stream, tool_search_budget_with_compaction, upstream_error,
     upstream_overflow_compaction_decision, validate_claude, validate_claude_generation,
     validate_openai, web_search_error_code, ApiError, AppState, Arc, Bytes, ClaudeRequest,
     ClaudeServerEvent, ClaudeToolSearchCatalog, ClaudeWebSearchTrace, CompactionReason,
@@ -340,6 +340,41 @@ async fn handle_claude_with_context(
         )
     })?;
     request = next_request;
+    let mut early_compaction = None;
+    let initial_payload_bytes = serialized_payload_bytes(&payload, ErrorFormat::Claude)?;
+    if initial_payload_bytes > config.context.max_upstream_payload_bytes
+        && config.context.auto_compact_on_overflow
+        && !client_compaction
+    {
+        // Admission is a byte budget. Account-dependent model resolution below
+        // remains responsible for deciding the actual token window.
+        early_compaction = compact_history_for_limits(
+            &state,
+            &mut payload,
+            u64::MAX,
+            config.context.max_upstream_payload_bytes,
+        )
+        .await
+        .map_err(|message| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                message,
+                ErrorFormat::Claude,
+            )
+        })?;
+        if let Some(stats) = &early_compaction {
+            tracing::info!(
+                trace_id = %trace_id,
+                compaction_reason = "payload_budget_overflow",
+                compaction_mode = "extractive_fallback",
+                original_payload_bytes = initial_payload_bytes,
+                original_input_tokens = stats.original_tokens,
+                compacted_input_tokens = stats.compacted_tokens,
+                removed_messages = stats.removed_messages,
+                "request history compacted before payload admission"
+            );
+        }
+    }
     // Pending server calls may execute an external Web Search before the
     // first Kiro generation. Reject an oversized initial working set before
     // acquiring a search account or making that external request. The same
@@ -414,7 +449,7 @@ async fn handle_claude_with_context(
                 format!("Tool Search operation limit of {max_tool_search_operations} was reached"),
             )
         } else {
-            let budget = remaining_tool_search_budget(&state, &payload, false)
+            let budget = tool_search_budget_with_compaction(&state, &payload, false)
                 .await
                 .map_err(|message| {
                     ApiError::new(
@@ -539,6 +574,41 @@ async fn handle_claude_with_context(
             resumed_web_searches.push(trace);
         }
     }
+    if (!resumed_tool_searches.is_empty() || !resumed_web_searches.is_empty())
+        && config.context.auto_compact_on_overflow
+        && !client_compaction
+        && serialized_payload_bytes(&payload, ErrorFormat::Claude)?
+            > config.context.max_upstream_payload_bytes
+    {
+        if let Some(mut stats) = compact_history_for_limits(
+            &state,
+            &mut payload,
+            u64::MAX,
+            config.context.max_upstream_payload_bytes,
+        )
+        .await
+        .map_err(|message| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                message,
+                ErrorFormat::Claude,
+            )
+        })? {
+            tracing::info!(
+                trace_id = %trace_id,
+                compaction_reason = "pending_server_tools_payload_overflow",
+                compaction_mode = "extractive_fallback",
+                original_input_tokens = stats.original_tokens,
+                compacted_input_tokens = stats.compacted_tokens,
+                removed_messages = stats.removed_messages,
+                "pending server tool history compacted before dispatch"
+            );
+            if let Some(previous) = &early_compaction {
+                stats.original_tokens = previous.original_tokens;
+            }
+            early_compaction = Some(stats);
+        }
+    }
     prepare_kiro_payload(
         &mut payload,
         "request-preparation",
@@ -552,7 +622,7 @@ async fn handle_claude_with_context(
         )
     })?;
     // Account-dependent rules, weighted choices, aliases, and default-model
-    // resolution must finish before irreversible context edits or rejection.
+    // resolution must finish before token-window compaction or rejection.
     let selected = prepare_upstream(
         &state,
         &account_ids,
@@ -592,11 +662,17 @@ async fn handle_claude_with_context(
                 ErrorFormat::Claude,
             )
         })? as u64;
-    let mut compacted = compact_boundary_applied;
-    let mut compaction_summary = None;
-    let initial_input_tokens = input_tokens;
+    let mut compacted = compact_boundary_applied || early_compaction.is_some();
+    let mut compaction_summary = early_compaction
+        .as_ref()
+        .and_then(|stats| stats.summary.clone());
+    let initial_input_tokens = early_compaction
+        .as_ref()
+        .map_or(input_tokens, |stats| stats.original_tokens as u64);
     let mut compaction_artifact = None;
-    let mut auto_compaction_original_input_tokens = None;
+    let mut auto_compaction_original_input_tokens = early_compaction
+        .as_ref()
+        .map(|stats| stats.original_tokens as u64);
     let mut compaction_iteration = None;
     if let Some(decision) = initial_compaction_decision(
         &state,
@@ -904,12 +980,14 @@ async fn handle_claude_with_context(
         Err(error) => return Err(upstream_error(error, ErrorFormat::Claude)),
     };
     if !client_compaction {
-        if let (Some(scope), Some(source), Some(summary)) =
-            (replay_scope, replay_source, compaction_summary.as_ref())
-        {
+        if let (Some(scope), Some(source), Some(summary)) = (
+            replay_scope.as_ref(),
+            replay_source,
+            compaction_summary.as_ref(),
+        ) {
             if state
                 .compaction_replay
-                .remember(scope, source, summary.clone())
+                .remember(scope.clone(), source, summary.clone())
             {
                 tracing::debug!(
                     event = "proxy.compaction.checkpoint_cached",
@@ -944,6 +1022,11 @@ async fn handle_claude_with_context(
         attempts,
         payload,
     } = execution;
+    let compaction_replay = if client_compaction {
+        None
+    } else {
+        replay_scope.zip(replay_source)
+    };
     if request.stream {
         return Ok(stream::response(
             upstream,
@@ -972,6 +1055,7 @@ async fn handle_claude_with_context(
                 input_tokens,
                 compact: compacted,
                 compaction_summary,
+                compaction_replay,
                 compaction_in_start: headers
                     .get("user-agent")
                     .and_then(|value| value.to_str().ok())
@@ -1031,6 +1115,7 @@ async fn handle_claude_with_context(
         started,
         prompt_cache,
         compaction_summary,
+        compaction_replay,
         compaction_iteration,
         auto_compaction_original_input_tokens,
         context_edit_stats,
@@ -1584,6 +1669,7 @@ async fn handle_openai_with_context(
                 input_tokens,
                 compact: false,
                 compaction_summary: None,
+                compaction_replay: None,
                 compaction_in_start: false,
                 compaction_iteration: None,
                 auto_compaction_original_input_tokens: None,

@@ -12,6 +12,136 @@ use super::{
 use crate::http::usage::produced_output;
 use tokio_util::codec::Decoder;
 
+/// Local, transactional recovery for a request whose history exceeds either
+/// budget. Continuations already hold an account lease, so they must not open
+/// a second upstream request to generate a summary.
+pub(in crate::http) async fn compact_history_for_limits(
+    state: &Arc<AppState>,
+    payload: &mut KiroPayload,
+    maximum_tokens: u64,
+    maximum_bytes: usize,
+) -> Result<Option<crosslane_translate::ContextCompactionStats>, String> {
+    let original_tokens = state.tokenizer.estimate_kiro_payload(payload).await? as u64;
+    let original_bytes = super::serialized_payload_bytes(payload, ErrorFormat::Claude)
+        .map_err(|error| error.message)?;
+    if original_tokens <= maximum_tokens && original_bytes <= maximum_bytes {
+        return Ok(None);
+    }
+    let mut minimum = payload.clone();
+    minimum.retain_required_history();
+    if state.tokenizer.estimate_kiro_payload(&minimum).await? as u64 > maximum_tokens
+        || super::serialized_payload_bytes(&minimum, ErrorFormat::Claude)
+            .map_err(|error| error.message)?
+            > maximum_bytes
+    {
+        return Ok(None);
+    }
+    let preserve = state
+        .config
+        .current()
+        .context
+        .compaction_preserve_recent_turns;
+    // The 75% target supplies headroom. If the indivisible current turn only
+    // fits the hard budget, retry from the original rather than rejecting it.
+    for target in [compact_target_from_maximum(maximum_tokens), maximum_tokens] {
+        let mut candidate = payload.clone();
+        let result = state
+            .tokenizer
+            .compact_kiro_payload_with_limits(
+                &mut candidate,
+                usize::try_from(target).unwrap_or(usize::MAX),
+                maximum_bytes,
+                preserve,
+            )
+            .await;
+        let mut stats = match result {
+            Ok(stats) if stats.removed_messages > 0 => stats,
+            Ok(_) => return Ok(None),
+            Err(error) if error.contains("local compaction did not reach target") => continue,
+            Err(error) => return Err(error),
+        };
+        prepare_kiro_payload(&mut candidate, "compaction", "local budget recovery")
+            .map_err(|error| error.message)?;
+        stats.compacted_tokens = state.tokenizer.estimate_kiro_payload(&candidate).await?;
+        if stats.compacted_tokens as u64 <= maximum_tokens
+            && super::serialized_payload_bytes(&candidate, ErrorFormat::Claude)
+                .map_err(|error| error.message)?
+                <= maximum_bytes
+        {
+            *payload = candidate;
+            return Ok(Some(stats));
+        }
+    }
+    // Keep the original intact so the existing guards report the real limit.
+    Ok(None)
+}
+
+pub(in crate::http) async fn tool_search_budget_with_compaction(
+    state: &Arc<AppState>,
+    payload: &KiroPayload,
+    compact: bool,
+) -> Result<crosslane_translate::ClaudeToolSearchBudget, String> {
+    let config = state.config.current();
+    let available = super::remaining_tool_search_budget(state, payload, compact).await?;
+    if !config.context.auto_compact_on_overflow
+        || available.max_tools == 0
+        || payload.conversation_state.history.len()
+            <= payload.protected_history_len() + payload.required_history_tail_len()
+    {
+        return Ok(available);
+    }
+    let model = &payload
+        .conversation_state
+        .current_message
+        .user_input_message
+        .model_id;
+    let maximum = context_maximum(state, compact, model);
+    let reserve_tokens = u64::from(config.context.max_tool_input_tokens).min(maximum / 4);
+    let reserve_bytes = (reserve_tokens.saturating_mul(3) as usize)
+        .min(config.context.max_upstream_payload_bytes / 4);
+    if available.max_bytes >= reserve_bytes {
+        return Ok(available);
+    }
+    // This is only a preview. Compact the actual continuation after adding the
+    // generated text and search results, so its checkpoint covers those too.
+    let mut preview = payload.clone();
+    compact_history_for_limits(
+        state,
+        &mut preview,
+        maximum.saturating_sub(reserve_tokens),
+        config
+            .context
+            .max_upstream_payload_bytes
+            .saturating_sub(reserve_bytes),
+    )
+    .await?;
+    super::remaining_tool_search_budget(state, &preview, compact).await
+}
+
+pub(in crate::http) async fn compact_tool_search_continuation(
+    state: &Arc<AppState>,
+    payload: &mut KiroPayload,
+    compact: bool,
+) -> Result<Option<crosslane_translate::ContextCompactionStats>, String> {
+    let config = state.config.current();
+    if !config.context.auto_compact_on_overflow {
+        return Ok(None);
+    }
+    let model = &payload
+        .conversation_state
+        .current_message
+        .user_input_message
+        .model_id;
+    let maximum = context_maximum(state, compact, model);
+    compact_history_for_limits(
+        state,
+        payload,
+        maximum,
+        config.context.max_upstream_payload_bytes,
+    )
+    .await
+}
+
 fn compaction_summary_concurrency(state: &AppState) -> usize {
     state
         .config
@@ -649,7 +779,12 @@ async fn extractive_compaction(
     let mut payload = source_payload.clone();
     let compacted = state
         .tokenizer
-        .compact_kiro_payload(&mut payload, target_tokens as usize, preserve_recent_turns)
+        .compact_kiro_payload_with_limits(
+            &mut payload,
+            target_tokens as usize,
+            state.config.current().context.max_upstream_payload_bytes,
+            preserve_recent_turns,
+        )
         .await;
     let mut stats = match compacted {
         Ok(stats) => stats,
@@ -658,6 +793,14 @@ async fn extractive_compaction(
                 && context_limit.is_some() =>
         {
             let decision = context_limit.expect("checked above");
+            super::enforce_payload_budget(
+                state,
+                0,
+                super::serialized_payload_bytes(&payload, ErrorFormat::Claude)?,
+                0,
+                false,
+                ErrorFormat::Claude,
+            )?;
             let actual = state
                 .tokenizer
                 .estimate_kiro_payload(&payload)
@@ -842,6 +985,20 @@ pub(super) async fn run_compaction(
         .tokenizer
         .partition_compaction_summary(summary_payload, summary_chunk_input_limit as usize)
         .await;
+    // Token limits alone do not bound JSON bytes (whitespace and attachments
+    // are typical counterexamples). Never dispatch an oversized summary part.
+    let summary_parts = summary_parts.and_then(|parts| {
+        let maximum = state.config.current().context.max_upstream_payload_bytes;
+        for part in &parts {
+            if super::serialized_payload_bytes(part, ErrorFormat::Claude)
+                .map_err(|error| error.message)?
+                > maximum
+            {
+                return Err("summary input exceeds the upstream payload byte budget".into());
+            }
+        }
+        Ok(parts)
+    });
     let mut fallback_reason = None;
     let mut semantic_summary = None;
     let mut iteration_usage = None;
@@ -931,7 +1088,10 @@ pub(super) async fn run_compaction(
             Ok(mut stats) => {
                 finalize_compaction_payload(state, &mut payload, &mut stats, "semantic compaction")
                     .await?;
-                if stats.compacted_tokens as u64 <= operation_target {
+                if stats.compacted_tokens as u64 <= operation_target
+                    && super::serialized_payload_bytes(&payload, ErrorFormat::Claude)?
+                        <= state.config.current().context.max_upstream_payload_bytes
+                {
                     return Ok(CompactionRun {
                         payload,
                         stats,

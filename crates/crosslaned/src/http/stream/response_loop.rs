@@ -1248,7 +1248,8 @@ pub fn response(
                     }
                     break 'rounds;
                 }
-                let mut budget = match super::super::handlers::remaining_tool_search_budget(
+                let previous_search_count = accumulated_searches.len();
+                let mut budget = match super::super::handlers::tool_search_budget_with_compaction(
                     &context.state,
                     &payload,
                     context.compact,
@@ -1305,12 +1306,6 @@ pub fn response(
                     loaded_names.extend(outcome.tools.iter().filter_map(|tool| {
                         tool.specification().map(|tool| tool.name.clone())
                     }));
-                    if matches!(protocol, StreamProtocol::Claude) {
-                        for data in claude.tool_search(&outcome.trace) {
-                            data_started = true;
-                            yield Ok::<Bytes, Infallible>(Bytes::from(data));
-                        }
-                    }
                     accumulated_searches.push(outcome.trace.clone());
                     searches.push((search_use, outcome));
                 }
@@ -1350,31 +1345,6 @@ pub fn response(
                             .executed(),
                         }
                     };
-                    if matches!(protocol, StreamProtocol::Claude) {
-                        match claude.web_search(&trace) {
-                            Ok(events) => {
-                                for data in events {
-                                    data_started = true;
-                                    yield Ok::<Bytes, Infallible>(Bytes::from(data));
-                                }
-                            }
-                            Err(error) => {
-                                let message = web_search_replay_failure(
-                                    &context.trace_id,
-                                    &context.request_id,
-                                    &context.user_agent,
-                                    &error,
-                                );
-                                failed = Some(message.clone());
-                                yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(
-                                    &protocol,
-                                    &context.request_id,
-                                    &message,
-                                )));
-                                break 'rounds;
-                            }
-                        }
-                    }
                     accumulated_web_searches.push(trace.clone());
                     parallel_web_searches.push((search_use, trace));
                 }
@@ -1446,6 +1416,90 @@ pub fn response(
                         &error,
                     )));
                     break 'rounds;
+                }
+
+                let local_compaction = match super::super::handlers::compact_tool_search_continuation(
+                    &context.state, &mut payload, context.compact,
+                ).await {
+                    Ok(stats) => stats,
+                    Err(error) => {
+                        failed = Some(error.clone());
+                        yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(
+                            &protocol, &context.request_id, &error,
+                        )));
+                        break 'rounds;
+                    }
+                };
+                if let Some(stats) = local_compaction {
+                    tracing::info!(
+                        trace_id = %context.trace_id,
+                        request_id = %context.request_id,
+                        compaction_reason = "tool_search_continuation_overflow",
+                        compaction_mode = "extractive_fallback",
+                        original_input_tokens = stats.original_tokens,
+                        compacted_input_tokens = stats.compacted_tokens,
+                        removed_messages = stats.removed_messages,
+                        "Tool Search continuation history compacted locally"
+                    );
+                    context.compact = true;
+                    context.auto_compaction_original_input_tokens.get_or_insert(stats.original_tokens as u64);
+                    claude.auto_compaction_original_input_tokens = context.auto_compaction_original_input_tokens;
+                    if let Some(summary) = stats.summary {
+                        // Publish the checkpoint before the newly loaded tool
+                        // references, preserving their client replay boundary.
+                        if matches!(protocol, StreamProtocol::Claude) {
+                            for data in claude.compaction(&summary) {
+                                data_started = true;
+                                yield Ok::<Bytes, Infallible>(Bytes::from(data));
+                            }
+                            // The boundary supersedes earlier tool references.
+                            // Restore them with fresh paired server blocks so
+                            // the next request can still load those tools.
+                            for previous in &accumulated_searches[..previous_search_count] {
+                                if previous.references.is_empty() {
+                                    continue;
+                                }
+                                let mut replay = previous.clone();
+                                replay.id = format!("srvtoolu_{}", uuid::Uuid::new_v4().simple());
+                                replay.emission = crosslane_translate::ClaudeServerToolEmission::Complete;
+                                for data in claude.tool_search(&replay) {
+                                    yield Ok::<Bytes, Infallible>(Bytes::from(data));
+                                }
+                            }
+                        }
+                        if let Some((scope, source)) = &context.compaction_replay {
+                            context.state.compaction_replay.remember(scope.clone(), *source, summary.clone());
+                        }
+                        context.compaction_summary = Some(summary);
+                    }
+                }
+                if matches!(protocol, StreamProtocol::Claude) {
+                    for (_, outcome) in &searches {
+                        for data in claude.tool_search(&outcome.trace) {
+                            data_started = true;
+                            yield Ok::<Bytes, Infallible>(Bytes::from(data));
+                        }
+                    }
+                    for (_, trace) in &parallel_web_searches {
+                        match claude.web_search(trace) {
+                            Ok(events) => {
+                                for data in events {
+                                    data_started = true;
+                                    yield Ok::<Bytes, Infallible>(Bytes::from(data));
+                                }
+                            }
+                            Err(error) => {
+                                let message = web_search_replay_failure(
+                                    &context.trace_id, &context.request_id, &context.user_agent, &error,
+                                );
+                                failed = Some(message.clone());
+                                yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(
+                                    &protocol, &context.request_id, &message,
+                                )));
+                                break 'rounds;
+                            }
+                        }
+                    }
                 }
 
                 let next_input_tokens = match context.state.tokenizer.estimate_kiro_payload(&payload).await {
@@ -1538,6 +1592,7 @@ pub fn response(
                     break 'rounds;
                 }
                 context.input_tokens = next_input_tokens;
+                claude.input_tokens = next_input_tokens;
                 let continuation_estimate = super::super::handlers::estimated_credits(
                     next_input_tokens,
                     payload.max_output_tokens().or(context.max_tokens).unwrap_or(super::super::handlers::DEFAULT_OUTPUT_TOKEN_ESTIMATE),

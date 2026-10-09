@@ -150,6 +150,29 @@ crosslane stats --detail --since 1h
 | 流式中断 | 最终流事件和 Trace 日志 |
 | 上下文超限 | 实际选中模型及请求大小 |
 
+### Kiro 请求大小与自动压缩
+
+Anthropic 请求先经过 50 MiB 的 HTTP 请求体限制，翻译后的 Kiro 请求默认最多
+8 MiB（`context.max_upstream_payload_bytes`）。模型输入窗口优先采用实际选中模型的
+元数据；普通请求和压缩后的请求分别使用 `safe_input_ratio` 与
+`compact_safe_input_ratio`，默认 0.95 和 0.99。
+
+启用 `context.auto_compact_on_overflow`（默认开启）时，历史导致字节超限会在上游发送前
+先做本地提取式压缩，不需要客户端先发送 compact 指令。Token 超限仍走语义摘要和本地
+回退流程。系统指令、已加载工具定义、当前消息及当前工具结果所依赖的完整工具调用链
+保留原样；这些不可压缩部分仍超限时返回具体的 400 错误。
+
+Tool Search 先预估压缩历史后的工具加载空间，再检查包含新工具与结果的完整续轮请求。
+续轮超限时使用本地压缩，避免持有账号并发名额时再请求摘要模型。流式压缩 checkpoint
+之后会补回之前已加载工具的 references，保证下一次工具结果回传仍能识别这些工具。
+客户端忽略 checkpoint 时，服务端仍可按已校验的历史前缀重放最新 checkpoint。
+
+大文本的 token 估算按 UTF-8 边界分块，并为边界保留少量余量，避免 tokenizer 在大段
+连续空白中抛异常；实际消息与工具 JSON 不会因此拆分。`/v1/messages/count_tokens`
+继续只返回本地估算，不触发新的摘要或压缩。关闭自动压缩时保留原有超限拒绝行为。
+日志中的 `payload_budget_overflow`、`pending_server_tools_payload_overflow` 和
+`tool_search_continuation_overflow` 可用于确认压缩触发位置。
+
 ### 客户端与会话归属
 
 所有构建都支持客户端识别，无需启用 `crs` feature。Claude Code 从旧格式或 JSON 字符串格式的

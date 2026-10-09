@@ -375,6 +375,10 @@ use compaction::{
     await_compaction_summary_task, await_compaction_summary_task_with_policy,
     compaction_operation_target, parse_compaction_summary,
 };
+pub(super) use compaction::{
+    compact_history_for_limits, compact_tool_search_continuation,
+    tool_search_budget_with_compaction,
+};
 use compaction::{
     initial_compaction_decision, reapply_compaction, resolved_compaction_decision, run_compaction,
     upstream_overflow_compaction_decision,

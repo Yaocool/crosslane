@@ -534,6 +534,10 @@ impl wiremock::Respond for ModelUnavailableFallbackResponder {
 }
 
 async fn mount_context_alignment_models(mock: &MockServer) {
+    mount_context_alignment_models_with_tiny_limit(mock, 500).await;
+}
+
+async fn mount_context_alignment_models_with_tiny_limit(mock: &MockServer, tiny_limit: u32) {
     Mock::given(method("GET"))
         .and(path("/ListAvailableModels"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -555,7 +559,7 @@ async fn mount_context_alignment_models(mock: &MockServer) {
                 },
                 {
                     "modelId":"resolved-tiny",
-                    "tokenLimits":{"maxInputTokens":500,"maxOutputTokens":16384}
+                    "tokenLimits":{"maxInputTokens":tiny_limit,"maxOutputTokens":16384}
                 },
                 {
                     "modelId":"summary-large",

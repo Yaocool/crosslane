@@ -103,6 +103,8 @@ pub struct StreamContext {
     pub input_tokens: u64,
     pub compact: bool,
     pub compaction_summary: Option<String>,
+    pub(crate) compaction_replay:
+        Option<(String, super::compaction_replay::CompactionReplaySource)>,
     /// Claude Code 2.1.260 retains compaction starts but ignores their deltas.
     pub compaction_in_start: bool,
     pub compaction_iteration: Option<CompactionIterationUsage>,
