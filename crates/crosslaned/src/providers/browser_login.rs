@@ -69,10 +69,18 @@ impl BrowserLoginManager {
         }
         if credentials.github_username.trim().is_empty()
             || credentials.github_username.chars().any(char::is_whitespace)
-            || credentials.github_username.contains('@')
         {
             return Err(RpcError::bad_params(
-                "github_username must be the complete GitHub username, not an Azure/email address or whitespace",
+                "github_username must be a GitHub username or email address without whitespace",
+            ));
+        }
+        if credentials.github_username.contains('@')
+            && (credentials.sso_username.is_some()
+                || credentials.sso_password.is_some()
+                || credentials.sso_start_url.is_some())
+        {
+            return Err(RpcError::bad_params(
+                "SSO login requires the complete GitHub username, not the Azure email address",
             ));
         }
         if credentials
@@ -310,6 +318,10 @@ mod tests {
         assert!(BrowserLoginManager::validate(&credentials).is_err());
         credentials.github_password = Some("github-only-password".into());
         assert!(BrowserLoginManager::validate(&credentials).is_ok());
+        credentials.github_username = "developer@example.com".into();
+        assert!(BrowserLoginManager::validate(&credentials).is_ok());
+        credentials.sso_start_url = Some("https://github.com/enterprises/example/sso".into());
+        assert!(BrowserLoginManager::validate(&credentials).is_err());
     }
 
     #[test]

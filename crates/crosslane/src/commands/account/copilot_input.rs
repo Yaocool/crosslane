@@ -83,10 +83,18 @@ pub(super) fn parse_csv(raw: &str) -> Result<Vec<CsvLogin>> {
 
 fn validate(credentials: &CopilotBrowserCredentials) -> Result<()> {
     if credentials.github_username.is_empty()
-        || credentials.github_username.contains('@')
         || credentials.github_username.chars().any(char::is_whitespace)
     {
-        return Err(anyhow!("需提供完整 GitHub 用户名，不能用 Azure 邮箱代替"));
+        return Err(anyhow!("需提供 GitHub 用户名或邮箱，不能包含空白字符"));
+    }
+    if credentials.github_username.contains('@')
+        && (credentials.sso_username.is_some()
+            || credentials.sso_password.is_some()
+            || credentials.sso_start_url.is_some())
+    {
+        return Err(anyhow!(
+            "SSO 登录需提供完整 GitHub 用户名，不能用 Azure 邮箱代替"
+        ));
     }
     let azure_user = credentials
         .sso_username
@@ -135,7 +143,7 @@ fn interactive(
     )?;
     let username = match username {
         Some(value) => value,
-        None => line(&mut tty, "完整 GitHub 用户名：")?,
+        None => line(&mut tty, "GitHub 用户名或邮箱（SSO 必须用完整用户名）：")?,
     };
     let mode = if sso_username.is_some() {
         "1".to_owned()
@@ -389,6 +397,7 @@ mod tests {
         assert!(rows[1].credentials.sso_password.is_none());
         assert_eq!(rows[0].label.as_deref(), Some("team"));
         assert!(parse_csv("username,password\noctocat,secret\n").is_ok());
+        assert!(parse_csv("username,password\nuser@example.com,secret\n").is_ok());
     }
 
     #[test]
@@ -397,7 +406,7 @@ mod tests {
             "octocat,private-secret\n",
             "github_username,sso_password\nmanaged_company,private-secret\n",
             "github_username,github_password\na,private-secret\nA,private-secret\n",
-            "github_username,github_password\nuser@example.com,private-secret\n",
+            "github_username,sso_username,sso_password\nuser@example.com,user@example.com,private-secret\n",
             "github_username,username,github_password\na,a,private-secret\n",
         ] {
             let error = parse_csv(raw).err().expect("invalid credentials");

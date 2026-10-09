@@ -80,6 +80,10 @@ crosslane account list --provider copilot
 ```
 
 选择组织允许的账号方式。`--provider` 使用 `provider add --id` 指定的实例 ID。
+无头服务器可用 `account add --provider copilot --headless` 选择 GitHub 密码登录，
+或使用 `--username <GitHub用户名或邮箱> --password-stdin`。邮箱必须属于授权账号且已验证；
+程序会通过 GitHub API 核验，核验失败不会保存账号。Azure SSO 的 `--username` 仍须填写
+完整 GitHub 用户名，Azure 邮箱使用 `--sso-username`。MFA 动态码或推送仍需本人完成。
 同一服务账号池内，Copilot 按账号当前并发数和最近使用时间选择账号；
 `[provider.pool.balance]` 可设置 `weight_active`、`weight_idle` 和
 `idle_window_ms`，默认分别为 `0.8`、`0.2` 和 `300000`。

@@ -979,6 +979,7 @@ pub struct AccountImportResult {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CopilotBrowserCredentials {
+    /// GitHub username, or a verified email for password-only GitHub login.
     pub github_username: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_password: Option<String>,

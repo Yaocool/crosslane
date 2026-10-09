@@ -91,6 +91,13 @@ crosslane account list --provider copilot
 
 Choose an account method that your GitHub organization permits. `--provider`
 takes the instance ID selected with `provider add --id`.
+On a headless server, select GitHub password login with
+`account add --provider copilot --headless`, or use
+`--username <GitHub-username-or-email> --password-stdin`. An email must be verified
+and belong to the authorized account; Crosslane checks it through the GitHub API
+before saving the account. Azure SSO still requires the full GitHub username in
+`--username` and the Azure email in `--sso-username`. MFA codes or push approval
+still require the account owner.
 Within a service account pool, Copilot selects accounts by active concurrency
 and recent use. Configure `weight_active`, `weight_idle`, and `idle_window_ms`
 under `[provider.pool.balance]` (defaults: `0.8`, `0.2`, `300000`). Copilot does

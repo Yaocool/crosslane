@@ -36,6 +36,27 @@ function step(options) {
   };
   const button = regex => [...document.querySelectorAll('button,input[type=submit],a')]
     .find(el => visible(el) && regex.test((el.innerText || el.value || '').trim()));
+  const authorize = () => {
+    // GitHub keeps Authorize disabled until the entire button group is in the
+    // viewport and its focus delay has passed. Scroll normally and let GitHub
+    // enable it; disabled controls must not be clicked or force-enabled.
+    const control = [...document.querySelectorAll('#js-oauth-authorize-btn,.js-oauth-authorize-btn,button[name="authorize"][value="1"],button[name="authorize"]:not([value]),button[value="authorize"]')]
+      .find(el => el.offsetParent !== null)
+      || [...document.querySelectorAll('button,input[type=submit]')]
+        .find(el => el.offsetParent !== null && /^authorize\b|^授权/iu.test((el.innerText || el.value || '').trim()));
+    if (!control) return null;
+    const group = control.closest('.js-authorization-buttons') || control;
+    const bounds = group.getBoundingClientRect();
+    if (bounds.top < 0 || bounds.bottom > innerHeight || bounds.left < 0 || bounds.right > innerWidth) {
+      group.scrollIntoView({ block: 'center', inline: 'nearest' });
+    }
+    if (control.disabled || control.getAttribute('aria-disabled') === 'true') {
+      memory.authorizeWaitAt ||= Date.now();
+      return state(Date.now() - memory.authorizeWaitAt >= 30000 ? 'authorization_unavailable' : 'authorize_waiting');
+    }
+    click(control, 'authorize');
+    return state('authorize');
+  };
   if (first(['input[autocomplete="new-password"]', 'input[name="new_password"]', '#newPassword'])) return state('password_change');
   if (first(['#captcha', 'iframe[src*="captcha"]', 'iframe[src*="arkoselabs"]'])) return state('captcha');
 
@@ -50,7 +71,11 @@ function step(options) {
     }
     return state('mfa_code');
   }
-  if (first(['#passwordError', '#usernameError', '#service_exception_message', '#errorText', '.flash-error'])) return state('login_rejected');
+  const loginError = first(['#passwordError', '#usernameError', '#service_exception_message', '#errorText', '.flash-error']);
+  if (loginError) {
+    if (github && /incorrect username or password/i.test(loginError.innerText)) return state('github_credentials_rejected');
+    return state('login_rejected');
+  }
   if (azure && /approve (the |this |a )?(sign.?in|request)|check your.*authenticator|批准.*(登录|请求)/i.test(text)) {
     const number = (first(['#idRichContext_DisplaySign'])?.innerText || '').trim();
     return { stage: 'mfa_push', number };
@@ -123,7 +148,13 @@ function step(options) {
       if (confirm) {
         const login = (confirm.getAttribute('aria-label') || '').match(/^Continue as (.+)$/i)?.[1];
         if (!login) return state('account_confirmation_required');
-        if (login.toLowerCase() !== credentials.github_username.toLowerCase()) return state('account_mismatch');
+        // Email sign-in resolves to a username here. Confirm the browser's
+        // signed-in user; the token's verified email is checked before import.
+        const expected = credentials.github_username.includes('@')
+          ? document.querySelector('meta[name="user-login"]')?.content
+          : credentials.github_username;
+        if (!expected) return state('account_confirmation_required');
+        if (login.toLowerCase() !== expected.toLowerCase()) return state('account_mismatch');
         click(confirm, 'select-account');
         return state('select_account');
       }
@@ -137,17 +168,13 @@ function step(options) {
       click(button(/^continue$|^submit$|^继续$|^提交$/i), 'device-code');
       return state('device_code');
     }
-    const authorize = first(['#js-oauth-authorize-btn', 'button[name="authorize"]', 'button[value="authorize"]'])
-      || button(/^authorize\b|^授权/iu);
-    if (authorize) {
-      click(authorize, 'authorize');
-      return state('authorize');
-    }
+    const authorization = authorize();
+    if (authorization) return authorization;
     if (/congratulations|you.?re all set|device is now connected|successfully authorized|授权成功/i.test(text)) return state('complete');
   }
   if (location.pathname.startsWith('/login/oauth/authorize')) {
-    const authorize = first(['#js-oauth-authorize-btn', 'button[name="authorize"]']) || button(/^authorize\b/iu);
-    if (authorize) { click(authorize, 'authorize'); return state('authorize'); }
+    const authorization = authorize();
+    if (authorization) return authorization;
   }
   // An optional enterprise SSO entry may land on its home page after login.
   if (credentials.sso_start_url && !location.pathname.startsWith('/login/')

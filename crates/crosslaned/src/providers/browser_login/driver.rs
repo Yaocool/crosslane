@@ -136,6 +136,11 @@ async fn drive(
         if let Some(error) = stage_error(&step.stage) {
             return Err(anyhow!("{error}"));
         }
+        if step.stage == "authorize_waiting" {
+            page.bring_to_front().await.map_err(|_| {
+                anyhow!("remote browser could not focus the GitHub authorization page")
+            })?;
+        }
         let mut message = stage_message(&step.stage).to_owned();
         if step.stage == "mfa_push" {
             if let Some(number) = step
@@ -157,6 +162,8 @@ fn stage_error(stage: &str) -> Option<&'static str> {
         "untrusted_origin" => Some("登录跳转到了尚未支持的身份提供商；未向该页面填写凭证"),
         "github_password_required" => Some("该账号要求 GitHub 密码；Azure 密码不会发送给 GitHub，请用 --credentials-stdin 分别提供两套凭证"),
         "sso_credentials_required" => Some("需要 Azure SSO 凭证；请提供 --sso-username 或在凭证 JSON 中设置 sso_username/sso_password"),
+        "github_credentials_rejected" => Some("GitHub 提示用户名或密码错误（Incorrect username or password）；请核对 GitHub 用户名/邮箱及 GitHub 密码后重试"),
+        "authorization_unavailable" => Some("已滚动到 GitHub 授权按钮并等待 30 秒，但按钮仍不可用；请检查 GitHub 页面提示或组织授权限制后重试"),
         "login_rejected" => Some("GitHub/Azure 拒绝了登录或授权，请检查账号、密码、组织授权策略及登录记录"),
         "account_mismatch" => Some("GitHub 确认页的账号与指定用户名不一致，已停止授权；请核对 GitHub 与 Azure 凭证对应关系"),
         "account_confirmation_required" => Some("无法校验 GitHub 账号确认页面，已停止自动授权；请检查页面变化"),
@@ -180,6 +187,7 @@ fn stage_message(stage: &str) -> &'static str {
         "device_code" => "远端浏览器已提交 Device Flow 验证码",
         "select_account" => "已核对并确认当前 GitHub 登录账号",
         "authorize" => "远端浏览器正在确认 OAuth 应用授权",
+        "authorize_waiting" => "已滚动到 GitHub 授权按钮，正在等待页面启用按钮",
         "mfa_code" => "远端浏览器正在等待 MFA 动态验证码",
         "mfa_submitted" => "MFA 验证码已提交",
         "mfa_push" => "请在手机 Authenticator 中批准当前登录；远端浏览器继续等待",
@@ -205,6 +213,13 @@ mod tests {
         assert!(stage_error("security_info_required")
             .unwrap()
             .contains("不会自动修改安全信息"));
+    }
+
+    #[test]
+    fn incorrect_github_credentials_have_a_specific_error() {
+        assert!(stage_error("github_credentials_rejected")
+            .unwrap()
+            .contains("Incorrect username or password"));
     }
 
     async fn step(
@@ -236,6 +251,81 @@ mod tests {
             .into_value::<serde_json::Value>()
             .unwrap();
         panic!("fixture did not reach an actionable browser stage: {diagnostic}");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an installed Chrome/Chromium browser"]
+    async fn remote_browser_scrolls_authorization_controls_and_waits_for_github() {
+        let server = MockServer::start().await;
+        let form = r#"<!doctype html><body style="margin:0">
+            <div style="height:1200px">Review the app permissions</div>
+            <form onsubmit="event.preventDefault();document.body.dataset.submitted=event.submitter.value">
+              <div class="js-authorization-buttons" style="height:100px">
+                <button class="js-oauth-authorize-btn" name="authorize" value="1" disabled>Authorize</button>
+                <button name="authorize" value="0">Cancel</button>
+              </div>
+            </form><div style="height:800px"></div>
+            <script>
+              let inView = false;
+              let ready = false;
+              const control = document.querySelector('.js-oauth-authorize-btn');
+              const update = () => { control.disabled = !(inView && ready); };
+              new IntersectionObserver(entries => {
+                inView = entries[0].intersectionRatio >= 1;
+                update();
+              }, {threshold:[0,1]}).observe(document.querySelector('.js-authorization-buttons'));
+              window.allowAuthorization = () => { ready = true; update(); };
+            </script></body>"#;
+        for route in ["/login/device/confirmation", "/login/oauth/authorize"] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(form, "text/html"))
+                .mount(&server)
+                .await;
+        }
+        let mut browser = BrowserSession::launch_page("about:blank", false)
+            .await
+            .unwrap();
+        let page = browser.page();
+        let options = json!({"githubOrigin":server.uri(),"verificationUri":format!("{}/login/device",server.uri()),"userCode":"ABCD-EFGH","credentials":{"github_username":"fixture-user"},"otp":null});
+        for route in ["/login/device/confirmation", "/login/oauth/authorize"] {
+            page.goto(format!("{}{route}", server.uri())).await.unwrap();
+            assert_eq!(step(page, options.clone(), None).await, "authorize_waiting");
+            assert!(page.evaluate("document.querySelector('.js-oauth-authorize-btn').disabled && !document.body.dataset.submitted")
+                .await.unwrap().into_value::<bool>().unwrap());
+            page.evaluate("window.allowAuthorization()").await.unwrap();
+            let mut stage = String::new();
+            for _ in 0..100 {
+                stage = step(page, options.clone(), None).await;
+                if stage == "authorize" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert_eq!(stage, "authorize");
+            assert_eq!(
+                page.evaluate("document.body.dataset.submitted")
+                    .await
+                    .unwrap()
+                    .into_value::<String>()
+                    .unwrap(),
+                "1"
+            );
+        }
+        page.goto(format!("{}/login/device/confirmation", server.uri()))
+            .await
+            .unwrap();
+        assert_eq!(step(page, options.clone(), None).await, "authorize_waiting");
+        page.evaluate("window.__crosslaneDeviceFlow.authorizeWaitAt = Date.now() - 31000")
+            .await
+            .unwrap();
+        assert_eq!(step(page, options, None).await, "authorization_unavailable");
+        assert!(page.evaluate("document.querySelector('.js-oauth-authorize-btn').disabled && !document.body.dataset.submitted")
+            .await.unwrap().into_value::<bool>().unwrap());
+        assert!(stage_error("authorization_unavailable")
+            .unwrap()
+            .contains("30 秒"));
+        browser.close().await;
     }
 
     #[tokio::test]
@@ -348,6 +438,47 @@ mod tests {
                 .into_value::<String>()
                 .unwrap(),
             ""
+        );
+
+        let mut email_account = options.clone();
+        email_account["credentials"]["github_username"] = json!("private@example.com");
+        assert_eq!(
+            step(page, email_account.clone(), None).await,
+            "account_confirmation_required"
+        );
+        page.evaluate("document.head.insertAdjacentHTML('beforeend', '<meta name=\"user-login\" content=\"different-user\">')")
+            .await.unwrap();
+        assert_eq!(
+            step(page, email_account.clone(), None).await,
+            "account_mismatch"
+        );
+        page.evaluate(
+            "document.querySelector('meta[name=\"user-login\"]').content = 'fixture-user'",
+        )
+        .await
+        .unwrap();
+        assert_eq!(step(page, email_account, None).await, "select_account");
+
+        page.goto(format!("{}/login/device", server.uri()))
+            .await
+            .unwrap();
+        page.set_content(r#"<div class="flash-error" style="display:none">Incorrect username or password.</div><input name="user_code"><button>Continue</button>"#).await.unwrap();
+        assert_eq!(step(page, options.clone(), None).await, "device_code");
+        page.set_content(r#"<div class="flash-error">Incorrect username or password.</div>"#)
+            .await
+            .unwrap();
+        assert_eq!(
+            step(page, options.clone(), None).await,
+            "github_credentials_rejected"
+        );
+        assert_eq!(
+            step(
+                page,
+                options.clone(),
+                Some("https://login.microsoftonline.com")
+            )
+            .await,
+            "login_rejected"
         );
 
         page.set_content(r#"<input name="loginfmt"><button id="idSIButton9" onclick="document.body.dataset.submitted='user'">Next</button>"#).await.unwrap();

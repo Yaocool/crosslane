@@ -158,7 +158,7 @@ diagnose all/endpoints、account overage 是 Kiro 专项功能。"#
    CSV 必须有 github_username 表头，可选 github_password,sso_username,sso_password,sso_start_url,label；GitHub 密码或 Azure SSO 凭证至少提供一套。
    非交互模式也可从标准输入读取密码：
    crosslane account add --provider copilot --auth device-flow --username USER_SHORTCODE --sso-username user@example.com --password-stdin
-   --username 填完整 GitHub 用户名；--sso-username 填 Azure 登录名，此时 stdin 密码仅用于 Azure。普通 GitHub 密码登录省略 --sso-username。两套密码不同可用 --credentials-stdin 读取 JSON。密码不保存在账号文件中。
+   SSO 的 --username 填完整 GitHub 用户名；--sso-username 填 Azure 登录名，此时 stdin 密码仅用于 Azure。普通 GitHub 密码登录省略 --sso-username，--username 可填 GitHub 用户名或已验证邮箱。两套密码不同可用 --credentials-stdin 读取 JSON。密码不保存在账号文件中。
    未提供浏览器凭证时，仍可在自己电脑的无痕/隐私窗口手动授权：
    crosslane account add --provider copilot --auth device-flow
    --provider 始终填创建实例时的 --id；以 provider list 的实例 ID 为准，不要填写 GitHub Copilot 类型名称。远端模式按任务隔离浏览器会话；MFA 推送仍需本人批准，动态验证码用 account login-code 提交。--capture-headers 可在服务器受保护文件中记录完整敏感 header，默认关闭。

@@ -126,7 +126,7 @@ pub enum AccountCommand {
         /// 从标准输入读取 Kiro API key 或 GitHub token 并显式导入。
         #[arg(long, conflicts_with_all = ["credentials_stdin", "batch", "headless", "password_stdin", "capture_headers"])]
         token_stdin: bool,
-        /// Kiro 邮箱（--email）或在远端无痕浏览器登录的 GitHub 用户名。
+        /// Kiro 邮箱（--email）或 GitHub 用户名/邮箱；Copilot SSO 必须用完整用户名。
         #[arg(long, visible_alias = "email", conflicts_with_all = ["credentials_stdin", "batch"])]
         username: Option<String>,
         /// 从标准输入读取一行密码；指定 --sso-username 时仅发送给 Azure。

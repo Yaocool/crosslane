@@ -255,6 +255,12 @@ struct GithubUser {
 }
 
 #[derive(Debug, Deserialize)]
+struct GithubEmail {
+    email: String,
+    verified: bool,
+}
+
+#[derive(Debug, Deserialize)]
 struct CopilotTokenResponse {
     token: String,
     expires_at: i64,
@@ -492,12 +498,20 @@ impl CopilotProvider {
         expected_login: Option<&str>,
     ) -> Result<CopilotAccountSummary, ProviderError> {
         let user = self.github_user(&credentials.github_access_token).await?;
-        if expected_login.is_some_and(|expected| !user.login.eq_ignore_ascii_case(expected)) {
-            return Err(ProviderError::new(
-                ProviderErrorKind::Authentication,
-                StatusCode::UNAUTHORIZED,
-                "authorized GitHub user does not match the requested browser-login username",
-            ));
+        if let Some(expected) = expected_login {
+            let matches = if expected.contains('@') {
+                self.github_verified_email(&credentials.github_access_token, expected)
+                    .await?
+            } else {
+                user.login.eq_ignore_ascii_case(expected)
+            };
+            if !matches {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::Authentication,
+                    StatusCode::UNAUTHORIZED,
+                    "authorized GitHub user does not match the requested browser-login username or verified email",
+                ));
+            }
         }
         let exchanged = self
             .exchange_token_value(&credentials.github_access_token)
@@ -1060,10 +1074,44 @@ impl CopilotProvider {
     }
 
     async fn github_user(&self, token: &str) -> Result<GithubUser, ProviderError> {
-        let url = endpoint_url(&self.settings.github_api_base, "/user")?;
+        self.github_get(token, "/user", &[]).await
+    }
+
+    async fn github_verified_email(
+        &self,
+        token: &str,
+        expected: &str,
+    ) -> Result<bool, ProviderError> {
+        // Check private/secondary emails as well as the public /user email.
+        // Device Flow already requests user:email; never accept an unverified address.
+        for page in 1..=10 {
+            let emails: Vec<GithubEmail> = self
+                .github_get(token, "/user/emails", &[("per_page", 100), ("page", page)])
+                .await?;
+            if emails
+                .iter()
+                .any(|email| email.verified && email.email.eq_ignore_ascii_case(expected))
+            {
+                return Ok(true);
+            }
+            if emails.len() < 100 {
+                break;
+            }
+        }
+        Ok(false)
+    }
+
+    async fn github_get<T: serde::de::DeserializeOwned>(
+        &self,
+        token: &str,
+        path: &str,
+        query: &[(&str, u32)],
+    ) -> Result<T, ProviderError> {
+        let url = endpoint_url(&self.settings.github_api_base, path)?;
         let response = self
             .http
             .get(url)
+            .query(query)
             .timeout(Duration::from_secs(30))
             .header("accept", "application/vnd.github+json")
             .header("authorization", format!("Bearer {token}"))
@@ -1072,7 +1120,7 @@ impl CopilotProvider {
             .send()
             .await
             .map_err(transport_error)?;
-        decode_json_response(response, "GitHub /user").await
+        decode_json_response(response, &format!("GitHub {path}")).await
     }
 
     async fn api_token(&self, account: &CopilotAccount) -> Result<CachedApiToken, ProviderError> {
@@ -3472,6 +3520,97 @@ mod tests {
         let reloaded = mock_provider(&server, directory.path()).await;
         assert!(reloaded.models(false).await.unwrap().is_empty());
         server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn browser_email_import_requires_a_verified_email_owned_by_the_token() {
+        let server = MockServer::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        mount_account_exchange(&server, "email-token").await;
+        Mock::given(method("GET"))
+            .and(path("/user/emails"))
+            .and(header("authorization", "Bearer email-token"))
+            .and(wiremock::matchers::query_param("per_page", "100"))
+            .and(wiremock::matchers::query_param("page", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"email":"unverified@example.com","verified":false},
+                {"email":"private@example.com","verified":true}
+            ])))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let provider = mock_provider(&server, directory.path()).await;
+        let credentials = CopilotCredentials {
+            github_access_token: "email-token".into(),
+            github_refresh_token: None,
+            github_expires_at: None,
+            github_refresh_token_expires_at: None,
+            token_type: "bearer".into(),
+        };
+        for email in ["unverified@example.com", "other@example.com"] {
+            let error = provider
+                .import_credentials(credentials.clone(), None, Some(email))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("does not match"));
+            assert!(provider.account_summaries().await.is_empty());
+        }
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| {
+                request.url.path() != "/copilot_internal/v2/token"
+                    && request.url.path() != "/models"
+            }));
+        let imported = provider
+            .import_credentials(credentials, None, Some("PRIVATE@example.com"))
+            .await
+            .unwrap();
+        assert_eq!(imported.login, "octocat");
+        assert_eq!(provider.account_summaries().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn browser_email_verification_paginates_and_fails_closed_on_api_errors() {
+        let server = MockServer::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        let provider = mock_provider(&server, directory.path()).await;
+        Mock::given(method("GET"))
+            .and(path("/user/emails"))
+            .and(wiremock::matchers::query_param("page", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![
+                serde_json::json!({"email":"other@example.com","verified":true});
+                100
+            ]))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/user/emails"))
+            .and(wiremock::matchers::query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"email":"private@example.com","verified":true}
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert!(provider
+            .github_verified_email("token", "private@example.com")
+            .await
+            .unwrap());
+        server.verify().await;
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/user/emails"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        assert!(provider
+            .github_verified_email("token", "private@example.com")
+            .await
+            .is_err());
     }
 
     #[tokio::test]
