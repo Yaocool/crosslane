@@ -133,6 +133,7 @@ pub struct AccountPool {
 
 pub struct AccountLease {
     state: Arc<AccountState>,
+    account_id: String,
     notify: Arc<Notify>,
 }
 
@@ -159,11 +160,7 @@ impl AccountLease {
     }
 
     pub fn account_id(&self) -> String {
-        self.state
-            .account
-            .try_read()
-            .map(|account| account.id.clone())
-            .unwrap_or_default()
+        self.account_id.clone()
     }
 
     pub async fn settle_credits(&mut self, actual: f64) {
@@ -325,12 +322,16 @@ impl AccountPool {
             .sort_by(|left, right| left.0.partial_cmp(&right.0).unwrap_or(CmpOrdering::Equal));
         let maximum = self.config().max_concurrent_per_account;
         for (_, state) in candidates {
+            // Resolve identity before reserving a slot: cancellation while
+            // waiting for the account lock must not leak active concurrency.
+            let account_id = state.account.read().await.id.clone();
             if !state.try_acquire_slot(maximum) {
                 continue;
             }
             state.mark_used_now();
             return Some(AccountLease {
                 state,
+                account_id,
                 notify: Arc::clone(&self.notify),
             });
         }
@@ -841,6 +842,17 @@ mod tests {
             max_queue_wait_ms: 0,
             ..PoolConfig::default()
         }
+    }
+
+    #[tokio::test]
+    async fn lease_account_id_is_stable_while_account_is_being_updated() {
+        let pool = AccountPool::new(
+            vec![account("stable", 0.0, SubscriptionKind::Pro)],
+            immediate_config(),
+        );
+        let lease = pool.acquire("", 0.0, &[]).await.expect("account lease");
+        let _write = lease.state.account.write().await;
+        assert_eq!(lease.account_id(), "stable");
     }
 
     #[test]
