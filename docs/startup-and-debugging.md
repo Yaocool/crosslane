@@ -145,9 +145,16 @@ crosslane account overage show
 Use an ID from the model list. Disabled models are unavailable to new requests.
 Copilot also accepts equivalent client aliases such as `claude-opus-4-8` for
 the discovered ID `claude-opus-4.8`. Explicit model mappings run first, and
-permissions are checked against the resolved ID. Aliases never select another
-version; unknown or ambiguous IDs require an explicit mapping. Inspect the
-result with `crosslane models resolve claude-opus-4-8 --provider copilot`.
+permissions are checked against the resolved ID. To route a missing Claude
+version to the nearest available version in the same Opus, Sonnet, or Haiku
+family, run `crosslane provider edit copilot --enable-model-fallback true`.
+This prefers the same major version, then the nearest version, and the newer
+version on a tie. For example, missing `claude-opus-4-6` resolves to
+`claude-opus-4.8` when that is the nearest available Opus model. Ambiguous IDs,
+unknown families, and variants such as `-fast` still require explicit mappings.
+Fallback does not bypass disabled models or API key permissions. The provider
+switch defaults to false; inspect the result with
+`crosslane models resolve claude-opus-4-6 --provider copilot --json`.
 Kiro overage is disabled by default. To set a maximum of 500 overage credits
 per account, run `crosslane account overage enable --max-credits 500`; use
 `crosslane account overage disable` to turn it off. Upstream limits and requests

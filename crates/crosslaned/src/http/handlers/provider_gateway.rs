@@ -8,7 +8,7 @@ use crosslane_core::config::{Config, ProxyServiceConfig};
 use crosslane_core::provider::{ProviderId, ProviderModel, ProviderProtocol};
 use crosslane_provider::{ProviderError, ProviderRequest, ProviderResponseBody};
 use crosslane_translate::model::{
-    map_model_for_provider, resolve_model_alias, ModelMappingContext, ModelRoute,
+    map_model_for_provider, resolve_model_with_family_fallback, ModelMappingContext, ModelRoute,
 };
 use futures::StreamExt;
 use serde_json::Value;
@@ -26,6 +26,7 @@ pub(super) struct SelectedProviderRoute {
     /// A provider-aware rule already selected this Kiro model. The legacy
     /// executor must not draw or apply the rule a second time.
     pub lock_kiro_mapping: bool,
+    pub enable_model_fallback: bool,
     pub body: Bytes,
 }
 
@@ -308,6 +309,7 @@ pub(super) fn select_provider_route(
         upstream_model: upstream_model.to_owned(),
         mapping_rule: route.rule,
         lock_kiro_mapping,
+        enable_model_fallback: selected.routing.enable_model_fallback,
         body,
     })
 }
@@ -342,7 +344,12 @@ fn resolve_copilot_route(
         .iter()
         .map(|model| model.id.clone())
         .collect::<Vec<_>>();
-    let resolved = resolve_model_alias(&route.upstream_model, &available).ok_or_else(|| {
+    let resolved = resolve_model_with_family_fallback(
+        &route.upstream_model,
+        &available,
+        route.enable_model_fallback,
+    )
+    .ok_or_else(|| {
         let mut error = ApiError::new(
             StatusCode::BAD_REQUEST,
             format!(

@@ -24,6 +24,68 @@ pub fn resolve_model_alias(model: &str, available: &[String]) -> Option<String> 
         .then(|| matched.clone())
 }
 
+/// Resolve aliases first, then optionally the nearest numeric Claude version
+/// in the same Opus, Sonnet, or Haiku family. Prefer the same major version and
+/// the newer version on equal distance; never guess between ambiguous IDs.
+pub fn resolve_model_with_family_fallback(
+    model: &str,
+    available: &[String],
+    enable_model_fallback: bool,
+) -> Option<String> {
+    if let Some(resolved) = resolve_model_alias(model, available) {
+        return Some(resolved);
+    }
+    let requested = crosslane_core::model_policy::model_key(model);
+    if !enable_model_fallback
+        || available
+            .iter()
+            .any(|candidate| crosslane_core::model_policy::model_key(candidate) == requested)
+    {
+        return None;
+    }
+    let (family, version) = numeric_claude_version(&requested)?;
+    let packed = |version: [u32; 3]| {
+        (u128::from(version[0]) << 64) | (u128::from(version[1]) << 32) | u128::from(version[2])
+    };
+    let rank = |candidate: [u32; 3]| {
+        (
+            candidate[0] != version[0],
+            packed(candidate).abs_diff(packed(version)),
+            std::cmp::Reverse(candidate),
+        )
+    };
+    let candidates = available
+        .iter()
+        .filter_map(|candidate| {
+            let key = crosslane_core::model_policy::model_key(candidate);
+            let (candidate_family, candidate_version) = numeric_claude_version(&key)?;
+            (candidate_family == family).then_some((candidate_version, candidate))
+        })
+        .collect::<Vec<_>>();
+    let (nearest_version, nearest) = candidates
+        .iter()
+        .min_by_key(|(version, _)| rank(*version))?;
+    candidates
+        .iter()
+        .all(|(version, candidate)| version != nearest_version || candidate == nearest)
+        .then(|| (*nearest).clone())
+}
+
+fn numeric_claude_version(model_key: &str) -> Option<(&str, [u32; 3])> {
+    let (family, version) = model_key.strip_prefix("claude-")?.split_once('-')?;
+    if !matches!(family, "opus" | "sonnet" | "haiku") {
+        return None;
+    }
+    let mut components = [0; 3];
+    for (index, component) in version.split('-').enumerate() {
+        if !component.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        *components.get_mut(index)? = component.parse().ok()?;
+    }
+    Some((family, components))
+}
+
 /// Resolve a client model name against the exact IDs returned by one account.
 /// Matching mirrors the TypeScript authority: exact, normalized/prefix, then
 /// highest version in the same model family.
@@ -1264,6 +1326,82 @@ mod tests {
         assert_eq!(
             resolve_model_alias("GPT-4.1", &["gpt-4.1".into()]).as_deref(),
             Some("gpt-4.1")
+        );
+    }
+
+    #[test]
+    fn family_fallback_selects_nearest_version_without_crossing_claude_families() {
+        let models = vec![
+            "claude-opus-5.5".into(),
+            "claude-opus-4.8-fast".into(),
+            "claude-sonnet-4.6".into(),
+            "claude-opus-4.8".into(),
+            "claude-haiku-4.5".into(),
+            "claude-opus-5".into(),
+        ];
+        for (requested, expected) in [
+            ("claude-opus-4-6", "claude-opus-4.8"),
+            ("anthropic.claude-opus-4-6-20261001", "claude-opus-4.8"),
+            ("opus4.9", "claude-opus-4.8"),
+            ("claude-opus-5-4", "claude-opus-5.5"),
+            ("claude-opus-6", "claude-opus-5.5"),
+            ("claude-haiku-4-6", "claude-haiku-4.5"),
+            ("claude-4-8-sonnet", "claude-sonnet-4.6"),
+        ] {
+            assert_eq!(
+                resolve_model_with_family_fallback(requested, &models, true).as_deref(),
+                Some(expected),
+                "{requested}"
+            );
+        }
+        assert!(resolve_model_with_family_fallback("claude-opus-4-6", &models, false).is_none());
+        for unknown in ["claude-opus-4-6-fast", "claude-fable-4-6", "gpt-4.6"] {
+            assert!(resolve_model_with_family_fallback(unknown, &models, true).is_none());
+        }
+        assert!(resolve_model_with_family_fallback("claude-opus-4-6", &[], true).is_none());
+        assert!(resolve_model_with_family_fallback(
+            "claude-opus-4-6",
+            &["claude-sonnet-4.6".into(), "claude-opus-4.8-fast".into()],
+            true
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn family_fallback_preserves_exact_aliases_and_ambiguity() {
+        let models = vec![
+            "claude-opus-4.6".into(),
+            "claude-opus-4.8".into(),
+            "claude-opus-5.5".into(),
+        ];
+        assert_eq!(
+            resolve_model_with_family_fallback("opus4.6", &models, true).as_deref(),
+            Some("claude-opus-4.6")
+        );
+        for available in [models.clone(), models.into_iter().rev().collect()] {
+            assert_eq!(
+                resolve_model_with_family_fallback("opus4.7", &available, true).as_deref(),
+                Some("claude-opus-4.8")
+            );
+        }
+        let ambiguous: Vec<String> = vec!["claude-opus-4.8".into(), "claude-opus-4-8".into()];
+        for exact in &ambiguous {
+            assert_eq!(
+                resolve_model_with_family_fallback(exact, &ambiguous, true).as_ref(),
+                Some(exact)
+            );
+        }
+        for model in ["opus4.8", "opus4.6"] {
+            assert!(resolve_model_with_family_fallback(model, &ambiguous, true).is_none());
+        }
+        assert_eq!(
+            resolve_model_with_family_fallback(
+                "opus4.9",
+                &["claude-opus-4.8".into(), "claude-opus-4.10".into()],
+                true
+            )
+            .as_deref(),
+            Some("claude-opus-4.10")
         );
     }
 

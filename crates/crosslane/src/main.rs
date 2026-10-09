@@ -1735,7 +1735,11 @@ async fn show_provider_model_resolution(
         .collect::<Vec<_>>();
     let resolved_model = match resolved_provider_config.kind.as_str() {
         "kiro" => crosslane_translate::model::resolve_dynamic_model(target, &available_models),
-        "copilot" => crosslane_translate::model::resolve_model_alias(target, &available_models),
+        "copilot" => crosslane_translate::model::resolve_model_with_family_fallback(
+            target,
+            &available_models,
+            resolved_provider_config.routing.enable_model_fallback,
+        ),
         _ => catalog
             .models
             .iter()
@@ -1754,6 +1758,9 @@ async fn show_provider_model_resolution(
         && provider_config.enabled
         && resolved_provider_config.enabled
         && resolved_model.is_some();
+    let used_family_fallback = available
+        && resolved_provider_config.kind == "copilot"
+        && crosslane_translate::model::resolve_model_alias(target, &available_models).is_none();
     let value = serde_json::json!({
         "provider_id":provider,
         "input_model":model,
@@ -1762,6 +1769,7 @@ async fn show_provider_model_resolution(
         "resolved_provider_id":resolved_provider,
         "resolved_model":available.then_some(resolved_model).flatten(),
         "available":available,
+        "used_family_fallback":used_family_fallback,
         "disabled":disabled,
         "provider_enabled":provider_config.enabled,
         "resolved_provider_enabled":resolved_provider_config.enabled,

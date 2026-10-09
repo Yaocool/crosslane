@@ -126,9 +126,14 @@ crosslane account overage show
 
 模型 ID 从列表中选取。禁用模型后，新请求将无法使用。
 Copilot 也接受等价的客户端别名，例如将 `claude-opus-4-8` 解析为模型目录中的
-`claude-opus-4.8`。显式模型映射优先执行，权限按解析后的 ID 检查。别名不会选择
-其他版本；未知或有歧义的 ID 需要显式映射。可运行
-`crosslane models resolve claude-opus-4-8 --provider copilot` 查看结果。
+`claude-opus-4.8`。显式模型映射优先执行，权限按解析后的 ID 检查。要将缺失的
+Claude 版本路由到同一 Opus、Sonnet 或 Haiku 系列中最近的可用版本，可运行
+`crosslane provider edit copilot --enable-model-fallback true`。
+优先选择相同主版本，再比较版本距离，距离相同时选择较新版本。例如目录中最近的
+Opus 型号为 `claude-opus-4.8` 时，缺失的 `claude-opus-4-6` 会路由到该型号。
+有歧义的 ID、未知系列以及 `-fast` 等变体仍需显式映射。回退继续检查禁用模型和
+API key 权限。此来源开关默认关闭；可运行
+`crosslane models resolve claude-opus-4-6 --provider copilot --json` 查看结果。
 Kiro overage 默认关闭。
 要将每个账号的超额额度上限设为 500 credits，可运行
 `crosslane account overage enable --max-credits 500`；关闭时运行

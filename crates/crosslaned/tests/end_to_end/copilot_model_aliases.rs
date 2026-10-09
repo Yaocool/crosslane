@@ -2,7 +2,7 @@ use super::*;
 use serde_json::{json, Value};
 
 #[tokio::test]
-async fn copilot_client_aliases_use_canonical_ids_across_protocols_and_permissions() {
+async fn copilot_client_aliases_and_family_fallback_respect_protocols_and_permissions() {
     let _guard = HTTP_TEST_LOCK.lock().await;
     let upstream = MockServer::start().await;
     for (endpoint, body) in [
@@ -47,7 +47,7 @@ async fn copilot_client_aliases_use_canonical_ids_across_protocols_and_permissio
             };
             ResponseTemplate::new(200).set_body_json(response)
         })
-        .expect(7)
+        .expect(13)
         .mount(&upstream)
         .await;
     let port = unused_tcp_port();
@@ -112,6 +112,46 @@ async fn copilot_client_aliases_use_canonical_ids_across_protocols_and_permissio
         assert!(response.text().await.unwrap().contains(error));
     }
     model_policy::configure(&daemon, |config| {
+        config.provider[0].routing.enable_model_fallback = true;
+    })
+    .await;
+    for (endpoint, model, stream) in [
+        ("/v1/messages", "claude-opus-4-6", false),
+        ("/v1/messages", "copilot/claude-opus-4-6", false),
+        ("/v1/chat/completions", "claude-opus-4-6", false),
+        ("/v1/responses", "claude-opus-4-6", false),
+        ("/v1/messages/count_tokens", "claude-opus-4-6", false),
+        ("/v1/messages", "claude-opus-4-6", true),
+    ] {
+        let body = if endpoint == "/v1/responses" {
+            json!({"model":model,"input":"hello","stream":stream})
+        } else {
+            json!({"model":model,"messages":[{"role":"user","content":"hello"}],"max_tokens":16,"stream":stream})
+        };
+        let response = client
+            .post(format!("http://127.0.0.1:{port}{endpoint}"))
+            .bearer_auth(daemon.api_key.as_deref().unwrap())
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let text = response.text().await.unwrap();
+        assert_eq!(status, 200, "{endpoint} {model}: {text}");
+        if !endpoint.ends_with("count_tokens") {
+            assert!(text.contains("claude-opus-4.8"), "{text}");
+        }
+    }
+    let response = client
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .bearer_auth(daemon.api_key.as_deref().unwrap())
+        .json(&json!({"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hello"}],"max_tokens":16}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
+    assert!(response.text().await.unwrap().contains("not allowed"));
+    model_policy::configure(&daemon, |config| {
         config.models.disabled = vec!["claude-opus-4.8".into()];
     })
     .await;
@@ -124,13 +164,22 @@ async fn copilot_client_aliases_use_canonical_ids_across_protocols_and_permissio
         .unwrap();
     assert_eq!(response.status(), 400);
     assert!(response.text().await.unwrap().contains("model_disabled"));
+    let response = client
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .bearer_auth(daemon.api_key.as_deref().unwrap())
+        .json(&json!({"model":"claude-opus-4-6","messages":[{"role":"user","content":"hello"}],"max_tokens":16}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    assert!(response.text().await.unwrap().contains("model_disabled"));
     model_policy::configure(&daemon, |config| {
         config.models.disabled.clear();
         config.api_key[0].allowed_models = vec!["copilot/claude-sonnet-4.8".into()];
         config.model_mapping.push(ModelMappingRule {
             name: "force-sonnet".into(),
             source_models: vec!["claude-opus-4-8".into()],
-            target_models: vec!["claude-sonnet-4-8".into()],
+            target_models: vec!["claude-sonnet-4-6".into()],
             providers: vec!["copilot".into()],
             ..ModelMappingRule::default()
         });
