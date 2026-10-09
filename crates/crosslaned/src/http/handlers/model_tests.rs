@@ -638,7 +638,14 @@ fn retry_limit_is_never_expanded_by_account_count() {
 
 #[test]
 fn opaque_upstream_bad_requests_are_reported_as_gateway_failures() {
-    for message in ["Internal Server Error", "", "{}"] {
+    for message in [
+        "Internal Server Error",
+        "",
+        "{}",
+        "ValidationException: Internal Server Error",
+        "ValidationException: service unavailable",
+        "ValidationException: account disabled",
+    ] {
         let error = upstream_api_error(
             KiroError {
                 status: Some(400),
@@ -648,7 +655,33 @@ fn opaque_upstream_bad_requests_are_reported_as_gateway_failures() {
             RequestLogContext::default(),
             ErrorFormat::Claude,
         );
-        assert_eq!(error.status, StatusCode::BAD_GATEWAY, "{message:?}");
+        let expected = if !cfg!(feature = "crs") && message.starts_with("ValidationException") {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::BAD_GATEWAY
+        };
+        assert_eq!(error.status, expected, "{message:?}");
+        assert_eq!(error.upstream_status, Some(400));
+        let body = error_envelope(
+            ErrorFormat::Claude,
+            error.status.as_u16(),
+            &error.message,
+            None,
+        );
+        assert_eq!(
+            body["error"]["type"],
+            if expected == StatusCode::BAD_GATEWAY {
+                "api_error"
+            } else {
+                "invalid_request_error"
+            }
+        );
+        if message == "ValidationException: Internal Server Error" {
+            assert_eq!(
+                body["error"]["message"],
+                "Upstream service error, please retry later"
+            );
+        }
     }
 
     let actionable = upstream_api_error(
@@ -661,6 +694,55 @@ fn opaque_upstream_bad_requests_are_reported_as_gateway_failures() {
         ErrorFormat::Claude,
     );
     assert_eq!(actionable.status, StatusCode::BAD_REQUEST);
+    let body = error_envelope(
+        ErrorFormat::Claude,
+        actionable.status.as_u16(),
+        &actionable.message,
+        None,
+    );
+    assert_eq!(
+        body["error"]["message"],
+        "prompt is too long: 200001 tokens > 200000"
+    );
+
+    let openai = upstream_api_error(
+        KiroError {
+            status: Some(400),
+            endpoint: "test".into(),
+            message: "ValidationException: Internal Server Error".into(),
+        },
+        RequestLogContext::default(),
+        ErrorFormat::OpenAi,
+    );
+    assert_eq!(openai.status, StatusCode::BAD_REQUEST);
+}
+
+#[cfg(feature = "crs")]
+#[tokio::test]
+async fn crs_kiro_error_body_carries_upstream_status_code_and_trace() {
+    let error = upstream_api_error(
+        KiroError {
+            status: Some(400),
+            endpoint: "test".into(),
+            message: "ValidationException: Internal Server Error".into(),
+        },
+        RequestLogContext::default(),
+        ErrorFormat::Claude,
+    );
+    let response = error.with_request_id("trace_kiro").into_response();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("body");
+    let body: Value = serde_json::from_slice(&bytes).expect("json");
+    assert_eq!(body["error"]["type"], "api_error");
+    assert_eq!(body["error"]["code"], "upstream_unavailable");
+    assert_eq!(body["error"]["upstream_status"], 400);
+    assert_eq!(body["request_id"], "trace_kiro");
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("request ID: trace_kiro"));
 }
 
 #[test]
@@ -832,6 +914,33 @@ fn upstream_413_preserves_diagnostics_without_triggering_claude_32mb_ui() {
     assert_eq!(error.status, StatusCode::BAD_REQUEST);
     assert_eq!(error.upstream_status, Some(413));
     assert_eq!(error.error_code, "request_payload_exceeded");
+
+    let opaque = upstream_api_error(
+        KiroError {
+            status: Some(413),
+            endpoint: "test".into(),
+            message: "Internal Server Error".into(),
+        },
+        RequestLogContext::default(),
+        ErrorFormat::Claude,
+    );
+    assert_eq!(
+        opaque.status,
+        if cfg!(feature = "crs") {
+            StatusCode::BAD_GATEWAY
+        } else {
+            StatusCode::BAD_REQUEST
+        }
+    );
+    assert_eq!(opaque.upstream_status, Some(413));
+    assert_eq!(
+        opaque.error_code,
+        if cfg!(feature = "crs") {
+            "upstream_unavailable"
+        } else {
+            "request_payload_exceeded"
+        }
+    );
 }
 
 #[test]

@@ -1,5 +1,7 @@
 //! Public business HTTP plane.
 
+#[cfg(feature = "crs")]
+mod crs;
 mod handlers;
 pub(crate) use handlers::fallback_models;
 pub(crate) mod compaction_replay;

@@ -915,10 +915,31 @@ fn provider_api_error(
     model: &str,
     mapping_rule: Option<&str>,
 ) -> ApiError {
-    let mut api = ApiError::new(error.status, error.message, format);
-    api.retry_after = error.retryable;
+    let upstream_status = error.status;
+    #[cfg(feature = "crs")]
+    let status = if format == ErrorFormat::Claude {
+        super::super::crs::normalized_upstream_status(
+            upstream_status,
+            &crosslane_translate::sanitize_error_message(&error.message),
+        )
+    } else {
+        upstream_status
+    };
+    #[cfg(not(feature = "crs"))]
+    let status = upstream_status;
+    let mut api = ApiError::new(status, error.message, format);
+    api.retry_after = error.retryable || status != upstream_status;
     api.account_error = error.account_error;
-    api.upstream_status = Some(error.status.as_u16());
+    api.upstream_status = Some(upstream_status.as_u16());
+    #[cfg(feature = "crs")]
+    if format == ErrorFormat::Claude
+        && matches!(
+            upstream_status,
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        )
+    {
+        api.error_code = "upstream_authentication_failed";
+    }
     if error.upstream_code.as_deref() == Some("model_disabled") {
         api.error_code = "model_disabled";
         api.error_stage = "model_policy";
@@ -936,6 +957,42 @@ fn provider_api_error(
 mod tests {
     use super::*;
     use crosslane_core::config::ProviderConfig;
+
+    #[cfg(feature = "crs")]
+    #[test]
+    fn crs_maps_opaque_provider_errors_without_mislabeling_client_requests() {
+        use crosslane_provider::ProviderErrorKind;
+
+        let opaque = provider_api_error(
+            ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                StatusCode::BAD_REQUEST,
+                "Internal Server Error",
+            ),
+            ErrorFormat::Claude,
+            "copilot",
+            "model",
+            "model",
+            None,
+        );
+        assert_eq!(opaque.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(opaque.error_code, "upstream_unavailable");
+        assert_eq!(opaque.upstream_status, Some(400));
+
+        let actionable = provider_api_error(
+            ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                StatusCode::BAD_REQUEST,
+                "prompt is too long: 200001 tokens > 200000",
+            ),
+            ErrorFormat::Claude,
+            "copilot",
+            "model",
+            "model",
+            None,
+        );
+        assert_eq!(actionable.status, StatusCode::BAD_REQUEST);
+    }
 
     fn service() -> ProxyServiceConfig {
         ProxyServiceConfig {

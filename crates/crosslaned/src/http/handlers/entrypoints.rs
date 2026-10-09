@@ -1,3 +1,5 @@
+#[cfg(feature = "crs")]
+use super::super::crs;
 use super::{
     handle_claude, handle_openai, json, log_model, logged_user_agent, now_secs, request_trace_id,
     sanitize_error_message, ApiError, AppState, Arc, BTreeSet, Body, Bytes, Duration, ErrorFormat,
@@ -247,7 +249,16 @@ pub async fn claude_messages(
     )
     .await
     {
-        Ok(response) => response,
+        Ok(response) => {
+            #[cfg(feature = "crs")]
+            {
+                crs::adapt_claude_response(response, &trace_id).await
+            }
+            #[cfg(not(feature = "crs"))]
+            {
+                response
+            }
+        }
         Err(error) => {
             record_failed_request(
                 &state,

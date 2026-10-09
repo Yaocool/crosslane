@@ -2202,12 +2202,21 @@ fn upstream_api_error(
         StatusCode::BAD_REQUEST
     } else {
         match error.status {
-            // An upstream 413 describes Kiro's translated payload, not necessarily
-            // a Claude request body over 32 MiB. Preserve the upstream status in
-            // diagnostics, but use 400 so Claude Code displays the real message.
-            Some(413) if format == ErrorFormat::Claude => StatusCode::BAD_REQUEST,
+            // An actionable upstream 413 describes Kiro's translated payload,
+            // not necessarily a Claude request body over 32 MiB. Preserve the
+            // upstream status in diagnostics, but use 400 so Claude Code shows
+            // the request-specific message. With CRS compatibility, opaque
+            // 413s are gateway failures instead.
+            Some(413)
+                if format == ErrorFormat::Claude
+                    && (!cfg!(feature = "crs")
+                        || upstream_bad_request_is_actionable(&error.message, format)) =>
+            {
+                StatusCode::BAD_REQUEST
+            }
+            Some(413) if format == ErrorFormat::Claude => StatusCode::BAD_GATEWAY,
             Some(413) => StatusCode::PAYLOAD_TOO_LARGE,
-            Some(400) if upstream_bad_request_is_actionable(&error.message) => {
+            Some(400) if upstream_bad_request_is_actionable(&error.message, format) => {
                 StatusCode::BAD_REQUEST
             }
             // crosslane already validates the public request and enforces its context
@@ -2250,7 +2259,9 @@ fn upstream_api_error(
         output.error_code = "upstream_model_unavailable";
     } else if upstream_status == Some(429) || upstream_throttle {
         output.error_code = "upstream_rate_limited";
-    } else if upstream_status == Some(413) {
+    } else if upstream_status == Some(413)
+        && (!cfg!(feature = "crs") || status == StatusCode::BAD_REQUEST)
+    {
         output.error_code = "request_payload_exceeded";
     } else if !request_rejection {
         output.error_code = "upstream_unavailable";
@@ -2258,7 +2269,21 @@ fn upstream_api_error(
     output
 }
 
-fn upstream_bad_request_is_actionable(message: &str) -> bool {
+fn upstream_bad_request_is_actionable(message: &str, format: ErrorFormat) -> bool {
+    // A broad upstream marker such as "ValidationException" can coexist with
+    // a server, auth, or account failure. If the client-safe message is a
+    // service error, do not label it as a bad client request.
+    if cfg!(feature = "crs")
+        && format == ErrorFormat::Claude
+        && matches!(
+            sanitize_error_message(message).as_str(),
+            "Upstream service error, please retry later"
+                | "Service temporarily unavailable, please retry"
+                | "service unavailable"
+        )
+    {
+        return false;
+    }
     let lower = message.to_ascii_lowercase();
     [
         "prompt is too long",
@@ -2399,6 +2424,15 @@ impl IntoResponse for ApiError {
             &self.message,
             self.request_id.as_deref(),
         );
+        #[cfg(feature = "crs")]
+        if self.format == ErrorFormat::Claude {
+            super::crs::enrich_error_envelope(
+                &mut envelope,
+                self.error_code,
+                self.upstream_status,
+                self.request_id.as_deref(),
+            );
+        }
         if let Some(context) = &self.context_overflow {
             envelope["error"]["context"] = json!(context);
         }

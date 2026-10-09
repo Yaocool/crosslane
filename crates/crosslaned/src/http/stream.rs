@@ -1240,6 +1240,12 @@ fn stream_error_response(
     request_id: &str,
 ) -> String {
     let safe = crosslane_translate::sanitize_error_message(message);
+    #[cfg(feature = "crs")]
+    let safe = if matches!(protocol, StreamProtocol::Claude) {
+        super::crs::enrich_stream_message(safe, code, request_id)
+    } else {
+        safe
+    };
     match protocol {
         StreamProtocol::Claude => sse(&json!({
             "type":"error",

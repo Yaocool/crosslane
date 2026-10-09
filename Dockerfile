@@ -15,9 +15,10 @@ RUN --mount=type=cache,id=crosslane-cargo-registry,target=/usr/local/cargo/regis
     && install -D -m 0755 /src/target/release/crosslaned /out/crosslaned
 
 FROM builder-base AS builder-full
+ARG CROSSLANED_FEATURES=crosslaned/sso
 RUN --mount=type=cache,id=crosslane-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=crosslane-cargo-target,target=/src/target,sharing=locked \
-    cargo build --release --locked -p crosslane -p crosslaned --all-features \
+    cargo build --release --locked -p crosslane -p crosslaned --no-default-features --features "${CROSSLANED_FEATURES}" \
     && install -D -m 0755 /src/target/release/crosslane /out/crosslane \
     && install -D -m 0755 /src/target/release/crosslaned /out/crosslaned \
     && touch /out/build-ready
