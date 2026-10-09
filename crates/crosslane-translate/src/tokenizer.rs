@@ -18,6 +18,10 @@ use crate::{
 };
 
 const MIN_CACHE_CHARS: usize = 512;
+// The tokenizer's backtracking regex can overflow its internal stack on a
+// multi-MiB whitespace span. Bound each call without changing source content.
+const TOKENIZER_CHUNK_BYTES: usize = 16 * 1024;
+const TOKENIZER_BOUNDARY_ALLOWANCE: usize = 8;
 const MESSAGE_OVERHEAD_TOKENS: usize = 8;
 const CONVERSATION_OVERHEAD_TOKENS: usize = 12;
 const TOOL_SCHEMA_OVERHEAD_TOKENS: usize = 18;
@@ -103,7 +107,7 @@ impl TokenCountCache {
         }
 
         let tokenizer = Arc::clone(&self.tokenizer);
-        let count = tokio::task::spawn_blocking(move || tokenizer.encode_ordinary(&text).len())
+        let count = tokio::task::spawn_blocking(move || estimated_text_tokens(&tokenizer, &text))
             .await
             .map_err(|error| error.to_string())?;
         if let Some(key) = key {
@@ -465,8 +469,8 @@ impl TokenCountCache {
     async fn compact_text_to_tokens(&self, text: String, maximum: usize) -> Result<String, String> {
         let tokenizer = Arc::clone(&self.tokenizer);
         tokio::task::spawn_blocking(move || {
-            let tokens = tokenizer.encode_ordinary(&text);
-            if tokens.len() <= maximum {
+            let tokens = encode_text_bounded(&tokenizer, &text);
+            if estimated_text_tokens(&tokenizer, &text) <= maximum {
                 return Ok(text);
             }
             let marker = "\n… [compaction checkpoint shortened to fit context] …\n";
@@ -497,7 +501,7 @@ impl TokenCountCache {
                 output.push_str(&suffix);
                 // Joining independently encoded spans can change BPE merges.
                 // Check the final text rather than assuming counts add up.
-                if tokenizer.encode_ordinary(&output).len() <= maximum {
+                if estimated_text_tokens(&tokenizer, &output) <= maximum {
                     return Ok(output);
                 }
                 if head >= tail && head > 0 {
@@ -759,6 +763,59 @@ fn recent_turn_start(history: &[KiroHistoryMessage], preserve_turns: usize) -> u
         .iter()
         .position(starts_conversation_turn)
         .unwrap_or(history.len())
+}
+
+fn text_chunks(text: &str) -> Vec<&str> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        let mut end = start.saturating_add(TOKENIZER_CHUNK_BYTES).min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        chunks.push(&text[start..end]);
+        start = end;
+    }
+    chunks
+}
+
+fn encode_text_bounded(tokenizer: &CoreBPE, text: &str) -> Vec<usize> {
+    let mut memo = std::collections::HashMap::<&str, Vec<usize>>::new();
+    let mut tokens = Vec::new();
+    for chunk in text_chunks(text) {
+        if let Some(encoded) = memo.get(chunk) {
+            tokens.extend_from_slice(encoded);
+        } else {
+            let encoded = tokenizer.encode_ordinary(chunk);
+            tokens.extend_from_slice(&encoded);
+            if memo.len() < 64 {
+                memo.insert(chunk, encoded);
+            }
+        }
+    }
+    tokens
+}
+
+fn estimated_text_tokens(tokenizer: &CoreBPE, text: &str) -> usize {
+    let chunks = text_chunks(text);
+    // Splitting may change a few BPE merges. Account for the boundary in the
+    // context estimate; source text and tool JSON themselves are never split.
+    let allowance = chunks.len().saturating_sub(1) * TOKENIZER_BOUNDARY_ALLOWANCE;
+    let mut memo = std::collections::HashMap::<&str, usize>::new();
+    let mut total = allowance;
+    for chunk in chunks {
+        let count = if let Some(count) = memo.get(chunk) {
+            *count
+        } else {
+            let count = tokenizer.encode_ordinary(chunk).len();
+            if memo.len() < 64 {
+                memo.insert(chunk, count);
+            }
+            count
+        };
+        total = total.saturating_add(count);
+    }
+    total
 }
 
 fn oldest_turn_len(history: &[KiroHistoryMessage]) -> usize {
@@ -1119,6 +1176,32 @@ mod tests {
             assert!(stats.compacted_tokens <= maximum);
         }
     }
+    #[tokio::test]
+    async fn multi_mib_whitespace_and_utf8_are_counted_without_tokenizer_panics() {
+        let cache = TokenCountCache::new(2).unwrap();
+        let text = format!(
+            "BEGIN\n{}\nEND 雪☃ 👩‍💻 e\u{301}",
+            format!("{}\n", " ".repeat(127)).repeat(25000)
+        );
+        assert!(text.len() > 3 * 1024 * 1024);
+        let count = cache.count(text.clone()).await.unwrap();
+        assert!(count > 0 && count < 300000);
+        assert_eq!(cache.count(text.clone()).await.unwrap(), count);
+        assert_eq!(cache.stats().hits, 1);
+        assert_eq!(text_chunks(&text).concat(), text);
+        let unicode = "雪☃ 👩‍💻 e\u{301} ".repeat(3000);
+        let tokens = encode_text_bounded(&cache.tokenizer, &unicode);
+        assert_eq!(cache.tokenizer.decode(tokens).unwrap(), unicode);
+        assert!(text_chunks(&unicode)
+            .iter()
+            .all(|chunk| chunk.len() <= TOKENIZER_CHUNK_BYTES));
+        let small = "ordinary text 雪☃";
+        assert_eq!(
+            cache.count(small.into()).await.unwrap(),
+            cache.tokenizer.encode_ordinary(small).len()
+        );
+    }
+
     #[tokio::test]
     async fn cache_is_exact_bounded_and_skips_short_text() {
         let cache = TokenCountCache::new(2).expect("tokenizer");

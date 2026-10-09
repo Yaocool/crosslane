@@ -3,7 +3,10 @@
 
 use std::collections::VecDeque;
 
-use super::{Arc, KiroHistoryMessage, KiroPayload, TokenCountCache};
+use super::{
+    encode_text_bounded, estimated_text_tokens, Arc, KiroHistoryMessage, KiroPayload,
+    TokenCountCache,
+};
 use crate::sanitize_kiro_tool_history;
 
 const MAX_SUMMARY_PARTS: usize = 16;
@@ -133,7 +136,7 @@ impl TokenCountCache {
     ) -> Result<Vec<String>, String> {
         let tokenizer = Arc::clone(&self.tokenizer);
         tokio::task::spawn_blocking(move || {
-            let tokens = tokenizer.encode_ordinary(&text);
+            let tokens = encode_text_bounded(&tokenizer, &text);
             let mut start = 0;
             let mut parts = Vec::new();
             while start < tokens.len() {
@@ -146,9 +149,12 @@ impl TokenCountCache {
                         return Err("summary token budget cannot hold one UTF-8 character".into());
                     }
                     if let Ok(fragment) = tokenizer.decode(tokens[start..end].to_vec()) {
-                        if tokenizer.encode_ordinary(&fragment).len() <= maximum {
+                        let estimate = estimated_text_tokens(&tokenizer, &fragment);
+                        if estimate <= maximum {
                             break fragment;
                         }
+                        end = end.saturating_sub(estimate - maximum).max(start);
+                        continue;
                     }
                     end -= 1;
                 };
