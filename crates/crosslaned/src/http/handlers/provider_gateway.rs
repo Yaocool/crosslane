@@ -257,11 +257,9 @@ pub(super) fn select_provider_route(
             .with_provider_id(selected_provider)
         })?;
     ensure_model_enabled(config, upstream_model, format)?;
-    // Kiro finishes account-aware mapping, alias resolution, and fallback in
-    // the legacy executor. Authorize that final wire model there. Adapter
-    // providers have already completed routing and can be checked now.
     // Kiro resolves after account selection; Copilot resolves against its live
-    // catalog before execution. Authorize the actual model in those paths.
+    // catalog before execution. Authorize their final wire models in those
+    // paths; other adapters finish routing here.
     if !matches!(selected.kind.as_str(), "kiro" | "copilot") {
         authorize_model(authenticated_key, selected_provider, upstream_model, format)?;
     }
@@ -976,6 +974,7 @@ async fn record_provider_request(
         .settle(UsageRecord {
             timestamp: crate::meter::now_secs(),
             provider_id: metadata.provider_id.clone(),
+            account_id: (!metadata.account_id.is_empty()).then(|| metadata.account_id.clone()),
             model: metadata.model.clone(),
             original_model: Some(metadata.original_model.clone()),
             kiro_model: None,

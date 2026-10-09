@@ -5,6 +5,9 @@ mod auth;
 mod bridge;
 mod client;
 
-pub use account::{CopilotAccount, CopilotAccountSummary, CopilotCredentials};
+pub use account::{
+    CopilotAccount, CopilotAccountInfo, CopilotAccountSummary, CopilotCredentials,
+    CopilotQuotaSnapshot,
+};
 pub use auth::{DeviceLoginState, DeviceLoginStatus};
 pub use client::{CopilotProvider, CopilotSettings};

@@ -89,6 +89,19 @@ crosslane account list --provider copilot
 `idle_window_ms`，默认分别为 `0.8`、`0.2` 和 `300000`。
 Copilot 当前没有可靠的单账号剩余额度数据，因此不按 Kiro credits 打分。
 
+`account list` 会显示 Copilot 套餐、API Token 到期时间、额度重置时间及各账号
+在本机累计的 AIU，上游 `credits_used` 已用值单独展示。`account show ID --provider copilot`
+还会显示 GitHub 访问凭据和
+刷新凭据的有效期、额度查询时间及 AIU 统计时间范围；`--json` 保留安全的上游额度字段。
+API Token 会自动续期，其到期时间不是订阅到期时间。上游未返回的有效期和计费数据
+显示为未知。额度查询成功和失败均缓存五分钟；失败保留旧数据，不改变账号健康状态。
+
+AIU 从本机观察到的第一条计费响应开始累计，包含普通 JSON 和流式响应，重启和清空
+客户端 Key 的统计均不会清除账号累计值。计量取自上游
+`copilot_usage.total_nano_aiu`（1 AIU = 1,000,000,000 nano AIU），不代表 GitHub
+全账号用量或组织剩余额度。个人额度不限，包括 Business 返回的零上限及
+`credits_used`，不能用来推断组织余额。Kiro credits 与 Copilot AIU 分别统计。
+
 ## 服务与客户端访问
 
 新安装不会自动创建业务监听。创建服务并妥善保存命令输出的客户端 API Key：

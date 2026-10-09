@@ -87,7 +87,9 @@ pub(super) async fn handle_account_list(state: &Arc<AppState>, params: Value) ->
         match descriptor.kind.as_str() {
             "kiro" => accounts.extend(kiro_accounts(state, &descriptor).await),
             "copilot" => match state.providers.copilot(&descriptor.id).await {
-                Some(runtime) => accounts.extend(
+                Some(runtime) => {
+                    runtime.refresh_account_info(None, false).await;
+                    accounts.extend(
                     runtime
                         .account_summaries()
                         .await
@@ -110,12 +112,16 @@ pub(super) async fn handle_account_list(state: &Arc<AppState>, params: Value) ->
                                 quota_limit: None,
                                 quota_unit: None,
                                 supported_models: account.supported_models,
-                                details: json!({"endpoint":account.endpoint,"last_error":account.last_error,"created_at":account.created_at}),
+                                details: json!({"endpoint":account.endpoint,"last_error":account.last_error,"created_at":account.created_at,"info":account.info}),
                             }
                         }),
-                ),
+                    );
+                }
                 None => {
-                    errors.insert(descriptor.id.to_string(), "Copilot runtime is unavailable".into());
+                    errors.insert(
+                        descriptor.id.to_string(),
+                        "Copilot runtime is unavailable".into(),
+                    );
                 }
             },
             _ => {
@@ -128,6 +134,11 @@ pub(super) async fn handle_account_list(state: &Arc<AppState>, params: Value) ->
     }
     let config = state.config.current();
     for account in &mut accounts {
+        if account.provider_kind == "copilot" {
+            account.details["local_aiu_usage"] = json!(state
+                .meter
+                .account_aiu_usage(&account.provider_id, &account.id));
+        }
         // Discovery caches retain the full catalog for re-enabling. Operational
         // account/pool views must not advertise a denied model as schedulable.
         account
@@ -815,7 +826,11 @@ async fn kiro_accounts(
                             - usage.limit_without_overage()
                     })
                 }),
-                "created_at":account.created_at
+                "created_at":account.created_at,
+                "token_expires_at":account.credentials.expires_at,
+                "subscription":account.subscription.as_ref().map(|subscription| {
+                    subscription.title.clone().unwrap_or_else(|| format!("{:?}", subscription.kind))
+                })
             }),
         });
     }
@@ -1030,6 +1045,7 @@ mod tests {
             endpoint: None,
             created_at: 0,
             last_error: None,
+            info: Default::default(),
         }
     }
 

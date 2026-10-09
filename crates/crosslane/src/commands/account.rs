@@ -11,7 +11,7 @@ use crosslane_ipc::protocol::{
 };
 
 use crate::client::AdminClient;
-use crate::output::{print_json, render_table};
+use crate::output::{format_timestamp, print_json, render_table};
 
 mod copilot_input;
 
@@ -54,7 +54,7 @@ pub enum AccountOverageCommand {
 /// 账号相关子命令。
 #[derive(Debug, Subcommand)]
 pub enum AccountCommand {
-    /// 列出 Kiro/Copilot 账号；额度状态仅对 Kiro 有意义。
+    /// 列出 Kiro/Copilot 账号、有效期、额度和本机累计 AIU。
     #[command(
         long_about = "列出 Kiro、GitHub Copilot 或全部账号，默认按邮箱排序。\n\n示例：\n  crosslane account list --provider kiro\n  crosslane account list --provider copilot\n  crosslane account list --provider all\n  crosslane account list --tag prod --enabled-only"
     )]
@@ -391,13 +391,17 @@ fn build_provider_list_rows(accounts: &[ProviderAccountSummary]) -> Vec<Vec<Stri
         .iter()
         .map(|account| {
             let kiro_total = account.details["kiro_overage_total_limit"].as_f64();
-            let quota = match (account.quota_current, account.quota_limit, kiro_total) {
-                (Some(current), Some(limit), Some(kiro_total)) => {
-                    format!("{current:.2}/{limit:.2}/{kiro_total:.2}")
+            let quota = if account.provider_kind == "copilot" {
+                copilot_quota_display(&account.details["info"])
+            } else {
+                match (account.quota_current, account.quota_limit, kiro_total) {
+                    (Some(current), Some(limit), Some(kiro_total)) => {
+                        format!("{current:.2}/{limit:.2}/{kiro_total:.2}")
+                    }
+                    (Some(current), Some(limit), None) => format!("{current:.2}/{limit:.2}"),
+                    (Some(current), None, _) => format!("{current:.2}"),
+                    _ => "未知".into(),
                 }
-                (Some(current), Some(limit), None) => format!("{current:.2}/{limit:.2}"),
-                (Some(current), None, _) => format!("{current:.2}"),
-                _ => "未知".into(),
             };
             let overage_enabled = account.details["overage_enabled"].as_bool();
             let configured_cap = account.details["max_overage_credits_per_account"].as_f64();
@@ -437,9 +441,103 @@ fn build_provider_list_rows(accounts: &[ProviderAccountSummary]) -> Vec<Vec<Stri
                 } else {
                     account.tags.join(",")
                 },
+                if account.provider_kind == "copilot" {
+                    account.details["info"]["plan"]
+                        .as_str()
+                        .unwrap_or("未知")
+                        .into()
+                } else {
+                    account.details["subscription"]
+                        .as_str()
+                        .unwrap_or("-")
+                        .into()
+                },
+                if account.provider_kind == "copilot" {
+                    metadata_timestamp(&account.details["info"]["api_token_expires_at"])
+                } else {
+                    metadata_timestamp(&account.details["token_expires_at"])
+                },
+                if account.provider_kind == "copilot" {
+                    account.details["local_aiu_usage"]["total_nano_aiu"]
+                        .as_u64()
+                        .map(format_nano_aiu)
+                        .unwrap_or_else(|| "未知".into())
+                } else {
+                    "-".into()
+                },
+                if account.provider_kind == "copilot" {
+                    account.details["info"]["quota_reset_date"]
+                        .as_str()
+                        .unwrap_or("未知")
+                        .into()
+                } else {
+                    "-".into()
+                },
+                if account.provider_kind == "copilot" {
+                    copilot_upstream_usage_display(&account.details["info"])
+                } else {
+                    "-".into()
+                },
             ]
         })
         .collect()
+}
+
+fn format_nano_aiu(amount: u64) -> String {
+    let whole = amount / 1_000_000_000;
+    let fraction = amount % 1_000_000_000;
+    if fraction == 0 {
+        whole.to_string()
+    } else {
+        format!("{whole}.{:09}", fraction)
+            .trim_end_matches('0')
+            .into()
+    }
+}
+
+fn metadata_timestamp(value: &serde_json::Value) -> String {
+    value
+        .as_i64()
+        .filter(|value| *value > 0)
+        .map(format_timestamp)
+        .unwrap_or_else(|| "未知".into())
+}
+
+fn copilot_quota_display(info: &serde_json::Value) -> String {
+    let quota = &info["quota_snapshots"]["premium_interactions"];
+    let display = if quota["unlimited"] == true {
+        "个人不限".into()
+    } else if quota["token_based_billing"] != true && info["token_based_billing"] != true {
+        match (quota["entitlement"].as_f64(), quota["remaining"].as_f64()) {
+            (Some(limit), Some(remaining))
+                if limit > 0.0 && remaining <= limit && remaining >= 0.0 =>
+            {
+                format!("{:.2}/{limit:.2} 请求", limit - remaining)
+            }
+            _ => "未知".into(),
+        }
+    } else if let Some(percent) = quota["percent_remaining"].as_f64() {
+        format!("剩余 {percent:.2}%")
+    } else {
+        "未知".into()
+    };
+    if info["quota_error"].as_str().is_some() {
+        format!("{display}(缓存)")
+    } else {
+        display
+    }
+}
+
+fn copilot_upstream_usage_display(info: &serde_json::Value) -> String {
+    let used = info["quota_snapshots"]["premium_interactions"]["credits_used"]
+        .as_f64()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "未知".into());
+    if info["quota_error"].as_str().is_some() {
+        format!("{used}(缓存)")
+    } else {
+        used
+    }
 }
 
 fn display_provider_health(health: &str) -> String {
@@ -475,20 +573,76 @@ fn print_provider_detail(account: &ProviderAccountSummary) {
     if let Some(label) = &account.label {
         println!("备注      {label}");
     }
-    match (
-        account.quota_current,
-        account.quota_limit,
-        account.details["kiro_overage_total_limit"].as_f64(),
-    ) {
-        (Some(current), Some(limit), Some(kiro_total)) => println!(
+    if account.provider_kind == "copilot" {
+        println!(
+            "个人额度  {}",
+            copilot_quota_display(&account.details["info"])
+        );
+        let info = &account.details["info"];
+        println!("套餐      {}", info["plan"].as_str().unwrap_or("未知"));
+        println!("SKU       {}", info["sku"].as_str().unwrap_or("未知"));
+        println!(
+            "上游已用  {}（credits_used，按上游口径）",
+            copilot_upstream_usage_display(info)
+        );
+        println!(
+            "API Token到期 {}（自动续期）",
+            metadata_timestamp(&info["api_token_expires_at"])
+        );
+        println!(
+            "GitHub凭据到期 {}",
+            metadata_timestamp(&info["github_token_expires_at"])
+        );
+        println!(
+            "GitHub刷新凭据到期 {}",
+            metadata_timestamp(&info["github_refresh_token_expires_at"])
+        );
+        println!(
+            "额度重置  {}",
+            info["quota_reset_date"].as_str().unwrap_or("未知")
+        );
+        println!(
+            "额度查询  {}",
+            metadata_timestamp(&info["quota_checked_at"])
+        );
+        if let Some(error) = info["quota_error"].as_str() {
+            println!("额度错误  {error}（保留上次数据）");
+        }
+        let usage = &account.details["local_aiu_usage"];
+        println!(
+            "本机 AIU  {}",
+            usage["total_nano_aiu"]
+                .as_u64()
+                .map(format_nano_aiu)
+                .unwrap_or_else(|| "未知".into())
+        );
+        if let Some(requests) = usage["billed_requests"].as_u64() {
+            println!("计费响应  {requests} 次（仅本机观察到的 copilot_usage）");
+            println!(
+                "统计开始  {}",
+                metadata_timestamp(&usage["first_recorded_at"])
+            );
+            println!(
+                "最近计费  {}",
+                metadata_timestamp(&usage["last_recorded_at"])
+            );
+        }
+    } else {
+        match (
+            account.quota_current,
+            account.quota_limit,
+            account.details["kiro_overage_total_limit"].as_f64(),
+        ) {
+            (Some(current), Some(limit), Some(kiro_total)) => println!(
             "额度      {current:.2}/{limit:.2}/{kiro_total:.2} {}（当前已用/配置总额/Kiro总额）",
             account.quota_unit.as_deref().unwrap_or("unknown")
         ),
-        (Some(current), Some(limit), None) => println!(
-            "额度      {current:.2}/{limit:.2} {}",
-            account.quota_unit.as_deref().unwrap_or("unknown")
-        ),
-        _ => println!("额度      未知"),
+            (Some(current), Some(limit), None) => println!(
+                "额度      {current:.2}/{limit:.2} {}",
+                account.quota_unit.as_deref().unwrap_or("unknown")
+            ),
+            _ => println!("额度      未知"),
+        }
     }
     if let Some(enabled) = account.details["overage_enabled"].as_bool() {
         println!("超额开关  {}", if enabled { "开启" } else { "关闭" });
@@ -1119,10 +1273,22 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
                             "额度(已用/代理/Kiro)",
                             "Overage(配置/Kiro)",
                             "标签",
+                            "套餐",
+                            "Token到期(UTC)",
+                            "AIU(本机累计)",
+                            "额度重置",
+                            "上游已用(credits_used)",
                         ],
                         &build_provider_list_rows(&list.accounts),
                     )
                 );
+                if list
+                    .accounts
+                    .iter()
+                    .any(|account| account.provider_kind == "copilot")
+                {
+                    println!("Copilot Token 为自动续期的 API Token；AIU 为本机累计，上游已用取 credits_used，不换算为 AIU。个人不限不代表组织余额无限。有效期详情见 account show。");
+                }
             }
             if !json {
                 for (provider, error) in &list.errors {
@@ -2307,6 +2473,67 @@ mod tests {
         let mut protected = summary(true);
         protected.health = Some("low_credit".into());
         assert_eq!(build_list_rows(&[protected])[0][2], "低额度保护");
+    }
+
+    #[test]
+    fn copilot_list_rows_show_token_expiry_native_quota_and_exact_local_aiu() {
+        let account = |info, usage| ProviderAccountSummary {
+            provider_id: "copilot".into(),
+            provider_kind: "copilot".into(),
+            id: "acc_test".into(),
+            display_name: "octocat".into(),
+            email: None,
+            label: None,
+            enabled: true,
+            health: "available".into(),
+            auth_state: "ready".into(),
+            tags: Vec::new(),
+            quota_current: None,
+            quota_limit: None,
+            quota_unit: None,
+            supported_models: Vec::new(),
+            details: serde_json::json!({"info":info,"local_aiu_usage":usage}),
+        };
+        let info = serde_json::json!({
+            "plan":"business","api_token_expires_at":1_767_225_600,
+            "token_based_billing":true,"quota_reset_date":"2026-11-01T00:00:00.000Z",
+            "quota_snapshots":{"premium_interactions":{"unlimited":true,"entitlement":0,"remaining":0,"credits_used":0}}
+        });
+        let rows = build_provider_list_rows(&[
+            account(
+                info.clone(),
+                serde_json::json!({"total_nano_aiu":17_000_000}),
+            ),
+            account(serde_json::Value::Null, serde_json::Value::Null),
+            account(info, serde_json::json!({"total_nano_aiu":0})),
+        ]);
+        assert_eq!(rows[0][5], "个人不限");
+        assert_eq!(rows[0][8], "business");
+        assert_eq!(rows[0][9], "2026-01-01T00:00:00Z");
+        assert_eq!(rows[0][10], "0.017");
+        assert_eq!(rows[0][11], "2026-11-01T00:00:00.000Z");
+        assert_eq!(rows[0][12], "0");
+        assert_eq!(rows[1][5], "未知");
+        assert_eq!(rows[1][9], "未知");
+        assert_eq!(rows[1][10], "未知");
+        assert_eq!(rows[1][12], "未知");
+        assert_eq!(rows[2][10], "0");
+        assert_eq!(format_nano_aiu(u64::MAX), "18446744073.709551615");
+        assert_eq!(format_nano_aiu(1), "0.000000001");
+        assert_eq!(format_nano_aiu(2_000_000_000), "2");
+        assert_eq!(
+            copilot_upstream_usage_display(&serde_json::json!({
+                "quota_snapshots":{"premium_interactions":{"credits_used":1}}
+            })),
+            "1"
+        );
+        assert_eq!(
+            copilot_quota_display(&serde_json::json!({
+                "quota_snapshots":{"premium_interactions":{"entitlement":300,"remaining":240}},
+                "quota_error":"HTTP 429"
+            })),
+            "60.00/300.00 请求(缓存)"
+        );
     }
 
     #[test]

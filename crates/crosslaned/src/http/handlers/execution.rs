@@ -1631,6 +1631,7 @@ pub(super) fn usage_record(
     UsageRecord {
         timestamp: now_secs(),
         provider_id: "kiro".into(),
+        account_id: None,
         model: model.into(),
         original_model: Some(original_model.into()),
         kiro_model: Some(kiro_model.into()),

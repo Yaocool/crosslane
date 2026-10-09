@@ -24,7 +24,10 @@ use tokio::sync::{Mutex, RwLock, Semaphore};
 use url::Url;
 use uuid::Uuid;
 
-use crate::account::{CopilotAccount, CopilotAccountSummary, CopilotCredentials};
+use crate::account::{
+    CopilotAccount, CopilotAccountInfo, CopilotAccountSummary, CopilotCredentials,
+    CopilotQuotaSnapshot,
+};
 use crate::auth::{DeviceLoginState, DeviceLoginStatus, DeviceLoginTask};
 
 const ACCOUNTS_FILE_MODE: u32 = 0o600;
@@ -33,6 +36,7 @@ const MODEL_CACHE_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_COPILOT_API: &str = "https://api.githubcopilot.com";
 const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+const ACCOUNT_INFO_TTL_SECS: i64 = 300;
 const FORWARDABLE_ANTHROPIC_BETAS: &[&str] = &[
     "claude-code-20250219",
     "context-1m-2025-08-07",
@@ -238,6 +242,18 @@ struct CachedApiToken {
     token: String,
     endpoint: String,
     expires_at: i64,
+    refresh_in_secs: Option<u64>,
+    sku: Option<String>,
+}
+
+impl CachedApiToken {
+    fn update_info(&self, info: &mut CopilotAccountInfo) {
+        info.api_token_expires_at = Some(self.expires_at);
+        info.api_token_refresh_in_secs = self.refresh_in_secs;
+        if self.sku.is_some() {
+            info.sku.clone_from(&self.sku);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,8 +280,34 @@ struct GithubEmail {
 struct CopilotTokenResponse {
     token: String,
     expires_at: i64,
+    refresh_in: Option<u64>,
+    sku: Option<String>,
     #[serde(default)]
     endpoints: CopilotEndpoints,
+}
+
+#[derive(Debug, Deserialize)]
+struct CopilotQuotaResponse {
+    copilot_plan: Option<String>,
+    access_type_sku: Option<String>,
+    token_based_billing: Option<bool>,
+    quota_reset_date: Option<String>,
+    quota_reset_date_utc: Option<String>,
+    #[serde(default)]
+    quota_snapshots: BTreeMap<String, CopilotQuotaSnapshot>,
+}
+
+impl CopilotQuotaResponse {
+    fn update_info(self, info: &mut CopilotAccountInfo) {
+        info.plan = self.copilot_plan;
+        if self.access_type_sku.is_some() {
+            info.sku = self.access_type_sku;
+        }
+        info.token_based_billing = self.token_based_billing;
+        info.quota_reset_date = self.quota_reset_date_utc.or(self.quota_reset_date);
+        info.quota_snapshots = self.quota_snapshots;
+        info.quota_error = None;
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -361,6 +403,7 @@ pub struct CopilotProvider {
     model_cache_path: PathBuf,
     accounts: RwLock<Vec<CopilotAccount>>,
     mutation: Mutex<()>,
+    account_info_refresh: Mutex<()>,
     token_cache: RwLock<HashMap<String, CachedApiToken>>,
     refresh_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     account_limits: StdMutex<HashMap<String, Arc<AccountSlot>>>,
@@ -409,6 +452,7 @@ impl CopilotProvider {
             model_cache_path,
             accounts: RwLock::new(accounts),
             mutation: Mutex::new(()),
+            account_info_refresh: Mutex::new(()),
             token_cache: RwLock::new(HashMap::new()),
             refresh_locks: Mutex::new(HashMap::new()),
             account_limits: StdMutex::new(account_limits),
@@ -441,6 +485,83 @@ impl CopilotProvider {
             .iter()
             .map(|account| self.account_summary(account))
             .collect()
+    }
+
+    /// Refresh optional metadata without changing account health. Bound the
+    /// entire list query and reuse recent successes and failures for five minutes.
+    pub async fn refresh_account_info(&self, account_id: Option<&str>, force: bool) {
+        if !self.enabled {
+            return;
+        }
+        let Ok(_refresh) = self.account_info_refresh.try_lock() else {
+            return;
+        };
+        let now = now_secs();
+        let accounts = self
+            .accounts
+            .read()
+            .await
+            .iter()
+            .filter(|account| {
+                account.enabled
+                    && account_id.is_none_or(|id| account.id == id)
+                    && (force
+                        || account.info.quota_checked_at.is_none_or(|checked| {
+                            now.saturating_sub(checked) >= ACCOUNT_INFO_TTL_SECS
+                        })
+                        || (account.info.quota_error.is_none()
+                            && account
+                                .info
+                                .api_token_expires_at
+                                .is_none_or(|expires| expires <= now)))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let refreshes =
+            futures::stream::iter(accounts).for_each_concurrent(4, |account| async move {
+                let result = tokio::time::timeout(Duration::from_secs(5), async {
+                    self.api_token(&account).await?;
+                    let current = self
+                        .find_account(&account.id)
+                        .await
+                        .ok_or_else(|| not_found_account(&account.id))?;
+                    self.github_get::<CopilotQuotaResponse>(
+                        &current.credentials.github_access_token,
+                        "/copilot_internal/user",
+                        &[],
+                    )
+                    .await
+                })
+                .await;
+                let _mutation = self.mutation.lock().await;
+                let mut accounts = self.accounts.write().await;
+                let mut next = accounts.clone();
+                let Some(current) = next.iter_mut().find(|current| current.id == account.id) else {
+                    return;
+                };
+                current.info.quota_checked_at = Some(now_secs());
+                match result {
+                    Ok(Ok(quota)) => quota.update_info(&mut current.info),
+                    Ok(Err(error)) => {
+                        current.info.quota_error = Some(format!(
+                            "Copilot account metadata is unavailable (HTTP {})",
+                            error.status
+                        ));
+                    }
+                    Err(_) => {
+                        current.info.quota_error =
+                            Some("Copilot account metadata refresh timed out".into());
+                    }
+                }
+                if let Err(error) = save_accounts(&self.accounts_path, &self.id, &next).await {
+                    tracing::warn!(provider_id = %self.id, account_id = %account.id, %error,
+                    "failed to persist Copilot account metadata");
+                }
+                *accounts = next;
+            });
+        // Large pools return their latest cached information within the CLI's
+        // response window, instead of waiting for every upstream request.
+        let _ = tokio::time::timeout(Duration::from_secs(8), refreshes).await;
     }
 
     pub async fn account(&self, id_or_login: &str) -> Option<CopilotAccountSummary> {
@@ -527,6 +648,8 @@ impl CopilotProvider {
             .map(|model| model.id.clone())
             .collect::<Vec<_>>();
         let now = now_secs();
+        let mut info = CopilotAccountInfo::default();
+        exchanged.update_info(&mut info);
         let account = CopilotAccount {
             id: format!("acc_{}", &Uuid::new_v4().simple().to_string()[..8]),
             github_host: self.settings.github_host.clone(),
@@ -542,6 +665,7 @@ impl CopilotProvider {
             supported_models: model_ids,
             endpoint: Some(exchanged.endpoint.clone()),
             last_error: None,
+            info,
         };
         let _mutation = self.mutation.lock().await;
         let mut accounts = self.accounts.write().await;
@@ -798,7 +922,9 @@ impl CopilotProvider {
                 "failed to persist refreshed Copilot model cache"
             );
         }
-        Ok(summary)
+        drop(_mutation);
+        self.refresh_account_info(Some(&account.id), true).await;
+        Ok(self.account(&account.id).await.unwrap_or(summary))
     }
 
     pub async fn start_device_login(
@@ -1037,6 +1163,9 @@ impl CopilotProvider {
         } else {
             "ready"
         };
+        let mut info = account.info.clone();
+        info.github_token_expires_at = account.credentials.github_expires_at;
+        info.github_refresh_token_expires_at = account.credentials.github_refresh_token_expires_at;
         CopilotAccountSummary {
             provider_id: self.id.to_string(),
             provider_kind: "copilot".into(),
@@ -1051,6 +1180,7 @@ impl CopilotProvider {
             endpoint: account.endpoint.clone(),
             created_at: account.created_at,
             last_error: account.last_error.clone(),
+            info,
         }
     }
 
@@ -1173,6 +1303,17 @@ impl CopilotProvider {
             .write()
             .await
             .insert(account.id.clone(), token.clone());
+        let _mutation = self.mutation.lock().await;
+        let mut accounts = self.accounts.write().await;
+        let mut next = accounts.clone();
+        if let Some(current) = next.iter_mut().find(|current| current.id == account.id) {
+            token.update_info(&mut current.info);
+            if let Err(error) = save_accounts(&self.accounts_path, &self.id, &next).await {
+                tracing::warn!(provider_id = %self.id, account_id = %account.id, %error,
+                    "failed to persist Copilot token deadline");
+            }
+            *accounts = next;
+        }
         Ok(token)
     }
 
@@ -1293,6 +1434,8 @@ impl CopilotProvider {
             token: token.token,
             endpoint,
             expires_at: token.expires_at,
+            refresh_in_secs: token.refresh_in,
+            sku: token.sku,
         })
     }
 
@@ -2717,6 +2860,8 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "token":"copilot-api-token",
                 "expires_at":now_secs() + 3600,
+                "refresh_in":3540,
+                "sku":"test-seat",
                 "endpoints":{"api":server.uri()}
             })))
             .mount(server)
@@ -2737,6 +2882,133 @@ mod tests {
             .expect(1)
             .mount(server)
             .await;
+    }
+
+    #[tokio::test]
+    async fn account_info_is_safe_cached_and_persisted_without_affecting_health() {
+        let server = MockServer::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        mount_account_exchange(&server, "github-token").await;
+        let provider = mock_provider(&server, directory.path()).await;
+        let imported = provider
+            .import_credentials(
+                CopilotCredentials {
+                    github_access_token: "github-token".into(),
+                    github_refresh_token: Some("github-refresh-secret".into()),
+                    github_expires_at: Some(4_000_000_000),
+                    github_refresh_token_expires_at: Some(5_000_000_000),
+                    token_type: "bearer".into(),
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(imported.info.api_token_expires_at.unwrap() > now_secs());
+        assert_eq!(imported.info.api_token_refresh_in_secs, Some(3540));
+        assert_eq!(imported.info.sku.as_deref(), Some("test-seat"));
+        assert_eq!(imported.info.github_token_expires_at, Some(4_000_000_000));
+        assert_eq!(
+            imported.info.github_refresh_token_expires_at,
+            Some(5_000_000_000)
+        );
+        {
+            let _quota = Mock::given(method("GET"))
+                .and(path("/copilot_internal/user"))
+                .and(header("authorization", "Bearer github-token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "copilot_plan":"business", "access_type_sku":"business-seat",
+                    "token_based_billing":true,
+                    "quota_reset_date":"2026-11-01", "quota_reset_date_utc":"2026-11-01T00:00:00.000Z",
+                    "quota_snapshots":{"premium_interactions":{
+                        "unlimited":true,"entitlement":0,"remaining":0,"credits_used":0,
+                        "percent_remaining":100.0,"token_based_billing":true,"has_quota":true
+                    }},
+                    "organization_secret":"must-not-be-stored"
+                })))
+                .expect(1).mount_as_scoped(&server).await;
+            provider.refresh_account_info(None, false).await;
+            provider.refresh_account_info(None, false).await;
+        }
+        let summary = provider.account(&imported.id).await.unwrap();
+        assert_eq!(summary.info.plan.as_deref(), Some("business"));
+        assert_eq!(summary.info.sku.as_deref(), Some("business-seat"));
+        assert_eq!(summary.info.token_based_billing, Some(true));
+        assert_eq!(
+            summary.info.quota_reset_date.as_deref(),
+            Some("2026-11-01T00:00:00.000Z")
+        );
+        let quota = &summary.info.quota_snapshots["premium_interactions"];
+        assert_eq!(quota.unlimited, Some(true));
+        assert_eq!(quota.credits_used, Some(0.0));
+        assert_eq!(quota.overage_count, None);
+        let serialized = serde_json::to_string(&summary).unwrap();
+        for secret in [
+            "github-token",
+            "github-refresh-secret",
+            "copilot-api-token",
+            "must-not-be-stored",
+        ] {
+            assert!(!serialized.contains(secret), "{secret}");
+        }
+        let _failure = Mock::given(method("GET"))
+            .and(path("/copilot_internal/user"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("private-error-body"))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        provider
+            .refresh_account_info(Some(&imported.id), true)
+            .await;
+        provider.refresh_account_info(None, false).await;
+        let reloaded = mock_provider(&server, directory.path()).await;
+        reloaded.refresh_account_info(None, false).await;
+        let summary = reloaded.account(&imported.id).await.unwrap();
+        assert_eq!(summary.auth_state, "ready");
+        assert!(summary.last_error.is_none());
+        assert_eq!(summary.info.plan.as_deref(), Some("business"));
+        assert!(summary.info.quota_error.as_deref().unwrap().contains("429"));
+        assert!(!summary
+            .info
+            .quota_error
+            .unwrap()
+            .contains("private-error-body"));
+    }
+
+    #[tokio::test]
+    async fn account_info_failure_and_legacy_files_keep_unknown_values_and_health() {
+        let server = MockServer::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        mount_account_exchange(&server, "github-token").await;
+        let provider = mock_provider(&server, directory.path()).await;
+        let imported = provider
+            .import_token("github-token".into(), None)
+            .await
+            .unwrap();
+        assert_eq!(imported.info.github_token_expires_at, None);
+        {
+            let mut accounts = provider.accounts.write().await;
+            accounts[0].info = CopilotAccountInfo::default();
+        }
+        let _failure = Mock::given(method("GET"))
+            .and(path("/copilot_internal/user"))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        provider.refresh_account_info(None, false).await;
+        // Missing token metadata must not bypass the failed-query backoff.
+        provider.refresh_account_info(None, false).await;
+        let summary = provider.account(&imported.id).await.unwrap();
+        assert!(summary.info.plan.is_none());
+        assert!(summary.info.api_token_expires_at.is_none());
+        assert_eq!(summary.auth_state, "ready");
+        assert!(summary.last_error.is_none());
+        let mut legacy = serde_json::to_value(&provider.accounts.read().await[0]).unwrap();
+        legacy.as_object_mut().unwrap().remove("info");
+        let legacy: CopilotAccount = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.info.quota_snapshots.is_empty());
+        assert!(legacy.info.quota_checked_at.is_none());
     }
 
     #[tokio::test]

@@ -74,6 +74,8 @@ pub struct UsageRecord {
     pub timestamp: i64,
     #[serde(default)]
     pub provider_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
     pub model: String,
     pub original_model: Option<String>,
     pub kiro_model: Option<String>,
@@ -87,6 +89,16 @@ pub struct UsageRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_billing: Option<ProviderBilling>,
     pub path: String,
+}
+
+/// Observed Copilot cost for one provider/account, independent of API keys.
+/// Absent history remains unknown; amounts are kept in exact nano AI units.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountAiuUsage {
+    pub total_nano_aiu: u64,
+    pub billed_requests: u64,
+    pub first_recorded_at: i64,
+    pub last_recorded_at: i64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -378,6 +390,8 @@ struct Persisted {
     api_keys: HashMap<String, ApiKeyUsage>,
     #[serde(default)]
     service_daily: ServiceDailyUsage,
+    #[serde(default)]
+    account_aiu_usage: HashMap<String, AccountAiuUsage>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -397,6 +411,7 @@ struct ServiceCreditState {
 pub struct Meter {
     path: PathBuf,
     keys: Mutex<HashMap<String, KeyState>>,
+    account_aiu_usage: Mutex<HashMap<String, AccountAiuUsage>>,
     service: Mutex<ServiceCreditState>,
     persist_lock: tokio::sync::Mutex<()>,
     persist_scheduled: AtomicBool,
@@ -433,6 +448,7 @@ impl Meter {
         Arc::new(Self {
             path: path.into(),
             keys: Mutex::new(keys),
+            account_aiu_usage: Mutex::new(HashMap::new()),
             service: Mutex::new(ServiceCreditState {
                 day: utc_day(now_secs()),
                 ..ServiceCreditState::default()
@@ -468,6 +484,7 @@ impl Meter {
         Arc::new(Self {
             path: path.into(),
             keys: Mutex::new(keys),
+            account_aiu_usage: Mutex::new(HashMap::new()),
             service: Mutex::new(ServiceCreditState {
                 day: utc_day(now_secs()),
                 ..ServiceCreditState::default()
@@ -533,6 +550,7 @@ impl Meter {
         Ok(Arc::new(Self {
             path: path.into(),
             keys: Mutex::new(keys),
+            account_aiu_usage: Mutex::new(persisted.account_aiu_usage),
             service: Mutex::new(ServiceCreditState {
                 day: today,
                 used: service_used,
@@ -548,6 +566,39 @@ impl Meter {
 
     pub fn set_daily_limit(&self, limit: f64) {
         lock(&self.service).limit = limit.max(0.0);
+    }
+
+    pub fn account_aiu_usage(&self, provider: &str, account: &str) -> Option<AccountAiuUsage> {
+        lock(&self.account_aiu_usage)
+            .get(&format!("{provider}/{account}"))
+            .cloned()
+    }
+
+    fn record_account_aiu(&self, record: &UsageRecord) {
+        let Some(account) = record.account_id.as_deref().filter(|id| !id.is_empty()) else {
+            return;
+        };
+        let Some(billing) = record.provider_billing.as_ref().filter(|billing| {
+            billing.source == "copilot_usage" && billing.unit.as_deref() == Some("nano_aiu")
+        }) else {
+            return;
+        };
+        let Some(amount) = billing.amount else {
+            return;
+        };
+        let mut accounts = lock(&self.account_aiu_usage);
+        let usage = accounts
+            .entry(format!("{}/{account}", record.provider_id))
+            .or_insert(AccountAiuUsage {
+                total_nano_aiu: 0,
+                billed_requests: 0,
+                first_recorded_at: record.timestamp,
+                last_recorded_at: record.timestamp,
+            });
+        usage.total_nano_aiu = usage.total_nano_aiu.saturating_add(amount);
+        usage.billed_requests = usage.billed_requests.saturating_add(1);
+        usage.first_recorded_at = usage.first_recorded_at.min(record.timestamp);
+        usage.last_recorded_at = usage.last_recorded_at.max(record.timestamp);
     }
 
     pub fn daily_snapshot(&self) -> (String, f64, f64, f64) {
@@ -728,6 +779,7 @@ impl Meter {
                     used: service.used,
                 }
             },
+            account_aiu_usage: lock(&self.account_aiu_usage).clone(),
         };
         crosslane_store::atomic::write_json_atomically(&self.path, &persisted, Some(0o600))
             .await
@@ -806,6 +858,7 @@ impl CreditReservation {
     }
 
     pub async fn settle(mut self, record: UsageRecord) -> Result<(), MeterError> {
+        self.meter.record_account_aiu(&record);
         let mut durable_limit_state = {
             let mut service = lock(&self.meter.service);
             reset_service_day_if_needed(&mut service);
@@ -926,6 +979,7 @@ mod tests {
         UsageRecord {
             timestamp: now_secs(),
             provider_id: "kiro".into(),
+            account_id: None,
             model: "mapped".into(),
             original_model: Some("client".into()),
             kiro_model: Some("kiro".into()),
@@ -1161,6 +1215,115 @@ mod tests {
 
         let reloaded = Meter::load(&path, &[config]).await.expect("reload");
         assert_eq!(reloaded.list()[0].usage.total_credits, 0.0);
+    }
+
+    fn copilot_usage(provider: &str, account: Option<&str>, amount: Option<u64>) -> UsageRecord {
+        let mut record = usage(0.0);
+        record.provider_id = provider.into();
+        record.account_id = account.map(str::to_owned);
+        record.kiro_model = None;
+        record.provider_billing = Some(ProviderBilling {
+            schema_version: 1,
+            source: "copilot_usage".into(),
+            unit: Some("nano_aiu".into()),
+            amount,
+            raw: serde_json::json!({"total_nano_aiu":amount}),
+        });
+        record
+    }
+
+    #[tokio::test]
+    async fn account_aiu_survives_key_reset_removal_and_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("daily.json");
+        let config = ApiKeyConfig {
+            id: Some("ak_test".into()),
+            name: "test".into(),
+            key: "secret".into(),
+            enabled: true,
+            ..ApiKeyConfig::default()
+        };
+        let meter = Meter::load(&path, &[config]).await.unwrap();
+        meter
+            .reserve(Some("ak_test"), 0.0)
+            .unwrap()
+            .settle(copilot_usage("copilot", Some("acc_a"), Some(17_000_000)))
+            .await
+            .unwrap();
+        assert!(meter.reset_usage("ak_test").await.unwrap());
+        let inflight = meter.reserve(Some("ak_test"), 0.0).unwrap();
+        meter.replace_configs(&[]);
+        inflight
+            .settle(copilot_usage("copilot", Some("acc_a"), Some(76_200_000)))
+            .await
+            .unwrap();
+        meter
+            .reserve(None, 0.0)
+            .unwrap()
+            .settle(copilot_usage("copilot", Some("acc_a"), Some(0)))
+            .await
+            .unwrap();
+        meter
+            .reserve(None, 0.0)
+            .unwrap()
+            .settle(copilot_usage("copilot-other", Some("acc_a"), Some(9)))
+            .await
+            .unwrap();
+        meter
+            .reserve(None, 0.0)
+            .unwrap()
+            .settle(copilot_usage("copilot", Some("acc_b"), None))
+            .await
+            .unwrap();
+        meter
+            .reserve(None, 0.0)
+            .unwrap()
+            .settle(copilot_usage("copilot", None, Some(10)))
+            .await
+            .unwrap();
+        meter
+            .reserve(None, 0.0)
+            .unwrap()
+            .settle(usage(1.5))
+            .await
+            .unwrap();
+        meter.persist().await.unwrap();
+        let reloaded = Meter::load(&path, &[]).await.unwrap();
+        let usage = reloaded.account_aiu_usage("copilot", "acc_a").unwrap();
+        assert_eq!(usage.total_nano_aiu, 93_200_000);
+        assert_eq!(usage.billed_requests, 3);
+        assert!(usage.first_recorded_at <= usage.last_recorded_at);
+        assert_eq!(
+            reloaded
+                .account_aiu_usage("copilot-other", "acc_a")
+                .unwrap()
+                .total_nano_aiu,
+            9
+        );
+        assert!(reloaded.account_aiu_usage("copilot", "acc_b").is_none());
+        assert_eq!(reloaded.daily_snapshot().1, 1.5);
+        assert!(reloaded.list().is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_meter_does_not_guess_historical_account_aiu() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("daily.json");
+        tokio::fs::write(
+            &path,
+            r#"{"api_keys":{},"service_daily":{"day":"2026-10-09","used":0}}"#,
+        )
+        .await
+        .unwrap();
+        let meter = Meter::load(&path, &[]).await.unwrap();
+        assert!(meter.account_aiu_usage("copilot", "acc_a").is_none());
+        let legacy_record: UsageRecord = serde_json::from_value({
+            let mut value = serde_json::to_value(usage(0.0)).unwrap();
+            value.as_object_mut().unwrap().remove("account_id");
+            value
+        })
+        .unwrap();
+        assert!(legacy_record.account_id.is_none());
     }
 
     #[test]

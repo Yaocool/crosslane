@@ -1367,6 +1367,7 @@ async fn finish_accounting(
         .settle(UsageRecord {
             timestamp: now_secs(),
             provider_id: "kiro".into(),
+            account_id: None,
             model: context.mapped_model.clone(),
             original_model: Some(context.original_model.clone()),
             kiro_model: Some(context.kiro_model.clone()),

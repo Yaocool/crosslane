@@ -104,6 +104,24 @@ under `[provider.pool.balance]` (defaults: `0.8`, `0.2`, `300000`). Copilot does
 not currently expose a reliable per-account remaining-credit balance, so Kiro
 credit scoring does not apply.
 
+`account list` includes Copilot's plan, API token deadline, quota reset date,
+observed AIU per account, and the upstream `credits_used` value separately.
+`account show ID --provider copilot` also displays
+GitHub access/refresh token deadlines, the quota query time, and the AIU tracking
+period; `--json` retains the safe upstream quota fields. An API token deadline
+is automatically renewed and is not a subscription expiry date. Missing
+deadlines or billing data remain unknown. Quota queries reuse successes and
+failures for five minutes; failed queries retain the previous snapshot without
+changing account health.
+
+AIU totals start with the first billed response observed by this installation,
+include both JSON and streaming responses, and survive restarts and client-key
+usage resets. They use the upstream `copilot_usage.total_nano_aiu` amount
+(1 AIU = 1,000,000,000 nano AIU); they do not represent GitHub-wide account
+usage or remaining organization credits. An unlimited personal quota, including
+Business responses containing zero limits and `credits_used`, does not establish
+the organization's balance. Kiro credits and Copilot AIU remain separate.
+
 ## Services and client access
 
 A new installation has no business listener. Create one and save the client
