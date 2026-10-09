@@ -11,6 +11,7 @@ use axum::body::{Body, Bytes};
 use axum::http::header;
 use axum::response::Response;
 use bytes::BytesMut;
+use crosslane_core::client_context::ClientContext;
 use crosslane_translate::{ResponsesRequest, ResponsesToolName};
 use futures::StreamExt;
 use serde_json::{json, Value};
@@ -29,10 +30,65 @@ const MAX_RESPONSES_SESSION_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 const RESPONSES_STORE_FAILED: &str =
     "unable to store response state within the configured in-memory limit";
 
+/// Attribution only for providers that own their Responses history upstream.
+/// Keep no prompts here, respect `store: false`, and bound TTL/cardinality.
+#[derive(Clone, Default)]
+pub(crate) struct ResponseClientContexts {
+    entries: Arc<Mutex<HashMap<ResponseContextKey, (ClientContext, Instant)>>>,
+}
+
+type ResponseContextKey = (ResponsesSessionOwner, String, String);
+
+impl ResponseClientContexts {
+    pub(crate) fn get(
+        &self,
+        owner: &ResponsesSessionOwner,
+        provider_id: &str,
+        response_id: &str,
+    ) -> Option<ClientContext> {
+        let mut entries = self.entries.lock().ok()?;
+        entries.retain(|_, (_, seen)| seen.elapsed() < RESPONSES_SESSION_TTL);
+        let (context, seen) = entries.get_mut(&(
+            owner.clone(),
+            provider_id.to_owned(),
+            response_id.to_owned(),
+        ))?;
+        *seen = Instant::now();
+        Some(context.clone())
+    }
+
+    pub(crate) fn insert(
+        &self,
+        owner: ResponsesSessionOwner,
+        provider_id: String,
+        response_id: String,
+        context: ClientContext,
+    ) {
+        if context.is_unknown() || response_id.is_empty() || response_id.len() > 256 {
+            return;
+        }
+        let Ok(mut entries) = self.entries.lock() else {
+            return;
+        };
+        entries.retain(|_, (_, seen)| seen.elapsed() < RESPONSES_SESSION_TTL);
+        let key = (owner, provider_id, response_id);
+        if !entries.contains_key(&key) && entries.len() >= MAX_RESPONSES_SESSIONS {
+            if let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, (_, seen))| *seen)
+                .map(|(key, _)| key.clone())
+            {
+                entries.remove(&oldest);
+            }
+        }
+        entries.insert(key, (context, Instant::now()));
+    }
+}
+
 /// A stored Responses conversation is scoped to both the proxy service and
 /// authenticated API key. Response IDs are random, but scoping them prevents a
 /// caller on another service or credential from replaying a known ID.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ResponsesSessionOwner {
     service_id: String,
     api_key_id: Option<String>,
@@ -50,6 +106,7 @@ impl ResponsesSessionOwner {
 #[derive(Debug, Clone)]
 pub(crate) struct StoredResponsesSession {
     owner: ResponsesSessionOwner,
+    client_context: ClientContext,
     /// The final UUID sent to Kiro, not the client hint that produced it.
     /// Persisting the resolved value keeps `previous_response_id` authoritative
     /// even if a later request drops or changes its session-affinity header.
@@ -71,6 +128,7 @@ impl StoredResponsesSession {
     ) -> Self {
         Self {
             owner,
+            client_context: ClientContext::default(),
             conversation_id,
             history: response_input_history(request),
             tools,
@@ -85,8 +143,13 @@ impl StoredResponsesSession {
         self.conversation_id.as_deref()
     }
 
+    pub(crate) fn client_context(&self) -> &ClientContext {
+        &self.client_context
+    }
+
     fn refresh_size(&mut self) -> bool {
         let Ok(serialized) = serde_json::to_vec(&(
+            &self.client_context,
             &self.conversation_id,
             &self.history,
             &self.tools,
@@ -325,6 +388,12 @@ impl ResponsesOptions {
     pub(super) fn set_conversation_id(&mut self, conversation_id: Option<String>) {
         if let Some((_, session)) = &mut self.session {
             session.conversation_id = conversation_id;
+        }
+    }
+
+    pub(super) fn set_client_context(&mut self, context: &ClientContext) {
+        if let Some((_, session)) = &mut self.session {
+            session.client_context = context.clone();
         }
     }
 

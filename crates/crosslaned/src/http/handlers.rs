@@ -40,6 +40,7 @@ use uuid::Uuid;
 use crate::meter::{now_secs, AuthenticatedApiKey, CreditReservation, MeterError, UsageRecord};
 use crate::state::AppState;
 use crate::stats::{RequestDiagnostics, RequestLog, UpstreamAttemptLog};
+use crosslane_core::client_context::ClientContext;
 
 use super::prompt_cache::PromptCacheProfile;
 use super::response::{
@@ -201,6 +202,59 @@ fn metadata_conversation_hint(metadata: Option<&Value>) -> Option<&str> {
         .filter(|hint| !hint.is_empty() && hint.len() <= 256)
 }
 
+fn client_conversation_id(
+    service_id: &str,
+    api_key_id: Option<&str>,
+    context: &ClientContext,
+    headers: &HeaderMap,
+    explicit: Option<&str>,
+    fallback: Option<&str>,
+) -> Option<String> {
+    if context.is_unknown() {
+        return stable_conversation_id(headers, api_key_id, explicit, fallback);
+    }
+    // A recognized session/thread outranks request-scoped affinity headers.
+    // Explicit client conversation/cache keys retain their role within that
+    // scope, while forks and distinct devices cannot collapse onto one UUID.
+    let legacy = context
+        .conversation_ref()
+        .map(str::to_owned)
+        .or_else(|| stable_conversation_id(headers, api_key_id, explicit, fallback))?;
+    let explicit = stable_conversation_id(&HeaderMap::new(), None, explicit, None);
+    let hint = serde_json::to_string(&(
+        "crosslane-client-conversation-v1",
+        service_id,
+        context.user_ref.as_deref(),
+        context.session_ref.as_deref(),
+        legacy,
+        explicit,
+    ))
+    .ok()?;
+    stable_conversation_id(&HeaderMap::new(), api_key_id, Some(&hint), None)
+}
+
+fn client_replay_scope(
+    service_id: &str,
+    api_key_id: Option<&str>,
+    context: &ClientContext,
+    fingerprint: Option<&str>,
+) -> Option<String> {
+    if context.is_unknown() {
+        return compaction_replay_scope(service_id, api_key_id, fingerprint);
+    }
+    // The full history-prefix digest remains mandatory in CompactionReplay.
+    // The fingerprint also keeps unrelated histories in one client session apart.
+    let hint = serde_json::to_string(&(
+        "crosslane-client-replay-v1",
+        context.user_ref.as_deref(),
+        context.session_ref.as_deref(),
+        context.conversation_ref(),
+        fingerprint?,
+    ))
+    .ok()?;
+    compaction_replay_scope(service_id, api_key_id, Some(&hint))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CompactionReason {
     ClientTrigger,
@@ -267,6 +321,7 @@ struct CompactionRun {
 
 struct CompactionRequest<'a> {
     trace_id: &'a str,
+    client_context: Option<&'a ClientContext>,
     key_id: Option<&'a str>,
     account_ids: Arc<HashSet<String>>,
     allowed_models: &'a [String],
@@ -473,11 +528,13 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
             return error.with_request_id(&trace_id).into_response();
         }
     };
+    let mut client_context = ClientContext::default();
     let result = async {
         let (headers, body, _body_reservations) =
             read_bounded_body(&state, request, ErrorFormat::Claude)
                 .await
                 .map_err(|error| error.with_provider_id_if_empty(&default_provider))?;
+        client_context = super::client_context::extract(&headers, &body);
         let provider_hint = provider_gateway::request_provider_hint(
             &state.config.current(),
             &service.service,
@@ -513,6 +570,7 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
                 _admission_guard,
                 ErrorFormat::Claude,
                 true,
+                client_context.clone(),
             )
             .await;
         }
@@ -555,16 +613,19 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
             original_request.model.clone_from(&locked_original_model);
         }
         let conversation_fingerprint = conversation_fingerprint(&original_request.messages);
-        let conversation_id = stable_conversation_id(
-            &headers,
+        let conversation_id = client_conversation_id(
+            &service.service.id,
             key_id.as_deref(),
+            &client_context,
+            &headers,
             original_request.conversation_id.as_deref(),
             metadata_conversation_hint(original_request.metadata.as_ref())
                 .or(conversation_fingerprint.as_deref()),
         );
-        let replay_scope = compaction_replay_scope(
+        let replay_scope = client_replay_scope(
             &service.service.id,
             key_id.as_deref(),
+            &client_context,
             conversation_fingerprint.as_deref(),
         );
         let replay = replay_scope.as_deref().and_then(|scope| {
@@ -766,6 +827,7 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
             credits: 0.0,
             error: None,
             diagnostics: RequestDiagnostics {
+                client_context: Some(client_context.clone()),
                 client_status: 200,
                 payload_bytes: body.len(),
                 ..RequestDiagnostics::default()
@@ -789,9 +851,11 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
         Ok::<_, ApiError>(Json(response).into_response())
     }
     .await;
+    super::client_context::log(&trace_id, &client_context);
     match result {
         Ok(response) => response,
         Err(error) => {
+            let error = error.with_client_context(&client_context);
             record_failed_request(&state, &trace_id, &path, &user_agent, "", started, &error);
             error.with_request_id(&trace_id).into_response()
         }
@@ -2327,6 +2391,7 @@ struct ApiError {
     upstream_status: Option<u16>,
     account_error: bool,
     context_overflow: Option<Box<crate::stats::ContextOverflowDiagnostics>>,
+    client_context: Option<Box<ClientContext>>,
 }
 
 impl ApiError {
@@ -2349,6 +2414,7 @@ impl ApiError {
             upstream_status: None,
             account_error: false,
             context_overflow: None,
+            client_context: None,
         }
     }
 
@@ -2382,6 +2448,11 @@ impl ApiError {
 
     fn with_request_id(mut self, request_id: &str) -> Self {
         self.request_id = Some(request_id.into());
+        self
+    }
+
+    fn with_client_context(mut self, context: &ClientContext) -> Self {
+        self.client_context = Some(Box::new(context.clone()));
         self
     }
 

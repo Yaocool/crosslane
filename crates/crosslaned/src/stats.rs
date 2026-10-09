@@ -41,6 +41,8 @@ pub struct ContextOverflowDiagnostics {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RequestDiagnostics {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_context: Option<crosslane_core::client_context::ClientContext>,
     #[serde(default)]
     pub original_tool_count: usize,
     #[serde(default)]
@@ -1707,6 +1709,7 @@ mod tests {
         assert!(decoded.model_mapping_rule.is_none());
         assert!(decoded.attempts.is_empty());
         assert_eq!(decoded.diagnostics.loaded_tool_count, 0);
+        assert!(decoded.diagnostics.client_context.is_none());
     }
 
     #[test]

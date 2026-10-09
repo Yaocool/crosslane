@@ -49,7 +49,9 @@ pub struct ResponsesRequest {
     pub safety_identifier: Option<String>,
     pub user: Option<String>,
     /// Codex telemetry; never used for authorization or added to model input.
-    pub client_metadata: Option<HashMap<String, String>>,
+    /// Telemetry is optional and can evolve independently of model inputs.
+    /// Its shape is interpreted best-effort by the HTTP client-context layer.
+    pub client_metadata: Option<Value>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

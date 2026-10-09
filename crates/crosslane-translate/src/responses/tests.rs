@@ -9,6 +9,25 @@ fn normalize(value: Value) -> ResponsesTranslation {
 }
 
 #[test]
+fn malformed_client_telemetry_does_not_reject_or_change_model_input() {
+    let base = json!({"model":"test","input":"hello"});
+    let expected = serde_json::to_value(normalize(base.clone()).request).unwrap();
+    for telemetry in [
+        json!(false),
+        json!("unexpected"),
+        json!({"session_id":42}),
+        Value::Null,
+    ] {
+        let mut body = base.clone();
+        body["client_metadata"] = telemetry;
+        assert_eq!(
+            serde_json::to_value(normalize(body).request).unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
 fn codex_request_preserves_instructions_controls_and_namespace_tools() {
     let translated = normalize(json!({
         "model":"claude-sonnet-4.5", "instructions":"Follow repository instructions.",

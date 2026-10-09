@@ -396,10 +396,17 @@ pub(super) async fn execute_provider(
     admission_guard: AdmissionGuard,
     format: ErrorFormat,
     count_tokens: bool,
+    client_context: crosslane_core::client_context::ClientContext,
 ) -> Result<Response, ApiError> {
     let started = Instant::now();
     let user_agent = super::logged_user_agent(&headers);
     let error_provider = route.provider_id.to_string();
+    let stores_response = protocol == ProviderProtocol::OpenAiResponses
+        && super::super::client_context::stores_response(&route.body);
+    let session_owner = super::super::responses::ResponsesSessionOwner::new(
+        service.service.id.clone(),
+        api_key_id.clone(),
+    );
     let reservation = service
         .app
         .meter
@@ -437,6 +444,7 @@ pub(super) async fn execute_provider(
         service_id: service.service.id.clone(),
         account_pool: Some(service.current_service()),
         api_key_id: api_key_id.clone(),
+        client_context: client_context.clone(),
     };
     let error_model = route.upstream_model.clone();
     let error_original_model = route.original_model.clone();
@@ -482,6 +490,9 @@ pub(super) async fn execute_provider(
         status: status.as_u16(),
         started,
         api_key_id,
+        client_context,
+        session_owner,
+        stores_response,
     };
     let body = match response.body {
         ProviderResponseBody::Full(bytes) => {
@@ -500,6 +511,10 @@ pub(super) async fn execute_provider(
                     match chunk {
                         Ok(bytes) => {
                             usage.push(&bytes);
+                            // Persist attribution before the completed event
+                            // reaches the client: it can immediately issue a
+                            // continuation without waiting for transport EOF.
+                            remember_provider_client_context(&state, &metadata, &mut usage.usage, metadata.status);
                             yield Ok::<_, ProviderError>(bytes)
                         },
                         Err(error) => {
@@ -544,6 +559,9 @@ struct ProviderRequestMetadata {
     status: u16,
     started: Instant,
     api_key_id: Option<String>,
+    client_context: crosslane_core::client_context::ClientContext,
+    session_owner: super::super::responses::ResponsesSessionOwner,
+    stores_response: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -556,6 +574,7 @@ struct ProviderUsage {
     reasoning_tokens: u64,
     billing: Option<ProviderBilling>,
     error: Option<String>,
+    completed_response_id: Option<String>,
 }
 
 impl ProviderUsage {
@@ -574,6 +593,7 @@ impl ProviderUsage {
         let mut usage = Self {
             billing: copilot_billing(value),
             error: provider_response_error(value),
+            completed_response_id: completed_response_id(value),
             ..Self::default()
         };
         if [
@@ -666,7 +686,25 @@ impl ProviderUsage {
         if other.error.is_some() {
             self.error = other.error;
         }
+        if other.completed_response_id.is_some() {
+            self.completed_response_id = other.completed_response_id;
+        }
     }
+}
+
+fn completed_response_id(value: &Value) -> Option<String> {
+    let response = value.get("response").unwrap_or(value);
+    if response.get("store").and_then(Value::as_bool) == Some(false) {
+        return None;
+    }
+    if !matches!(
+        response.get("status").and_then(Value::as_str),
+        Some("completed" | "incomplete")
+    ) {
+        return None;
+    }
+    let id = response.get("id")?.as_str()?;
+    (!id.is_empty() && id.len() <= 256).then(|| id.to_owned())
 }
 
 fn provider_response_error(value: &Value) -> Option<String> {
@@ -818,6 +856,24 @@ impl ProviderUsageScanner {
     }
 }
 
+fn remember_provider_client_context(
+    state: &AppState,
+    metadata: &ProviderRequestMetadata,
+    usage: &mut ProviderUsage,
+    status: u16,
+) {
+    if metadata.stores_response && (200..300).contains(&status) && usage.error.is_none() {
+        if let Some(response_id) = usage.completed_response_id.take() {
+            state.response_client_contexts.insert(
+                metadata.session_owner.clone(),
+                metadata.provider_id.clone(),
+                response_id,
+                metadata.client_context.clone(),
+            );
+        }
+    }
+}
+
 async fn record_provider_request(
     state: &Arc<AppState>,
     metadata: &ProviderRequestMetadata,
@@ -831,6 +887,7 @@ async fn record_provider_request(
     } else {
         metadata.status
     };
+    remember_provider_client_context(state, metadata, &mut usage, status);
     if let Err(error) = reservation
         .settle(UsageRecord {
             timestamp: crate::meter::now_secs(),
@@ -895,6 +952,7 @@ async fn record_provider_request(
             (metadata.status >= 400).then(|| format!("provider returned HTTP {}", metadata.status))
         }),
         diagnostics: RequestDiagnostics {
+            client_context: Some(metadata.client_context.clone()),
             client_status: status,
             upstream_status: Some(metadata.status),
             error_stage: if status >= 400 {

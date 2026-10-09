@@ -144,6 +144,23 @@ crosslane stats --detail --since 1h
 | 流式中断 | 最终流事件和 Trace 日志 |
 | 上下文超限 | 实际选中模型及请求大小 |
 
+### 客户端与会话归属
+
+所有构建都支持客户端识别，无需启用 `crs` feature。Claude Code 从旧格式或 JSON 字符串格式的
+`metadata.user_id` 提取设备、会话；Codex 从 `client_metadata` 提取
+`x-codex-installation-id`、`session_id`、`thread_id`，相应 HTTP 头作为后备。
+CRS Console 和 OpenAI Responses 转发保留这些字段时即可使用，无需修改 CRS。
+
+`proxy.client.context` 事件及请求日志的 `diagnostics.client_context` 记录哈希后的
+`user_ref`、`session_ref`、`thread_ref`、客户端类型与身份来源。同一设备/安装在不同会话中
+保持相同用户归属；这不代表自然人或 CRS Key。信息缺失时保持未知，异常或过长的标识会被忽略。
+
+生成与 token 计数采用一致的会话规则，压缩重放按服务、Crosslane Key、设备、会话/线程隔离，
+并继续校验完整历史前缀。Responses 续接在原有服务/Key 归属校验后继承省略的信息；分叉线程使用
+独立的上游会话，已知设备冲突返回请求错误。由 provider 保存历史的 Responses 归属信息仅在
+成功响应后保存在内存，最多 256 条、30 分钟；`store: false` 禁止保留。
+账号池调度、额度与按请求内容计算的 token 缓存继续使用原有策略。
+
 ## 备份与恢复
 
 升级或修改可能影响数据的配置前先备份。标准 Docker 部署可停止写入后复制数据目录：

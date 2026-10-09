@@ -168,6 +168,7 @@ pub struct AppState {
     pub prompt_cache: PromptCacheTracker,
     /// Ephemeral, credential-scoped state for Responses `store=true` turns.
     pub responses_sessions: ResponsesSessionStore,
+    pub response_client_contexts: crate::http::responses::ResponseClientContexts,
     pub task_registry: TaskRegistry,
     /// Dynamically managed API proxy listeners.
     pub proxy_services: Arc<crate::http::ProxyServiceManager>,
@@ -323,6 +324,7 @@ impl AppState {
             compaction_replay: CompactionReplayTracker::default(),
             prompt_cache: PromptCacheTracker::default(),
             responses_sessions: ResponsesSessionStore::default(),
+            response_client_contexts: crate::http::responses::ResponseClientContexts::default(),
             task_registry: TaskRegistry::default(),
             proxy_services: Arc::new(crate::http::ProxyServiceManager::default()),
             shutdown: CancellationToken::new(),

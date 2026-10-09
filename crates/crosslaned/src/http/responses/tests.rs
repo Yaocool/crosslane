@@ -62,6 +62,47 @@ fn completed_chat(text: &str) -> Value {
 }
 
 #[test]
+fn response_client_attribution_is_owner_provider_scoped_expiring_and_bounded() {
+    let store = ResponseClientContexts::default();
+    let owner = ResponsesSessionOwner::new("service-a".into(), Some("key-a".into()));
+    let context = ClientContext {
+        user_ref: Some("hashed-device".into()),
+        ..Default::default()
+    };
+    store.insert(
+        owner.clone(),
+        "copilot".into(),
+        "resp_1".into(),
+        context.clone(),
+    );
+    assert_eq!(
+        store.get(&owner, "copilot", "resp_1"),
+        Some(context.clone())
+    );
+    assert!(store.get(&owner, "other-provider", "resp_1").is_none());
+    for other in [
+        ResponsesSessionOwner::new("service-b".into(), Some("key-a".into())),
+        ResponsesSessionOwner::new("service-a".into(), Some("key-b".into())),
+    ] {
+        assert!(store.get(&other, "copilot", "resp_1").is_none());
+    }
+    for index in 0..=MAX_RESPONSES_SESSIONS {
+        store.insert(
+            owner.clone(),
+            "copilot".into(),
+            format!("resp_{index}"),
+            context.clone(),
+        );
+    }
+    assert_eq!(store.entries.lock().unwrap().len(), MAX_RESPONSES_SESSIONS);
+    for (_, seen) in store.entries.lock().unwrap().values_mut() {
+        *seen = Instant::now() - RESPONSES_SESSION_TTL;
+    }
+    assert!(store.get(&owner, "copilot", "resp_256").is_none());
+    assert!(store.entries.lock().unwrap().is_empty());
+}
+
+#[test]
 fn stored_sessions_are_credential_scoped_and_do_not_replay_old_instructions() {
     let request: ResponsesRequest = serde_json::from_value(json!({
         "model":"claude-sonnet-4.5",

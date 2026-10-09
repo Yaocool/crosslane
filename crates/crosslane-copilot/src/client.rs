@@ -2602,6 +2602,7 @@ mod tests {
                         service_id: "test".into(),
                         account_pool: None,
                         api_key_id: None,
+                        client_context: Default::default(),
                     };
                     let error = provider.execute(request.clone()).await.err().unwrap();
                     assert_eq!(error.upstream_code.as_deref(), Some("model_disabled"));
@@ -2687,6 +2688,7 @@ mod tests {
                             service_id: "test".into(),
                             account_pool: None,
                             api_key_id: None,
+                            client_context: Default::default(),
                         })
                         .await
                         .unwrap_or_else(|error| {
@@ -3128,6 +3130,7 @@ mod tests {
                 service_id: "svc-test".into(),
                 account_pool: None,
                 api_key_id: Some("ak-test".into()),
+                client_context: Default::default(),
             })
             .await
         {
@@ -3153,6 +3156,7 @@ mod tests {
                 service_id: "svc-test".into(),
                 account_pool: None,
                 api_key_id: Some("ak-test".into()),
+                client_context: Default::default(),
             })
             .await
             .unwrap();
@@ -3448,6 +3452,7 @@ mod tests {
                     service_id: "svc-test".into(),
                     account_pool: None,
                     api_key_id: Some("ak-test".into()),
+                    client_context: Default::default(),
                 },
             ),
             (
@@ -3463,6 +3468,7 @@ mod tests {
                     service_id: "svc-test".into(),
                     account_pool: None,
                     api_key_id: Some("ak-test".into()),
+                    client_context: Default::default(),
                 },
             ),
             (
@@ -3478,6 +3484,7 @@ mod tests {
                     service_id: "svc-test".into(),
                     account_pool: None,
                     api_key_id: Some("ak-test".into()),
+                    client_context: Default::default(),
                 },
             ),
         ];
@@ -3556,6 +3563,7 @@ mod tests {
             service_id: "svc-test".into(),
             account_pool: None,
             api_key_id: Some("ak-test".into()),
+            client_context: Default::default(),
         };
         let failed = provider.execute(request.clone()).await.unwrap();
         assert_eq!(failed.status, StatusCode::SERVICE_UNAVAILABLE);

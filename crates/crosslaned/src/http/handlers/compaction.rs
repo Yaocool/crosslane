@@ -26,6 +26,7 @@ async fn generate_compaction_summary(
     state: &Arc<AppState>,
     account_ids: Arc<std::collections::HashSet<String>>,
     trace_id: &str,
+    client_context: &crosslane_core::client_context::ClientContext,
     key_id: Option<&str>,
     allowed_models: &[String],
     service_id: Option<&str>,
@@ -36,6 +37,7 @@ async fn generate_compaction_summary(
     let owned_state = Arc::clone(state);
     let owned_account_ids = account_ids;
     let owned_trace_id = trace_id.to_owned();
+    let owned_client_context = client_context.clone();
     let owned_key_id = key_id.map(str::to_owned);
     let owned_allowed_models = allowed_models.to_vec();
     let owned_service_id = service_id.map(str::to_owned);
@@ -60,6 +62,7 @@ async fn generate_compaction_summary(
                 let state = &owned_state;
                 let account_ids = &owned_account_ids;
                 let trace_id = &owned_trace_id;
+                let client_context = &owned_client_context;
                 let key_id = owned_key_id.as_deref();
                 let allowed_models = owned_allowed_models.as_slice();
                 let service_id = owned_service_id.as_deref();
@@ -80,6 +83,7 @@ async fn generate_compaction_summary(
                             state,
                             account_ids,
                             trace_id,
+                            client_context,
                             key_id,
                             allowed_models,
                             service_id,
@@ -263,6 +267,7 @@ async fn generate_compaction_summary_inner(
     state: &Arc<AppState>,
     account_ids: &std::collections::HashSet<String>,
     trace_id: &str,
+    client_context: &crosslane_core::client_context::ClientContext,
     key_id: Option<&str>,
     allowed_models: &[String],
     service_id: Option<&str>,
@@ -440,6 +445,7 @@ async fn generate_compaction_summary_inner(
         attempts,
         started,
         RequestDiagnostics {
+            client_context: Some(client_context.clone()),
             payload_bytes: serde_json::to_vec(&payload).map_or(0, |value| value.len()),
             ..RequestDiagnostics::default()
         },
@@ -757,6 +763,7 @@ pub(super) async fn run_compaction(
 ) -> Result<CompactionRun, ApiError> {
     let CompactionRequest {
         trace_id,
+        client_context,
         key_id,
         account_ids,
         allowed_models,
@@ -873,6 +880,7 @@ pub(super) async fn run_compaction(
                 state,
                 Arc::clone(&account_ids),
                 trace_id,
+                &client_context.cloned().unwrap_or_default(),
                 key_id,
                 allowed_models,
                 service_id,

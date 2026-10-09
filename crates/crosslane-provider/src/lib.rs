@@ -35,6 +35,8 @@ pub struct ProviderRequest {
     /// Immutable service membership rules for account selection and failover.
     pub account_pool: Option<crosslane_core::config::ProxyServiceConfig>,
     pub api_key_id: Option<String>,
+    /// Shared anonymous client attribution, available with every build.
+    pub client_context: crosslane_core::client_context::ClientContext,
 }
 
 /// Response body returned by a provider. Streaming stays streaming end to end.

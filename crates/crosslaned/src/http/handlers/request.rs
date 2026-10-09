@@ -39,6 +39,34 @@ pub(super) async fn handle_claude(
     connection_guard: crate::state::AdmissionGuard,
     admission_guard: crate::state::AdmissionGuard,
 ) -> Result<Response, ApiError> {
+    let client_context = super::super::client_context::extract(&headers, &body);
+    let context_trace_id = trace_id.clone();
+    let result = handle_claude_with_context(
+        service,
+        trace_id,
+        path,
+        headers,
+        body,
+        connection_guard,
+        admission_guard,
+        &client_context,
+    )
+    .await;
+    super::super::client_context::log(&context_trace_id, &client_context);
+    result.map_err(|error| error.with_client_context(&client_context))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_claude_with_context(
+    service: ServiceHttpState,
+    trace_id: String,
+    path: String,
+    headers: HeaderMap,
+    body: Bytes,
+    connection_guard: crate::state::AdmissionGuard,
+    admission_guard: crate::state::AdmissionGuard,
+    client_context: &crosslane_core::client_context::ClientContext,
+) -> Result<Response, ApiError> {
     let state = Arc::clone(&service.app);
     let started = Instant::now();
     let provider_hint = super::provider_gateway::request_provider_hint(
@@ -79,6 +107,7 @@ pub(super) async fn handle_claude(
             admission_guard,
             ErrorFormat::Claude,
             false,
+            client_context.clone(),
         )
         .await;
     }
@@ -109,16 +138,19 @@ pub(super) async fn handle_claude(
     }
     let replay_source = CompactionReplaySource::capture(&request.messages);
     let conversation_fingerprint = super::conversation_fingerprint(&request.messages);
-    let conversation_id = super::stable_conversation_id(
-        &headers,
+    let conversation_id = super::client_conversation_id(
+        &service.service.id,
         key_id.as_deref(),
+        client_context,
+        &headers,
         request.conversation_id.as_deref(),
         super::metadata_conversation_hint(request.metadata.as_ref())
             .or(conversation_fingerprint.as_deref()),
     );
-    let replay_scope = super::compaction_replay_scope(
+    let replay_scope = super::client_replay_scope(
         &service.service.id,
         key_id.as_deref(),
+        client_context,
         conversation_fingerprint.as_deref(),
     );
     let replay_applied = replay_scope
@@ -585,6 +617,7 @@ pub(super) async fn handle_claude(
             &state,
             CompactionRequest {
                 trace_id: &trace_id,
+                client_context: Some(client_context),
                 key_id: key_id.as_deref(),
                 account_ids: Arc::clone(&account_ids),
                 allowed_models: &allowed_models,
@@ -654,6 +687,7 @@ pub(super) async fn handle_claude(
         .max(full_tool_tokens);
     let payload_bytes = serialized_payload_bytes(&payload, ErrorFormat::Claude)?;
     let mut diagnostics = RequestDiagnostics {
+        client_context: Some(client_context.clone()),
         original_tool_count,
         loaded_tool_count: loaded_tool_count(&payload),
         deferred_tool_count: tool_search
@@ -759,6 +793,7 @@ pub(super) async fn handle_claude(
                     &state,
                     CompactionRequest {
                         trace_id: &trace_id,
+                        client_context: Some(client_context),
                         key_id: key_id.as_deref(),
                         account_ids: Arc::clone(&account_ids),
                         allowed_models: &allowed_models,
@@ -1022,6 +1057,34 @@ pub(super) async fn handle_openai(
     connection_guard: crate::state::AdmissionGuard,
     admission_guard: crate::state::AdmissionGuard,
 ) -> Result<Response, ApiError> {
+    let mut client_context = super::super::client_context::extract(&headers, &body);
+    let context_trace_id = trace_id.clone();
+    let result = handle_openai_with_context(
+        service,
+        trace_id,
+        path,
+        headers,
+        body,
+        connection_guard,
+        admission_guard,
+        &mut client_context,
+    )
+    .await;
+    super::super::client_context::log(&context_trace_id, &client_context);
+    result.map_err(|error| error.with_client_context(&client_context))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_openai_with_context(
+    service: ServiceHttpState,
+    trace_id: String,
+    path: String,
+    headers: HeaderMap,
+    body: Bytes,
+    connection_guard: crate::state::AdmissionGuard,
+    admission_guard: crate::state::AdmissionGuard,
+    client_context: &mut crosslane_core::client_context::ClientContext,
+) -> Result<Response, ApiError> {
     let state = Arc::clone(&service.app);
     let started = Instant::now();
     // Multi-candidate chat re-enters this handler for every candidate. Keep
@@ -1054,6 +1117,20 @@ pub(super) async fn handle_openai(
         .map_or_else(Vec::new, |key| key.allowed_models.clone());
     let key_id = authenticated_key.as_ref().map(|key| key.id.clone());
     if provider_route.provider_kind != "kiro" {
+        if is_responses_path(&path) {
+            if let Some(previous_id) = super::super::client_context::previous_response_id(&body) {
+                let owner = ResponsesSessionOwner::new(service.service.id.clone(), key_id.clone());
+                if let Some(previous) = state.response_client_contexts.get(
+                    &owner,
+                    provider_route.provider_id.as_str(),
+                    &previous_id,
+                ) {
+                    client_context.inherit(&previous).map_err(|message| {
+                        ApiError::new(StatusCode::BAD_REQUEST, message, ErrorFormat::OpenAi)
+                    })?;
+                }
+            }
+        }
         let protocol = if is_responses_path(&path) {
             ProviderProtocol::OpenAiResponses
         } else {
@@ -1071,6 +1148,7 @@ pub(super) async fn handle_openai(
             admission_guard,
             ErrorFormat::OpenAi,
             false,
+            client_context.clone(),
         )
         .await;
     }
@@ -1110,17 +1188,25 @@ pub(super) async fn handle_openai(
                         ErrorFormat::OpenAi,
                     )
                 })?;
-            inherited_conversation_id = Some(
-                session
-                    .conversation_id()
-                    .ok_or_else(|| {
-                        ApiError::response_assembly(
-                            "stored response is missing its upstream conversation state",
-                            ErrorFormat::OpenAi,
-                        )
-                    })?
-                    .to_owned(),
-            );
+            let forks = client_context.forks(session.client_context());
+            client_context
+                .inherit(session.client_context())
+                .map_err(|message| {
+                    ApiError::new(StatusCode::BAD_REQUEST, message, ErrorFormat::OpenAi)
+                })?;
+            inherited_conversation_id = (!forks)
+                .then(|| {
+                    session
+                        .conversation_id()
+                        .ok_or_else(|| {
+                            ApiError::response_assembly(
+                                "stored response is missing its upstream conversation state",
+                                ErrorFormat::OpenAi,
+                            )
+                        })
+                        .map(str::to_owned)
+                })
+                .transpose()?;
             resume_responses_request(&mut responses, session);
         }
         let translated = responses_to_openai(&responses).map_err(|error| {
@@ -1130,13 +1216,14 @@ pub(super) async fn handle_openai(
                 ErrorFormat::OpenAi,
             )
         })?;
-        let options = ResponsesOptions::new(
+        let mut options = ResponsesOptions::new(
             &responses,
             translated.tools,
             translated.tool_names,
             Some((state.responses_sessions.clone(), session_owner)),
             inherited_conversation_id,
         );
+        options.set_client_context(client_context);
         (translated.request, Some(options))
     } else {
         let value: Value = serde_json::from_slice(&body).map_err(|_| {
@@ -1249,9 +1336,11 @@ pub(super) async fn handle_openai(
         .map(str::to_owned);
     let conversation_fingerprint = super::conversation_fingerprint(&request.messages);
     options.conversation_id = inherited_responses_conversation_id.or_else(|| {
-        super::stable_conversation_id(
-            &headers,
+        super::client_conversation_id(
+            &service.service.id,
             key_id.as_deref(),
+            client_context,
+            &headers,
             request.conversation_id.as_deref(),
             super::metadata_conversation_hint(request.metadata.as_ref())
                 .or_else(|| {
@@ -1371,6 +1460,7 @@ pub(super) async fn handle_openai(
         })? as u64;
     let payload_bytes = serialized_payload_bytes(&payload, ErrorFormat::OpenAi)?;
     let diagnostics = RequestDiagnostics {
+        client_context: Some(client_context.clone()),
         original_tool_count: request.tools.len(),
         loaded_tool_count: loaded_tool_count(&payload),
         deferred_tool_count: 0,

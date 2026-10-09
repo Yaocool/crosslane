@@ -3,6 +3,7 @@
 //! 本 crate 不做 IO，不依赖异步运行时。
 
 pub mod account;
+pub mod client_context;
 pub mod config;
 pub mod ids;
 pub mod model_policy;

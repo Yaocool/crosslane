@@ -116,6 +116,128 @@ fn internal_response_errors_have_proxy_classification() {
     assert_eq!(error.error_stage, "response_assembly");
 }
 
+#[test]
+fn client_context_isolates_conversations_and_replay_across_devices_threads_and_owners() {
+    let context = |device: &str, session: &str, thread: &str| {
+        super::super::client_context::extract(&HeaderMap::new(), &serde_json::to_vec(&json!({
+            "client_metadata":{"x-codex-installation-id":device,"session_id":session,"thread_id":thread}
+        })).unwrap())
+    };
+    let first = context("device-a", "session-a", "thread-a");
+    let headers = HeaderMap::new();
+    let conversation = |service, key, client: &ClientContext, hint| {
+        client_conversation_id(
+            service,
+            Some(key),
+            client,
+            &headers,
+            hint,
+            Some("same history"),
+        )
+    };
+    let original = conversation("service-a", "key-a", &first, Some("cache-key"));
+    for (service, key, other) in [
+        ("service-b", "key-a", first.clone()),
+        ("service-a", "key-b", first.clone()),
+        (
+            "service-a",
+            "key-a",
+            context("device-b", "session-a", "thread-a"),
+        ),
+        (
+            "service-a",
+            "key-a",
+            context("device-a", "session-b", "thread-b"),
+        ),
+        (
+            "service-a",
+            "key-a",
+            context("device-a", "session-b", "thread-a"),
+        ),
+        (
+            "service-a",
+            "key-a",
+            context("device-a", "session-a", "thread-b"),
+        ),
+    ] {
+        assert_ne!(
+            original,
+            conversation(service, key, &other, Some("cache-key"))
+        );
+        assert_ne!(
+            client_replay_scope("service-a", Some("key-a"), &first, Some("same history")),
+            client_replay_scope(service, Some(key), &other, Some("same history"))
+        );
+    }
+    assert_ne!(
+        original,
+        conversation("service-a", "key-a", &first, Some("another-cache-key"))
+    );
+    let mut request_headers = HeaderMap::new();
+    request_headers.insert("x-client-request-id", HeaderValue::from_static("request-a"));
+    assert_eq!(
+        original,
+        client_conversation_id(
+            "service-a",
+            Some("key-a"),
+            &first,
+            &request_headers,
+            Some("cache-key"),
+            Some("different history")
+        )
+    );
+    let unknown = ClientContext::default();
+    assert_eq!(
+        client_conversation_id(
+            "service-a",
+            Some("key-a"),
+            &unknown,
+            &headers,
+            None,
+            Some("same history")
+        ),
+        stable_conversation_id(&headers, Some("key-a"), None, Some("same history"))
+    );
+}
+
+#[test]
+fn client_replay_scope_keeps_full_history_digest_validation() {
+    use super::super::compaction_replay::{CompactionReplaySource, CompactionReplayTracker};
+    use crosslane_translate::ClaudeMessage;
+    let context = super::super::client_context::extract(&HeaderMap::new(), &serde_json::to_vec(&json!({
+        "metadata":{"user_id":json!({"device_id":"device-a","session_id":"session-a"}).to_string()}
+    })).unwrap());
+    let source: Vec<ClaudeMessage> = serde_json::from_value(json!([
+        {"role":"user","content":"same first message"},
+        {"role":"assistant","content":"private history"},
+        {"role":"user","content":"question"}
+    ]))
+    .unwrap();
+    let scope = client_replay_scope(
+        "service-a",
+        Some("key-a"),
+        &context,
+        conversation_fingerprint(&source).as_deref(),
+    )
+    .unwrap();
+    let tracker = CompactionReplayTracker::default();
+    assert!(tracker.remember(
+        scope.clone(),
+        CompactionReplaySource::capture(&source).unwrap(),
+        "checkpoint".into()
+    ));
+    let mut extended = source;
+    extended.extend(
+        serde_json::from_value::<Vec<ClaudeMessage>>(json!([
+            {"role":"assistant","content":"response"}, {"role":"user","content":"continue"}
+        ]))
+        .unwrap(),
+    );
+    assert!(tracker.find(&scope, &extended).is_some());
+    extended[1].content = json!("different private history");
+    assert!(tracker.find(&scope, &extended).is_none());
+}
+
 #[tokio::test]
 async fn timed_out_summary_task_still_runs_its_accounting_tail() {
     let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1134,6 +1256,7 @@ async fn multiwave_summary_input_falls_back_without_dispatching_semantic_work() 
         &state,
         CompactionRequest {
             trace_id: "trace_capacity",
+            client_context: None,
             key_id: None,
             account_ids: Arc::new(
                 state
@@ -1232,6 +1355,7 @@ async fn multiwave_summary_input_falls_back_without_dispatching_semantic_work() 
         &state,
         CompactionRequest {
             trace_id: "trace_oversized_current",
+            client_context: None,
             key_id: None,
             account_ids: Arc::new(
                 state

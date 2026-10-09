@@ -151,6 +151,30 @@ Business request logs include the client `user_agent` when supplied. Use the
 response status, error code, and trace when investigating failures. A stream can fail after
 HTTP 200, so inspect its final event.
 
+### Anonymous client and conversation attribution
+
+Client context is available in every build, independently of the `crs` feature.
+Claude Code's old and JSON-encoded `metadata.user_id` formats provide a device ID
+and session ID. Codex's `client_metadata` provides `x-codex-installation-id`,
+`session_id`, and `thread_id`; matching HTTP headers are accepted as fallbacks.
+Body telemetry takes precedence. No CRS code changes are required for Console
+and OpenAI Responses relays that preserve these fields.
+
+The `proxy.client.context` event and request-log `diagnostics.client_context`
+contain hashed `user_ref`, `session_ref`, and `thread_ref`, plus client kind and
+identity source. A user reference groups one device/installation across sessions;
+it is not a person or CRS key. Missing identity remains unknown. Malformed or
+oversized telemetry is ignored, and identifiers are never added to model input.
+
+Generation and token counting use the same conversation/replay scope, isolated
+by service, authenticated Crosslane key, device, and session/thread. Compaction
+replay still validates the full history prefix. Owned Responses continuations
+inherit omitted telemetry; explicit forks keep separate upstream conversations.
+A conflicting known device produces a request error. Attribution for provider
+Responses is retained in memory for up to 30 minutes (256 entries), after a
+successful response; `store: false` disables retention. Existing account pool
+selection, quotas, and content-based token-count caching retain their policies.
+
 ### Claude Relay Service response compatibility
 
 Build `crosslaned` with `cargo build -p crosslaned --bin crosslaned --release --features crs`

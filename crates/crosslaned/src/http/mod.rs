@@ -1,5 +1,8 @@
 //! Public business HTTP plane.
 
+pub(crate) mod client_context;
+#[cfg(test)]
+mod client_context_tests;
 #[cfg(feature = "crs")]
 mod crs;
 mod handlers;
@@ -763,7 +766,7 @@ mod tests {
         }
     }
 
-    async fn test_state(mut config: Config) -> (tempfile::TempDir, Arc<AppState>) {
+    pub(super) async fn test_state(mut config: Config) -> (tempfile::TempDir, Arc<AppState>) {
         config.server.port = 5580;
         let directory = tempfile::tempdir().expect("tempdir");
         let paths = Paths::from_env_values(
@@ -782,7 +785,7 @@ mod tests {
         (directory, state)
     }
 
-    async fn body_json(response: Response) -> serde_json::Value {
+    pub(super) async fn body_json(response: Response) -> serde_json::Value {
         let bytes = to_bytes(response.into_body(), 1024 * 1024)
             .await
             .expect("body");
