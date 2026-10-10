@@ -1320,7 +1320,14 @@ mod tests {
             .await
             .expect("response");
 
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.status(),
+            if cfg!(feature = "crs") {
+                StatusCode::OK
+            } else {
+                StatusCode::BAD_REQUEST
+            }
+        );
         let request_id = response
             .headers()
             .get(REQUEST_ID_HEADER)
@@ -1335,14 +1342,33 @@ mod tests {
                 .expect("trace id header"),
             request_id.as_str()
         );
-        let body = body_json(response).await;
+        let body = if cfg!(feature = "crs") {
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let text = std::str::from_utf8(&bytes).unwrap();
+            serde_json::from_str(
+                text.lines()
+                    .find_map(|line| line.strip_prefix("data: "))
+                    .unwrap(),
+            )
+            .unwrap()
+        } else {
+            body_json(response).await
+        };
         assert_eq!(body["type"], "error");
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(body["request_id"], request_id);
         let message = body["error"]["message"].as_str().expect("message");
         assert!(message.starts_with("prompt is too long for model '"));
         assert!(message.contains("claude-sonnet-4.6"));
+        #[cfg(not(feature = "crs"))]
         assert!(message.ends_with(" tokens > 128"));
+        #[cfg(feature = "crs")]
+        {
+            assert!(message.contains(" tokens > 128"));
+            assert!(message.contains(&format!("request ID: {request_id}")));
+            assert_eq!(body["error"]["status"], 400);
+            assert!(body["error"].get("upstream_status").is_none());
+        }
     }
 
     #[tokio::test]
@@ -2289,14 +2315,25 @@ mod tests {
                 let counting = path.ends_with("count_tokens");
                 assert_eq!(
                     response.status(),
-                    if counting {
+                    if counting || cfg!(feature = "crs") && stream {
                         StatusCode::OK
                     } else {
                         StatusCode::SERVICE_UNAVAILABLE
                     },
                     "path={path}, stream={stream}, output_config={config}"
                 );
-                let body = body_json(response).await;
+                let body = if cfg!(feature = "crs") && stream && !counting {
+                    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                    let text = std::str::from_utf8(&bytes).unwrap();
+                    serde_json::from_str(
+                        text.lines()
+                            .find_map(|line| line.strip_prefix("data: "))
+                            .unwrap(),
+                    )
+                    .unwrap()
+                } else {
+                    body_json(response).await
+                };
                 if counting {
                     assert!(body["input_tokens"].as_u64().is_some());
                 } else {

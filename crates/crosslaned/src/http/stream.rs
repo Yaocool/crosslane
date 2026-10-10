@@ -1232,22 +1232,27 @@ fn classified_stream_error(
     diagnostics: Option<&StreamFailureDiagnostics>,
 ) -> String {
     let details = classify_stream_failure(message, diagnostics);
-    stream_error_response(protocol, message, details.error_code, request_id)
+    stream_error_response(protocol, message, details, request_id)
 }
 
 fn stream_error_response(
     protocol: &StreamProtocol,
     message: &str,
-    code: &str,
+    details: StreamFailureDetails,
     request_id: &str,
 ) -> String {
     let safe = crosslane_translate::sanitize_error_message(message);
+    let code = details.error_code;
     #[cfg(feature = "crs")]
-    let safe = if matches!(protocol, StreamProtocol::Claude) {
-        super::crs::enrich_stream_message(safe, code, request_id)
-    } else {
-        safe
-    };
+    if matches!(protocol, StreamProtocol::Claude) {
+        return sse(&super::crs::stream_error_envelope(
+            message,
+            code,
+            details.error_stage,
+            details.upstream_status,
+            request_id,
+        ));
+    }
     match protocol {
         StreamProtocol::Claude => sse(&json!({
             "type":"error",

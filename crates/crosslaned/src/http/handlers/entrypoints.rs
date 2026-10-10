@@ -231,6 +231,8 @@ pub async fn claude_messages(
             }
         };
     let model = request_model_hint(&body);
+    #[cfg(feature = "crs")]
+    let stream_requested = crs::stream_requested(&body);
     tracing::debug!(
         trace_id = %trace_id,
         protocol = "claude",
@@ -252,7 +254,11 @@ pub async fn claude_messages(
         Ok(response) => {
             #[cfg(feature = "crs")]
             {
-                crs::adapt_claude_response(response, &trace_id).await
+                if stream_requested {
+                    crs::adapt_claude_stream_response(response, &trace_id).await
+                } else {
+                    crs::adapt_claude_response(response, &trace_id).await
+                }
             }
             #[cfg(not(feature = "crs"))]
             {
@@ -260,6 +266,15 @@ pub async fn claude_messages(
             }
         }
         Err(error) => {
+            #[cfg(feature = "crs")]
+            let error = if stream_requested && crs::uses_sse_error(error.status) {
+                ApiError {
+                    client_status: Some(200),
+                    ..error
+                }
+            } else {
+                error
+            };
             record_failed_request(
                 &state,
                 &trace_id,
@@ -269,7 +284,14 @@ pub async fn claude_messages(
                 started,
                 &error,
             );
-            error.with_request_id(&trace_id).into_response()
+            #[cfg(feature = "crs")]
+            let use_sse = stream_requested && crs::uses_sse_error(error.status);
+            let response = error.with_request_id(&trace_id).into_response();
+            #[cfg(feature = "crs")]
+            if use_sse {
+                return crs::adapt_claude_stream_response(response, &trace_id).await;
+            }
+            response
         }
     }
 }

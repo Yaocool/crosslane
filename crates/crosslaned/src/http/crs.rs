@@ -1,8 +1,8 @@
 //! Response compatibility for Claude Relay Service's Console/CCR relay paths.
 //!
-//! CRS forwards non-200 bodies directly, but it commits HTTP 200 as soon as
-//! Crosslane sends streaming headers. Probe only the bounded SSE prelude so a
-//! failure before assistant content can still be returned as a JSON error.
+//! CRS replaces non-200 error bodies with fixed messages. Streaming requests
+//! use standard SSE error events under HTTP 200 so client-visible diagnostics
+//! survive its Console relay. Non-streaming requests retain HTTP error status.
 
 use std::time::Duration;
 
@@ -29,35 +29,156 @@ pub(super) fn enrich_error_envelope(
     if let Some(status) = upstream_status {
         envelope["error"]["upstream_status"] = Value::from(status);
     }
-    let message = envelope["error"]["message"].as_str().unwrap_or_default();
-    if is_opaque_message(message) {
-        envelope["error"]["message"] =
-            Value::String(diagnostic_message(code, upstream_status, request_id));
-    }
-}
-
-pub(super) fn enrich_stream_message(message: String, code: &str, request_id: &str) -> String {
-    if is_opaque_message(&message) {
-        diagnostic_message(safe_code(code), None, Some(request_id))
+    // Keep the sanitized cause separate: normalizing a rendered context error
+    // again must not interpret digits in its trace ID as token counts.
+    let detail = sanitize_error_message(error_message(envelope).unwrap_or_default());
+    let cause = if is_opaque_message(&detail) {
+        match code {
+            "upstream_authentication_failed" => "Upstream credentials were rejected.",
+            "upstream_idle_timeout" => "The upstream response timed out.",
+            "upstream_transport_interrupted" => "The upstream connection was interrupted.",
+            _ => "The service could not complete this request.",
+        }
+        .to_owned()
+    } else if code == "context_length_exceeded"
+        && upstream_status.is_some()
+        && detail == "prompt is too long: context length exceeded"
+    {
+        "prompt is too long: upstream input limit exceeded; the exact limit was not reported."
+            .to_owned()
     } else {
-        message
+        detail.clone()
+    };
+    let hint = error_hint(code);
+    let mut message = cause.chars().take(512).collect::<String>();
+    if envelope["error"]["recovery"] == "compaction_retry_failed" {
+        message.push_str(" Compaction was attempted, but the retry still failed.");
     }
-}
-
-fn diagnostic_message(
-    code: &str,
-    upstream_status: Option<u16>,
-    request_id: Option<&str>,
-) -> String {
-    let mut detail = format!("Upstream request failed (code: {code}");
+    message.push(' ');
+    message.push_str(hint);
+    message.push_str(&format!(" [code: {code}"));
+    if let Some(stage) = envelope["error"]["stage"]
+        .as_str()
+        .filter(|stage| valid_code(stage))
+    {
+        message.push_str(&format!(", stage: {stage}"));
+    }
     if let Some(status) = upstream_status {
-        detail.push_str(&format!(", upstream HTTP {status}"));
+        message.push_str(&format!(", upstream HTTP {status}"));
+    }
+    if envelope["error"]["upstream_reason"] == "CONTENT_LENGTH_EXCEEDS_THRESHOLD" {
+        message.push_str(", reason: CONTENT_LENGTH_EXCEEDS_THRESHOLD");
     }
     if let Some(request_id) = request_id {
-        detail.push_str(&format!(", request ID: {request_id}"));
+        message.push_str(&format!(", request ID: {request_id}"));
     }
-    detail.push(')');
-    detail
+    message.push(']');
+    envelope["error"]["detail"] = Value::String(detail);
+    envelope["error"]["hint"] = Value::String(hint.to_owned());
+    envelope["error"]["message"] = Value::String(message);
+    envelope["error"]["retryable"] = Value::Bool(matches!(
+        code,
+        "upstream_unavailable"
+            | "upstream_rate_limited"
+            | "upstream_overloaded"
+            | "upstream_idle_timeout"
+            | "upstream_transport_interrupted"
+            | "upstream_event_stream_empty"
+            | "upstream_event_stream_corrupt"
+            | "upstream_model_unavailable"
+            | "model_unavailable"
+    ));
+}
+
+fn error_hint(code: &str) -> &'static str {
+    match code {
+        "context_length_exceeded" => {
+            "Run /compact, reduce large tool results or attachments, or start a new session."
+        }
+        "request_payload_exceeded" | "request_body_too_large" => {
+            "Reduce request content, attachments, or tool definitions."
+        }
+        "tool_budget_exceeded" | "tool_catalog_too_large" => {
+            "Reduce enabled tools or tool schema size; enable Tool Search where supported."
+        }
+        "invalid_tool_protocol" | "unsupported_tool_protocol" => {
+            "Check tool definitions and tool_use/tool_result pairing."
+        }
+        "model_not_available" | "model_disabled" => {
+            "Choose an available model or ask the service administrator to check model routing."
+        }
+        "upstream_authentication_failed" | "upstream_quota_exhausted" => {
+            "Ask the service administrator to check upstream access or quota using the request ID."
+        }
+        "upstream_rate_limited" | "upstream_overloaded" => "Wait briefly and retry.",
+        "invalid_request" => {
+            "Check the request parameters; share the request ID if the problem persists."
+        }
+        _ => "Retry; if the problem persists, share the request ID with the service administrator.",
+    }
+}
+
+pub(super) fn context_rejection_reason(message: &str) -> Option<&'static str> {
+    let lower = message.to_ascii_lowercase();
+    (!is_opaque_message(&sanitize_error_message(message))
+        && (lower.contains("content_length_exceeds_threshold")
+            || lower.contains("input content length exceeds threshold")))
+    .then_some("CONTENT_LENGTH_EXCEEDS_THRESHOLD")
+}
+
+pub(super) fn uses_sse_error(status: StatusCode) -> bool {
+    matches!(status.as_u16(), 400 | 404 | 408 | 422 | 429 | 500..=599)
+}
+
+pub(super) fn stream_requested(body: &[u8]) -> bool {
+    // Ignore the large messages/tools rather than allocating a second request
+    // tree just to read the flag. Invalid JSON retains the HTTP validation path.
+    #[derive(serde::Deserialize)]
+    struct RequestMode {
+        #[serde(default)]
+        stream: bool,
+    }
+    serde_json::from_slice::<RequestMode>(body).is_ok_and(|request| request.stream)
+}
+
+pub(super) async fn adapt_claude_stream_response(response: Response, request_id: &str) -> Response {
+    let response = adapt_claude_response(response, request_id).await;
+    if !uses_sse_error(response.status()) {
+        return response;
+    }
+    let status = response.status();
+    let (mut parts, body) = response.into_parts();
+    // Normalized errors are bounded JSON; keep the semantic failure status in
+    // the event and headers even though CRS requires a 200 streaming transport.
+    let bytes = to_bytes(body, MAX_ERROR_BODY_BYTES)
+        .await
+        .unwrap_or_default();
+    let mut envelope = serde_json::from_slice::<Value>(&bytes).unwrap_or_else(|_| {
+        error_envelope(
+            ErrorFormat::Claude,
+            status.as_u16(),
+            "Upstream service error",
+            Some(request_id),
+        )
+    });
+    envelope["error"]["status"] = Value::from(status.as_u16());
+    parts.status = StatusCode::OK;
+    parts.headers.remove(header::CONTENT_LENGTH);
+    parts.headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    parts
+        .headers
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    parts.headers.insert(
+        "x-crosslane-error-status",
+        HeaderValue::from(status.as_u16()),
+    );
+    Response::from_parts(
+        parts,
+        Body::from(format!("event: error\ndata: {envelope}\n\n")),
+    )
 }
 
 pub(super) async fn adapt_claude_response(response: Response, request_id: &str) -> Response {
@@ -116,13 +237,15 @@ async fn normalize_json_success(response: Response, request_id: &str) -> Respons
         .pointer("/error/type")
         .or_else(|| error.pointer("/response/error/type"))
         .and_then(Value::as_str);
-    let mut response = json_error(
+    let envelope = diagnostic_envelope(
         status_for_error(code, kind),
         message,
         code,
         Some(StatusCode::OK.as_u16()),
         request_id,
+        Some(error),
     );
+    let mut response = error_response(status_for_error(code, kind), envelope, request_id);
     if let Some(retry_after) = parts.headers.get(header::RETRY_AFTER) {
         response
             .headers_mut()
@@ -174,12 +297,12 @@ async fn normalize_http_error(response: Response, request_id: &str) -> Response 
     let message = parsed
         .as_ref()
         .and_then(error_message)
-        .or_else(|| sse_error.as_ref().map(|(message, _)| message.as_str()))
+        .or_else(|| sse_error.as_ref().and_then(error_message))
         .unwrap_or("Upstream service error");
     let parsed_code = parsed
         .as_ref()
         .and_then(error_code)
-        .or_else(|| sse_error.as_ref().map(|(_, code)| code.as_str()));
+        .or_else(|| sse_error.as_ref().and_then(error_code));
     let safe = sanitize_error_message(message);
     let status = if original_status.is_client_error() || original_status.is_server_error() {
         normalized_upstream_status(original_status, &safe)
@@ -197,13 +320,40 @@ async fn normalize_http_error(response: Response, request_id: &str) -> Response 
     } else {
         parsed_code.unwrap_or_else(|| default_code(status))
     };
-    let mut response = json_error(
-        status,
-        &safe,
-        code,
-        Some(original_status.as_u16()),
-        request_id,
-    );
+    let metadata = parsed.as_ref().or(sse_error.as_ref());
+    let upstream_status = metadata
+        .and_then(|value| value.pointer("/error/upstream_status"))
+        .and_then(Value::as_u64)
+        .and_then(|status| u16::try_from(status).ok())
+        .filter(|status| (100..=599).contains(status))
+        .or_else(|| {
+            parts
+                .headers
+                .get("x-crosslane-upstream-status")?
+                .to_str()
+                .ok()?
+                .parse::<u16>()
+                .ok()
+        })
+        .or_else(|| {
+            (!parts.headers.contains_key("x-crosslane-error-code"))
+                .then_some(original_status.as_u16())
+        });
+    let envelope =
+        diagnostic_envelope(status, message, code, upstream_status, request_id, metadata);
+    let mut response = error_response(status, envelope, request_id);
+    for name in [
+        "x-crosslane-error-code",
+        "x-crosslane-error-stage",
+        "x-crosslane-account-error",
+        "x-crosslane-upstream-status",
+    ] {
+        if let Some(value) = parts.headers.get(name) {
+            response
+                .headers_mut()
+                .insert(header::HeaderName::from_static(name), value.clone());
+        }
+    }
     if let Some(retry_after) = parts.headers.get(header::RETRY_AFTER) {
         response
             .headers_mut()
@@ -226,9 +376,22 @@ async fn preflight_stream(response: Response, request_id: &str) -> Response {
                     message,
                     code,
                     status,
+                    metadata,
                 } => {
                     finish_discarded_stream(stream);
-                    return json_error(status, &message, &code, None, request_id);
+                    let upstream_status = metadata
+                        .pointer("/error/upstream_status")
+                        .and_then(Value::as_u64)
+                        .and_then(|status| u16::try_from(status).ok());
+                    let envelope = diagnostic_envelope(
+                        status,
+                        &message,
+                        &code,
+                        upstream_status,
+                        request_id,
+                        Some(&metadata),
+                    );
+                    return error_response(status, envelope, request_id);
                 }
                 PreludeEvent::Success => {
                     return restore_stream(parts, prefix, stream, request_id.to_owned());
@@ -349,9 +512,23 @@ impl SseErrorRewriter {
                         message,
                         code,
                         status,
+                        metadata,
                     } => {
                         self.saw_error = true;
-                        output.push(sse_error_bytes(&message, &code, status, &self.request_id));
+                        let upstream_status = metadata
+                            .pointer("/error/upstream_status")
+                            .and_then(Value::as_u64)
+                            .and_then(|status| u16::try_from(status).ok());
+                        let mut envelope = diagnostic_envelope(
+                            status,
+                            &message,
+                            &code,
+                            upstream_status,
+                            &self.request_id,
+                            Some(&metadata),
+                        );
+                        envelope["error"]["status"] = Value::from(status.as_u16());
+                        output.push(Bytes::from(format!("event: error\ndata: {envelope}\n\n")));
                     }
                     PreludeEvent::Prelude | PreludeEvent::Success => output.push(frame),
                 }
@@ -381,7 +558,29 @@ fn sse_error_bytes(message: &str, code: &str, status: StatusCode, request_id: &s
         Some(request_id),
     );
     enrich_error_envelope(&mut envelope, code, None, Some(request_id));
+    envelope["error"]["status"] = Value::from(status.as_u16());
     Bytes::from(format!("event: error\ndata: {envelope}\n\n"))
+}
+
+pub(super) fn stream_error_envelope(
+    message: &str,
+    code: &str,
+    stage: &str,
+    upstream_status: Option<u16>,
+    request_id: &str,
+) -> Value {
+    let metadata = serde_json::json!({"error":{"stage":stage}});
+    let status = status_for_error(code, None);
+    let mut envelope = diagnostic_envelope(
+        status,
+        message,
+        code,
+        upstream_status,
+        request_id,
+        Some(&metadata),
+    );
+    envelope["error"]["status"] = Value::from(status.as_u16());
+    envelope
 }
 
 fn finish_discarded_stream(
@@ -402,6 +601,7 @@ enum PreludeEvent {
         message: String,
         code: String,
         status: StatusCode,
+        metadata: Value,
     },
 }
 
@@ -450,9 +650,10 @@ fn next_event(buffer: &[u8], offset: usize) -> Option<(usize, PreludeEvent)> {
         return Some((
             next,
             PreludeEvent::Error {
-                message: sanitize_error_message(message),
+                message: message.to_owned(),
                 code: code.to_owned(),
                 status: status_for_error(code, kind),
+                metadata: parsed.unwrap_or(Value::Null),
             },
         ));
     }
@@ -471,7 +672,8 @@ fn next_event(buffer: &[u8], offset: usize) -> Option<(usize, PreludeEvent)> {
 
 fn error_message(value: &Value) -> Option<&str> {
     value
-        .pointer("/error/message")
+        .pointer("/error/detail")
+        .or_else(|| value.pointer("/error/message"))
         .and_then(Value::as_str)
         .or_else(|| value.get("error").and_then(Value::as_str))
         .or_else(|| {
@@ -488,7 +690,11 @@ fn error_code(value: &Value) -> Option<&str> {
         .or_else(|| value.pointer("/response/error/code"))
         .or_else(|| value.get("code"))
         .and_then(Value::as_str)
-        .filter(|code| valid_code(code))
+        .filter(|code| valid_code(code) && safe_code(code) == *code)
+        .or_else(|| {
+            crosslane_translate::error::is_context_length_error(error_message(value)?)
+                .then_some("context_length_exceeded")
+        })
         .or_else(|| {
             let kind = value
                 .pointer("/error/type")
@@ -505,12 +711,21 @@ fn error_code(value: &Value) -> Option<&str> {
         })
 }
 
-fn error_from_sse(body: &[u8]) -> Option<(String, String)> {
+fn error_from_sse(body: &[u8]) -> Option<Value> {
     let mut offset = 0;
     while let Some((next, event)) = next_event(body, offset) {
         offset = next;
-        if let PreludeEvent::Error { message, code, .. } = event {
-            return Some((message, code));
+        if let PreludeEvent::Error {
+            message,
+            code,
+            metadata,
+            ..
+        } = event
+        {
+            if metadata.is_object() {
+                return Some(metadata);
+            }
+            return Some(serde_json::json!({"error":{"message":message,"code":code}}));
         }
     }
     None
@@ -519,6 +734,9 @@ fn error_from_sse(body: &[u8]) -> Option<(String, String)> {
 fn status_for_error(code: &str, kind: Option<&str>) -> StatusCode {
     match code {
         "context_length_exceeded"
+        | "request_payload_exceeded"
+        | "tool_catalog_too_large"
+        | "unsupported_tool_protocol"
         | "tool_budget_exceeded"
         | "invalid_tool_protocol"
         | "invalid_request" => StatusCode::BAD_REQUEST,
@@ -557,7 +775,7 @@ fn valid_code(code: &str) -> bool {
 }
 
 fn safe_code(code: &str) -> &str {
-    if valid_code(code) {
+    if valid_code(code) && !code.to_ascii_lowercase().starts_with("ksk_") {
         code
     } else {
         "upstream_unavailable"
@@ -591,13 +809,60 @@ fn json_error(
     upstream_status: Option<u16>,
     request_id: &str,
 ) -> Response {
+    let envelope = diagnostic_envelope(status, message, code, upstream_status, request_id, None);
+    error_response(status, envelope, request_id)
+}
+
+fn diagnostic_envelope(
+    status: StatusCode,
+    message: &str,
+    code: &str,
+    upstream_status: Option<u16>,
+    request_id: &str,
+    metadata: Option<&Value>,
+) -> Value {
     let mut envelope = error_envelope(
         ErrorFormat::Claude,
         status.as_u16(),
         message,
         Some(request_id),
     );
+    if let Some(metadata) = metadata {
+        if let Some(stage) = metadata
+            .pointer("/error/stage")
+            .and_then(Value::as_str)
+            .filter(|stage| valid_code(stage) && safe_code(stage) == *stage)
+        {
+            envelope["error"]["stage"] = Value::String(stage.to_owned());
+        }
+        if metadata.pointer("/error/recovery").and_then(Value::as_str)
+            == Some("compaction_retry_failed")
+        {
+            envelope["error"]["recovery"] = Value::String("compaction_retry_failed".to_owned());
+        }
+        if metadata
+            .pointer("/error/upstream_reason")
+            .and_then(Value::as_str)
+            == Some("CONTENT_LENGTH_EXCEEDS_THRESHOLD")
+        {
+            envelope["error"]["upstream_reason"] =
+                Value::String("CONTENT_LENGTH_EXCEEDS_THRESHOLD".to_owned());
+        }
+        if let Some(context) = metadata.pointer("/error/context").and_then(|value| {
+            serde_json::from_value::<crate::stats::ContextOverflowDiagnostics>(value.clone()).ok()
+        }) {
+            envelope["error"]["context"] =
+                serde_json::to_value(context).expect("context diagnostics");
+        }
+    }
+    if let Some(reason) = context_rejection_reason(message) {
+        envelope["error"]["upstream_reason"] = Value::String(reason.to_owned());
+    }
     enrich_error_envelope(&mut envelope, code, upstream_status, Some(request_id));
+    envelope
+}
+
+fn error_response(status: StatusCode, envelope: Value, request_id: &str) -> Response {
     let mut response = (status, axum::Json(envelope)).into_response();
     if matches!(
         status,
@@ -625,6 +890,175 @@ mod tests {
             .await
             .expect("body");
         serde_json::from_slice(&bytes).expect("json")
+    }
+
+    async fn body_sse_error(response: Response) -> Value {
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/event-stream"
+        );
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert_eq!(text.matches("event: error").count(), 1);
+        assert!(text.ends_with("\n\n"));
+        serde_json::from_str(
+            text.lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn stream_mode_requires_a_valid_request_and_keeps_auth_and_body_statuses() {
+        assert!(stream_requested(
+            br#"{"stream":true,"messages":[{"content":"large history"}]}"#
+        ));
+        for body in [
+            br#"{"stream":false}"#.as_slice(),
+            br#"{"stream":"true"}"#,
+            br#"{"stream":true"#,
+            br#"{}"#,
+        ] {
+            assert!(!stream_requested(body));
+        }
+        for status in [401, 403, 405, 413] {
+            assert!(!uses_sse_error(StatusCode::from_u16(status).unwrap()));
+        }
+    }
+
+    #[tokio::test]
+    async fn context_threshold_stream_error_survives_crs_with_recovery_and_trace() {
+        let mut envelope = error_envelope(
+            ErrorFormat::Claude,
+            400,
+            "Input content length exceeds threshold.",
+            Some("trace_old_999"),
+        );
+        envelope["error"]["stage"] = serde_json::json!("upstream_dispatch");
+        envelope["error"]["recovery"] = serde_json::json!("compaction_retry_failed");
+        envelope["error"]["upstream_reason"] =
+            serde_json::json!("CONTENT_LENGTH_EXCEEDS_THRESHOLD");
+        enrich_error_envelope(
+            &mut envelope,
+            "context_length_exceeded",
+            Some(400),
+            Some("trace_old_999"),
+        );
+        let response = Response::builder()
+            .status(400)
+            .header("x-crosslane-error-code", "context_length_exceeded")
+            .header("x-crosslane-account-error", "false")
+            .body(Body::from(envelope.to_string()))
+            .unwrap();
+        let adapted = adapt_claude_stream_response(response, "trace_current_123456").await;
+        assert_eq!(adapted.headers()["x-crosslane-error-status"], "400");
+        assert_eq!(adapted.headers()["x-crosslane-account-error"], "false");
+        let body = body_sse_error(adapted).await;
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["status"], 400);
+        assert_eq!(body["error"]["upstream_status"], 400);
+        assert_eq!(body["request_id"], "trace_current_123456");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.starts_with("prompt is too long: upstream input limit exceeded"));
+        assert!(message.contains("the exact limit was not reported"));
+        assert!(message.contains("Compaction was attempted, but the retry still failed"));
+        assert!(message.contains("Run /compact"));
+        assert!(message.contains("reason: CONTENT_LENGTH_EXCEEDS_THRESHOLD"));
+        assert!(message.contains("request ID: trace_current_123456"));
+        assert!(!message.contains("trace_old"));
+        assert_eq!(message.matches("[code:").count(), 1);
+        assert_eq!(body["error"]["retryable"], false);
+    }
+
+    #[tokio::test]
+    async fn stream_adapter_preserves_numeric_context_and_typed_diagnostics() {
+        let mut envelope = error_envelope(
+            ErrorFormat::Claude,
+            400,
+            "prompt is too long: 200001 tokens > 200000",
+            Some("trace_old_500999"),
+        );
+        envelope["error"]["context"] = serde_json::json!({
+            "total_input_tokens":200001, "protected_prefix_tokens":100, "tool_definition_tokens":200,
+            "current_message_tokens":1000, "history_tokens":198701, "overhead_tokens":0,
+            "minimum_input_tokens":1300, "maximum_input_tokens":200000
+        });
+        enrich_error_envelope(
+            &mut envelope,
+            "context_length_exceeded",
+            None,
+            Some("trace_old_500999"),
+        );
+        let response = Response::builder()
+            .status(400)
+            .header("x-crosslane-error-code", "context_length_exceeded")
+            .body(Body::from(envelope.to_string()))
+            .unwrap();
+        let body =
+            body_sse_error(adapt_claude_stream_response(response, "trace_new_123456").await).await;
+        assert_eq!(
+            body["error"]["detail"],
+            "prompt is too long: 200001 tokens > 200000"
+        );
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("prompt is too long: 200001 tokens > 200000"));
+        assert!(
+            body["error"].get("upstream_status").is_none(),
+            "local validation did not dispatch upstream"
+        );
+        assert_eq!(body["error"]["context"]["maximum_input_tokens"], 200000);
+    }
+
+    #[tokio::test]
+    async fn upstream_payload_stream_error_keeps_real_413_and_gateway_502() {
+        for (status, raw, code, client_status) in [
+            (413, "payload too large", "request_payload_exceeded", 400),
+            (502, "Internal Server Error", "upstream_unavailable", 502),
+        ] {
+            let response = Response::builder()
+                .status(status)
+                .body(Body::from(
+                    serde_json::json!({"error":{"message":raw}}).to_string(),
+                ))
+                .unwrap();
+            let body =
+                body_sse_error(adapt_claude_stream_response(response, "trace_failure").await).await;
+            assert_eq!(body["error"]["upstream_status"], status);
+            assert_eq!(body["error"]["status"], client_status);
+            assert_eq!(body["error"]["code"], code);
+            assert!(body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("request ID: trace_failure"));
+        }
+    }
+
+    #[tokio::test]
+    async fn rich_stream_errors_still_redact_credentials_and_ban_triggers() {
+        for raw in [
+            "account is disabled; Input content length exceeds threshold; ksk_private-credential",
+            "tool schema invalid: ksk_private-credential",
+        ] {
+            let response = Response::builder()
+                .status(400)
+                .body(Body::from(
+                    serde_json::json!({"error":{"message":raw,"code":"ksk_private-credential"}})
+                        .to_string(),
+                ))
+                .unwrap();
+            let body =
+                body_sse_error(adapt_claude_stream_response(response, "trace_redacted").await)
+                    .await;
+            let rendered = body.to_string();
+            assert!(!rendered.contains("ksk_private"));
+            assert!(!rendered.contains("account is disabled"));
+            assert!(body["error"]["message"].as_str().unwrap().chars().count() <= 1024);
+        }
     }
 
     #[tokio::test]
@@ -672,7 +1106,11 @@ mod tests {
         assert_eq!(adapted.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(adapted.headers()[header::CONTENT_TYPE], "application/json");
         let body = body_json(adapted).await;
-        assert_eq!(body["error"]["message"], "model is temporarily unavailable");
+        assert_eq!(body["error"]["detail"], "model is temporarily unavailable");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("request ID: trace_json_error"));
         assert_eq!(body["error"]["code"], "model_unavailable");
         assert_eq!(body["error"]["upstream_status"], 200);
         assert_eq!(body["request_id"], "trace_json_error");
@@ -691,7 +1129,7 @@ mod tests {
             let adapted = adapt_claude_response(response, "trace_mislabeled").await;
             assert_eq!(adapted.status(), StatusCode::BAD_GATEWAY);
             let body = body_json(adapted).await;
-            assert_eq!(body["error"]["message"], "model is not supported");
+            assert_eq!(body["error"]["detail"], "model is not supported");
             assert_eq!(body["error"]["upstream_status"], 200);
         }
     }
@@ -743,7 +1181,7 @@ mod tests {
         let adapted = adapt_claude_response(response, "trace_string_error").await;
         assert_eq!(adapted.status(), StatusCode::BAD_REQUEST);
         let body = body_json(adapted).await;
-        assert_eq!(body["error"]["message"], "model is not supported");
+        assert_eq!(body["error"]["detail"], "model is not supported");
     }
 
     #[tokio::test]
@@ -794,9 +1232,14 @@ mod tests {
         let body = body_json(adapted).await;
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(
-            body["error"]["message"],
+            body["error"]["detail"],
             "prompt is too long: 200001 tokens > 200000"
         );
+        assert_eq!(body["error"]["code"], "context_length_exceeded");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Run /compact"));
     }
 
     #[tokio::test]

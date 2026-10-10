@@ -53,11 +53,25 @@ async fn assert_hidden_and_rejected(daemon: &Daemon, port: u16, models: &[&str],
                     .unwrap();
                 assert_eq!(
                     response.status(),
-                    400,
+                    if cfg!(feature = "crs") && stream && endpoint == "/v1/messages" {
+                        200
+                    } else {
+                        400
+                    },
                     "{model} {endpoint} stream={stream}: {}",
                     response.text().await.unwrap()
                 );
                 let body = response.text().await.unwrap();
+                if cfg!(feature = "crs") && stream && endpoint == "/v1/messages" {
+                    let error: Value = serde_json::from_str(
+                        body.lines()
+                            .find_map(|line| line.strip_prefix("data: "))
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(error["error"]["status"], 400);
+                    assert_eq!(error["error"]["type"], "invalid_request_error");
+                }
                 assert!(
                     body.contains("model_disabled"),
                     "{model} {endpoint} stream={stream}: {body}"

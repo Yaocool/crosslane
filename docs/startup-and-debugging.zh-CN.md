@@ -222,6 +222,28 @@ CRS Console 和 OpenAI Responses 转发保留这些字段时即可使用，无�
 成功响应后保存在内存，最多 256 条、30 分钟；`store: false` 禁止保留。
 账号池调度、额度与按请求内容计算的 token 缓存继续使用原有策略。
 
+### Claude Relay Service 响应兼容
+
+Claude Messages 作为 CRS Console/CCR 上游时，使用
+`cargo build -p crosslaned --bin crosslaned --release --features crs` 构建。
+该 feature 对二进制中的所有 Claude Messages 监听服务生效，默认关闭。
+完整 Docker 镜像可使用
+`docker build --target runtime-full --build-arg CROSSLANED_FEATURES=crosslaned/sso,crosslaned/crs -t crosslane:crs .`；
+未指定此参数时，完整镜像只启用 `sso`。
+
+启用 `crs` 后，非流式请求的异常上游响应（包括 HTTP 200 错误对象）会转换为
+Anthropic 格式 JSON。普通上游 400/413 转为 HTTP 502，可明确修正的请求错误保留 HTTP 400。
+
+CRS Console 会把非 200 错误体替换为固定文案。有效请求设置 `stream: true` 时，
+Crosslane 对 400、404、408、422、429 和 5xx 使用 HTTP 200 加 SSE `event: error`。
+客户端认证、方法和 HTTP 请求体限制错误保留原有 HTTP 状态。服务端检查最初最多
+64 KiB 或五秒的 SSE 事件，也会规范化已经开始输出助手内容后的错误。
+
+错误保留 `error.status`、已知的真实 `error.upstream_status`、稳定的 `error.code` 和
+`request_id`；流开始前的 SSE 错误还带有 `x-crosslane-error-status`。
+文案包含操作建议、失败阶段和请求 ID；上下文错误保留已知 token 数量，并在压缩重试
+失败时说明恢复结果。请求统计分别记录业务失败状态和客户端 HTTP 200 传输状态。
+
 ## 备份与恢复
 
 升级或修改可能影响数据的配置前先备份。标准 Docker 部署可停止写入后复制数据目录：

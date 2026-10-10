@@ -266,14 +266,23 @@ For a full Docker image with this compatibility enabled, build with
 `docker build --target runtime-full --build-arg CROSSLANED_FEATURES=crosslaned/sso,crosslaned/crs -t crosslane:crs .`.
 The full image enables `sso` without `crs` unless this build argument is set.
 
-With `crs` enabled, Crosslane returns Anthropic-shaped JSON for abnormal upstream HTTP errors,
-including HTTP 200 responses whose body is an error object. It keeps the original upstream status
-in `error.upstream_status` and includes a stable `error.code` and `request_id` in the body. Generic
-upstream 400/413 responses become HTTP 502; actionable request errors remain HTTP 400. For
-streaming responses, Crosslane checks up to 64 KiB or five seconds of the initial SSE events
-before committing HTTP 200. An error or incomplete stream in that prelude becomes a non-200 JSON
-response that CRS can forward. Once assistant content has started, errors remain SSE `event: error`
-with a code and request ID; a later transport failure is converted to that event.
+With `crs` enabled, non-streaming requests receive Anthropic-shaped JSON for abnormal
+upstream responses, including HTTP 200 error objects. Generic upstream 400/413
+responses become HTTP 502; actionable request errors remain HTTP 400.
+
+CRS Console replaces non-200 error bodies with fixed messages. For valid requests
+with `stream: true`, Crosslane therefore returns HTTP 200 and an SSE `event: error`
+for error statuses 400, 404, 408, 422, 429, and 5xx. Client
+authentication, method, and HTTP body-limit failures retain their HTTP statuses.
+Crosslane checks up to 64 KiB or five seconds of initial SSE events and also
+normalizes failures after assistant content starts.
+
+Errors retain their semantic status in `error.status`, the real upstream status
+in `error.upstream_status` when known, and a stable `error.code` and `request_id`.
+An early SSE error also includes `x-crosslane-error-status`. Messages include an
+action hint, failure stage, and request ID; context errors preserve known token
+counts and report a failed compaction retry when applicable. Request statistics
+retain the failure status separately from the HTTP 200 client transport status.
 
 | Symptom | First checks |
 | --- | --- |

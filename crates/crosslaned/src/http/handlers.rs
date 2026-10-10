@@ -2393,6 +2393,8 @@ struct ApiError {
     account_error: bool,
     context_overflow: Option<Box<crate::stats::ContextOverflowDiagnostics>>,
     client_context: Option<Box<ClientContext>>,
+    #[cfg(feature = "crs")]
+    compaction_retried: bool,
 }
 
 impl ApiError {
@@ -2416,6 +2418,8 @@ impl ApiError {
             account_error: false,
             context_overflow: None,
             client_context: None,
+            #[cfg(feature = "crs")]
+            compaction_retried: false,
         }
     }
 
@@ -2496,17 +2500,24 @@ impl IntoResponse for ApiError {
             &self.message,
             self.request_id.as_deref(),
         );
+        if let Some(context) = &self.context_overflow {
+            envelope["error"]["context"] = json!(context);
+        }
         #[cfg(feature = "crs")]
         if self.format == ErrorFormat::Claude {
+            envelope["error"]["stage"] = json!(self.error_stage);
+            if let Some(reason) = super::crs::context_rejection_reason(&self.message) {
+                envelope["error"]["upstream_reason"] = json!(reason);
+            }
+            if self.compaction_retried {
+                envelope["error"]["recovery"] = json!("compaction_retry_failed");
+            }
             super::crs::enrich_error_envelope(
                 &mut envelope,
                 self.error_code,
                 self.upstream_status,
                 self.request_id.as_deref(),
             );
-        }
-        if let Some(context) = &self.context_overflow {
-            envelope["error"]["context"] = json!(context);
         }
         let mut response = (status, Json(envelope)).into_response();
         if let Some(request_id) = self.request_id.as_deref() {

@@ -100,7 +100,7 @@ async fn upstream_context_error_variants_compact_without_a_client_trigger() {
 #[tokio::test]
 async fn context_recovery_respects_disable_and_stops_after_one_retry() {
     let _http_guard = HTTP_TEST_LOCK.lock().await;
-    for automatic in [false, true] {
+    for (automatic, stream) in [(false, false), (true, false), (false, true), (true, true)] {
         let mock = MockServer::start().await;
         mount_context_alignment_models(&mock).await;
         let main_calls = Arc::new(AtomicUsize::new(0));
@@ -121,8 +121,10 @@ async fn context_recovery_respects_disable_and_stops_after_one_retry() {
                         ))
                 } else {
                     calls.fetch_add(1, Ordering::SeqCst);
-                    ResponseTemplate::new(400)
-                        .set_body_json(json!({"reason":"CONTEXT_LENGTH_EXCEEDED"}))
+                    ResponseTemplate::new(400).set_body_json(json!({
+                        "message":"Input content length exceeds threshold.",
+                        "reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"
+                    }))
                 }
             })
             .mount(&mock)
@@ -146,7 +148,7 @@ async fn context_recovery_respects_disable_and_stops_after_one_retry() {
             .header("x-api-key", daemon.api_key.as_deref().unwrap())
             .header("user-agent", "claude-cli/2.1.260 (external, e2e)")
             .json(&json!({
-                "model":"source-large", "max_tokens":64,
+                "model":"source-large", "max_tokens":64, "stream":stream,
                 "messages":[
                     {"role":"user","content":"earlier context ".repeat(2_000)},
                     {"role":"assistant","content":"Keep the earlier decision"},
@@ -156,21 +158,80 @@ async fn context_recovery_respects_disable_and_stops_after_one_retry() {
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        let sse_error = cfg!(feature = "crs") && stream;
+        assert_eq!(
+            response.status(),
+            if sse_error {
+                reqwest::StatusCode::OK
+            } else {
+                reqwest::StatusCode::BAD_REQUEST
+            }
+        );
         assert_eq!(
             response.headers()["x-crosslane-error-code"],
             "context_length_exceeded"
         );
         assert_eq!(response.headers()["x-crosslane-account-error"], "false");
-        let body: Value = response.json().await.unwrap();
+        let trace_id = response.headers()["request-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let text = response.text().await.unwrap();
+        let body: Value = if sse_error {
+            assert_eq!(text.matches("event: error").count(), 1);
+            serde_json::from_str(
+                text.lines()
+                    .find_map(|line| line.strip_prefix("data: "))
+                    .unwrap(),
+            )
+            .unwrap()
+        } else {
+            serde_json::from_str(&text).unwrap()
+        };
+        #[cfg(not(feature = "crs"))]
         assert_eq!(
             body["error"]["message"],
             "prompt is too long: context length exceeded"
         );
+        #[cfg(feature = "crs")]
+        {
+            let message = body["error"]["message"].as_str().unwrap();
+            assert!(message.contains("upstream input limit exceeded"));
+            assert!(message.contains("the exact limit was not reported"));
+            assert!(message.contains("Run /compact"));
+            assert!(message.contains(&format!("request ID: {trace_id}")));
+            assert_eq!(
+                body["error"]["upstream_reason"],
+                "CONTENT_LENGTH_EXCEEDS_THRESHOLD"
+            );
+            assert_eq!(body["error"]["stage"], "upstream_dispatch");
+            assert_eq!(body["error"]["upstream_status"], 400);
+            assert_eq!(message.contains("Compaction was attempted"), automatic);
+            assert_eq!(body["error"]["retryable"], false);
+        }
+        assert_eq!(body["request_id"], trace_id);
         assert_eq!(
             main_calls.load(Ordering::SeqCst),
             if automatic { 2 } else { 1 }
         );
+        let stats = expect_ok(
+            daemon
+                .call("stats", json!({"detail":true,"recent":10}))
+                .await,
+        );
+        let recorded = stats["stats"]["recent_requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|request| request["trace_id"] == trace_id && request["path"] == "/v1/messages")
+            .expect("correlated request record");
+        assert_eq!(recorded["status"], 400);
+        assert_eq!(
+            recorded["diagnostics"]["client_status"],
+            if sse_error { 200 } else { 400 }
+        );
+        assert_eq!(recorded["diagnostics"]["upstream_status"], 400);
+        assert_eq!(recorded["diagnostics"]["account_error"], false);
         daemon.stop().await;
     }
 }
@@ -346,7 +407,15 @@ async fn byte_overflow_compacts_history_before_admission_and_preserves_hard_limi
                 .to_string()
                 .contains("Keep the governing instruction."));
         } else {
-            assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(
+                status,
+                if cfg!(feature = "crs") && stream {
+                    reqwest::StatusCode::OK
+                } else {
+                    reqwest::StatusCode::BAD_REQUEST
+                },
+                "{body}"
+            );
             assert!(
                 body.contains("translated upstream payload is too large"),
                 "{body}"

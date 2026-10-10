@@ -972,7 +972,13 @@ async fn handle_claude_with_context(
                 }
                 Err(mut retry_error) => {
                     prepend_execute_error_attempts(&mut retry_error, previous_attempts);
-                    return Err(upstream_error(retry_error, ErrorFormat::Claude));
+                    let error = upstream_error(retry_error, ErrorFormat::Claude);
+                    #[cfg(feature = "crs")]
+                    let error = ApiError {
+                        compaction_retried: true,
+                        ..error
+                    };
+                    return Err(error);
                 }
             };
             (execution, reservation)

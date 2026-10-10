@@ -201,8 +201,12 @@ fn classified_stream_errors_include_stable_code_and_request_id_without_done() {
     assert!(claude.contains("\"code\":\"upstream_unavailable\""));
     assert!(claude.contains("\"request_id\":\"req_test\""));
     #[cfg(feature = "crs")]
-    assert!(claude
-        .contains("Upstream request failed (code: upstream_unavailable, request ID: req_test)"));
+    {
+        assert!(claude.contains("The service could not complete this request"));
+        assert!(claude.contains("upstream HTTP 503"));
+        assert!(claude.contains("stage: upstream_stream"));
+        assert!(claude.contains("request ID: req_test"));
+    }
 
     let openai = classified_stream_error(
         &StreamProtocol::OpenAi,
