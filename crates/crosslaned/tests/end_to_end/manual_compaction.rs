@@ -157,6 +157,172 @@ async fn manual_compact_after_an_oversized_tool_result_reaches_the_summary_model
 }
 
 #[tokio::test]
+async fn client_summary_input_threshold_rejection_partitions_complete_source_and_retries() {
+    let _http_guard = HTTP_TEST_LOCK.lock().await;
+    let tool_result = format!(
+        "EARLY=cobalt-731\n{}\nMIDDLE=mango-482\n{}\nLATE=spruce-956",
+        "tool output record\n".repeat(85_000),
+        "tool output record\n".repeat(85_000),
+    );
+    let prompt =
+        format!("CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\n{COMPACT_PROMPT}");
+    for (stream, automatic) in [(false, false), (true, true)] {
+        let request = json!({
+            "model":"source-large", "max_tokens":1024, "stream":stream,
+            "system":"Preserve all governing requirements and exact identifiers.",
+            "tools":[{"name":"Read", "input_schema":{"type":"object",
+                "properties":{"path":{"type":"string"}}, "required":["path"],
+                "additionalProperties":false}}],
+            "messages":[
+                {"role":"user","content":"Read the complete records"},
+                {"role":"assistant","content":[{"type":"tool_use","id":"read-1","name":"Read","input":{"path":"approved.txt"}}]},
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"read-1","content":tool_result},
+                    {"type":"text","text":prompt}
+                ]}
+            ]
+        });
+        assert!(serde_json::to_vec(&request).unwrap().len() > 3 * 1024 * 1024);
+        let payloads = assert_client_summary_threshold_recovery(request, automatic).await;
+        let tokenizer = crosslane_translate::TokenCountCache::new(16).unwrap();
+        let initial = &payloads[0];
+        let initial_tokens = tokenizer.estimate_kiro_payload(initial).await.unwrap();
+        assert!(
+            initial_tokens > 200_000 && initial_tokens < 950_000,
+            "the published 1M window must admit the initial request"
+        );
+        assert!(serde_json::to_vec(initial).unwrap().len() < 8 * 1024 * 1024);
+        let mut parts: Vec<_> = payloads[1..payloads.len() - 1].iter().collect();
+        assert!(parts.len() > 1, "recovery must use partitioned summaries");
+        parts.sort_by_key(|payload| {
+            payload
+                .conversation_state
+                .conversation_id
+                .rsplit_once("-part-")
+                .unwrap()
+                .1
+                .parse::<usize>()
+                .unwrap()
+        });
+        let mut transcript = String::new();
+        let mut source_tool_call_found = false;
+        for part in parts {
+            assert!(tokenizer.estimate_kiro_payload(part).await.unwrap() <= 148_500);
+            for message in &part.conversation_state.history {
+                if let Some(user) = &message.user_input_message {
+                    transcript.push_str(&user.content);
+                }
+                if let Some(assistant) = &message.assistant_response_message {
+                    source_tool_call_found |= assistant.content.contains("approved.txt");
+                }
+            }
+        }
+        assert!(
+            transcript.contains(&tool_result),
+            "recovery lost source text"
+        );
+        assert!(transcript.contains("Preserve all governing requirements and exact identifiers."));
+        assert!(transcript.contains("additionalProperties"));
+        assert!(
+            source_tool_call_found,
+            "recovery lost the original tool call"
+        );
+        let retried = payloads.last().unwrap();
+        assert!(tokenizer.estimate_kiro_payload(retried).await.unwrap() <= 190_000);
+        assert_eq!(
+            retried
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content,
+            prompt,
+            "the client summary instruction must survive recovery"
+        );
+    }
+}
+
+async fn assert_client_summary_threshold_recovery(
+    request: Value,
+    automatic: bool,
+) -> Vec<crosslane_translate::KiroPayload> {
+    let mock = MockServer::start().await;
+    mount_context_alignment_models(&mock).await;
+    let main_calls = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::clone(&main_calls);
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(move |request: &wiremock::Request| {
+            let payload: Value = serde_json::from_slice(&request.body).unwrap();
+            let current = payload["conversationState"]["currentMessage"]["userInputMessage"]
+                ["content"]
+                .as_str()
+                .unwrap();
+            if !current.contains("durable conversation checkpoint")
+                && calls.fetch_add(1, Ordering::SeqCst) == 0
+            {
+                return ResponseTemplate::new(400).set_body_json(json!({
+                    "message":"Input content length exceeds threshold.",
+                    "reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"
+                }));
+            }
+            summary_response(request)
+        })
+        .mount(&mock)
+        .await;
+    let port = unused_tcp_port();
+    let daemon =
+        Daemon::start_http(port, &format!("{}/generateAssistantResponse", mock.uri())).await;
+    import_context_alignment_account(&daemon, 0.0).await;
+    let config_path = daemon.home().join("config.toml");
+    let mut config: Config =
+        toml::from_str(&tokio::fs::read_to_string(&config_path).await.unwrap()).unwrap();
+    config.context.auto_compact_on_overflow = automatic;
+    config.pool.max_concurrent_per_account = 1;
+    tokio::fs::write(&config_path, toml::to_string(&config).unwrap())
+        .await
+        .unwrap();
+    expect_ok(daemon.call("config.reload", json!({})).await);
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .unwrap()
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .header("x-api-key", daemon.api_key.as_deref().unwrap())
+        .header(
+            "user-agent",
+            "claude-cli/2.1.283 (external, claude-vscode, agent-sdk/0.3.283)",
+        )
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+    if request["stream"] == true {
+        assert!(body.contains("\"type\":\"compaction\""), "{body}");
+        assert!(body.contains(CLIENT_SUMMARY), "{body}");
+        assert!(body.contains("\"type\":\"message_stop\""), "{body}");
+        assert!(!body.contains("\"type\":\"error\""), "{body}");
+    } else {
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["content"][0]["type"], "compaction");
+        assert_eq!(body["content"][1]["text"], CLIENT_SUMMARY);
+    }
+    assert_eq!(main_calls.load(Ordering::SeqCst), 2, "one recovery retry");
+    let payloads = mock
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|request| request.url.path() == "/generateAssistantResponse")
+        .map(|request| serde_json::from_slice(&request.body).unwrap())
+        .collect();
+    daemon.stop().await;
+    payloads
+}
+
+#[tokio::test]
 async fn manual_compact_partitions_oversized_system_and_tool_definitions() {
     let _http_guard = HTTP_TEST_LOCK.lock().await;
     let mock = MockServer::start().await;

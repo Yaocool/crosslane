@@ -7,6 +7,8 @@ async fn upstream_context_error_variants_compact_without_a_client_trigger() {
     for rejection in [
         "CONTEXT_LENGTH_EXCEEDED",
         "INPUT_TOO_LONG",
+        "CONTENT_LENGTH_EXCEEDS_THRESHOLD",
+        "Input content length exceeds threshold.",
         "The context window has been exceeded",
     ] {
         for stream in [false, true] {

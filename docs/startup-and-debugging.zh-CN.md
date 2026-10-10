@@ -200,6 +200,11 @@ Tool Search 先预估压缩历史后的工具加载空间，再检查包含新�
 日志中的 `payload_budget_overflow`、`pending_server_tools_payload_overflow` 和
 `tool_search_continuation_overflow` 可用于确认压缩触发位置。
 
+Kiro 返回 `CONTENT_LENGTH_EXCEEDS_THRESHOLD` 或 `Input content length exceeds threshold`
+时，即使本地估算未超过模型公布的窗口，也会进入上下文恢复流程。自动恢复只重试一次；
+客户端主动请求摘要时，关闭自动压缩仍可恢复。摘要恢复会分段处理完整原文，并保留客户端
+摘要指令。该上游错误没有报告准确的 token 限制，也不会被当作账号故障。
+
 ### 客户端与会话归属
 
 所有构建都支持客户端识别，无需启用 `crs` feature。Claude Code 从旧格式或 JSON 字符串格式的

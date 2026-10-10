@@ -84,6 +84,8 @@ fn stream_failures_keep_real_upstream_status_and_account_scope() {
     for rejection in [
         "CONTEXT_LENGTH_EXCEEDED",
         "INPUT_TOO_LONG",
+        "CONTENT_LENGTH_EXCEEDS_THRESHOLD",
+        "Input content length exceeds threshold.",
         "The context window has been exceeded",
     ] {
         let failure = classify_stream_failure(

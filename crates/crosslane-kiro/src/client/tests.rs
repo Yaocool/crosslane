@@ -1244,6 +1244,8 @@ fn context_overflow_codes_and_window_errors_are_recoverable() {
     for message in [
         r#"{"reason":"CONTEXT_LENGTH_EXCEEDED","message":"ValidationException"}"#,
         r#"{"reason":"INPUT_TOO_LONG"}"#,
+        r#"{"message":"Input content length exceeds threshold.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#,
+        "Input content length exceeds threshold.",
         "The context window has been exceeded",
     ] {
         let error = KiroError {

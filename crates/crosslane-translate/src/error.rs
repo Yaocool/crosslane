@@ -18,6 +18,10 @@ pub fn is_context_length_error(message: &str) -> bool {
         "context_length_exceeded",
         "input is too long",
         "input_too_long",
+        // Kiro can reject input that passes local token and byte checks.
+        // Both forms must enter the same compaction recovery path.
+        "content_length_exceeds_threshold",
+        "input content length exceeds threshold",
         "maximum context",
     ]
     .iter()
@@ -369,6 +373,8 @@ mod tests {
         for message in [
             r#"{"reason":"CONTEXT_LENGTH_EXCEEDED","message":"ValidationException"}"#,
             r#"{"reason":"INPUT_TOO_LONG"}"#,
+            r#"{"message":"Input content length exceeds threshold.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#,
+            "Input content length exceeds threshold.",
             "The context window has been exceeded",
         ] {
             assert!(is_context_length_error(message), "{message}");
@@ -379,6 +385,7 @@ mod tests {
         }
         for message in [
             "request body size exceeds the 8 MiB limit",
+            "HTTP Content-Length exceeds the configured body limit",
             "ValidationException: tool schema request too large",
         ] {
             assert!(!is_context_length_error(message), "{message}");

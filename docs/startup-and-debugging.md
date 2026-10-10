@@ -224,6 +224,13 @@ compaction preserves limit rejection. Compaction logs identify the stage with
 `payload_budget_overflow`, `pending_server_tools_payload_overflow`, or
 `tool_search_continuation_overflow`.
 
+Kiro's `CONTENT_LENGTH_EXCEEDS_THRESHOLD` and `Input content length exceeds threshold`
+errors also trigger context recovery, even when local estimates fit the advertised
+window. Automatic recovery retries once; client-requested summaries can recover
+with automatic compaction disabled. Summary recovery partitions the complete
+source and preserves the client's summary instruction. The upstream error does
+not report an exact token limit and is not treated as an account failure.
+
 ### Anonymous client and conversation attribution
 
 Client context is available in every build, independently of the `crs` feature.
