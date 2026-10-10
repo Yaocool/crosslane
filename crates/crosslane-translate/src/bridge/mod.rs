@@ -7,10 +7,12 @@
 mod request;
 mod response;
 mod stream;
+mod tools;
 
 pub use request::translate_request;
 pub use response::{translate_error, translate_response};
 pub use stream::StreamBridge;
+pub use tools::ToolNames;
 
 use crosslane_core::provider::ProviderProtocol;
 use serde_json::{json, Value};

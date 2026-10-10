@@ -1978,6 +1978,14 @@ impl CopilotProvider {
                     request.protocol,
                     prepared.streaming,
                     &request.model,
+                    if request.protocol == ProviderProtocol::OpenAiResponses {
+                        let body: Value = serde_json::from_slice(&request.body)
+                            .map_err(|error| internal_error(error.to_string()))?;
+                        crosslane_translate::bridge::ToolNames::for_responses(&body)
+                            .map_err(|error| internal_error(error.to_string()))?
+                    } else {
+                        Default::default()
+                    },
                 )
                 .await;
             }

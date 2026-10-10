@@ -19,6 +19,7 @@ pub struct StreamBridge {
     finished: bool,
     sequence: u64,
     received_bytes: usize,
+    tool_names: super::ToolNames,
 }
 
 impl StreamBridge {
@@ -35,7 +36,13 @@ impl StreamBridge {
             finished: false,
             sequence: 0,
             received_bytes: 0,
+            tool_names: Default::default(),
         }
+    }
+
+    pub fn with_tool_names(mut self, names: super::ToolNames) -> Self {
+        self.tool_names = names;
+        self
     }
 
     pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<Vec<u8>>, BridgeError> {
@@ -153,6 +160,9 @@ impl StreamBridge {
     }
 
     fn frame(&mut self, mut value: Value, event: Option<&str>) -> Vec<u8> {
+        if self.to == ProviderProtocol::OpenAiResponses {
+            self.tool_names.restore(&mut value);
+        }
         if value.get("usage").is_some() && !self.state.usage.reported {
             value["crosslane_usage_source"] = json!("unreported");
         }

@@ -3,7 +3,7 @@ use crosslane_core::provider::ProviderProtocol;
 use crosslane_provider::{
     ProviderError, ProviderErrorKind, ProviderResponse, ProviderResponseBody,
 };
-use crosslane_translate::bridge::{translate_error, translate_response, StreamBridge};
+use crosslane_translate::bridge::{translate_error, translate_response, StreamBridge, ToolNames};
 use futures::StreamExt;
 use http::{HeaderValue, StatusCode};
 
@@ -13,6 +13,7 @@ pub(super) async fn adapt_response(
     to: ProviderProtocol,
     streaming: bool,
     model: &str,
+    tool_names: ToolNames,
 ) -> Result<ProviderResponse, ProviderError> {
     let is_sse = response
         .headers
@@ -26,7 +27,7 @@ pub(super) async fn adapt_response(
     response.headers.remove("content-length");
     response.headers.remove("content-encoding");
     if streaming && response.status.is_success() && is_sse {
-        let mut bridge = StreamBridge::new(from, to, model);
+        let mut bridge = StreamBridge::new(from, to, model).with_tool_names(tool_names);
         let stream = async_stream::stream! {
             let mut failed = false;
             while let Some(chunk) = upstream.next().await {
@@ -76,12 +77,15 @@ pub(super) async fn adapt_response(
         if response.status.is_success() && value.is_object() && value.get("model").is_none() {
             value["model"] = serde_json::json!(model);
         }
-        let value = if response.status.is_success() {
+        let mut value = if response.status.is_success() {
             translate_response(&value, from, to)
                 .map_err(|error| upstream_error(error.to_string()))?
         } else {
             translate_error(&value, to)
         };
+        if to == ProviderProtocol::OpenAiResponses {
+            tool_names.restore(&mut value);
+        }
         response
             .headers
             .insert("content-type", HeaderValue::from_static("application/json"));

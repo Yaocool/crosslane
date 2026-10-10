@@ -231,6 +231,7 @@ fn responses_content_to_chat(content: &Value) -> Result<Value, BridgeError> {
 }
 
 fn responses_to_chat(body: &Value) -> Result<Value, BridgeError> {
+    let names = super::ToolNames::for_responses(body)?;
     for field in ["previous_response_id", "conversation"] {
         if body.get(field).is_some_and(|v| !v.is_null()) {
             return Err(invalid(format!("{field} requires native Responses support; send the complete input history for this model")));
@@ -256,7 +257,7 @@ fn responses_to_chat(body: &Value) -> Result<Value, BridgeError> {
                     messages.push(json!({"role":item["role"],"content":content}));
                 }
                 "function_call" => {
-                    let tool = json!({"id":item["call_id"],"type":"function","function":{"name":item["name"],"arguments":item["arguments"]}});
+                    let tool = json!({"id":item["call_id"],"type":"function","function":{"name":names.upstream_name(item),"arguments":item["arguments"]}});
                     if let Some(previous) = messages
                         .last_mut()
                         .filter(|previous| previous["role"] == "assistant")
@@ -322,7 +323,19 @@ fn responses_to_chat(body: &Value) -> Result<Value, BridgeError> {
         ],
     );
     if let Some(tools) = body.get("tools") {
-        output["tools"] = json!(array(tools)
+        let mut flattened = Vec::new();
+        for tool in array(tools) {
+            if tool["type"] == "namespace" {
+                for child in array(&tool["tools"]) {
+                    let mut child = child.clone();
+                    child["namespace"] = tool["name"].clone();
+                    flattened.push(child);
+                }
+            } else {
+                flattened.push(tool.clone());
+            }
+        }
+        output["tools"] = json!(flattened
             .iter()
             .map(|tool| {
                 if tool["type"] != "function" {
@@ -332,15 +345,55 @@ fn responses_to_chat(body: &Value) -> Result<Value, BridgeError> {
                 }
                 let mut function = tool.clone();
                 function.as_object_mut().unwrap().remove("type");
+                function.as_object_mut().unwrap().remove("namespace");
+                function["name"] = json!(names.upstream_name(tool));
                 Ok(json!({"type":"function","function":function}))
             })
             .collect::<Result<Vec<_>, BridgeError>>()?);
     }
-    if let Some(choice) = body.get("tool_choice") {
-        output["tool_choice"] = if choice["type"] == "function" {
-            json!({"type":"function","function":{"name":choice["name"]}})
-        } else {
-            choice.clone()
+    if let Some(choice) = body.get("tool_choice").filter(|choice| !choice.is_null()) {
+        output["tool_choice"] = match choice["type"].as_str() {
+            Some("function") => {
+                json!({"type":"function","function":{"name":names.upstream_name(choice)}})
+            }
+            Some("auto" | "none" | "required") => choice["type"].clone(),
+            Some("allowed_tools") => {
+                let allowed = choice.get("allowed_tools").unwrap_or(choice);
+                let mode = string(&allowed["mode"]);
+                if !matches!(mode, "auto" | "required") || !allowed["tools"].is_array() {
+                    return Err(invalid(
+                        "allowed_tools requires mode auto or required and a tools array",
+                    ));
+                }
+                let selected = array(&allowed["tools"])
+                    .iter()
+                    .map(|tool| names.upstream_name(tool))
+                    .collect::<std::collections::HashSet<_>>();
+                let tools = output["tools"]
+                    .as_array_mut()
+                    .ok_or_else(|| invalid("allowed_tools requires tool definitions"))?;
+                if selected.iter().any(|name| {
+                    !tools
+                        .iter()
+                        .any(|tool| tool["function"]["name"] == name.as_str())
+                }) {
+                    return Err(invalid("allowed_tools references an unknown function"));
+                }
+                tools.retain(|tool| {
+                    tool["function"]["name"]
+                        .as_str()
+                        .is_some_and(|name| selected.contains(name))
+                });
+                if tools.is_empty() {
+                    if mode == "required" {
+                        return Err(invalid("required allowed_tools must not be empty"));
+                    }
+                    json!("none")
+                } else {
+                    json!(mode)
+                }
+            }
+            _ => choice.clone(),
         };
     }
     Ok(output)
@@ -488,7 +541,7 @@ fn chat_to_messages(body: &Value, max_output_tokens: Option<u64>) -> Result<Valu
             })
             .collect::<Result<Vec<_>, BridgeError>>()?);
     }
-    if let Some(choice) = body.get("tool_choice") {
+    if let Some(choice) = body.get("tool_choice").filter(|choice| !choice.is_null()) {
         output["tool_choice"] = match choice.as_str() {
             Some("required") => json!({"type":"any"}),
             Some(other) => json!({"type":other}),

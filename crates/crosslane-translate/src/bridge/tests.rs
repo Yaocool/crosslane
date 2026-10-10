@@ -533,3 +533,160 @@ fn parallel_tool_outputs_are_merged_into_one_anthropic_user_turn() {
     assert_eq!(value["messages"][1]["content"].as_array().unwrap().len(), 2);
     assert_eq!(value["max_tokens"], 1024);
 }
+
+#[test]
+fn namespaces_survive_forced_calls_history_and_fragmented_streams() {
+    let mut request = json!({"model":"test","input":"read", "tools":[
+        {"type":"namespace","name":"a.b","tools":[{"type":"function","name":"read","parameters":{"type":"object"}}]},
+        {"type":"namespace","name":"a_b","tools":[{"type":"function","name":"read","parameters":{"type":"object"}}]}
+    ],"tool_choice":{"type":"function","namespace":"a.b","name":"read"}});
+    let names = ToolNames::for_responses(&request).unwrap();
+    for protocol in [
+        ProviderProtocol::OpenAiChat,
+        ProviderProtocol::ClaudeMessages,
+    ] {
+        let converted = translate_request(
+            &request,
+            ProviderProtocol::OpenAiResponses,
+            protocol,
+            Some(2048),
+        )
+        .unwrap();
+        let upstream = if protocol == ProviderProtocol::OpenAiChat {
+            converted["tools"][0]["function"]["name"].as_str().unwrap()
+        } else {
+            converted["tools"][0]["name"].as_str().unwrap()
+        };
+        let other = if protocol == ProviderProtocol::OpenAiChat {
+            &converted["tools"][1]["function"]["name"]
+        } else {
+            &converted["tools"][1]["name"]
+        };
+        assert_ne!(json!(upstream), *other);
+        let choice = if protocol == ProviderProtocol::OpenAiChat {
+            &converted["tool_choice"]["function"]["name"]
+        } else {
+            &converted["tool_choice"]["name"]
+        };
+        assert_eq!(choice, &json!(upstream));
+        let chunks = if protocol == ProviderProtocol::OpenAiChat {
+            vec![
+                json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":upstream,"arguments":"{}"}}]}}]}),
+                json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
+            ]
+        } else {
+            vec![
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_1","name":upstream,"input":{}}}),
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}),
+                json!({"type":"content_block_stop","index":0}),
+                json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}),
+                json!({"type":"message_stop"}),
+            ]
+        };
+        let mut wire = chunks
+            .iter()
+            .map(|chunk| format!("data: {chunk}\n\n"))
+            .collect::<String>();
+        if protocol == ProviderProtocol::OpenAiChat {
+            wire.push_str("data: [DONE]\n\n");
+        }
+        let mut bridge = StreamBridge::new(protocol, ProviderProtocol::OpenAiResponses, "test")
+            .with_tool_names(names.clone());
+        let mut frames = Vec::new();
+        for fragment in wire.as_bytes().chunks(7) {
+            frames.extend(bridge.push(fragment).unwrap());
+        }
+        frames.extend(bridge.finish().unwrap());
+        let events = events(&frames);
+        for event in events
+            .iter()
+            .filter(|event| event["item"]["type"] == "function_call")
+        {
+            assert_eq!(event["item"]["name"], "read");
+            assert_eq!(event["item"]["namespace"], "a.b");
+        }
+        let terminal = events
+            .iter()
+            .find(|event| event["type"] == "response.completed")
+            .unwrap();
+        assert_eq!(terminal["response"]["output"][0]["namespace"], "a.b");
+        request["input"] = json!([{"type":"function_call","call_id":"call_1","name":"read","namespace":"a.b","arguments":"{}"},{"type":"function_call_output","call_id":"call_1","output":"done"}]);
+        let history = translate_request(
+            &request,
+            ProviderProtocol::OpenAiResponses,
+            protocol,
+            Some(2048),
+        )
+        .unwrap();
+        let history_name = if protocol == ProviderProtocol::OpenAiChat {
+            &history["messages"][0]["tool_calls"][0]["function"]["name"]
+        } else {
+            &history["messages"][0]["content"][0]["name"]
+        };
+        assert_eq!(history_name, &json!(upstream));
+    }
+}
+
+#[test]
+fn responses_choices_keep_defaults_and_namespace_restrictions() {
+    let mut request = json!({"model":"test","input":"read", "tools":[
+        {"type":"namespace","name":"files","tools":[{"type":"function","name":"read","parameters":{"type":"object"}}]},
+        {"type":"function","name":"other","parameters":{"type":"object"}}
+    ]});
+    for protocol in [
+        ProviderProtocol::OpenAiChat,
+        ProviderProtocol::ClaudeMessages,
+    ] {
+        request["tool_choice"] = Value::Null;
+        let converted = translate_request(
+            &request,
+            ProviderProtocol::OpenAiResponses,
+            protocol,
+            Some(2048),
+        )
+        .unwrap();
+        assert!(converted.get("tool_choice").is_none());
+        request["tool_choice"] = json!({"type":"auto"});
+        let converted = translate_request(
+            &request,
+            ProviderProtocol::OpenAiResponses,
+            protocol,
+            Some(2048),
+        )
+        .unwrap();
+        assert_eq!(
+            converted["tool_choice"],
+            if protocol == ProviderProtocol::OpenAiChat {
+                json!("auto")
+            } else {
+                json!({"type":"auto"})
+            }
+        );
+        request["tool_choice"] = json!({"type":"allowed_tools","mode":"required","tools":[{"type":"function","namespace":"files","name":"read"}]});
+        let converted = translate_request(
+            &request,
+            ProviderProtocol::OpenAiResponses,
+            protocol,
+            Some(2048),
+        )
+        .unwrap();
+        assert_eq!(converted["tools"].as_array().unwrap().len(), 1);
+        assert!(!converted["tools"].to_string().contains("other"));
+        assert_eq!(
+            converted["tool_choice"],
+            if protocol == ProviderProtocol::OpenAiChat {
+                json!("required")
+            } else {
+                json!({"type":"any"})
+            }
+        );
+        request["tool_choice"] = json!({"type":"allowed_tools","mode":"required","tools":[{"type":"function","name":"unknown"}]});
+        assert!(translate_request(
+            &request,
+            ProviderProtocol::OpenAiResponses,
+            protocol,
+            Some(2048)
+        )
+        .is_err());
+    }
+}
