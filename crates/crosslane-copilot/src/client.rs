@@ -2332,6 +2332,15 @@ fn prepare_provider_request(
         .unwrap_or(false);
     let vision = object.values().any(contains_image_content);
     if request.model.starts_with("claude-") {
+        if object
+            .get("thinking")
+            .and_then(|thinking| thinking.get("display"))
+            .is_some_and(|value| value == "updates")
+        {
+            // Copilot does not implement the progress-summary beta. Preserve
+            // thinking and expose its supported summarized representation.
+            object.get_mut("thinking").unwrap()["display"] = Value::String("summarized".into());
+        }
         if let Some(tools) = object.get_mut("tools").and_then(Value::as_array_mut) {
             for tool in tools {
                 let schema = if request.protocol == ProviderProtocol::ClaudeMessages {
@@ -2893,6 +2902,36 @@ mod tests {
     use super::*;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn claude_native_requests_preserve_schema_constraints_and_thinking() {
+        let body = serde_json::json!({"thinking":{"type":"adaptive","display":"updates"},
+            "tools":[{"name":"mode","input_schema":{"type":"object","oneOf":[{"required":["a"]},{"required":["b"]}]}}]});
+        let request = ProviderRequest {
+            original_model: None,
+            protocol: ProviderProtocol::ClaudeMessages,
+            model: "claude-opus-5".into(),
+            path: "/v1/messages".into(),
+            headers: HeaderMap::new(),
+            body: bytes::Bytes::from(body.to_string()),
+            trace_id: "test".into(),
+            service_id: "test".into(),
+            account_pool: None,
+            api_key_id: None,
+            client_context: Default::default(),
+        };
+        let wire: Value =
+            serde_json::from_slice(&prepare_provider_request(&request).unwrap().body).unwrap();
+        assert_eq!(
+            wire["thinking"],
+            serde_json::json!({"type":"adaptive","display":"summarized"})
+        );
+        assert!(wire["tools"][0]["input_schema"].get("oneOf").is_none());
+        assert_eq!(
+            wire["tools"][0]["input_schema"]["then"]["oneOf"],
+            body["tools"][0]["input_schema"]["oneOf"]
+        );
+    }
 
     #[test]
     fn forwards_per_turn_control_beta_with_different_date_suffixes() {

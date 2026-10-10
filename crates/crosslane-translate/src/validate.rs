@@ -2261,9 +2261,12 @@ fn validate_thinking(
     if thinking
         .display
         .as_deref()
-        .is_some_and(|display| !matches!(display, "summarized" | "omitted"))
+        .is_some_and(|display| !matches!(display, "summarized" | "omitted" | "updates"))
     {
-        return invalid("thinking.display", "expected summarized or omitted");
+        return invalid(
+            "thinking.display",
+            "expected summarized, omitted, or updates",
+        );
     }
     if thinking.r#type == "disabled" && thinking.display.is_some() {
         return invalid(
