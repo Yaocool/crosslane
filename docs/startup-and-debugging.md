@@ -201,6 +201,39 @@ crosslane help service edit
 crosslane help apikey edit
 ```
 
+## Desktop tools and web search
+
+For Claude upstreams that reject root `oneOf`, `allOf`, or `anyOf` tool schemas,
+Crosslane moves those constraints into an equivalent conditional subschema,
+preserving required branches, local definitions, and closed object constraints.
+Responses namespace function tools use unique upstream names and restore their
+original namespace and name in client output. Claude Code's `thinking.display:
+"updates"` is adapted to upstream `summarized` while retaining thinking settings;
+`omitted` continues to hide thinking output.
+
+Copilot handles ordinary generation even when a Responses catalog advertises
+`web_search`. An actual search call switches both search and the turn's following
+generation to Kiro, with no Copilot fallback. Claude Code's server-side WebSearch
+subrequests also take this route. Add to the existing Copilot `[[proxy_service]]`:
+
+```toml
+web_search_provider = "kiro" # Kiro provider instance ID
+```
+
+This grants only search and its continuation. Service account tags, explicit
+account inclusions/exclusions, and client model permissions still apply. Kiro
+services default to their own provider when this field is omitted. Run
+`crosslane config reload` after editing. Missing Kiro configuration/accounts,
+search failures, and failed Kiro continuations report `web_search is not supported`.
+
+Responses include `web_search_call`, real source links and URL citations, with
+streaming events and replayable tool history. `external_web_access:false` uses
+only the service/key's five-minute search cache and reports a cache miss. Codex
+clients needing live search can set `web_search = "live"`. Search replay is scoped
+to the same service/key, lasts at most thirty minutes, and expires on restart.
+Claude server-side search still rejects nonempty `allowed_domains`,
+`blocked_domains`, and `user_location` explicitly.
+
 ## Models and quotas
 
 ```bash

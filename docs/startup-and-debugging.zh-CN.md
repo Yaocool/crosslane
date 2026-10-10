@@ -164,6 +164,34 @@ crosslane help service edit
 crosslane help apikey edit
 ```
 
+## 桌面端工具与网页搜索
+
+Claude 上游不接受工具 schema 根部的 `oneOf`、`allOf`、`anyOf` 时，Crosslane
+将组合约束移到等价的条件子 schema，保留分支必填字段、定义引用和闭合对象约束。
+Responses 的 namespace 函数工具在上游使用唯一函数名，返回客户端时恢复原来的 namespace
+和名称。Claude Code 的 `thinking.display: "updates"` 会适配为上游支持的 `summarized`，
+保留 thinking 设置；`omitted` 仍隐藏思考内容。
+
+Copilot 普通生成请求保持原来源，即使 Responses 工具列表声明了 `web_search`。
+模型实际调用搜索后，搜索及本轮后续回答交给 Kiro，不回退到 Copilot。Claude Code 的
+WebSearch 服务端子请求也使用此路径。为 Copilot 服务在已有 `[[proxy_service]]` 配置中加入：
+
+```toml
+web_search_provider = "kiro" # Kiro provider 实例 ID
+```
+
+这项配置只授权搜索及其后续生成，仍受服务账号标签、加入/排除账号和客户端模型权限限制。
+Kiro 服务省略该项时使用自身默认来源。修改后执行 `crosslane config reload`。
+未配置 Kiro、没有可用账号、搜索失败或搜索后的 Kiro 生成失败时，返回
+`web_search is not supported`，不把失败包装成搜索成功。
+
+Responses 返回 `web_search_call`、真实来源链接与 URL 引用，并保留流式事件和工具历史。
+`external_web_access:false` 仅复用该服务和 Key 的五分钟搜索缓存；未命中时明确报错。
+需要实时搜索的 Codex 客户端可在配置中设置 `web_search = "live"`。搜索历史续接仅在
+同一服务和 Key 下有效，最长保留三十分钟；服务重启后需要发送新请求。
+Claude 服务端搜索目前仍不支持非空的 `allowed_domains`、`blocked_domains` 和
+`user_location`；这些配置会明确报错。
+
 ## 模型与额度
 
 ```bash
