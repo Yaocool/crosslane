@@ -593,7 +593,7 @@ fn unsupported_execution_controls_are_rejected_explicitly() {
         ("truncation", json!("invalid")),
         ("max_output_tokens", json!(0)),
         ("context_management", json!([])),
-        ("tools", json!([{"type":"web_search"}])),
+        ("tools", json!([{"type":"code_interpreter"}])),
         (
             "tools",
             json!([{"type":"function","name":"deferred","defer_loading":true}]),

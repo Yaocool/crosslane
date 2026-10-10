@@ -285,6 +285,7 @@ pub(super) async fn plan(
             mapping_rule: None,
             lock_kiro_mapping: provider.kind == "kiro",
             enable_model_fallback: false,
+            web_search_operation: false,
             failover_timeout_ms: provider.routing.failover_timeout_ms,
             body: body.clone(),
             automatic: true,

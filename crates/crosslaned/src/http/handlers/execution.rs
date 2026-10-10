@@ -578,13 +578,9 @@ pub(super) async fn collect_nonstream_rounds(
                     web_search_round += 1;
                     match execute_kiro_web_search(state, lease, &query).await {
                         Ok(results) => ClaudeWebSearchTrace::success(server_id, &query, results),
-                        Err(error) => ClaudeWebSearchTrace::error(
-                            server_id,
-                            &query,
-                            web_search_error_code(&error),
-                            sanitize_error_message(&error.to_string()),
-                        )
-                        .executed(),
+                        Err(error) => {
+                            return Err(ExecuteError::UnsupportedWebSearch(error.message))
+                        }
                     }
                 };
                 accumulated_server_events.push(ClaudeServerEvent::WebSearch {
@@ -855,13 +851,9 @@ pub(super) async fn collect_nonstream_rounds(
                     web_search_round += 1;
                     match execute_kiro_web_search(state, lease, &query).await {
                         Ok(results) => ClaudeWebSearchTrace::success(server_id, &query, results),
-                        Err(error) => ClaudeWebSearchTrace::error(
-                            server_id,
-                            &query,
-                            web_search_error_code(&error),
-                            sanitize_error_message(&error.to_string()),
-                        )
-                        .executed(),
+                        Err(error) => {
+                            return Err(ExecuteError::UnsupportedWebSearch(error.message))
+                        }
                     }
                 };
                 accumulated_server_events.push(ClaudeServerEvent::WebSearch {
@@ -1011,16 +1003,6 @@ pub(super) async fn collect_nonstream_rounds(
             .await
             .map_err(ExecuteError::Upstream)?;
         round += 1;
-    }
-}
-
-pub(in crate::http) fn web_search_error_code(error: &KiroError) -> &'static str {
-    match error.status {
-        Some(429) => "too_many_requests",
-        Some(413) => "request_too_large",
-        Some(400) if error.message.to_ascii_lowercase().contains("too long") => "query_too_long",
-        Some(400) => "invalid_tool_input",
-        _ => "unavailable",
     }
 }
 

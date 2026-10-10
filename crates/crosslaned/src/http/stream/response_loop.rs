@@ -1337,13 +1337,12 @@ pub fn response(
                             &query,
                         ).await {
                             Ok(results) => ClaudeWebSearchTrace::success(server_id, &query, results),
-                            Err(error) => ClaudeWebSearchTrace::error(
-                                server_id,
-                                &query,
-                                super::super::handlers::web_search_error_code(&error),
-                                crosslane_translate::sanitize_error_message(&error.to_string()),
-                            )
-                            .executed(),
+                            Err(error) => {
+                                let message = format!("web_search is not supported: {}", crosslane_translate::sanitize_error_message(&error.message));
+                                failed = Some(message.clone());
+                                yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &context.request_id, &message)));
+                                break 'rounds;
+                            },
                         }
                     };
                     accumulated_web_searches.push(trace.clone());
@@ -1720,13 +1719,12 @@ pub fn response(
                             &query,
                         ).await {
                             Ok(results) => ClaudeWebSearchTrace::success(server_id, &query, results),
-                            Err(error) => ClaudeWebSearchTrace::error(
-                                server_id,
-                                &query,
-                                super::super::handlers::web_search_error_code(&error),
-                                crosslane_translate::sanitize_error_message(&error.to_string()),
-                            )
-                            .executed(),
+                            Err(error) => {
+                                let message = format!("web_search is not supported: {}", crosslane_translate::sanitize_error_message(&error.message));
+                                failed = Some(message.clone());
+                                yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &context.request_id, &message)));
+                                break 'rounds;
+                            },
                         }
                     };
                     if matches!(protocol, StreamProtocol::Claude) {

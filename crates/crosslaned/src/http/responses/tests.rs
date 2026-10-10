@@ -664,3 +664,36 @@ async fn adapter_reports_truncated_and_invalid_streams_as_failed() {
         assert!(!body.contains("event: response.completed\n"));
     }
 }
+
+#[tokio::test]
+async fn hosted_failure_retains_already_delivered_partial_text() {
+    let (sender, receiver) = tokio::sync::mpsc::channel(8);
+    let operation = async move {
+        for event in [
+            json!({"type":"response.output_item.added","output_index":0,"item":{"id":"partial","type":"message","role":"assistant","status":"in_progress","content":[]}}),
+            json!({"type":"response.content_part.added","output_index":0,"content_index":0,"item_id":"partial","part":{"type":"output_text","text":"","annotations":[]}}),
+            json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"item_id":"partial","delta":"A partial answer"}),
+        ] {
+            sender.send(event).await.unwrap();
+        }
+        Err((
+            "unsupported_tool_protocol".into(),
+            "web_search is not supported: continuation interrupted".into(),
+        ))
+    };
+    let response = hosted_stream(operation, receiver, options());
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let body = String::from_utf8(bytes.to_vec()).unwrap();
+    let terminal: Value = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|event| event["type"] == "response.failed")
+        .unwrap();
+    assert_eq!(
+        terminal["response"]["output"][0]["content"][0]["text"],
+        "A partial answer"
+    );
+    assert_eq!(terminal["response"]["output"][0]["status"], "incomplete");
+    assert!(!body.contains("response.completed"));
+}

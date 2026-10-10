@@ -188,7 +188,7 @@ fn responses_still_rejects_malformed_history_and_unimplemented_controls() {
         ),
         (
             "hosted tool the proxy cannot execute",
-            json!({"model":"claude-haiku-4.5","input":"hi","tools":[{"type":"web_search"}]}),
+            json!({"model":"claude-haiku-4.5","input":"hi","tools":[{"type":"code_interpreter"}]}),
         ),
     ] {
         let request: ResponsesRequest =

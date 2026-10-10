@@ -1302,6 +1302,7 @@ pub(super) async fn reapply_compaction(
 
 fn execute_error_message(error: ExecuteError) -> String {
     match error {
+        ExecuteError::UnsupportedWebSearch(reason) => super::hosted_web::unsupported_search(reason).message.to_string(),
         ExecuteError::Pool(error) => error.to_string(),
         ExecuteError::Upstream(error) => error.to_string(),
         ExecuteError::Dispatch(error) => error.error.to_string(),

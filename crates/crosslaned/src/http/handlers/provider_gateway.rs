@@ -28,6 +28,8 @@ pub(super) struct SelectedProviderRoute {
     /// executor must not draw or apply the rule a second time.
     pub lock_kiro_mapping: bool,
     pub enable_model_fallback: bool,
+    /// An actual search owns its Kiro continuation and must fail without fallback.
+    pub web_search_operation: bool,
     pub failover_timeout_ms: u64,
     pub body: Bytes,
     pub automatic: bool,
@@ -313,6 +315,7 @@ pub(super) fn select_provider_route(
         mapping_rule: route.rule,
         lock_kiro_mapping,
         enable_model_fallback: selected.routing.enable_model_fallback,
+        web_search_operation: false,
         failover_timeout_ms: selected.routing.failover_timeout_ms,
         body,
         automatic: false,

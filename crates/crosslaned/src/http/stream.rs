@@ -1580,6 +1580,15 @@ fn classify_stream_failure(
     let lower = message.to_ascii_lowercase();
     let upstream_status = extract_upstream_status(&lower);
 
+    if lower.starts_with("web_search is not supported:") {
+        return StreamFailureDetails {
+            upstream_status,
+            error_code: "unsupported_tool_protocol",
+            error_stage: "web_search",
+            scope: StreamFailureScope::Proxy,
+        };
+    }
+
     if lower.contains(WEB_SEARCH_REPLAY_FAILURE_MESSAGE) {
         return StreamFailureDetails {
             upstream_status: None,

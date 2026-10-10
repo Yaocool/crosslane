@@ -41,6 +41,9 @@ mod copilot_account_info;
 #[path = "end_to_end/responses.rs"]
 mod responses;
 
+#[path = "end_to_end/hosted_web.rs"]
+mod hosted_web;
+
 #[path = "end_to_end/thinking_controls.rs"]
 mod thinking_controls;
 
@@ -110,6 +113,14 @@ impl Daemon {
             .env("CROSSLANE_CODEWHISPERER_URL", upstream_url)
             .env("CROSSLANE_AMAZONQ_URL", upstream_url)
             .env("CROSSLANE_RUNTIME_URL", upstream_url)
+            .env(
+                "CROSSLANE_MCP_URL",
+                url::Url::parse(upstream_url)
+                    .unwrap()
+                    .join("/mcp")
+                    .unwrap()
+                    .as_str(),
+            )
             .env("RUST_LOG", "warn")
             .stdout(Stdio::null())
             .stderr(Stdio::null())

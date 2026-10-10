@@ -430,6 +430,49 @@ impl ResponsesOptions {
         Ok(self.envelope(output, status, usage, Value::Null))
     }
 
+    pub(super) fn finalize_hosted(&self, response: Value) -> Result<Value, &'static str> {
+        let mut output = response["output"].as_array().cloned().unwrap_or_default();
+        let sources = output
+            .iter()
+            .filter(|item| item["type"] == "web_search_call")
+            .flat_map(|item| {
+                item.pointer("/action/sources")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .cloned()
+            })
+            .collect::<Vec<_>>();
+        for item in &mut output {
+            if item["type"] != "message" {
+                continue;
+            }
+            for part in item["content"].as_array_mut().into_iter().flatten() {
+                let Some(text) = part["text"].as_str() else {
+                    continue;
+                };
+                let mut annotations = part["annotations"].as_array().cloned().unwrap_or_default();
+                let citations = sources.iter().filter_map(|source| {
+                    let url = source["url"].as_str()?;
+                    let index = text.find(url)?;
+                    let start = text[..index].chars().count();
+                    Some(json!({"type":"url_citation","start_index":start,"end_index":start + url.chars().count(),"url":url,"title":source["title"]}))
+                }).collect::<Vec<_>>();
+                for citation in citations {
+                    if !annotations.contains(&citation) {
+                        annotations.push(citation);
+                    }
+                }
+                part["annotations"] = json!(annotations);
+            }
+        }
+        self.finalize(
+            output,
+            response["status"].as_str().unwrap_or("completed"),
+            response["usage"].clone(),
+        )
+    }
+
     fn tool(&self, call: &Value) -> ItemContent {
         let custom = call["type"] == "custom";
         let body = &call[if custom { "custom" } else { "function" }];
@@ -897,6 +940,145 @@ impl ResponsesStream {
         );
         vec![self.event(json!({"type":"response.failed","response":response}))]
     }
+}
+
+pub(super) fn hosted_stream(
+    operation: impl std::future::Future<Output = Result<Value, (String, String)>> + Send + 'static,
+    mut events: tokio::sync::mpsc::Receiver<Value>,
+    options: ResponsesOptions,
+) -> Response {
+    let stream = async_stream::stream! {
+        let mut state = ResponsesStream::new(options);
+        let mut output = Vec::<Value>::new();
+        for event in state.start() { yield Ok::<Bytes, Infallible>(Bytes::from(event)); }
+        tokio::pin!(operation);
+        let mut keepalive = tokio::time::interval(Duration::from_secs(8));
+        let mut receiving = true;
+        loop {
+            tokio::select! {
+                event = events.recv(), if receiving => match event {
+                    Some(event) => { remember_hosted_item(&mut output, &event); yield Ok(Bytes::from(state.event(event))); },
+                    None => receiving = false,
+                },
+                result = &mut operation => {
+                    while let Ok(event) = events.try_recv() { remember_hosted_item(&mut output, &event); yield Ok(Bytes::from(state.event(event))); }
+                    match result {
+                        Ok(response) => match state.options.finalize_hosted(response) {
+                            Ok(response) => {
+                                let kind = if response["status"] == "incomplete" { "response.incomplete" } else { "response.completed" };
+                                yield Ok(Bytes::from(state.event(json!({"type":kind,"response":response}))));
+                            }
+                            Err(message) => yield Ok(Bytes::from(hosted_failure(&mut state, output, "response_assembly", message))),
+                        },
+                        Err((code, message)) => yield Ok(Bytes::from(hosted_failure(&mut state, output, &code, &message))),
+                    }
+                    break;
+                }
+                _ = keepalive.tick() => yield Ok(Bytes::from_static(b": keepalive\n\n")),
+            }
+        }
+    };
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(stream))
+        .expect("valid SSE response")
+}
+
+fn remember_hosted_item(output: &mut Vec<Value>, event: &Value) {
+    let Some(index) = event["output_index"]
+        .as_u64()
+        .and_then(|index| usize::try_from(index).ok())
+        .filter(|index| *index <= output.len())
+    else {
+        return;
+    };
+    let kind = event["type"].as_str().unwrap_or_default();
+    if matches!(
+        kind,
+        "response.output_item.added" | "response.output_item.done"
+    ) {
+        if index == output.len() {
+            output.push(event["item"].clone());
+        } else {
+            output[index] = event["item"].clone();
+        }
+        return;
+    }
+    let Some(item) = output.get_mut(index) else {
+        return;
+    };
+    if kind.starts_with("response.function_call_arguments.") {
+        if kind.ends_with(".done") {
+            item["arguments"] = event["arguments"].clone();
+        } else if let (Some(arguments), Some(delta)) =
+            (item["arguments"].as_str(), event["delta"].as_str())
+        {
+            item["arguments"] = json!(format!("{arguments}{delta}"));
+        }
+        return;
+    }
+    let (field, part_index) = if kind.starts_with("response.reasoning_summary_") {
+        ("summary", "summary_index")
+    } else {
+        ("content", "content_index")
+    };
+    let Some(index) = event[part_index]
+        .as_u64()
+        .and_then(|index| usize::try_from(index).ok())
+    else {
+        return;
+    };
+    let Some(parts) = item.get_mut(field).and_then(Value::as_array_mut) else {
+        return;
+    };
+    if matches!(
+        kind,
+        "response.content_part.added"
+            | "response.content_part.done"
+            | "response.reasoning_summary_part.added"
+            | "response.reasoning_summary_part.done"
+    ) {
+        if index == parts.len() {
+            parts.push(event["part"].clone());
+        } else if let Some(part) = parts.get_mut(index) {
+            *part = event["part"].clone();
+        }
+    } else if let Some(part) = parts.get_mut(index) {
+        if matches!(
+            kind,
+            "response.output_text.delta" | "response.reasoning_summary_text.delta"
+        ) {
+            if let (Some(text), Some(delta)) = (part["text"].as_str(), event["delta"].as_str()) {
+                part["text"] = json!(format!("{text}{delta}"));
+            }
+        } else if matches!(
+            kind,
+            "response.output_text.done" | "response.reasoning_summary_text.done"
+        ) {
+            part["text"] = event["text"].clone();
+        }
+    }
+}
+
+fn hosted_failure(
+    state: &mut ResponsesStream,
+    mut output: Vec<Value>,
+    code: &str,
+    message: &str,
+) -> String {
+    for item in &mut output {
+        if item["status"] == "in_progress" {
+            item["status"] = json!("incomplete");
+        }
+    }
+    let response = state.options.envelope(
+        output,
+        "failed",
+        Value::Null,
+        json!({"code":code,"message":crosslane_translate::sanitize_error_message(message)}),
+    );
+    state.event(json!({"type":"response.failed","response":response}))
 }
 
 pub(super) fn stream_response(response: Response, options: ResponsesOptions) -> Response {

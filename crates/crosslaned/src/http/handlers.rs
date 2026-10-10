@@ -340,6 +340,7 @@ use entrypoints::{attempt_diagnostics, read_bounded_body, record_failed_request}
 pub use entrypoints::{claude_messages, health, openai_chat, readiness, root};
 
 mod chat;
+mod hosted_web;
 mod provider_balance;
 mod provider_gateway;
 mod request;
@@ -433,6 +434,7 @@ enum ExecuteError {
     Dispatch(Box<DispatchFailure>),
     Meter(MeterError),
     ContextLimit(ContextLimitError),
+    UnsupportedWebSearch(String),
     ModelNotAllowed {
         provider_id: String,
         model: String,
@@ -492,7 +494,6 @@ mod execution;
 pub(super) use execution::{
     apply_remaining_output_budget, execute_kiro_web_search, find_model_fallback,
     prepare_kiro_payload, resolve_static_model, set_payload_model, validate_internal_continuation,
-    web_search_error_code,
 };
 #[cfg(test)]
 use execution::{
@@ -2247,6 +2248,11 @@ fn reserve_credits(
 
 fn upstream_error(error: ExecuteError, format: ErrorFormat) -> ApiError {
     match error {
+        ExecuteError::UnsupportedWebSearch(reason) => {
+            let mut error = hosted_web::unsupported_search(reason);
+            error.format = format;
+            error
+        }
         ExecuteError::Pool(PoolError::QueueFull | PoolError::QueueTimeout) => {
             ApiError::retryable("Service busy, please retry", format)
         }

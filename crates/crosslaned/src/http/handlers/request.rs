@@ -9,14 +9,14 @@ use super::{
     nonstream_openai, normalize_compaction_boundary, openai_to_kiro, openai_tool_identities,
     prepare_kiro_payload, prepare_upstream, prepend_attempt_logs, prepend_execute_error_attempts,
     reapply_compaction, reserve_credits, resolved_compaction_decision, resume_tool_search_payload,
-    resume_web_search_payload, run_compaction, sanitize_error_message, serialized_payload_bytes,
-    stream, tool_search_budget_with_compaction, upstream_error,
-    upstream_overflow_compaction_decision, validate_claude, validate_claude_generation,
-    validate_openai, web_search_error_code, ApiError, AppState, Arc, Bytes, ClaudeRequest,
-    ClaudeServerEvent, ClaudeToolSearchCatalog, ClaudeWebSearchTrace, CompactionReason,
-    CompactionRequest, Duration, Engine, ErrorFormat, ExecuteError, HeaderMap, Instant, IpAddr,
-    OpenAiRequest, RequestDiagnostics, Response, ServiceHttpState, StatusCode, StreamContext,
-    StreamExt, StreamProtocol, TranslationOptions, UpstreamExecution, Url, Uuid, Value,
+    resume_web_search_payload, run_compaction, serialized_payload_bytes, stream,
+    tool_search_budget_with_compaction, upstream_error, upstream_overflow_compaction_decision,
+    validate_claude, validate_claude_generation, validate_openai, ApiError, AppState, Arc, Bytes,
+    ClaudeRequest, ClaudeServerEvent, ClaudeToolSearchCatalog, ClaudeWebSearchTrace,
+    CompactionReason, CompactionRequest, Duration, Engine, ErrorFormat, ExecuteError, HeaderMap,
+    Instant, IpAddr, OpenAiRequest, RequestDiagnostics, Response, ServiceHttpState, StatusCode,
+    StreamContext, StreamExt, StreamProtocol, TranslationOptions, UpstreamExecution, Url, Uuid,
+    Value,
 };
 use crosslane_core::provider::ProviderProtocol;
 use crosslane_translate::model::{map_model_for_provider, ModelMappingContext, ModelRoute};
@@ -137,6 +137,61 @@ async fn handle_claude_route(
     trace_id: String,
     path: String,
     headers: HeaderMap,
+    mut provider_route: SelectedProviderRoute,
+    authenticated_key: Option<crate::meter::AuthenticatedApiKey>,
+    connection_guard: crate::state::AdmissionGuard,
+    admission_guard: crate::state::AdmissionGuard,
+    client_context: &crosslane_core::client_context::ClientContext,
+) -> Result<Response, ApiError> {
+    let body: Value = serde_json::from_slice(&provider_route.body).unwrap_or_default();
+    let search_request = body["tools"].as_array().is_some_and(|tools| {
+        tools.iter().any(|tool| {
+            tool["type"]
+                .as_str()
+                .is_some_and(|kind| matches_type_family(kind, "web_search"))
+        })
+    });
+    if search_request {
+        let config = service.app.config.current();
+        if config.features.disable_tools || !config.features.enable_web_tools {
+            let mut error = super::hosted_web::unsupported_search("web search is disabled");
+            error.format = ErrorFormat::Claude;
+            return Err(error);
+        }
+        provider_route.enable_model_fallback = false;
+        provider_route.web_search_operation = true;
+    }
+    let response = Box::pin(handle_claude_route_inner(
+        service,
+        trace_id,
+        path,
+        headers,
+        provider_route,
+        authenticated_key,
+        connection_guard,
+        admission_guard,
+        client_context,
+    ))
+    .await;
+    if search_request {
+        response
+            .map(super::hosted_web::claude_search_response)
+            .map_err(|error| {
+                let mut error = super::hosted_web::unsupported_search(error.message);
+                error.format = ErrorFormat::Claude;
+                error
+            })
+    } else {
+        response
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_claude_route_inner(
+    service: ServiceHttpState,
+    trace_id: String,
+    path: String,
+    headers: HeaderMap,
     provider_route: SelectedProviderRoute,
     authenticated_key: Option<crate::meter::AuthenticatedApiKey>,
     connection_guard: crate::state::AdmissionGuard,
@@ -145,7 +200,43 @@ async fn handle_claude_route(
 ) -> Result<Response, ApiError> {
     let state = Arc::clone(&service.app);
     let started = Instant::now();
-    let allow_model_fallback = !provider_route.automatic;
+    if provider_route.provider_kind == "copilot" {
+        let body: Value = serde_json::from_slice(&provider_route.body).unwrap_or_default();
+        if body["tools"].as_array().is_some_and(|tools| {
+            tools.iter().any(|tool| {
+                tool["type"]
+                    .as_str()
+                    .is_some_and(|kind| matches_type_family(kind, "web_search"))
+            })
+        }) {
+            // Claude Code declares the server-side web tool only in its actual
+            // WebSearch subrequest, unlike the Responses tool catalog.
+            let (route, key) = super::hosted_web::kiro_search_route(
+                &service,
+                &provider_route,
+                authenticated_key.as_ref(),
+                &body,
+            )
+            .await
+            .map_err(|mut error| {
+                error.format = ErrorFormat::Claude;
+                error
+            })?;
+            return Box::pin(handle_claude_route(
+                service,
+                trace_id,
+                path,
+                headers,
+                route,
+                key,
+                connection_guard,
+                admission_guard,
+                client_context,
+            ))
+            .await;
+        }
+    }
+    let allow_model_fallback = !provider_route.automatic && !provider_route.web_search_operation;
     let allowed_models = authenticated_key
         .as_ref()
         .map_or_else(Vec::new, |key| key.allowed_models.clone());
@@ -609,13 +700,11 @@ async fn handle_claude_route(
                             &query,
                             results,
                         ),
-                        Err(error) => ClaudeWebSearchTrace::error(
-                            tool_use.tool_use_id.clone(),
-                            &query,
-                            web_search_error_code(&error),
-                            sanitize_error_message(&error.to_string()),
-                        )
-                        .executed(),
+                        Err(error) => {
+                            let mut error = super::hosted_web::unsupported_search(error.message);
+                            error.format = ErrorFormat::Claude;
+                            return Err(error);
+                        }
                     },
                     None => ClaudeWebSearchTrace::error(
                         tool_use.tool_use_id.clone(),
@@ -1343,7 +1432,7 @@ async fn handle_openai_with_context(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn handle_openai_route(
+pub(super) async fn handle_openai_route(
     service: ServiceHttpState,
     trace_id: String,
     path: String,
@@ -1357,7 +1446,27 @@ async fn handle_openai_route(
 ) -> Result<Response, ApiError> {
     let state = Arc::clone(&service.app);
     let started = Instant::now();
-    let allow_model_fallback = !provider_route.automatic;
+    if is_responses_path(&path)
+        && super::hosted_web::has_web_search(
+            &service,
+            authenticated_key.as_ref(),
+            &provider_route.body,
+        )
+    {
+        return super::hosted_web::handle(
+            service,
+            trace_id,
+            path,
+            headers,
+            provider_route,
+            authenticated_key,
+            connection_guard,
+            admission_guard,
+            client_context.clone(),
+        )
+        .await;
+    }
+    let allow_model_fallback = !provider_route.automatic && !provider_route.web_search_operation;
     let allowed_models = authenticated_key
         .as_ref()
         .map_or_else(Vec::new, |key| key.allowed_models.clone());
