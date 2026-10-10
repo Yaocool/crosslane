@@ -661,7 +661,7 @@ pub fn kiro_tool_named(
                     // keywords such as `additionalProperties: false` and
                     // `$schema`; deleting them silently weakens the client's
                     // tool contract.
-                    json: schema.clone(),
+                    json: crate::tool_schema::compatible_tool_schema(schema),
                 },
             },
         },

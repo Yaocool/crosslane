@@ -2331,6 +2331,20 @@ fn prepare_provider_request(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let vision = object.values().any(contains_image_content);
+    if request.model.starts_with("claude-") {
+        if let Some(tools) = object.get_mut("tools").and_then(Value::as_array_mut) {
+            for tool in tools {
+                let schema = if request.protocol == ProviderProtocol::ClaudeMessages {
+                    tool.get_mut("input_schema")
+                } else {
+                    tool.pointer_mut("/function/parameters")
+                };
+                if let Some(schema) = schema {
+                    *schema = crosslane_translate::tool_schema::compatible_tool_schema(schema);
+                }
+            }
+        }
+    }
     if request.protocol == ProviderProtocol::ClaudeMessages {
         for field in ["fallbacks", "container", "mcp_servers"] {
             object.remove(field);

@@ -9,6 +9,7 @@ pub mod protocol;
 pub mod responses;
 pub mod tokenizer;
 pub mod tool_history;
+pub mod tool_schema;
 pub mod translate;
 pub mod validate;
 
