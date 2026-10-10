@@ -235,7 +235,7 @@ Copilot API 地址优先使用账号 token 返回的 endpoint；仅当缺失且�
             "`crosslane models list` 默认聚合全部来源；`--provider kiro --refresh` 和 `--provider copilot --refresh` 分别刷新并查看 Kiro、Copilot 的模型、输入上下文和输出上限，`-` 表示上游未返回对应元数据。`--mapped` 同时显示显式映射结果。`crosslane models resolve <MODEL_ID> --provider <ID>` 显示指定来源中的映射与最终模型；还可配合 `--api-key` 和 `--refresh`。`model` 与 `models` 等价。`model disable/enable <MODEL_ID...>` 全局禁用/启用模型（跨全部 provider，使用不带来源前缀的 ID；若有 CROSSLANE_PROVIDER 请覆盖 --provider all）。禁用规则保存在 models.disabled，热更新生效，配置重置保留。CLI 列表标记不可用，公共列表隐藏；直接请求、映射、默认模型、回退、重试和内部探测均在发送前拦截。已发送请求无法撤回。"
         }
         "docker" => {
-            "默认 `docker compose up -d --build` 构建 runtime-full，启用全部 feature 并包含 Chromium SSO 运行时。数据保存在 crosslane-data 命名卷。"
+            "使用 `./deploy/docker-setup.sh --build` 构建 runtime-full，默认启用全部 Cargo feature（包括 sso 和 crs）并包含 Chromium SSO 运行时。数据保存在 crosslane-data 命名卷。"
         }
         _ => {
             return Err(anyhow!(

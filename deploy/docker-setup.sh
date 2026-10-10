@@ -30,7 +30,8 @@ Options:
   --timeout SECONDS     Health-check timeout (default: 60)
   --image IMAGE         Pull and deploy an image reference (default: saved image
                         or $default_image)
-  --build               Build from source locally with the Compose build override
+  --build               Build from source locally with all Cargo features
+                        (including sso and crs) and the SSO browser
   --no-pull             Start the saved/existing image without pulling it
   --no-build            Deprecated alias for --no-pull
   --force               Replace an unrelated command already at --target

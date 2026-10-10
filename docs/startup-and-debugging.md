@@ -311,11 +311,13 @@ selection, quotas, and content-based token-count caching retain their policies.
 Build `crosslaned` with `cargo build -p crosslaned --bin crosslaned --release --features crs`
 when its Claude Messages endpoint is used as a Claude Relay Service Console/CCR upstream. This Cargo
 feature applies to every Claude Messages listener in that binary. It is disabled in the default
-build.
+Cargo build.
 
-For a full Docker image with this compatibility enabled, build with
-`docker build --target runtime-full --build-arg CROSSLANED_FEATURES=crosslaned/sso,crosslaned/crs -t crosslane:crs .`.
-The full image enables `sso` without `crs` unless this build argument is set.
+Full Docker images enable all Cargo features, including `sso` and `crs`, by default.
+Use `./deploy/docker-setup.sh --build` to build and deploy locally, or
+`docker build --target runtime-full -t crosslane:full .` to build an image only.
+To select a feature subset, pass `--build-arg CROSSLANED_FEATURES=crosslaned/sso`
+to `docker build`; this disables `crs`.
 
 New builds report compiled features with `crosslaned --version`; inside Docker,
 run `docker exec <container> crosslaned --version` and check `crs=true`.

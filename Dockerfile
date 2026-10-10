@@ -15,10 +15,16 @@ RUN --mount=type=cache,id=crosslane-cargo-registry,target=/usr/local/cargo/regis
     && install -D -m 0755 /src/target/release/crosslaned /out/crosslaned
 
 FROM builder-base AS builder-full
-ARG CROSSLANED_FEATURES=crosslaned/sso
+# Full images enable all Cargo features by default, including sso and crs.
+# Override CROSSLANED_FEATURES with a feature list to select a subset.
+ARG CROSSLANED_FEATURES=all
 RUN --mount=type=cache,id=crosslane-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=crosslane-cargo-target,target=/src/target,sharing=locked \
-    cargo build --release --locked -p crosslane -p crosslaned --no-default-features --features "${CROSSLANED_FEATURES}" \
+    case "${CROSSLANED_FEATURES}" in \
+        all) set -- --all-features ;; \
+        *) set -- --no-default-features --features "${CROSSLANED_FEATURES}" ;; \
+    esac \
+    && cargo build --release --locked -p crosslane -p crosslaned "$@" \
     && install -D -m 0755 /src/target/release/crosslane /out/crosslane \
     && install -D -m 0755 /src/target/release/crosslaned /out/crosslaned \
     && touch /out/build-ready

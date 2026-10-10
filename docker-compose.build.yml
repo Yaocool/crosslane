@@ -3,7 +3,7 @@ services:
     image: "${CROSSLANE_BUILD_IMAGE:-crosslane:latest}"
     build:
       context: .
-      target: runtime-full # Includes all features and the SSO browser.
+      target: runtime-full # Enables all Cargo features (sso, crs) by default and includes the SSO browser.
       args:
         RUST_VERSION: "1.97.1"
         CARGO_BUILD_JOBS: "${CARGO_BUILD_JOBS:-1}"

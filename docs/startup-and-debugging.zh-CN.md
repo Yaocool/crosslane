@@ -263,10 +263,12 @@ CRS Console 和 OpenAI Responses 转发保留这些字段时即可使用，无�
 
 Claude Messages 作为 CRS Console/CCR 上游时，使用
 `cargo build -p crosslaned --bin crosslaned --release --features crs` 构建。
-该 feature 对二进制中的所有 Claude Messages 监听服务生效，默认关闭。
-完整 Docker 镜像可使用
-`docker build --target runtime-full --build-arg CROSSLANED_FEATURES=crosslaned/sso,crosslaned/crs -t crosslane:crs .`；
-未指定此参数时，完整镜像只启用 `sso`。
+该 feature 对二进制中的所有 Claude Messages 监听服务生效，普通 Cargo 构建默认关闭。
+完整 Docker 镜像默认启用全部 Cargo feature，包括 `sso` 和 `crs`。
+使用 `./deploy/docker-setup.sh --build` 本地构建并部署，或
+`docker build --target runtime-full -t crosslane:full .` 仅构建镜像。
+如需只启用部分 feature，可为 `docker build` 传入
+`--build-arg CROSSLANED_FEATURES=crosslaned/sso`，此时关闭 `crs`。
 
 新构建的 `crosslaned --version` 会显示编译 feature；容器内运行
 `docker exec <容器名> crosslaned --version`，检查是否包含 `crs=true`。
