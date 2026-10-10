@@ -2333,7 +2333,17 @@ fn forwardable_anthropic_betas(value: &str) -> String {
     value
         .split(',')
         .map(str::trim)
-        .filter(|beta| FORWARDABLE_ANTHROPIC_BETAS.contains(beta))
+        .filter(|beta| {
+            FORWARDABLE_ANTHROPIC_BETAS.contains(beta)
+                // Preserve dated revisions of the native per-message control beta.
+                || beta.strip_prefix("per-turn-control-").is_some_and(|date| {
+                    date.len() == 10
+                        && date.bytes().enumerate().all(|(index, byte)| match index {
+                            4 | 7 => byte == b'-',
+                            _ => byte.is_ascii_digit(),
+                        })
+                })
+        })
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>()
@@ -2814,6 +2824,33 @@ mod tests {
     use super::*;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn forwards_per_turn_control_beta_with_different_date_suffixes() {
+        for date in ["2026-07-01", "2026-10-10", "2027-01-15"] {
+            let beta = format!("per-turn-control-{date}");
+            assert_eq!(forwardable_anthropic_betas(&beta), beta);
+        }
+        for beta in [
+            "per-turn-control",
+            "per-turn-control-",
+            "per-turn-control-20260701",
+            "per-turn-control-2026-7-1",
+            "per-turn-control-2026-07-xx",
+            "per-turn-control-2026-07-01-extra",
+            "per-turn-control-extra-2026-07-01",
+            "per-turn-controls-2026-07-01",
+            "unknown-beta-2026-07-01",
+        ] {
+            assert_eq!(forwardable_anthropic_betas(beta), "", "{beta}");
+        }
+        assert_eq!(
+            forwardable_anthropic_betas(
+                " per-turn-control-2027-01-15,context-management-2025-06-27,per-turn-control-2027-01-15,unknown-beta-2027-01-15 "
+            ),
+            "context-management-2025-06-27,per-turn-control-2027-01-15"
+        );
+    }
 
     async fn mock_provider(server: &MockServer, directory: &Path) -> CopilotProvider {
         let mut config = ProviderConfig {
@@ -4001,11 +4038,17 @@ mod tests {
         let server = MockServer::start().await;
         let directory = tempfile::tempdir().unwrap();
         mount_account_exchange(&server, "github-token").await;
+        let message_history = serde_json::json!([
+            {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+            {"role": "system", "content": [], "output_config": {"effort": "low"}},
+            {"role": "user", "content": "say ok"}
+        ]);
         let messages = serde_json::json!({
             "model": "gpt-test",
             "max_tokens": 128,
             "stream": false,
-            "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+            "messages": message_history.clone(),
+            "output_config": {"effort": "high"},
             "tools": [{"name": "lookup", "description": "Lookup", "input_schema": {"type": "object"}}],
             "context_management": {"edits": []},
             "mcp_servers": [{"name": "unsupported"}]
@@ -4013,7 +4056,8 @@ mod tests {
         let messages_upstream = serde_json::json!({
             "model": "gpt-test",
             "max_tokens": 128,
-            "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+            "messages": message_history.clone(),
+            "output_config": {"effort": "high"},
             "tools": [{"name": "lookup", "description": "Lookup", "input_schema": {"type": "object"}}],
             "context_management": {"edits": []}
         });
@@ -4025,14 +4069,20 @@ mod tests {
         });
         let count = serde_json::json!({
             "model": "gpt-test",
-            "messages": [{"role": "user", "content": "hello"}]
+            "messages": message_history
         });
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .and(header("authorization", "Bearer copilot-api-token"))
             .and(header("user-agent", "GitHubCopilotChat/0.31.0"))
             .and(header("anthropic-version", DEFAULT_ANTHROPIC_VERSION))
-            .and(header("anthropic-beta", "context-management-2025-06-27"))
+            .and(wiremock::matchers::headers(
+                "anthropic-beta",
+                vec![
+                    "context-management-2025-06-27",
+                    "per-turn-control-2026-10-10",
+                ],
+            ))
             .and(wiremock::matchers::body_json(messages_upstream))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": "msg-test",
@@ -4058,6 +4108,13 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v1/messages/count_tokens"))
             .and(header("authorization", "Bearer copilot-api-token"))
+            .and(wiremock::matchers::headers(
+                "anthropic-beta",
+                vec![
+                    "context-management-2025-06-27",
+                    "per-turn-control-2026-10-10",
+                ],
+            ))
             .and(wiremock::matchers::body_json(count.clone()))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "input_tokens": 5
@@ -4074,7 +4131,9 @@ mod tests {
         let mut anthropic_headers = HeaderMap::new();
         anthropic_headers.insert(
             "anthropic-beta",
-            HeaderValue::from_static("context-management-2025-06-27,advisor-tool-2026-03-01"),
+            HeaderValue::from_static(
+                "context-management-2025-06-27,per-turn-control-2026-10-10,advisor-tool-2026-03-01",
+            ),
         );
         let requests = [
             (
@@ -4127,12 +4186,17 @@ mod tests {
             ),
         ];
         for (count_tokens, request) in requests {
+            let request_path = request.path.clone();
             let response = if count_tokens {
                 provider.count_tokens(request).await.unwrap()
             } else {
                 provider.execute(request).await.unwrap()
             };
-            assert_eq!(response.status, StatusCode::OK);
+            assert_eq!(
+                response.status,
+                StatusCode::OK,
+                "upstream request {request_path}"
+            );
             let mut body = match response.body {
                 ProviderResponseBody::Stream(stream) => stream,
                 ProviderResponseBody::Full(_) => panic!("Copilot response must remain streaming"),
