@@ -17,6 +17,7 @@ use super::{ApiError, ErrorFormat, RequestDiagnostics, RequestLog, ServiceHttpSt
 use crate::meter::{AuthenticatedApiKey, CreditReservation, ProviderBilling, UsageRecord};
 use crate::state::{AdmissionGuard, AppState};
 
+#[derive(Clone)]
 pub(super) struct SelectedProviderRoute {
     pub provider_id: ProviderId,
     pub provider_kind: String,
@@ -27,7 +28,11 @@ pub(super) struct SelectedProviderRoute {
     /// executor must not draw or apply the rule a second time.
     pub lock_kiro_mapping: bool,
     pub enable_model_fallback: bool,
+    pub failover_timeout_ms: u64,
     pub body: Bytes,
+    pub automatic: bool,
+    pub account_pool: Option<ProxyServiceConfig>,
+    pub account_ids: Option<Arc<std::collections::HashSet<String>>>,
 }
 
 pub(super) fn request_provider_hint(
@@ -308,7 +313,11 @@ pub(super) fn select_provider_route(
         mapping_rule: route.rule,
         lock_kiro_mapping,
         enable_model_fallback: selected.routing.enable_model_fallback,
+        failover_timeout_ms: selected.routing.failover_timeout_ms,
         body,
+        automatic: false,
+        account_pool: None,
+        account_ids: None,
     })
 }
 
@@ -484,7 +493,7 @@ pub(super) async fn execute_provider(
             )
             .with_provider_id(&error_provider)
         })?;
-    if route.provider_kind == "copilot" {
+    if route.provider_kind == "copilot" && !route.automatic {
         let models = adapter.models(false).await.map_err(|error| {
             provider_api_error(
                 error,
@@ -524,14 +533,19 @@ pub(super) async fn execute_provider(
         body: route.body,
         trace_id: trace_id.clone(),
         service_id: service.service.id.clone(),
-        account_pool: Some(service.current_service()),
+        account_pool: Some(
+            route
+                .account_pool
+                .clone()
+                .unwrap_or_else(|| service.current_service()),
+        ),
         api_key_id: api_key_id.clone(),
         client_context: client_context.clone(),
     };
     let error_model = route.upstream_model.clone();
     let error_original_model = route.original_model.clone();
     let error_mapping_rule = route.mapping_rule.clone();
-    let response = if count_tokens {
+    let mut response = if count_tokens {
         adapter.count_tokens(request).await
     } else {
         adapter.execute(request).await
@@ -546,6 +560,69 @@ pub(super) async fn execute_provider(
             error_mapping_rule.as_deref(),
         )
     })?;
+    // Native adapters stream JSON bodies too. Inspect a bounded JSON response
+    // before exposing its HTTP 200, so a protocol error can still fail over.
+    // Larger responses keep streaming with their original bytes and permit.
+    if route.automatic
+        && response.status.is_success()
+        && response
+            .headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("application/json"))
+    {
+        response.body = inspect_json_response(response.body)
+            .await
+            .map_err(|error| {
+                provider_api_error(
+                    error,
+                    format,
+                    &error_provider,
+                    &error_original_model,
+                    &error_model,
+                    error_mapping_rule.as_deref(),
+                )
+            })?;
+    }
+    // Failed attempts in an automatic route are recorded by the coordinator,
+    // not as additional client requests. Keep pinned-provider responses intact.
+    let protocol_error = if route.automatic && response.status.is_success() {
+        match &response.body {
+            ProviderResponseBody::Full(bytes) => ProviderUsage::from_bytes(bytes).error,
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if route.automatic
+        && (super::provider_balance::failover_status(response.status) || protocol_error.is_some())
+    {
+        let mut error = provider_api_error(
+            ProviderError::new(
+                crosslane_provider::ProviderErrorKind::Upstream,
+                if protocol_error.is_some() {
+                    StatusCode::BAD_GATEWAY
+                } else {
+                    response.status
+                },
+                protocol_error.unwrap_or_else(|| {
+                    format!(
+                        "provider {} returned HTTP {}",
+                        route.provider_id,
+                        response.status.as_u16()
+                    )
+                }),
+            ),
+            format,
+            &error_provider,
+            &error_original_model,
+            &error_model,
+            error_mapping_rule.as_deref(),
+        );
+        error.account_error = true;
+        error.log_context.account_id = response.account_id.clone().unwrap_or_default();
+        return Err(error);
+    }
     let status = response.status;
     let account_id = response.account_id.unwrap_or_default();
     let request_id = response
@@ -626,6 +703,33 @@ pub(super) async fn execute_provider(
         )
         .with_provider_id(&error_provider)
     })
+}
+
+async fn inspect_json_response(
+    body: ProviderResponseBody,
+) -> Result<ProviderResponseBody, ProviderError> {
+    const INSPECTION_LIMIT: usize = 1024 * 1024;
+    let ProviderResponseBody::Stream(mut upstream) = body else {
+        return Ok(body);
+    };
+    let mut buffered = Vec::new();
+    while let Some(chunk) = upstream.next().await {
+        let bytes = chunk?;
+        if buffered.len().saturating_add(bytes.len()) > INSPECTION_LIMIT {
+            let stream = async_stream::try_stream! {
+                if !buffered.is_empty() {
+                    yield Bytes::from(buffered);
+                }
+                yield bytes;
+                while let Some(chunk) = upstream.next().await {
+                    yield chunk?;
+                }
+            };
+            return Ok(ProviderResponseBody::Stream(Box::pin(stream)));
+        }
+        buffered.extend_from_slice(&bytes);
+    }
+    Ok(ProviderResponseBody::Full(Bytes::from(buffered)))
 }
 
 struct ProviderRequestMetadata {
@@ -834,7 +938,7 @@ fn copilot_billing(value: &Value) -> Option<ProviderBilling> {
 }
 
 #[derive(Default)]
-struct ProviderUsageScanner {
+pub(super) struct ProviderUsageScanner {
     pending: Vec<u8>,
     event_data: Vec<u8>,
     line_overflowed: bool,
@@ -846,7 +950,7 @@ impl ProviderUsageScanner {
     const MAX_LINE_BYTES: usize = 128 * 1024;
     const MAX_EVENT_BYTES: usize = 128 * 1024;
 
-    fn push(&mut self, bytes: &[u8]) {
+    pub(super) fn push(&mut self, bytes: &[u8]) {
         for byte in bytes {
             if self.pending.len() < Self::MAX_LINE_BYTES {
                 self.pending.push(*byte);
@@ -935,6 +1039,10 @@ impl ProviderUsageScanner {
         }
         self.consume_event();
         self.usage
+    }
+
+    pub(super) fn failed(self) -> bool {
+        self.finish().error.is_some()
     }
 }
 
@@ -1069,6 +1177,15 @@ fn provider_api_error(
     model: &str,
     mapping_rule: Option<&str>,
 ) -> ApiError {
+    let upstream_failure = matches!(
+        error.kind,
+        crosslane_provider::ProviderErrorKind::Authentication
+            | crosslane_provider::ProviderErrorKind::Authorization
+            | crosslane_provider::ProviderErrorKind::RateLimited
+            | crosslane_provider::ProviderErrorKind::Unavailable
+            | crosslane_provider::ProviderErrorKind::Transport
+            | crosslane_provider::ProviderErrorKind::Upstream
+    );
     let upstream_status = error.status;
     #[cfg(feature = "crs")]
     let status = if format == ErrorFormat::Claude {
@@ -1082,6 +1199,9 @@ fn provider_api_error(
     #[cfg(not(feature = "crs"))]
     let status = upstream_status;
     let mut api = ApiError::new(status, error.message, format);
+    if upstream_failure {
+        api.error_stage = "upstream_dispatch";
+    }
     api.retry_after = error.retryable || status != upstream_status;
     api.account_error = error.account_error;
     api.upstream_status = Some(upstream_status.as_u16());
@@ -1111,6 +1231,39 @@ fn provider_api_error(
 mod tests {
     use super::*;
     use crosslane_core::config::ProviderConfig;
+
+    #[tokio::test]
+    async fn json_inspection_preserves_large_responses_and_transport_failures() {
+        let pieces = vec![
+            Bytes::from(vec![b'a'; 800_000]),
+            Bytes::from(vec![b'b'; 800_000]),
+            Bytes::from_static(b"tail"),
+        ];
+        let expected = pieces.concat();
+        let upstream = futures::stream::iter(pieces.into_iter().map(Ok));
+        let body = inspect_json_response(ProviderResponseBody::Stream(Box::pin(upstream)))
+            .await
+            .unwrap();
+        let ProviderResponseBody::Stream(mut body) = body else {
+            panic!("large responses must retain bounded streaming");
+        };
+        let mut actual = Vec::new();
+        while let Some(chunk) = body.next().await {
+            actual.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(actual, expected);
+
+        let upstream = futures::stream::iter([
+            Ok(Bytes::from_static(b"{\"error\":")),
+            Err(ProviderError::new(
+                crosslane_provider::ProviderErrorKind::Transport,
+                StatusCode::BAD_GATEWAY,
+                "connection lost",
+            )),
+        ]);
+        let result = inspect_json_response(ProviderResponseBody::Stream(Box::pin(upstream))).await;
+        assert!(matches!(result, Err(error) if error.status == StatusCode::BAD_GATEWAY));
+    }
 
     #[cfg(feature = "crs")]
     #[test]

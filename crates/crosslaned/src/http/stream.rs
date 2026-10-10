@@ -96,6 +96,8 @@ pub struct StreamContext {
     /// A provider-aware route has already selected the Kiro target. Streaming
     /// retries must preserve that choice instead of drawing the mapping again.
     pub lock_model_mapping: bool,
+    /// Automatic provider routing keeps the exact model throughout the stream.
+    pub allow_model_fallback: bool,
     pub kiro_model: String,
     pub model_path: Vec<String>,
     pub model_mapping_rule: Option<String>,

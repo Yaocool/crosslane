@@ -709,12 +709,26 @@ impl Default for ProviderModelsConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProviderRoutingConfig {
     pub default_model_id: String,
     pub enable_model_fallback: bool,
     pub allow_cross_provider_fallback: bool,
+    /// Automatic-route attempt deadline before a response is returned. Zero
+    /// disables the deadline; a started stream keeps its existing idle timeout.
+    pub failover_timeout_ms: u64,
+}
+
+impl Default for ProviderRoutingConfig {
+    fn default() -> Self {
+        Self {
+            default_model_id: String::new(),
+            enable_model_fallback: false,
+            allow_cross_provider_fallback: false,
+            failover_timeout_ms: 300_000,
+        }
+    }
 }
 
 /// 模型映射规则。
@@ -916,7 +930,9 @@ pub struct ProxyServiceConfig {
     /// 从该服务账号池中显式排除的账号 ID。
     #[serde(default)]
     pub excluded_account_ids: Vec<String>,
-    /// Provider selected for an unqualified model ID. Empty means `kiro`.
+    /// Default provider for explicit mappings and undiscovered models; also
+    /// the initial rotation preference for automatic Kiro/Copilot routing.
+    /// Empty means `kiro`.
     #[serde(default)]
     pub default_provider: String,
     /// Provider instances exposed by this listener. Empty means `kiro`.
@@ -1564,6 +1580,12 @@ impl Config {
                     "must be greater than or equal to cache_ttl_ms",
                 );
             }
+            if provider.routing.failover_timeout_ms > 86_400_000 {
+                return invalid_config(
+                    format!("provider.{index}.routing.failover_timeout_ms"),
+                    "must not exceed 86400000 milliseconds (24 hours); zero disables the deadline",
+                );
+            }
         }
 
         let mut api_key_ids = BTreeSet::new();
@@ -2030,6 +2052,7 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# =====================================
 # enable_model_fallback = false
 # 是否允许映射规则把请求转发到另一提供源。
 # allow_cross_provider_fallback = false
+# failover_timeout_ms = 300000 # Automatic attempt deadline; 0 disables it.
 
 # ----------------------------------------------------------------------------
 # API 服务共享配置

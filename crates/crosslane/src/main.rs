@@ -375,6 +375,9 @@ enum ProviderCommand {
         enable_model_fallback: Option<bool>,
         #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
         allow_cross_provider_fallback: Option<bool>,
+        /// 自动路由单次尝试的等待上限（毫秒）；0 表示不设上限。
+        #[arg(long)]
+        failover_timeout_ms: Option<u64>,
     },
     /// 启用提供源实例。
     Enable { id: String },
@@ -987,6 +990,7 @@ async fn main() -> Result<()> {
                     default_model,
                     enable_model_fallback,
                     allow_cross_provider_fallback,
+                    failover_timeout_ms,
                 }),
         } => {
             crate::commands::runtime::edit_provider(
@@ -998,6 +1002,7 @@ async fn main() -> Result<()> {
                 default_model.as_deref(),
                 enable_model_fallback,
                 allow_cross_provider_fallback,
+                failover_timeout_ms,
                 cli.json,
             )
             .await?;

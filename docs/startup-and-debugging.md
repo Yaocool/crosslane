@@ -146,6 +146,50 @@ To make a service use only Copilot, specify its provider and default provider:
 crosslane service create --name copilot --host 127.0.0.1 --provider copilot --default-provider copilot
 ```
 
+A service exposing both Kiro and Copilot automatically balances unqualified
+requests that do not match an explicit model mapping:
+
+```bash
+crosslane service create --name mixed --host 127.0.0.1 --provider kiro --provider copilot --default-provider kiro
+```
+
+Both the service and client key must permit each provider. Routing checks the
+service's account membership and usable model caches for the same model,
+including equivalent aliases, then selects the provider with lower concurrent
+load relative to account capacity. Equal pressure rotates between providers.
+Automatic routing does not estimate Copilot credits or change model versions;
+each provider retains its own account scheduler. `default_provider` is the
+initial rotation preference and the compatibility default for explicit mappings
+or requests without a discovered route. Account bindings do not expand access.
+
+Connection failures, upstream account authentication/quota failures, throttling,
+and service errors before response delivery can fail over to another compatible
+provider. Failed routes cool down per service and model, starting at five
+seconds and increasing to sixty seconds after consecutive failures. One recovery
+request is admitted after cooldown; success restores balancing. Client request,
+permission, and client-key quota errors are not retried across providers. Once a
+stream starts, existing error events are preserved and subsequent requests avoid
+the failed provider; emitted content is never replayed. Messages, Chat
+Completions, Responses, and `count_tokens` share this routing entry point.
+Batched Chat requests keep their native semantics; each candidate expanded by
+Kiro participates in automatic routing independently.
+Token counting has independent circuit state: a local Kiro count cannot reset
+generation failures. Each automatic attempt has a five-minute deadline before
+returning a response. Configure `[provider.routing].failover_timeout_ms` with
+`crosslane provider edit copilot --failover-timeout-ms 300000`, or set it to `0`
+to disable this deadline. Started streams retain their existing idle
+timeouts and are not cut off by the attempt deadline.
+
+Qualified IDs such as `kiro/MODEL_ID` and `copilot/MODEL_ID`, and explicit model
+mappings retain their provider selection. Model defaults that replace a request
+with a different model keep their original route; defaults for the same model
+or an equivalent alias still allow balancing. Responses continuations retain the
+provider that created `previous_response_id`, including for anonymous clients.
+Explicit cross-provider mappings still require the source provider's
+`allow_cross_provider_fallback`; automatic balancing uses the providers already
+allowed by the service and key. Correlate `upstream.provider.selected` and
+`upstream.provider.failover` log events with `trace_id` to inspect decisions.
+
 A service accepts only its bound client keys. Generation routes also enforce
 a client product User-Agent policy. For another client, an operator can set
 `--skip-user-agent-check true` on the service or client key; key authentication

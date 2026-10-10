@@ -30,7 +30,7 @@ const MAX_RESPONSES_SESSION_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 const RESPONSES_STORE_FAILED: &str =
     "unable to store response state within the configured in-memory limit";
 
-/// Attribution only for providers that own their Responses history upstream.
+/// Provider affinity and attribution for native upstream Responses history.
 /// Keep no prompts here, respect `store: false`, and bound TTL/cardinality.
 #[derive(Clone, Default)]
 pub(crate) struct ResponseClientContexts {
@@ -64,7 +64,9 @@ impl ResponseClientContexts {
         response_id: String,
         context: ClientContext,
     ) {
-        if context.is_unknown() || response_id.is_empty() || response_id.len() > 256 {
+        // Even an anonymous client needs its native continuation ID to retain
+        // the originating provider when fresh requests are load balanced.
+        if response_id.is_empty() || response_id.len() > 256 {
             return;
         }
         let Ok(mut entries) = self.entries.lock() else {

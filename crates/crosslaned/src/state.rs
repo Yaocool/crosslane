@@ -154,6 +154,7 @@ pub struct AppState {
     pub models: Arc<ModelCache>,
     /// Registered Kiro, Copilot, and future provider runtimes.
     pub providers: Arc<crate::providers::ProviderManager>,
+    pub(crate) provider_scheduler: crate::provider_routing::ProviderScheduler,
     model_refresh: tokio::sync::Notify,
     refresher: RwLock<TokenRefresher>,
     tls_config: RwLock<Option<axum_server::tls_rustls::RustlsConfig>>,
@@ -311,6 +312,7 @@ impl AppState {
             stats,
             models,
             providers,
+            provider_scheduler: crate::provider_routing::ProviderScheduler::default(),
             model_refresh: tokio::sync::Notify::new(),
             refresher: RwLock::new(refresher),
             tls_config: RwLock::new(None),
@@ -1457,16 +1459,23 @@ impl AdmissionGate {
             })
             .ok()
             .map(|_| AdmissionGuard {
-                gate: Arc::clone(self),
+                _permit: Arc::new(AdmissionPermit {
+                    gate: Arc::clone(self),
+                }),
             })
     }
 }
 
+#[derive(Clone)]
 pub struct AdmissionGuard {
+    _permit: Arc<AdmissionPermit>,
+}
+
+struct AdmissionPermit {
     gate: Arc<AdmissionGate>,
 }
 
-impl Drop for AdmissionGuard {
+impl Drop for AdmissionPermit {
     fn drop(&mut self) {
         self.gate.current.fetch_sub(1, Ordering::AcqRel);
     }
@@ -1557,6 +1566,22 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+
+    #[test]
+    fn admission_clones_hold_one_slot_until_the_last_attempt_or_stream_finishes() {
+        let gate = Arc::new(AdmissionGate::new(1));
+        let request = gate.try_acquire().unwrap();
+        let attempt = request.clone();
+        let stream = attempt.clone();
+        drop(attempt);
+        assert_eq!(gate.current(), 1);
+        assert!(gate.try_acquire().is_none());
+        drop(request);
+        assert_eq!(gate.current(), 1);
+        drop(stream);
+        assert_eq!(gate.current(), 0);
+        assert!(gate.try_acquire().is_some());
+    }
 
     fn refreshable_account(id: &str, email: &str, token: &str) -> Account {
         Account {

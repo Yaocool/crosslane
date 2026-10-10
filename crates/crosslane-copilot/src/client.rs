@@ -487,6 +487,61 @@ impl CopilotProvider {
             .collect()
     }
 
+    /// Cached, service-scoped capacity for an equivalent model and native
+    /// protocol. Routing never refreshes an unrelated account's catalog.
+    pub async fn routing_snapshot(
+        &self,
+        pool: &crosslane_core::config::ProxyServiceConfig,
+        requested: &str,
+        protocol: ProviderProtocol,
+    ) -> Option<(String, usize, usize)> {
+        let accounts = self.accounts.read().await;
+        let cache = self.model_cache.read().await;
+        let now = now_secs();
+        let matching = accounts
+            .iter()
+            .filter(|account| {
+                account.enabled
+                    && pool.includes_provider_account(self.id.as_str(), &account.id, &account.tags)
+            })
+            .filter_map(|account| {
+                let entry = cache.accounts.get(&account.id)?;
+                cache_entry_is_usable(entry, now, self.settings.model_max_stale_secs)
+                    .then_some((account, entry))
+            })
+            .collect::<Vec<_>>();
+        let available = matching
+            .iter()
+            .flat_map(|(_, entry)| entry.models.iter())
+            .filter(|model| !is_embedding_model(model) && model.protocols.contains(&protocol))
+            .map(|model| model.id.clone())
+            .collect::<Vec<_>>();
+        let model = crosslane_translate::model::resolve_model_alias(requested, &available)?;
+        let slots = self
+            .account_limits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut capacity = 0usize;
+        let mut active = 0usize;
+        for (account, entry) in matching {
+            if !account.supported_models.contains(&model)
+                || !entry.models.iter().any(|candidate| {
+                    candidate.id == model && candidate.protocols.contains(&protocol)
+                })
+            {
+                continue;
+            }
+            capacity += self.settings.max_concurrent_per_account;
+            if let Some(slot) = slots.get(&account.id) {
+                active += self
+                    .settings
+                    .max_concurrent_per_account
+                    .saturating_sub(slot.semaphore.available_permits());
+            }
+        }
+        (capacity > 0).then_some((model, capacity, active))
+    }
+
     /// Refresh optional metadata without changing account health. Bound the
     /// entire list query and reuse recent successes and failures for five minutes.
     pub async fn refresh_account_info(&self, account_id: Option<&str>, force: bool) {

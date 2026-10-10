@@ -435,6 +435,7 @@ async fn generate_compaction_summary_inner(
             true,
             &payload,
             None,
+            true,
         ) => result.map_err(execute_error_message)?,
         _ = cancel.cancelled() => {
             return Err(CompactionSummaryFailure {

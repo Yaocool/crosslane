@@ -57,6 +57,7 @@ pub(in crate::http::handlers) async fn prepare_upstream(
         payload,
         None,
         true,
+        true,
     )
     .await?
     {
@@ -82,6 +83,7 @@ pub(in crate::http::handlers) async fn execute_upstream(
     compact: bool,
     payload: &crosslane_translate::KiroPayload,
     prepared: Option<PreparedUpstream>,
+    allow_model_fallback: bool,
 ) -> Result<UpstreamExecution, ExecuteError> {
     match dispatch_upstream(
         state,
@@ -100,6 +102,7 @@ pub(in crate::http::handlers) async fn execute_upstream(
         payload,
         prepared,
         false,
+        allow_model_fallback,
     )
     .await?
     {
@@ -126,6 +129,7 @@ async fn dispatch_upstream(
     payload: &crosslane_translate::KiroPayload,
     prepared: Option<PreparedUpstream>,
     preflight_only: bool,
+    allow_model_fallback: bool,
 ) -> Result<DispatchOutcome, ExecuteError> {
     let mut input_tokens = input_tokens;
     let config = state.config.current();
@@ -646,7 +650,10 @@ async fn dispatch_upstream(
                     pool.record_error(&account.id).await;
                 }
                 last_error = Some(error);
-                if config.features.enable_model_fallback && fallback_model.is_none() {
+                if allow_model_fallback
+                    && config.features.enable_model_fallback
+                    && fallback_model.is_none()
+                {
                     let (mut models, _) = state.models.get(config.models.cache_ttl_ms);
                     models
                         .retain(|model| !state.config.current().is_model_disabled(&model.model_id));

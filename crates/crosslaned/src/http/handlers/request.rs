@@ -28,7 +28,7 @@ use super::super::responses::{
     is_responses_path, resume_responses_request, stream_response, ResponsesOptions,
     ResponsesSessionOwner,
 };
-use super::provider_gateway::{execute_provider, select_provider_route};
+use super::provider_gateway::{execute_provider, SelectedProviderRoute};
 
 pub(super) async fn handle_claude(
     service: ServiceHttpState,
@@ -53,7 +53,13 @@ pub(super) async fn handle_claude(
     )
     .await;
     super::super::client_context::log(&context_trace_id, &client_context);
-    result.map_err(|error| error.with_client_context(&client_context))
+    result.map_err(|error| {
+        if error.client_context.is_some() {
+            error
+        } else {
+            error.with_client_context(&client_context)
+        }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -68,7 +74,6 @@ async fn handle_claude_with_context(
     client_context: &crosslane_core::client_context::ClientContext,
 ) -> Result<Response, ApiError> {
     let state = Arc::clone(&service.app);
-    let started = Instant::now();
     let provider_hint = super::provider_gateway::request_provider_hint(
         &state.config.current(),
         &service.service,
@@ -83,13 +88,64 @@ async fn handle_claude_with_context(
     .map_err(|error| error.with_provider_id_if_empty(&provider_hint))?;
     enforce_claude_user_agent(&service, &headers, authenticated_key.as_ref())
         .map_err(|error| error.with_provider_id_if_empty(&provider_hint))?;
-    let provider_route = select_provider_route(
-        &state.config.current(),
-        &service.service,
+    let plan = super::provider_balance::plan(
+        &service,
         authenticated_key.as_ref(),
         &body,
+        ProviderProtocol::ClaudeMessages,
         ErrorFormat::Claude,
-    )?;
+    )
+    .await?;
+    super::provider_balance::execute(
+        &state.provider_scheduler,
+        &service.service.id,
+        &trace_id,
+        plan,
+        ErrorFormat::Claude,
+        |route| {
+            let service = service.clone();
+            let trace_id = trace_id.clone();
+            let path = path.clone();
+            let headers = headers.clone();
+            let key = authenticated_key.clone();
+            let connection = connection_guard.clone();
+            let admission = admission_guard.clone();
+            async move {
+                handle_claude_route(
+                    service,
+                    trace_id,
+                    path,
+                    headers,
+                    route,
+                    key,
+                    connection,
+                    admission,
+                    client_context,
+                )
+                .await
+                .map(|response| (response, ()))
+            }
+        },
+    )
+    .await
+    .map(|(response, ())| response)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_claude_route(
+    service: ServiceHttpState,
+    trace_id: String,
+    path: String,
+    headers: HeaderMap,
+    provider_route: SelectedProviderRoute,
+    authenticated_key: Option<crate::meter::AuthenticatedApiKey>,
+    connection_guard: crate::state::AdmissionGuard,
+    admission_guard: crate::state::AdmissionGuard,
+    client_context: &crosslane_core::client_context::ClientContext,
+) -> Result<Response, ApiError> {
+    let state = Arc::clone(&service.app);
+    let started = Instant::now();
+    let allow_model_fallback = !provider_route.automatic;
     let allowed_models = authenticated_key
         .as_ref()
         .map_or_else(Vec::new, |key| key.allowed_models.clone());
@@ -115,10 +171,14 @@ async fn handle_claude_with_context(
     let locked_original_model = provider_route.original_model.clone();
     let locked_upstream_model = provider_route.upstream_model.clone();
     let locked_mapping_name = provider_route.mapping_rule.clone();
+    let account_ids = provider_route.account_ids.clone();
     let body = provider_route.body;
     // Only the Kiro path consults the pool, so resolve the service's account
     // scope after the non-Kiro providers have returned.
-    let account_ids = service.account_ids().await;
+    let account_ids = match account_ids {
+        Some(ids) => ids,
+        None => service.account_ids().await,
+    };
     tracing::debug!(
         event = "proxy.authentication.completed",
         trace_id = %trace_id,
@@ -632,7 +692,11 @@ async fn handle_claude_with_context(
         key_id.as_deref(),
         &allowed_models,
         Some(&service.service.id),
-        &config.features.default_model_id,
+        if allow_model_fallback {
+            config.features.default_model_id.as_str()
+        } else {
+            ""
+        },
         locked_mapping_rule,
         &payload,
     )
@@ -822,13 +886,18 @@ async fn handle_claude_with_context(
         key_id.as_deref(),
         &allowed_models,
         Some(&service.service.id),
-        &config.features.default_model_id,
+        if allow_model_fallback {
+            config.features.default_model_id.as_str()
+        } else {
+            ""
+        },
         locked_mapping_rule,
         estimate,
         input_tokens,
         compacted,
         &payload,
         prepared,
+        allow_model_fallback,
     )
     .await;
     let (execution, reservation) = match first_execution {
@@ -956,13 +1025,18 @@ async fn handle_claude_with_context(
                 key_id.as_deref(),
                 &allowed_models,
                 Some(&service.service.id),
-                &config.features.default_model_id,
+                if allow_model_fallback {
+                    config.features.default_model_id.as_str()
+                } else {
+                    ""
+                },
                 locked_mapping_rule,
                 estimate,
                 input_tokens,
                 true,
                 &payload,
                 None,
+                allow_model_fallback,
             )
             .await;
             let execution = match retry_execution {
@@ -1054,6 +1128,7 @@ async fn handle_claude_with_context(
                 api_key_id: key_id.clone(),
                 allowed_models,
                 lock_model_mapping: lock_kiro_mapping,
+                allow_model_fallback,
                 kiro_model,
                 model_path,
                 model_mapping_rule,
@@ -1162,7 +1237,13 @@ pub(super) async fn handle_openai(
     )
     .await;
     super::super::client_context::log(&context_trace_id, &client_context);
-    result.map_err(|error| error.with_client_context(&client_context))
+    result.map_err(|error| {
+        if error.client_context.is_some() {
+            error
+        } else {
+            error.with_client_context(&client_context)
+        }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1177,11 +1258,9 @@ async fn handle_openai_with_context(
     client_context: &mut crosslane_core::client_context::ClientContext,
 ) -> Result<Response, ApiError> {
     let state = Arc::clone(&service.app);
-    let started = Instant::now();
     // Multi-candidate chat re-enters this handler for every candidate. Keep
     // the client body so provider selection and a cross-provider mapping are
     // evaluated from the same request rather than from the first routed body.
-    let original_body = body.clone();
     let provider_hint = super::provider_gateway::request_provider_hint(
         &state.config.current(),
         &service.service,
@@ -1196,20 +1275,98 @@ async fn handle_openai_with_context(
     .map_err(|error| error.with_provider_id_if_empty(&provider_hint))?;
     enforce_codex_user_agent(&service, &headers, authenticated_key.as_ref())
         .map_err(|error| error.with_provider_id_if_empty(&provider_hint))?;
-    let provider_route = select_provider_route(
-        &state.config.current(),
-        &service.service,
+    let protocol = if is_responses_path(&path) {
+        ProviderProtocol::OpenAiResponses
+    } else {
+        ProviderProtocol::OpenAiChat
+    };
+    let plan = super::provider_balance::plan(
+        &service,
         authenticated_key.as_ref(),
         &body,
+        protocol,
         ErrorFormat::OpenAi,
-    )?;
+    )
+    .await?;
+    let automatic = plan.is_automatic();
+    let mut connection_guard = Some(connection_guard);
+    let mut admission_guard = Some(admission_guard);
+    let result = super::provider_balance::execute(
+        &state.provider_scheduler,
+        &service.service.id,
+        &trace_id,
+        plan,
+        ErrorFormat::OpenAi,
+        |route| {
+            let service = service.clone();
+            let trace_id = trace_id.clone();
+            let path = path.clone();
+            let headers = headers.clone();
+            let body = body.clone();
+            let key = authenticated_key.clone();
+            let connection = if automatic {
+                connection_guard.as_ref().expect("request guard").clone()
+            } else {
+                connection_guard.take().expect("single pinned attempt")
+            };
+            let admission = if automatic {
+                admission_guard.as_ref().expect("request guard").clone()
+            } else {
+                admission_guard.take().expect("single pinned attempt")
+            };
+            let mut context = client_context.clone();
+            async move {
+                let result = handle_openai_route(
+                    service,
+                    trace_id,
+                    path,
+                    headers,
+                    body,
+                    route,
+                    key,
+                    connection,
+                    admission,
+                    &mut context,
+                )
+                .await;
+                result
+                    .map(|response| (response, context.clone()))
+                    .map_err(|error| error.with_client_context(&context))
+            }
+        },
+    )
+    .await;
+    result.map(|(response, context)| {
+        *client_context = context;
+        response
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_openai_route(
+    service: ServiceHttpState,
+    trace_id: String,
+    path: String,
+    headers: HeaderMap,
+    original_body: Bytes,
+    provider_route: SelectedProviderRoute,
+    authenticated_key: Option<crate::meter::AuthenticatedApiKey>,
+    connection_guard: crate::state::AdmissionGuard,
+    admission_guard: crate::state::AdmissionGuard,
+    client_context: &mut crosslane_core::client_context::ClientContext,
+) -> Result<Response, ApiError> {
+    let state = Arc::clone(&service.app);
+    let started = Instant::now();
+    let allow_model_fallback = !provider_route.automatic;
     let allowed_models = authenticated_key
         .as_ref()
         .map_or_else(Vec::new, |key| key.allowed_models.clone());
     let key_id = authenticated_key.as_ref().map(|key| key.id.clone());
     if provider_route.provider_kind != "kiro" {
         if is_responses_path(&path) {
-            if let Some(previous_id) = super::super::client_context::previous_response_id(&body) {
+            if let Some(previous_id) =
+                super::super::client_context::previous_response_id(&original_body)
+            {
                 let owner = ResponsesSessionOwner::new(service.service.id.clone(), key_id.clone());
                 if let Some(previous) = state.response_client_contexts.get(
                     &owner,
@@ -1247,10 +1404,14 @@ async fn handle_openai_with_context(
     let locked_original_model = provider_route.original_model.clone();
     let locked_upstream_model = provider_route.upstream_model.clone();
     let locked_mapping_name = provider_route.mapping_rule.clone();
+    let account_ids = provider_route.account_ids.clone();
     let body = provider_route.body;
     // Only the Kiro path consults the pool, so resolve the service's account
     // scope after the non-Kiro providers have returned.
-    let account_ids = service.account_ids().await;
+    let account_ids = match account_ids {
+        Some(ids) => ids,
+        None => service.account_ids().await,
+    };
     tracing::debug!(
         event = "proxy.authentication.completed",
         trace_id = %trace_id,
@@ -1499,7 +1660,11 @@ async fn handle_openai_with_context(
             key_id.as_deref(),
             &allowed_models,
             Some(&service.service.id),
-            &config.features.default_model_id,
+            if allow_model_fallback {
+                config.features.default_model_id.as_str()
+            } else {
+                ""
+            },
             locked_mapping_rule,
             &payload,
         )
@@ -1623,13 +1788,18 @@ async fn handle_openai_with_context(
         key_id.as_deref(),
         &allowed_models,
         Some(&service.service.id),
-        &config.features.default_model_id,
+        if allow_model_fallback {
+            config.features.default_model_id.as_str()
+        } else {
+            ""
+        },
         locked_mapping_rule,
         estimate,
         input_tokens,
         false,
         &payload,
         prepared,
+        allow_model_fallback,
     )
     .await
     .map_err(|error| upstream_error(error, ErrorFormat::OpenAi))?;
@@ -1668,6 +1838,7 @@ async fn handle_openai_with_context(
                 api_key_id: key_id.clone(),
                 allowed_models,
                 lock_model_mapping: lock_kiro_mapping,
+                allow_model_fallback,
                 kiro_model,
                 model_path,
                 model_mapping_rule,

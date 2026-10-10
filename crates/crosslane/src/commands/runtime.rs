@@ -75,7 +75,7 @@ pub enum ServiceCommand {
         /// 服务和首个 API key 允许使用的提供源，可重复或逗号分隔。
         #[arg(id = "provider", long = "provider", value_delimiter = ',')]
         providers: Vec<String>,
-        /// 无前缀模型请求的默认实例；省略时使用 --provider 的第一个 ID，未指定来源时为 kiro。
+        /// 默认实例及多来源均衡的初始偏好；省略时使用 --provider 的第一个 ID，未指定来源时为 kiro。
         #[arg(long)]
         default_provider: Option<String>,
     },
@@ -1839,6 +1839,7 @@ pub async fn edit_provider(
     default_model: Option<&str>,
     enable_model_fallback: Option<bool>,
     allow_cross_provider_fallback: Option<bool>,
+    failover_timeout_ms: Option<u64>,
     json: bool,
 ) -> Result<()> {
     if settings.is_empty()
@@ -1847,9 +1848,10 @@ pub async fn edit_provider(
         && default_model.is_none()
         && enable_model_fallback.is_none()
         && allow_cross_provider_fallback.is_none()
+        && failover_timeout_ms.is_none()
     {
         return Err(anyhow!(
-            "没有指定修改项；请使用 --setting、--remove-setting、--max-concurrent-per-account、--default-model、--enable-model-fallback 或 --allow-cross-provider-fallback"
+            "没有指定修改项；请使用 --setting、--remove-setting、--max-concurrent-per-account、--default-model、--enable-model-fallback、--allow-cross-provider-fallback 或 --failover-timeout-ms"
         ));
     }
     let settings = parse_provider_settings(settings)?;
@@ -1887,6 +1889,12 @@ pub async fn edit_provider(
             ensure_table(table, "routing")?.insert(
                 "allow_cross_provider_fallback".into(),
                 toml::Value::Boolean(enabled),
+            );
+        }
+        if let Some(timeout) = failover_timeout_ms {
+            ensure_table(table, "routing")?.insert(
+                "failover_timeout_ms".into(),
+                toml::Value::Integer(i64::try_from(timeout).context("等待上限过大")?),
             );
         }
         Ok(())

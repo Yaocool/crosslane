@@ -340,6 +340,7 @@ use entrypoints::{attempt_diagnostics, read_bounded_body, record_failed_request}
 pub use entrypoints::{claude_messages, health, openai_chat, readiness, root};
 
 mod chat;
+mod provider_balance;
 mod provider_gateway;
 mod request;
 
@@ -553,306 +554,42 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
         .map_err(|error| error.with_provider_id_if_empty(&provider_hint))?;
         enforce_claude_user_agent(&service, &headers, authenticated_key.as_ref())
             .map_err(|error| error.with_provider_id_if_empty(&provider_hint))?;
-        let provider_route = provider_gateway::select_provider_route(
-            &state.config.current(),
-            &service.service,
+        let plan = provider_balance::plan(
+            &service,
             authenticated_key.as_ref(),
             &body,
+            ProviderProtocol::ClaudeMessages,
             ErrorFormat::Claude,
-        )?;
-        let key_id = authenticated_key.as_ref().map(|key| key.id.clone());
-        if provider_route.provider_kind != "kiro" {
-            return provider_gateway::execute_provider(
-                service,
-                provider_route,
-                ProviderProtocol::ClaudeMessages,
-                path.clone(),
-                headers,
-                trace_id.clone(),
-                authenticated_key,
-                _connection_guard,
-                _admission_guard,
-                ErrorFormat::Claude,
-                true,
-                client_context.clone(),
-            )
-            .await;
-        }
-        let lock_kiro_mapping = provider_route.lock_kiro_mapping;
-        let locked_original_model = provider_route.original_model.clone();
-        let locked_upstream_model = provider_route.upstream_model.clone();
-        let locked_mapping_name = provider_route.mapping_rule.clone();
-        let body = provider_route.body;
-        tracing::debug!(
-            trace_id = %trace_id,
-            protocol = "claude_count_tokens",
-            api_key_id = key_id.as_deref().unwrap_or("anonymous"),
-            body_bytes = body.len(),
-            "client authentication completed"
-        );
-        let mut value: Value = serde_json::from_slice(&body).map_err(|_| {
-            ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "Invalid JSON in request body",
-                ErrorFormat::Claude,
-            )
-        })?;
-        let object = value.as_object_mut().ok_or_else(|| {
-            ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "request body must be a JSON object",
-                ErrorFormat::Claude,
-            )
-        })?;
-        object.entry("max_tokens").or_insert_with(|| json!(1));
-        let mut original_request: ClaudeRequest =
-            serde_json::from_value(value).map_err(|error| {
-                ApiError::new(
-                    StatusCode::BAD_REQUEST,
-                    format!("Invalid request body: {error}"),
-                    ErrorFormat::Claude,
-                )
-            })?;
-        if lock_kiro_mapping {
-            original_request.model.clone_from(&locked_original_model);
-        }
-        let conversation_fingerprint = conversation_fingerprint(&original_request.messages);
-        let conversation_id = client_conversation_id(
+        )
+        .await?
+        .for_token_count();
+        provider_balance::execute(
+            &state.provider_scheduler,
             &service.service.id,
-            key_id.as_deref(),
-            &client_context,
-            &headers,
-            original_request.conversation_id.as_deref(),
-            metadata_conversation_hint(original_request.metadata.as_ref())
-                .or(conversation_fingerprint.as_deref()),
-        );
-        let replay_scope = client_replay_scope(
-            &service.service.id,
-            key_id.as_deref(),
-            &client_context,
-            conversation_fingerprint.as_deref(),
-        );
-        let replay = replay_scope.as_deref().and_then(|scope| {
-            state
-                .compaction_replay
-                .find(scope, &original_request.messages)
-        });
-        let has_context_edits =
-            has_context_management_edits(original_request.context_management.as_ref());
-        // Validate the semantically effective history before touching remote
-        // media. A completed compaction boundary can make stale history
-        // irrelevant to protocol validation, while `original_input_tokens`
-        // still needs to count that pre-boundary history.
-        let mut request = original_request.clone();
-        let replay_applied = replay
-            .as_ref()
-            .and_then(|replay| replay.apply_to(&mut request.messages));
-        let compaction_normalization = normalize_compaction_boundary(&mut request);
-        let boundary_applied = compaction_normalization.boundary_applied;
-        crosslane_translate::validate_claude_count(&request).map_err(claude_validation_error)?;
-        // Counting must include the real bytes of every attachment in the
-        // pre-edit request. Generation can avoid fetching history that will
-        // be cleared, but the count endpoint promises both original and
-        // effective token totals.
-        let _attachment_guards =
-            request::hydrate_claude_attachments(&state, &mut original_request).await?;
-        request.clone_from(&original_request);
-        if let Some(replay) = replay.as_ref() {
-            let _ = replay.apply_to(&mut request.messages);
-        }
-        normalize_compaction_boundary(&mut request);
-        crosslane_translate::validate_claude_count(&request).map_err(claude_validation_error)?;
-        tracing::info!(
-            trace_id = %trace_id,
-            protocol = "claude_count_tokens",
-            model = %log_model(&request.model),
-            message_count = request.messages.len(),
-            tool_count = request.tools.len(),
-            server_compaction_replayed = replay_applied.is_some(),
-            "client token-count request validated"
-        );
-        let config = state.config.current();
-        let claude_code = headers
-            .get(header::USER_AGENT)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(is_claude_user_agent);
-        let client_compaction =
-            claude_code && crosslane_translate::prepare_claude_code_compaction(&mut request);
-        let original_client_compaction = claude_code
-            && crosslane_translate::prepare_claude_code_compaction(&mut original_request);
-        if config.features.disable_tools {
-            request.tools.clear();
-            request.tool_choice = None;
-            original_request.tools.clear();
-            original_request.tool_choice = None;
-        } else if !config.features.enable_web_tools {
-            request.tools.retain(|tool| {
-                !tool.r#type.as_deref().is_some_and(|kind| {
-                    matches_type_family(kind, "web_search")
-                        || matches_type_family(kind, "web_fetch")
-                })
-            });
-            original_request.tools.retain(|tool| {
-                !tool.r#type.as_deref().is_some_and(|kind| {
-                    matches_type_family(kind, "web_search")
-                        || matches_type_family(kind, "web_fetch")
-                })
-            });
-        }
-        if !config.features.enable_tool_search
-            && request.tools.iter().any(|tool| {
-                tool.defer_loading
-                    || tool
-                        .r#type
-                        .as_deref()
-                        .is_some_and(crosslane_translate::is_tool_search_type)
-            })
-        {
-            return Err(ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "Anthropic Tool Search is disabled by proxy configuration",
-                ErrorFormat::Claude,
-            ));
-        }
-        let route = if lock_kiro_mapping {
-            ModelRoute {
-                original: locked_original_model,
-                mapped: locked_upstream_model,
-                rule: locked_mapping_name,
-                rule_index: None,
-            }
-        } else {
-            map_model_for_provider(
-                &request.model,
-                &config.model_mapping,
-                ModelMappingContext {
-                    provider_id: "kiro",
-                    service_id: Some(&service.service.id),
-                    api_key_id: key_id.as_deref(),
-                    remaining_percent: None,
-                },
-                "",
-            )
-        };
-        let (cached_models, _) = state.models.get(config.models.cache_ttl_ms);
-        let authorization_models = if cached_models.is_empty() {
-            fallback_models(&config)
-        } else {
-            cached_models
-        };
-        let available_models = authorization_models
-            .iter()
-            .map(|model| model.model_id.clone())
-            .collect::<Vec<_>>();
-        let authorization_model = resolve_kiro_authorization_model(
-            &route.mapped,
-            &config.features.default_model_id,
-            &available_models,
-        );
-        provider_gateway::ensure_model_enabled(&config, &route.mapped, ErrorFormat::Claude)?;
-        provider_gateway::ensure_model_enabled(&config, &authorization_model, ErrorFormat::Claude)?;
-        provider_gateway::authorize_model(
-            authenticated_key.as_ref(),
-            "kiro",
-            &authorization_model,
+            &trace_id,
+            plan,
             ErrorFormat::Claude,
-        )?;
-        let mut normal = TranslationOptions::new(route.mapped.clone(), "AI_EDITOR");
-        normal.enhance_system_prompt = config.features.enhance_system_prompt && !client_compaction;
-        normal.enable_prompt_cache = config.features.enable_prompt_cache;
-        normal.separate_compaction_instruction = client_compaction;
-        normal.conversation_id = conversation_id;
-        normal.additional_model_request_fields_schema = state
-            .resolved_model_info(&route.mapped)
-            .and_then(|model| model.additional_model_request_fields_schema);
-        let mut original_payload = claude_to_kiro(&original_request, &normal);
-        if original_client_compaction {
-            crosslane_translate::prepare_compaction_source_history(&mut original_payload);
-        }
-        state.prepare_model_request(&mut original_payload);
-        let original_input_tokens = state
-            .tokenizer
-            .estimate_kiro_payload(&original_payload)
-            .await
-            .map_err(|error| {
-                ApiError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    error,
-                    ErrorFormat::Claude,
-                )
-            })?;
-        let mut effective_request = request.clone();
-        let context_edit_stats = apply_context_management_edits(
-            &mut effective_request,
-            u64::try_from(original_input_tokens).unwrap_or(u64::MAX),
-        );
-        let mut effective_payload = claude_to_kiro(&effective_request, &normal);
-        if client_compaction {
-            crosslane_translate::prepare_compaction_source_history(&mut effective_payload);
-        }
-        state.prepare_model_request(&mut effective_payload);
-        let input_tokens = state
-            .tokenizer
-            .estimate_kiro_payload(&effective_payload)
-            .await
-            .map_err(|error| {
-                ApiError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    error,
-                    ErrorFormat::Claude,
-                )
-            })?;
-        let mut response = json!({"input_tokens":input_tokens});
-        if has_context_edits {
-            response["context_management"] = json!({
-                "original_input_tokens":original_input_tokens
-            });
-        }
-        state.stats.record(RequestLog {
-            timestamp: now_secs(),
-            trace_id: trace_id.clone(),
-            request_id: format!("req_{}", Uuid::new_v4().simple()),
-            path: path.clone(),
-            user_agent: user_agent.clone(),
-            provider_id: "kiro".into(),
-            model: route.mapped.clone(),
-            original_model: request.model.clone(),
-            kiro_model: route.mapped.clone(),
-            account_id: String::new(),
-            account_name: String::new(),
-            endpoint: "local-tokenizer".into(),
-            model_path: vec![request.model.clone(), route.mapped.clone()],
-            model_mapping_rule: route.rule.clone(),
-            attempts: Vec::new(),
-            duration_ms: started.elapsed().as_millis() as u64,
-            status: 200,
-            input_tokens: input_tokens as u64,
-            output_tokens: 0,
-            credits: 0.0,
-            error: None,
-            diagnostics: RequestDiagnostics {
-                client_context: Some(client_context.clone()),
-                client_status: 200,
-                payload_bytes: body.len(),
-                ..RequestDiagnostics::default()
+            |route| {
+                let service = service.clone();
+                let trace_id = trace_id.clone();
+                let path = path.clone();
+                let headers = headers.clone();
+                let key = authenticated_key.clone();
+                let connection = _connection_guard.clone();
+                let admission = _admission_guard.clone();
+                let context = client_context.clone();
+                async move {
+                    count_tokens_route(
+                        service, trace_id, path, headers, route, key, connection, admission,
+                        context,
+                    )
+                    .await
+                    .map(|response| (response, ()))
+                }
             },
-        });
-        tracing::info!(
-            trace_id = %trace_id,
-            protocol = "claude_count_tokens",
-            model = %log_model(&request.model),
-            input_tokens,
-            original_input_tokens,
-            compaction_boundary_applied = boundary_applied,
-            server_compaction_replayed = replay_applied.is_some(),
-            removed_noop_compaction_blocks = compaction_normalization.removed_noop_blocks,
-            removed_noop_compaction_messages = compaction_normalization.removed_noop_messages,
-            cleared_tool_results = context_edit_stats.cleared_tool_results,
-            cleared_tool_inputs = context_edit_stats.cleared_tool_inputs,
-            duration_ms = started.elapsed().as_millis() as u64,
-            "client token-count response completed"
-        );
-        Ok::<_, ApiError>(Json(response).into_response())
+        )
+        .await
+        .map(|(response, ())| response)
     }
     .await;
     super::client_context::log(&trace_id, &client_context);
@@ -864,6 +601,318 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
             error.with_request_id(&trace_id).into_response()
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn count_tokens_route(
+    service: ServiceHttpState,
+    trace_id: String,
+    path: String,
+    headers: HeaderMap,
+    provider_route: provider_gateway::SelectedProviderRoute,
+    authenticated_key: Option<AuthenticatedApiKey>,
+    _connection_guard: crate::state::AdmissionGuard,
+    _admission_guard: crate::state::AdmissionGuard,
+    client_context: ClientContext,
+) -> Result<Response, ApiError> {
+    let state = Arc::clone(&service.app);
+    let started = Instant::now();
+    let user_agent = logged_user_agent(&headers);
+    let key_id = authenticated_key.as_ref().map(|key| key.id.clone());
+    if provider_route.provider_kind != "kiro" {
+        return provider_gateway::execute_provider(
+            service,
+            provider_route,
+            ProviderProtocol::ClaudeMessages,
+            path.clone(),
+            headers,
+            trace_id.clone(),
+            authenticated_key,
+            _connection_guard,
+            _admission_guard,
+            ErrorFormat::Claude,
+            true,
+            client_context.clone(),
+        )
+        .await;
+    }
+    let automatic = provider_route.automatic;
+    let lock_kiro_mapping = provider_route.lock_kiro_mapping;
+    let locked_original_model = provider_route.original_model.clone();
+    let locked_upstream_model = provider_route.upstream_model.clone();
+    let locked_mapping_name = provider_route.mapping_rule.clone();
+    let body = provider_route.body;
+    tracing::debug!(
+        trace_id = %trace_id,
+        protocol = "claude_count_tokens",
+        api_key_id = key_id.as_deref().unwrap_or("anonymous"),
+        body_bytes = body.len(),
+        "client authentication completed"
+    );
+    let mut value: Value = serde_json::from_slice(&body).map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Invalid JSON in request body",
+            ErrorFormat::Claude,
+        )
+    })?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "request body must be a JSON object",
+            ErrorFormat::Claude,
+        )
+    })?;
+    object.entry("max_tokens").or_insert_with(|| json!(1));
+    let mut original_request: ClaudeRequest = serde_json::from_value(value).map_err(|error| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("Invalid request body: {error}"),
+            ErrorFormat::Claude,
+        )
+    })?;
+    if lock_kiro_mapping {
+        original_request.model.clone_from(&locked_original_model);
+    }
+    let conversation_fingerprint = conversation_fingerprint(&original_request.messages);
+    let conversation_id = client_conversation_id(
+        &service.service.id,
+        key_id.as_deref(),
+        &client_context,
+        &headers,
+        original_request.conversation_id.as_deref(),
+        metadata_conversation_hint(original_request.metadata.as_ref())
+            .or(conversation_fingerprint.as_deref()),
+    );
+    let replay_scope = client_replay_scope(
+        &service.service.id,
+        key_id.as_deref(),
+        &client_context,
+        conversation_fingerprint.as_deref(),
+    );
+    let replay = replay_scope.as_deref().and_then(|scope| {
+        state
+            .compaction_replay
+            .find(scope, &original_request.messages)
+    });
+    let has_context_edits =
+        has_context_management_edits(original_request.context_management.as_ref());
+    // Validate the semantically effective history before touching remote
+    // media. A completed compaction boundary can make stale history
+    // irrelevant to protocol validation, while `original_input_tokens`
+    // still needs to count that pre-boundary history.
+    let mut request = original_request.clone();
+    let replay_applied = replay
+        .as_ref()
+        .and_then(|replay| replay.apply_to(&mut request.messages));
+    let compaction_normalization = normalize_compaction_boundary(&mut request);
+    let boundary_applied = compaction_normalization.boundary_applied;
+    crosslane_translate::validate_claude_count(&request).map_err(claude_validation_error)?;
+    // Counting must include the real bytes of every attachment in the
+    // pre-edit request. Generation can avoid fetching history that will
+    // be cleared, but the count endpoint promises both original and
+    // effective token totals.
+    let _attachment_guards =
+        request::hydrate_claude_attachments(&state, &mut original_request).await?;
+    request.clone_from(&original_request);
+    if let Some(replay) = replay.as_ref() {
+        let _ = replay.apply_to(&mut request.messages);
+    }
+    normalize_compaction_boundary(&mut request);
+    crosslane_translate::validate_claude_count(&request).map_err(claude_validation_error)?;
+    tracing::info!(
+        trace_id = %trace_id,
+        protocol = "claude_count_tokens",
+        model = %log_model(&request.model),
+        message_count = request.messages.len(),
+        tool_count = request.tools.len(),
+        server_compaction_replayed = replay_applied.is_some(),
+        "client token-count request validated"
+    );
+    let config = state.config.current();
+    let claude_code = headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(is_claude_user_agent);
+    let client_compaction =
+        claude_code && crosslane_translate::prepare_claude_code_compaction(&mut request);
+    let original_client_compaction =
+        claude_code && crosslane_translate::prepare_claude_code_compaction(&mut original_request);
+    if config.features.disable_tools {
+        request.tools.clear();
+        request.tool_choice = None;
+        original_request.tools.clear();
+        original_request.tool_choice = None;
+    } else if !config.features.enable_web_tools {
+        request.tools.retain(|tool| {
+            !tool.r#type.as_deref().is_some_and(|kind| {
+                matches_type_family(kind, "web_search") || matches_type_family(kind, "web_fetch")
+            })
+        });
+        original_request.tools.retain(|tool| {
+            !tool.r#type.as_deref().is_some_and(|kind| {
+                matches_type_family(kind, "web_search") || matches_type_family(kind, "web_fetch")
+            })
+        });
+    }
+    if !config.features.enable_tool_search
+        && request.tools.iter().any(|tool| {
+            tool.defer_loading
+                || tool
+                    .r#type
+                    .as_deref()
+                    .is_some_and(crosslane_translate::is_tool_search_type)
+        })
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Anthropic Tool Search is disabled by proxy configuration",
+            ErrorFormat::Claude,
+        ));
+    }
+    let route = if lock_kiro_mapping {
+        ModelRoute {
+            original: locked_original_model,
+            mapped: locked_upstream_model,
+            rule: locked_mapping_name,
+            rule_index: None,
+        }
+    } else {
+        map_model_for_provider(
+            &request.model,
+            &config.model_mapping,
+            ModelMappingContext {
+                provider_id: "kiro",
+                service_id: Some(&service.service.id),
+                api_key_id: key_id.as_deref(),
+                remaining_percent: None,
+            },
+            "",
+        )
+    };
+    let (cached_models, _) = state.models.get(config.models.cache_ttl_ms);
+    let authorization_models = if cached_models.is_empty() {
+        fallback_models(&config)
+    } else {
+        cached_models
+    };
+    let available_models = authorization_models
+        .iter()
+        .map(|model| model.model_id.clone())
+        .collect::<Vec<_>>();
+    let authorization_model = resolve_kiro_authorization_model(
+        &route.mapped,
+        if automatic {
+            ""
+        } else {
+            &config.features.default_model_id
+        },
+        &available_models,
+    );
+    provider_gateway::ensure_model_enabled(&config, &route.mapped, ErrorFormat::Claude)?;
+    provider_gateway::ensure_model_enabled(&config, &authorization_model, ErrorFormat::Claude)?;
+    provider_gateway::authorize_model(
+        authenticated_key.as_ref(),
+        "kiro",
+        &authorization_model,
+        ErrorFormat::Claude,
+    )?;
+    let mut normal = TranslationOptions::new(route.mapped.clone(), "AI_EDITOR");
+    normal.enhance_system_prompt = config.features.enhance_system_prompt && !client_compaction;
+    normal.enable_prompt_cache = config.features.enable_prompt_cache;
+    normal.separate_compaction_instruction = client_compaction;
+    normal.conversation_id = conversation_id;
+    normal.additional_model_request_fields_schema = state
+        .resolved_model_info(&route.mapped)
+        .and_then(|model| model.additional_model_request_fields_schema);
+    let mut original_payload = claude_to_kiro(&original_request, &normal);
+    if original_client_compaction {
+        crosslane_translate::prepare_compaction_source_history(&mut original_payload);
+    }
+    state.prepare_model_request(&mut original_payload);
+    let original_input_tokens = state
+        .tokenizer
+        .estimate_kiro_payload(&original_payload)
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error,
+                ErrorFormat::Claude,
+            )
+        })?;
+    let mut effective_request = request.clone();
+    let context_edit_stats = apply_context_management_edits(
+        &mut effective_request,
+        u64::try_from(original_input_tokens).unwrap_or(u64::MAX),
+    );
+    let mut effective_payload = claude_to_kiro(&effective_request, &normal);
+    if client_compaction {
+        crosslane_translate::prepare_compaction_source_history(&mut effective_payload);
+    }
+    state.prepare_model_request(&mut effective_payload);
+    let input_tokens = state
+        .tokenizer
+        .estimate_kiro_payload(&effective_payload)
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error,
+                ErrorFormat::Claude,
+            )
+        })?;
+    let mut response = json!({"input_tokens":input_tokens});
+    if has_context_edits {
+        response["context_management"] = json!({
+            "original_input_tokens":original_input_tokens
+        });
+    }
+    state.stats.record(RequestLog {
+        timestamp: now_secs(),
+        trace_id: trace_id.clone(),
+        request_id: format!("req_{}", Uuid::new_v4().simple()),
+        path: path.clone(),
+        user_agent: user_agent.clone(),
+        provider_id: "kiro".into(),
+        model: route.mapped.clone(),
+        original_model: request.model.clone(),
+        kiro_model: route.mapped.clone(),
+        account_id: String::new(),
+        account_name: String::new(),
+        endpoint: "local-tokenizer".into(),
+        model_path: vec![request.model.clone(), route.mapped.clone()],
+        model_mapping_rule: route.rule.clone(),
+        attempts: Vec::new(),
+        duration_ms: started.elapsed().as_millis() as u64,
+        status: 200,
+        input_tokens: input_tokens as u64,
+        output_tokens: 0,
+        credits: 0.0,
+        error: None,
+        diagnostics: RequestDiagnostics {
+            client_context: Some(client_context.clone()),
+            client_status: 200,
+            payload_bytes: body.len(),
+            ..RequestDiagnostics::default()
+        },
+    });
+    tracing::info!(
+        trace_id = %trace_id,
+        protocol = "claude_count_tokens",
+        model = %log_model(&request.model),
+        input_tokens,
+        original_input_tokens,
+        compaction_boundary_applied = boundary_applied,
+        server_compaction_replayed = replay_applied.is_some(),
+        removed_noop_compaction_blocks = compaction_normalization.removed_noop_blocks,
+        removed_noop_compaction_messages = compaction_normalization.removed_noop_messages,
+        cleared_tool_results = context_edit_stats.cleared_tool_results,
+        cleared_tool_inputs = context_edit_stats.cleared_tool_inputs,
+        duration_ms = started.elapsed().as_millis() as u64,
+        "client token-count response completed"
+    );
+    Ok::<_, ApiError>(Json(response).into_response())
 }
 
 pub async fn models(State(service): State<ServiceHttpState>, request: Request) -> Response {
@@ -2163,7 +2212,7 @@ pub(super) fn estimated_credits(
 }
 
 fn meter_error(error: MeterError, format: ErrorFormat) -> ApiError {
-    match error {
+    let mut api = match error {
         MeterError::Unauthorized => {
             ApiError::new(StatusCode::UNAUTHORIZED, error.to_string(), format)
         }
@@ -2176,7 +2225,9 @@ fn meter_error(error: MeterError, format: ErrorFormat) -> ApiError {
         MeterError::Persist(_) => {
             ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string(), format)
         }
-    }
+    };
+    api.error_stage = "metering";
+    api
 }
 
 fn reserve_credits(
@@ -2202,11 +2253,16 @@ fn upstream_error(error: ExecuteError, format: ErrorFormat) -> ApiError {
         ExecuteError::Pool(PoolError::NoAvailableAccount(_)) => {
             ApiError::retryable("Service temporarily unavailable, please retry", format)
         }
-        ExecuteError::Pool(PoolError::CreditsExhausted) => ApiError::new(
-            StatusCode::UNAUTHORIZED,
-            "Credit quota exhausted; no compatible account currently has usable credit",
-            format,
-        ),
+        ExecuteError::Pool(PoolError::CreditsExhausted) => {
+            let mut error = ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "Credit quota exhausted; no compatible account currently has usable credit",
+                format,
+            );
+            error.account_error = true;
+            error.error_stage = "upstream_dispatch";
+            error
+        },
         ExecuteError::Meter(error) => meter_error(error, format),
         ExecuteError::ContextLimit(limit) => {
             let mut error = ApiError::new(

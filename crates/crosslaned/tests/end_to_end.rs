@@ -32,6 +32,9 @@ mod model_policy;
 #[path = "end_to_end/copilot_model_aliases.rs"]
 mod copilot_model_aliases;
 
+#[path = "end_to_end/provider_balance.rs"]
+mod provider_balance;
+
 #[path = "end_to_end/copilot_account_info.rs"]
 mod copilot_account_info;
 

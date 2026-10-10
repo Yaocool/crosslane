@@ -141,7 +141,8 @@ impl AccountState {
         models
     }
 
-    pub(crate) async fn cooling_expired(&self) -> bool {
+    /// Whether a cooled account can be reconsidered by the provider router.
+    pub async fn cooling_expired(&self) -> bool {
         if self.health() != AccountHealth::Cooling {
             return false;
         }

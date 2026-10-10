@@ -124,6 +124,37 @@ crosslane ready
 crosslane service create --name copilot --host 127.0.0.1 --provider copilot --default-provider copilot
 ```
 
+同时使用 Kiro 和 Copilot 的服务会自动均衡无来源前缀、未命中模型映射的请求：
+
+```bash
+crosslane service create --name mixed --host 127.0.0.1 --provider kiro --provider copilot --default-provider kiro
+```
+
+服务及客户端 Key 都必须允许对应来源。路由先从该服务的账号池及有效模型缓存中查找
+同一模型（包含等价别名），再按账号容量与当前并发选择压力较低的来源；压力相同时轮转。
+跨来源调度不会使用 Copilot 剩余额度估值，也不会把模型切到其他版本。来源确定后，
+各自账号池保留原有选号逻辑。`default_provider` 为初始轮转偏好，并用于模型映射及
+模型目录尚未发现可用路由时的兼容路径；仅绑定账号不会扩大服务或 Key 的来源权限。
+
+响应交付前的连接故障、上游账号认证/额度错误、限流及服务异常可切换到另一兼容来源。
+失败来源按服务和模型进入 5 秒起的冷却，连续失败时增加至最多 60 秒；到期允许单个
+恢复请求，成功后重新均衡。客户端参数、权限及客户端 Key 额度错误不会触发灾备。
+已开始交付的流式响应保持原有错误事件，后续请求避开失败来源，避免重放已输出内容。
+Messages、Chat Completions、Responses 及 `count_tokens` 使用相同调度入口。
+多候选 Chat 请求保留原有批处理方式；Kiro 拆分出的每个候选分别参与自动调度。
+计数接口的冷却状态独立，Kiro 本地计数成功不会重置生成接口的故障状态。
+自动路由每个来源在返回响应前最多等待 5 分钟；可通过 `[provider.routing]` 的
+`failover_timeout_ms` 调整（CLI：`crosslane provider edit copilot --failover-timeout-ms 300000`），
+设为 `0` 可取消此等待上限。开始交付后的流式响应
+继续使用原有空闲超时，该参数不会截断已经开始的长响应。
+
+`kiro/MODEL_ID`、`copilot/MODEL_ID` 和显式模型映射保留指定来源语义。
+将请求改成另一模型的默认模型覆盖也沿用原有路径；覆盖为同一模型或等价别名时仍可均衡。
+带 `previous_response_id` 的 Responses 请求沿用创建该 ID 的来源，包括匿名客户端。
+显式跨来源模型映射仍需开启源 provider 的 `allow_cross_provider_fallback`；
+自动均衡使用服务与 Key 已允许的来源范围。用日志事件 `upstream.provider.selected` 和
+`upstream.provider.failover` 配合 `trace_id` 查看均衡与切换过程。
+
 服务只接受已绑定的客户端 Key。生成接口还会检查客户端产品 User-Agent。接入其他客户端时，
 操作员可在服务或客户端 Key 上设置 `--skip-user-agent-check true`；Key 认证和其他服务限制
 仍然生效。调整访问前先查看命令帮助：

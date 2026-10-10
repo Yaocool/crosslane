@@ -588,6 +588,7 @@ pub fn response(
                     && pre_data_retries < retry_limit
                     && may_switch
                     && is_model_capacity_error
+                    && context.allow_model_fallback
                     && config.features.enable_model_fallback
                     && fallback_model.is_none()
                 {
