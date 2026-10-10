@@ -1158,6 +1158,7 @@ mod tests {
         let service = ServiceHttpState {
             app: state,
             service: Arc::new(ProxyServiceConfig {
+                web_search_provider: None,
                 id: "svc_team".into(),
                 name: "team".into(),
                 host: "127.0.0.1".into(),
@@ -1185,6 +1186,7 @@ mod tests {
     #[tokio::test]
     async fn account_pool_edits_are_hot_reloaded_without_restarting_the_listener() {
         let service = ProxyServiceConfig {
+            web_search_provider: None,
             id: "svc_team".into(),
             name: "team".into(),
             host: "127.0.0.1".into(),
@@ -1532,6 +1534,7 @@ mod tests {
         outside.tags = vec!["team-b".into()];
         state.pool().replace_accounts(vec![outside]).await;
         let service = ProxyServiceConfig {
+            web_search_provider: None,
             id: "svc_team_a".into(),
             name: "team-a".into(),
             host: "127.0.0.1".into(),
@@ -1589,6 +1592,7 @@ mod tests {
         };
         state.models.finish_refresh(vec![model("outside-only")]);
         let service = ProxyServiceConfig {
+            web_search_provider: None,
             id: "svc_team_a".into(),
             name: "team-a".into(),
             host: "127.0.0.1".into(),

@@ -1646,6 +1646,7 @@ mod tests {
         config
             .proxy_service
             .push(crosslane_core::config::ProxyServiceConfig {
+                web_search_provider: None,
                 id: "svc_team_a".into(),
                 name: "team-a".into(),
                 host: "127.0.0.1".into(),

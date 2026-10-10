@@ -938,6 +938,10 @@ pub struct ProxyServiceConfig {
     /// Provider instances exposed by this listener. Empty means `kiro`.
     #[serde(default)]
     pub allowed_providers: Vec<String>,
+    /// Kiro backend for actual web search and its generation continuation.
+    /// Ordinary generation permissions are unchanged. Account scope still applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_search_provider: Option<String>,
     /// 创建时间（Unix 秒）。
     #[serde(default)]
     pub created_at: i64,
@@ -958,6 +962,7 @@ impl Default for ProxyServiceConfig {
             excluded_account_ids: Vec::new(),
             default_provider: String::new(),
             allowed_providers: Vec::new(),
+            web_search_provider: None,
             created_at: 0,
         }
     }
@@ -1673,6 +1678,18 @@ impl Config {
                     format!("{field}.default_provider"),
                     "must be included in allowed_providers",
                 );
+            }
+            if let Some(backend) = &service.web_search_provider {
+                if !self
+                    .effective_providers()
+                    .iter()
+                    .any(|provider| provider.id == *backend && provider.kind == "kiro")
+                {
+                    return invalid_config(
+                        format!("{field}.web_search_provider"),
+                        "must reference a Kiro provider instance",
+                    );
+                }
             }
             let mut bound_ids = BTreeSet::new();
             for key_id in &service.api_key_ids {
