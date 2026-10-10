@@ -284,23 +284,23 @@ curl -i "$CROSSLANE_URL/v1/messages" \
 此请求通过认证后仅触发本地必填字段校验，不调用上游。启用 `crs` 时返回
 HTTP 200、`text/event-stream` 和 `event: error`；未启用时返回 HTTP 400 JSON。
 
-启用 `crs` 后，非流式请求的异常上游响应（包括 HTTP 200 错误对象）会转换为
-Anthropic 格式 JSON。普通上游 400/413 转为 HTTP 502，可明确修正的请求错误保留 HTTP 400。
+Kiro 和 Copilot 返回的错误状态码保留原值，包括 401、402、403、413、503、504 和 529。
+非流式响应及未启用 `crs` 的响应使用原 HTTP 状态码；CRS 兼容的 Claude 流式响应将原值
+写入 SSE 错误字段。错误分类和凭据脱敏不映射供应商状态码。没有供应商 HTTP 错误响应的
+传输、协议故障继续使用代理自身的错误状态。
 
-CRS Console 会把非 200 错误体替换为固定文案。有效请求设置 `stream: true` 时，
-Crosslane 对 400、404、408、422、429 和 5xx 使用 HTTP 200 加 SSE `event: error`。
-客户端认证、方法和 HTTP 请求体限制错误保留原有 HTTP 状态。服务端检查最初最多
-64 KiB 或五秒的 SSE 事件，也会规范化已经开始输出助手内容后的错误。
+启用 `crs` 后，错误正文保留 Anthropic 格式、脱敏原因、操作建议、失败阶段、请求 ID、
+`error.status` 和已知的真实 `error.upstream_status`。上下文错误还保留 token 诊断和
+压缩重试结果。无需修改 CRS 代码。现有 CRS Console 会把非 2xx JSON 错误正文替换成
+固定文案，因此只有流式响应能通过其现有转发保留详细诊断；CCR 路径也会保留非流式错误正文。
 
-流开始前的错误会先初始化流、完成一个空文本块，再发送错误事件。Claude Code 2.1.295
-收到只有错误事件的流时，会退回非流式重试，后一次错误会被 CRS Console 再次清理。
-初始化帧 token 用量为零，流以错误终止，客户端仍记录 API 失败。显式非流式请求继续
-保留 HTTP 错误状态，其详细文案仍受 CRS Console 的错误清理影响。
-
-错误保留 `error.status`、已知的真实 `error.upstream_status`、稳定的 `error.code` 和
-`request_id`；流开始前的 SSE 错误还带有 `x-crosslane-error-status`。
-文案包含操作建议、失败阶段和请求 ID；上下文错误保留已知 token 数量，并在压缩重试
-失败时说明恢复结果。请求统计分别记录业务失败状态和客户端 HTTP 200 传输状态。
+Claude 请求设置 `stream: true` 且启用 `crs` 时，供应商错误采用 HTTP 200 加 SSE
+`event: error`，在 `error.status`、`error.upstream_status` 和 `x-crosslane-error-status`
+中保留原始状态码。流开始前的错误先初始化零用量的空文本块，避免 Claude Code 退回非流式
+重试后被 Console 清理掉错误详情。客户端认证、方法和 HTTP 请求体限制错误保留原 HTTP 状态。
+成功的 SSE 响应已经开始输出后，后续错误继续通过流内事件表达。请求统计分别记录失败状态和
+客户端 HTTP 200 传输状态。服务端检查最初最多 64 KiB 或五秒的 SSE 事件，也会补充已经开始
+输出助手内容后的错误诊断。
 
 ## 备份与恢复
 

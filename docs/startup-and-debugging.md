@@ -334,30 +334,31 @@ This authenticated probe fails local validation without calling an upstream.
 With `crs` enabled it returns HTTP 200, `text/event-stream` and `event: error`;
 without the feature it returns HTTP 400 JSON.
 
-With `crs` enabled, non-streaming requests receive Anthropic-shaped JSON for abnormal
-upstream responses, including HTTP 200 error objects. Generic upstream 400/413
-responses become HTTP 502; actionable request errors remain HTTP 400.
+Supplier error statuses are preserved for Kiro and Copilot, including 401, 402,
+403, 413, 503, 504, and 529. Non-streaming and non-CRS responses use the original
+HTTP status; CRS-compatible Claude streams carry it in their SSE error payload.
+Error classification and credential redaction do not map supplier statuses.
+Transport or protocol failures without a supplier HTTP error still use the
+proxy's own error status.
 
-CRS Console replaces non-200 error bodies with fixed messages. For valid requests
-with `stream: true`, Crosslane therefore returns HTTP 200 and an SSE `event: error`
-for error statuses 400, 404, 408, 422, 429, and 5xx. Client
+With `crs` enabled, errors include Anthropic-shaped JSON with the sanitized cause,
+action hint, failure stage, request ID, `error.status`, and the known supplier
+status in `error.upstream_status`. Context errors retain token diagnostics and
+compaction-retry results. No CRS code changes are required. CRS Console replaces
+non-2xx JSON bodies with fixed messages, so only streaming responses preserve
+the detailed diagnostics through its existing relay. CCR preserves non-streaming
+error bodies as well.
+
+For Claude `stream: true` with `crs`, supplier errors use HTTP 200 and an SSE
+`event: error`, preserving the original status in `error.status`,
+`error.upstream_status` and `x-crosslane-error-status`. Early errors initialize a
+zero-usage empty text block before the error, preventing Claude Code from falling
+back to non-streaming and losing details through Console sanitization. Client
 authentication, method, and HTTP body-limit failures retain their HTTP statuses.
-Crosslane checks up to 64 KiB or five seconds of initial SSE events and also
-normalizes failures after assistant content starts.
-
-Early errors initialize the stream and complete an empty text block before the
-error event. Claude Code 2.1.295 otherwise retries an error-only stream without
-streaming, whose error CRS Console sanitizes again. Initialization reports zero
-token usage and no success stop event; the client still reports an API failure.
-Explicit non-streaming requests retain HTTP error statuses and remain subject to
-CRS Console's error sanitization.
-
-Errors retain their semantic status in `error.status`, the real upstream status
-in `error.upstream_status` when known, and a stable `error.code` and `request_id`.
-An early SSE error also includes `x-crosslane-error-status`. Messages include an
-action hint, failure stage, and request ID; context errors preserve known token
-counts and report a failed compaction retry when applicable. Request statistics
-retain the failure status separately from the HTTP 200 client transport status.
+Once a successful SSE response has started, subsequent errors remain in the
+committed stream. Request statistics record failure status separately from the
+HTTP 200 client transport. Crosslane checks up to 64 KiB or five seconds of initial
+SSE events and enriches errors after assistant content starts.
 
 | Symptom | First checks |
 | --- | --- |
