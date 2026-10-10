@@ -18,6 +18,14 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 static HTTP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+fn sse_error_payload(body: &str) -> serde_json::Value {
+    body.lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .find(|event| event["type"] == "error")
+        .expect("SSE error event")
+}
+
 #[path = "end_to_end/model_policy.rs"]
 mod model_policy;
 
@@ -38,6 +46,9 @@ mod compatibility_controls;
 
 #[path = "end_to_end/claude_gateway.rs"]
 mod claude_gateway;
+
+#[path = "end_to_end/crs_errors.rs"]
+mod crs_errors;
 
 #[path = "end_to_end/cache_controls.rs"]
 mod cache_controls;

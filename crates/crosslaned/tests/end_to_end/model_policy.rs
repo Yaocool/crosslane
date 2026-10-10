@@ -63,12 +63,7 @@ async fn assert_hidden_and_rejected(daemon: &Daemon, port: u16, models: &[&str],
                 );
                 let body = response.text().await.unwrap();
                 if cfg!(feature = "crs") && stream && endpoint == "/v1/messages" {
-                    let error: Value = serde_json::from_str(
-                        body.lines()
-                            .find_map(|line| line.strip_prefix("data: "))
-                            .unwrap(),
-                    )
-                    .unwrap();
+                    let error = sse_error_payload(&body);
                     assert_eq!(error["error"]["status"], 400);
                     assert_eq!(error["error"]["type"], "invalid_request_error");
                 }

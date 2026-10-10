@@ -224,12 +224,7 @@ async fn cache_hints_work_across_messages_aliases_counting_and_openai_http_modes
             let status = response.status();
             let text = response.text().await.unwrap();
             let body: Value = if cfg!(feature = "crs") && stream {
-                serde_json::from_str(
-                    text.lines()
-                        .find_map(|line| line.strip_prefix("data: "))
-                        .unwrap(),
-                )
-                .unwrap()
+                sse_error_payload(&text)
             } else {
                 serde_json::from_str(&text).unwrap()
             };

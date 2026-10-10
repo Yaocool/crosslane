@@ -10,6 +10,7 @@ use axum::body::{to_bytes, Body, Bytes};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::BytesMut;
+use crosslane_translate::error::log_model;
 use crosslane_translate::{error_envelope, sanitize_error_message, ErrorFormat};
 use futures::StreamExt;
 use serde_json::Value;
@@ -141,7 +142,11 @@ pub(super) fn stream_requested(body: &[u8]) -> bool {
     serde_json::from_slice::<RequestMode>(body).is_ok_and(|request| request.stream)
 }
 
-pub(super) async fn adapt_claude_stream_response(response: Response, request_id: &str) -> Response {
+pub(super) async fn adapt_claude_stream_response(
+    response: Response,
+    request_id: &str,
+    model: &str,
+) -> Response {
     let response = adapt_claude_response(response, request_id).await;
     if !uses_sse_error(response.status()) {
         return response;
@@ -177,7 +182,34 @@ pub(super) async fn adapt_claude_stream_response(response: Response, request_id:
     );
     Response::from_parts(
         parts,
-        Body::from(format!("event: error\ndata: {envelope}\n\n")),
+        Body::from(initial_error_stream(&envelope, request_id, model)),
+    )
+}
+
+fn initial_error_stream(envelope: &Value, request_id: &str, model: &str) -> String {
+    // Claude Code retries an error-only stream without streaming. CRS then
+    // sanitizes that HTTP error and erases the original diagnostics again.
+    // A completed empty block makes the SSE error terminal for the client.
+    // Initialization has zero usage and ends with error, never message_stop.
+    let model = log_model(model);
+    let start = serde_json::json!({
+        "type":"message_start",
+        "message":{
+            "id":format!("msg_{request_id}"),
+            "type":"message",
+            "role":"assistant",
+            "model":if model.is_empty() { "unknown" } else { &model },
+            "content":[],
+            "stop_reason":null,
+            "stop_sequence":null,
+            "usage":{"input_tokens":0,"output_tokens":0}
+        }
+    });
+    format!(
+        "event: message_start\ndata: {start}\n\n\
+         event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n\
+         event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+         event: error\ndata: {envelope}\n\n"
     )
 }
 
@@ -827,6 +859,9 @@ fn diagnostic_envelope(
         message,
         Some(request_id),
     );
+    if upstream_status.is_some() {
+        envelope["error"]["stage"] = Value::String("provider_upstream".to_owned());
+    }
     if let Some(metadata) = metadata {
         if let Some(stage) = metadata
             .pointer("/error/stage")
@@ -902,12 +937,35 @@ mod tests {
         let text = std::str::from_utf8(&bytes).unwrap();
         assert_eq!(text.matches("event: error").count(), 1);
         assert!(text.ends_with("\n\n"));
-        serde_json::from_str(
-            text.lines()
-                .find_map(|line| line.strip_prefix("data: "))
-                .unwrap(),
-        )
-        .unwrap()
+        let events = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|data| serde_json::from_str::<Value>(data).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_stop",
+                "error"
+            ]
+        );
+        assert_eq!(events[0]["message"]["content"], serde_json::json!([]));
+        assert_eq!(
+            events[0]["message"]["usage"],
+            serde_json::json!({"input_tokens":0,"output_tokens":0})
+        );
+        assert_eq!(events[0]["message"]["stop_reason"], Value::Null);
+        assert_eq!(
+            events[1]["content_block"],
+            serde_json::json!({"type":"text","text":""})
+        );
+        assert_eq!(events[1]["index"], events[2]["index"]);
+        events.last().unwrap().clone()
     }
 
     #[test]
@@ -952,7 +1010,9 @@ mod tests {
             .header("x-crosslane-account-error", "false")
             .body(Body::from(envelope.to_string()))
             .unwrap();
-        let adapted = adapt_claude_stream_response(response, "trace_current_123456").await;
+        let adapted =
+            adapt_claude_stream_response(response, "trace_current_123456", "claude-sonnet-4.6")
+                .await;
         assert_eq!(adapted.headers()["x-crosslane-error-status"], "400");
         assert_eq!(adapted.headers()["x-crosslane-account-error"], "false");
         let body = body_sse_error(adapted).await;
@@ -997,8 +1057,10 @@ mod tests {
             .header("x-crosslane-error-code", "context_length_exceeded")
             .body(Body::from(envelope.to_string()))
             .unwrap();
-        let body =
-            body_sse_error(adapt_claude_stream_response(response, "trace_new_123456").await).await;
+        let body = body_sse_error(
+            adapt_claude_stream_response(response, "trace_new_123456", "claude-sonnet-4.6").await,
+        )
+        .await;
         assert_eq!(
             body["error"]["detail"],
             "prompt is too long: 200001 tokens > 200000"
@@ -1026,8 +1088,10 @@ mod tests {
                     serde_json::json!({"error":{"message":raw}}).to_string(),
                 ))
                 .unwrap();
-            let body =
-                body_sse_error(adapt_claude_stream_response(response, "trace_failure").await).await;
+            let body = body_sse_error(
+                adapt_claude_stream_response(response, "trace_failure", "claude-sonnet-4.6").await,
+            )
+            .await;
             assert_eq!(body["error"]["upstream_status"], status);
             assert_eq!(body["error"]["status"], client_status);
             assert_eq!(body["error"]["code"], code);
@@ -1051,14 +1115,44 @@ mod tests {
                         .to_string(),
                 ))
                 .unwrap();
-            let body =
-                body_sse_error(adapt_claude_stream_response(response, "trace_redacted").await)
-                    .await;
+            let body = body_sse_error(
+                adapt_claude_stream_response(response, "trace_redacted", "ksk_private-credential")
+                    .await,
+            )
+            .await;
             let rendered = body.to_string();
             assert!(!rendered.contains("ksk_private"));
             assert!(!rendered.contains("account is disabled"));
             assert!(body["error"]["message"].as_str().unwrap().chars().count() <= 1024);
         }
+    }
+
+    #[tokio::test]
+    async fn copilot_field_validation_error_keeps_cause_stage_and_status() {
+        let response = Response::builder()
+            .status(400)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.1.output_config: Extra inputs are not permitted"}}"#,
+            ))
+            .unwrap();
+        let adapted =
+            adapt_claude_stream_response(response, "trace_copilot", "claude-opus-5-5").await;
+        assert_eq!(adapted.headers()["x-crosslane-error-status"], "400");
+        let error = body_sse_error(adapted).await;
+        assert_eq!(
+            error["error"]["detail"],
+            "messages.1.output_config: Extra inputs are not permitted"
+        );
+        assert_eq!(error["error"]["type"], "invalid_request_error");
+        assert_eq!(error["error"]["status"], 400);
+        assert_eq!(error["error"]["upstream_status"], 400);
+        assert_eq!(error["error"]["stage"], "provider_upstream");
+        assert_eq!(error["error"]["retryable"], false);
+        assert!(error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("request ID: trace_copilot"));
     }
 
     #[tokio::test]

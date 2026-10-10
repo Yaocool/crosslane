@@ -237,6 +237,20 @@ Claude Messages 作为 CRS Console/CCR 上游时，使用
 `docker build --target runtime-full --build-arg CROSSLANED_FEATURES=crosslaned/sso,crosslaned/crs -t crosslane:crs .`；
 未指定此参数时，完整镜像只启用 `sso`。
 
+新构建的 `crosslaned --version` 会显示编译 feature；容器内运行
+`docker exec <容器名> crosslaned --version`，检查是否包含 `crs=true`。
+旧构建可直接探测 Crosslane 监听端口（不经过 CRS）：
+
+```bash
+curl -i "$CROSSLANE_URL/v1/messages" \
+  -H "x-api-key: $CROSSLANE_API_KEY" \
+  -H 'User-Agent: claude-cli/2.1.295 (external, cli)' \
+  -H 'Content-Type: application/json' --data '{"stream":true}'
+```
+
+此请求通过认证后仅触发本地必填字段校验，不调用上游。启用 `crs` 时返回
+HTTP 200、`text/event-stream` 和 `event: error`；未启用时返回 HTTP 400 JSON。
+
 启用 `crs` 后，非流式请求的异常上游响应（包括 HTTP 200 错误对象）会转换为
 Anthropic 格式 JSON。普通上游 400/413 转为 HTTP 502，可明确修正的请求错误保留 HTTP 400。
 
@@ -244,6 +258,11 @@ CRS Console 会把非 200 错误体替换为固定文案。有效请求设置 `s
 Crosslane 对 400、404、408、422、429 和 5xx 使用 HTTP 200 加 SSE `event: error`。
 客户端认证、方法和 HTTP 请求体限制错误保留原有 HTTP 状态。服务端检查最初最多
 64 KiB 或五秒的 SSE 事件，也会规范化已经开始输出助手内容后的错误。
+
+流开始前的错误会先初始化流、完成一个空文本块，再发送错误事件。Claude Code 2.1.295
+收到只有错误事件的流时，会退回非流式重试，后一次错误会被 CRS Console 再次清理。
+初始化帧 token 用量为零，流以错误终止，客户端仍记录 API 失败。显式非流式请求继续
+保留 HTTP 错误状态，其详细文案仍受 CRS Console 的错误清理影响。
 
 错误保留 `error.status`、已知的真实 `error.upstream_status`、稳定的 `error.code` 和
 `request_id`；流开始前的 SSE 错误还带有 `x-crosslane-error-status`。

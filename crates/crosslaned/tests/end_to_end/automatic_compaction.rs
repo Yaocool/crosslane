@@ -179,12 +179,7 @@ async fn context_recovery_respects_disable_and_stops_after_one_retry() {
         let text = response.text().await.unwrap();
         let body: Value = if sse_error {
             assert_eq!(text.matches("event: error").count(), 1);
-            serde_json::from_str(
-                text.lines()
-                    .find_map(|line| line.strip_prefix("data: "))
-                    .unwrap(),
-            )
-            .unwrap()
+            sse_error_payload(&text)
         } else {
             serde_json::from_str(&text).unwrap()
         };

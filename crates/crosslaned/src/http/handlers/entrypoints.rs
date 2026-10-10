@@ -255,7 +255,7 @@ pub async fn claude_messages(
             #[cfg(feature = "crs")]
             {
                 if stream_requested {
-                    crs::adapt_claude_stream_response(response, &trace_id).await
+                    crs::adapt_claude_stream_response(response, &trace_id, &model).await
                 } else {
                     crs::adapt_claude_response(response, &trace_id).await
                 }
@@ -289,7 +289,7 @@ pub async fn claude_messages(
             let response = error.with_request_id(&trace_id).into_response();
             #[cfg(feature = "crs")]
             if use_sse {
-                return crs::adapt_claude_stream_response(response, &trace_id).await;
+                return crs::adapt_claude_stream_response(response, &trace_id, &model).await;
             }
             response
         }

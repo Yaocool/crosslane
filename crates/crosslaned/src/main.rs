@@ -11,7 +11,7 @@ mod state;
 mod stats;
 mod tasks;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -28,8 +28,22 @@ use crate::state::AppState;
 
 const CONFIG_DEBOUNCE: Duration = Duration::from_millis(500);
 
+fn build_version() -> &'static str {
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION
+        .get_or_init(|| {
+            format!(
+                "{}\nfeatures: crs={} sso={}",
+                env!("CARGO_PKG_VERSION"),
+                cfg!(feature = "crs"),
+                cfg!(feature = "sso")
+            )
+        })
+        .as_str()
+}
+
 #[derive(Debug, Parser)]
-#[command(name = "crosslaned", version, about = "crosslane 常驻服务")]
+#[command(name = "crosslaned", version, long_version = build_version(), about = "crosslane 常驻服务")]
 struct Cli {
     /// 配置文件路径，默认按 XDG 解析。
     #[arg(long, value_name = "PATH")]

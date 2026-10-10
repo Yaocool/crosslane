@@ -1345,12 +1345,11 @@ mod tests {
         let body = if cfg!(feature = "crs") {
             let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
             let text = std::str::from_utf8(&bytes).unwrap();
-            serde_json::from_str(
-                text.lines()
-                    .find_map(|line| line.strip_prefix("data: "))
-                    .unwrap(),
-            )
-            .unwrap()
+            text.lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .map(|data| serde_json::from_str::<serde_json::Value>(data).unwrap())
+                .find(|event| event["type"] == "error")
+                .expect("SSE error event")
         } else {
             body_json(response).await
         };
@@ -2325,12 +2324,11 @@ mod tests {
                 let body = if cfg!(feature = "crs") && stream && !counting {
                     let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
                     let text = std::str::from_utf8(&bytes).unwrap();
-                    serde_json::from_str(
-                        text.lines()
-                            .find_map(|line| line.strip_prefix("data: "))
-                            .unwrap(),
-                    )
-                    .unwrap()
+                    text.lines()
+                        .filter_map(|line| line.strip_prefix("data: "))
+                        .map(|data| serde_json::from_str::<serde_json::Value>(data).unwrap())
+                        .find(|event| event["type"] == "error")
+                        .expect("SSE error event")
                 } else {
                     body_json(response).await
                 };

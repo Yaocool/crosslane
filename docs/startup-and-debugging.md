@@ -273,6 +273,21 @@ For a full Docker image with this compatibility enabled, build with
 `docker build --target runtime-full --build-arg CROSSLANED_FEATURES=crosslaned/sso,crosslaned/crs -t crosslane:crs .`.
 The full image enables `sso` without `crs` unless this build argument is set.
 
+New builds report compiled features with `crosslaned --version`; inside Docker,
+run `docker exec <container> crosslaned --version` and check `crs=true`.
+For older builds, directly probe the Crosslane listener (bypassing CRS):
+
+```bash
+curl -i "$CROSSLANE_URL/v1/messages" \
+  -H "x-api-key: $CROSSLANE_API_KEY" \
+  -H 'User-Agent: claude-cli/2.1.295 (external, cli)' \
+  -H 'Content-Type: application/json' --data '{"stream":true}'
+```
+
+This authenticated probe fails local validation without calling an upstream.
+With `crs` enabled it returns HTTP 200, `text/event-stream` and `event: error`;
+without the feature it returns HTTP 400 JSON.
+
 With `crs` enabled, non-streaming requests receive Anthropic-shaped JSON for abnormal
 upstream responses, including HTTP 200 error objects. Generic upstream 400/413
 responses become HTTP 502; actionable request errors remain HTTP 400.
@@ -283,6 +298,13 @@ for error statuses 400, 404, 408, 422, 429, and 5xx. Client
 authentication, method, and HTTP body-limit failures retain their HTTP statuses.
 Crosslane checks up to 64 KiB or five seconds of initial SSE events and also
 normalizes failures after assistant content starts.
+
+Early errors initialize the stream and complete an empty text block before the
+error event. Claude Code 2.1.295 otherwise retries an error-only stream without
+streaming, whose error CRS Console sanitizes again. Initialization reports zero
+token usage and no success stop event; the client still reports an API failure.
+Explicit non-streaming requests retain HTTP error statuses and remain subject to
+CRS Console's error sanitization.
 
 Errors retain their semantic status in `error.status`, the real upstream status
 in `error.upstream_status` when known, and a stable `error.code` and `request_id`.
