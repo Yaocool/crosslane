@@ -1,8 +1,8 @@
 //! Response compatibility for Claude Relay Service's Console/CCR relay paths.
 //!
-//! CRS replaces non-200 error bodies with fixed messages. Streaming requests
-//! use standard SSE error events under HTTP 200 so client-visible diagnostics
-//! survive its Console relay. Non-streaming requests retain HTTP error status.
+//! Preserve supplier error statuses in sanitized diagnostics and HTTP responses.
+//! Streaming errors use HTTP 200 SSE so CRS Console retains their details.
+//! Errors after an SSE response starts remain in the already committed stream.
 
 use std::time::Duration;
 
@@ -127,8 +127,11 @@ pub(super) fn context_rejection_reason(message: &str) -> Option<&'static str> {
     .then_some("CONTENT_LENGTH_EXCEEDS_THRESHOLD")
 }
 
-pub(super) fn uses_sse_error(status: StatusCode) -> bool {
+pub(super) fn uses_sse_error(status: StatusCode, upstream_status: Option<u16>) -> bool {
+    // Supplier failures need SSE even for auth/payload statuses. Local client
+    // authentication, authorization and body limits retain their HTTP status.
     matches!(status.as_u16(), 400 | 404 | 408 | 422 | 429 | 500..=599)
+        || upstream_status.is_some_and(|status| (400..=599).contains(&status))
 }
 
 pub(super) fn stream_requested(body: &[u8]) -> bool {
@@ -148,7 +151,12 @@ pub(super) async fn adapt_claude_stream_response(
     model: &str,
 ) -> Response {
     let response = adapt_claude_response(response, request_id).await;
-    if !uses_sse_error(response.status()) {
+    let upstream_status = response
+        .headers()
+        .get("x-crosslane-upstream-status")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok());
+    if !uses_sse_error(response.status(), upstream_status) {
         return response;
     }
     let status = response.status();
@@ -326,32 +334,32 @@ async fn normalize_http_error(response: Response, request_id: &str) -> Response 
         .as_deref()
         .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok());
     let sse_error = bytes.as_deref().and_then(error_from_sse);
+    let text_message = bytes
+        .as_deref()
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .filter(|text| !text.trim().is_empty());
     let message = parsed
         .as_ref()
         .and_then(error_message)
         .or_else(|| sse_error.as_ref().and_then(error_message))
+        .or_else(|| parsed.is_none().then_some(text_message).flatten())
         .unwrap_or("Upstream service error");
     let parsed_code = parsed
         .as_ref()
         .and_then(error_code)
         .or_else(|| sse_error.as_ref().and_then(error_code));
-    let safe = sanitize_error_message(message);
     let status = if original_status.is_client_error() || original_status.is_server_error() {
-        normalized_upstream_status(original_status, &safe)
+        original_status
     } else {
+        // A malformed success/redirect is a local protocol failure, not a
+        // supplier HTTP error whose status needs to be forwarded.
         StatusCode::BAD_GATEWAY
     };
-    let code = if status != original_status {
-        match original_status {
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => "upstream_authentication_failed",
-            StatusCode::PAYLOAD_TOO_LARGE if status == StatusCode::BAD_REQUEST => {
-                "request_payload_exceeded"
-            }
-            _ => "upstream_unavailable",
-        }
-    } else {
-        parsed_code.unwrap_or_else(|| default_code(status))
-    };
+    let code = parsed_code.unwrap_or_else(|| match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => "upstream_authentication_failed",
+        StatusCode::PAYMENT_REQUIRED => "upstream_quota_exhausted",
+        _ => default_code(status),
+    });
     let metadata = parsed.as_ref().or(sse_error.as_ref());
     let upstream_status = metadata
         .and_then(|value| value.pointer("/error/upstream_status"))
@@ -602,7 +610,10 @@ pub(super) fn stream_error_envelope(
     request_id: &str,
 ) -> Value {
     let metadata = serde_json::json!({"error":{"stage":stage}});
-    let status = status_for_error(code, None);
+    let status = upstream_status
+        .and_then(|status| StatusCode::from_u16(status).ok())
+        .filter(|status| status.is_client_error() || status.is_server_error())
+        .unwrap_or_else(|| status_for_error(code, None));
     let mut envelope = diagnostic_envelope(
         status,
         message,
@@ -684,7 +695,20 @@ fn next_event(buffer: &[u8], offset: usize) -> Option<(usize, PreludeEvent)> {
             PreludeEvent::Error {
                 message: message.to_owned(),
                 code: code.to_owned(),
-                status: status_for_error(code, kind),
+                status: parsed
+                    .as_ref()
+                    .and_then(|value| {
+                        ["/error/upstream_status", "/error/status"]
+                            .into_iter()
+                            .find_map(|pointer| {
+                                let status = value.pointer(pointer)?.as_u64()?;
+                                let status = u16::try_from(status).ok()?;
+                                let status = StatusCode::from_u16(status).ok()?;
+                                (status.is_client_error() || status.is_server_error())
+                                    .then_some(status)
+                            })
+                    })
+                    .unwrap_or_else(|| status_for_error(code, kind)),
                 metadata: parsed.unwrap_or(Value::Null),
             },
         ));
@@ -824,16 +848,6 @@ fn is_opaque_message(message: &str) -> bool {
     )
 }
 
-pub(super) fn normalized_upstream_status(status: StatusCode, safe_message: &str) -> StatusCode {
-    match status {
-        StatusCode::BAD_REQUEST if is_opaque_message(safe_message) => StatusCode::BAD_GATEWAY,
-        StatusCode::PAYLOAD_TOO_LARGE if is_opaque_message(safe_message) => StatusCode::BAD_GATEWAY,
-        StatusCode::PAYLOAD_TOO_LARGE => StatusCode::BAD_REQUEST,
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => StatusCode::SERVICE_UNAVAILABLE,
-        _ => status,
-    }
-}
-
 fn json_error(
     status: StatusCode,
     message: &str,
@@ -893,12 +907,27 @@ fn diagnostic_envelope(
     if let Some(reason) = context_rejection_reason(message) {
         envelope["error"]["upstream_reason"] = Value::String(reason.to_owned());
     }
+    envelope["error"]["status"] = Value::from(status.as_u16());
     enrich_error_envelope(&mut envelope, code, upstream_status, Some(request_id));
     envelope
 }
 
 fn error_response(status: StatusCode, envelope: Value, request_id: &str) -> Response {
+    let upstream_status = envelope
+        .pointer("/error/upstream_status")
+        .and_then(Value::as_u64)
+        .and_then(|status| u16::try_from(status).ok());
     let mut response = (status, axum::Json(envelope)).into_response();
+    if let Some(upstream_status) = upstream_status {
+        response.headers_mut().insert(
+            "x-crosslane-upstream-status",
+            HeaderValue::from(upstream_status),
+        );
+    }
+    response.headers_mut().insert(
+        "x-crosslane-error-status",
+        HeaderValue::from(status.as_u16()),
+    );
     if matches!(
         status,
         StatusCode::BAD_GATEWAY
@@ -968,11 +997,87 @@ mod tests {
         events.last().unwrap().clone()
     }
 
+    #[tokio::test]
+    async fn supplier_http_errors_keep_status_and_crs_diagnostics() {
+        for status in [
+            400, 401, 402, 403, 404, 408, 409, 413, 422, 429, 500, 502, 503, 504, 529, 599,
+        ] {
+            for message in [
+                "",
+                "Internal Server Error",
+                "messages.1.output_config: Extra inputs are not permitted",
+            ] {
+                let response = Response::builder()
+                    .status(status)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::RETRY_AFTER, "17")
+                    .body(Body::from(
+                        serde_json::json!({"error":{"message":message}}).to_string(),
+                    ))
+                    .unwrap();
+                let adapted = adapt_claude_response(response, "trace_passthrough").await;
+                assert_eq!(adapted.status().as_u16(), status);
+                assert_eq!(
+                    adapted.headers()["x-crosslane-error-status"],
+                    status.to_string()
+                );
+                assert_eq!(adapted.headers()[header::RETRY_AFTER], "17");
+                let body = body_json(adapted).await;
+                assert_eq!(body["error"]["status"], status);
+                assert_eq!(body["error"]["upstream_status"], status);
+                assert_eq!(body["request_id"], "trace_passthrough");
+                assert!(body["error"]["detail"].is_string());
+                assert!(body["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("trace_passthrough"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn supplier_plain_text_errors_keep_status_and_sanitized_cause() {
+        let response = Response::builder()
+            .status(422)
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::from("tool schema invalid: ksk_private-credential"))
+            .unwrap();
+        let adapted = adapt_claude_response(response, "trace_plain_text").await;
+        assert_eq!(adapted.status().as_u16(), 422);
+        let body = body_json(adapted).await;
+        assert_eq!(body["error"]["upstream_status"], 422);
+        assert_eq!(body["error"]["detail"], "tool schema invalid: [REDACTED]");
+    }
+
+    #[tokio::test]
+    async fn supplier_stream_errors_keep_raw_status_in_sse_diagnostics() {
+        for status in [
+            400, 401, 402, 403, 404, 408, 409, 413, 422, 429, 500, 502, 503, 504, 529, 599,
+        ] {
+            let response = Response::builder()
+                .status(status)
+                .body(Body::from(
+                    serde_json::json!({"error":{"message":"invalid tool schema"}}).to_string(),
+                ))
+                .unwrap();
+            let adapted =
+                adapt_claude_stream_response(response, "trace_sse_status", "claude-sonnet-4.6")
+                    .await;
+            assert_eq!(
+                adapted.headers()["x-crosslane-error-status"],
+                status.to_string()
+            );
+            let body = body_sse_error(adapted).await;
+            assert_eq!(body["error"]["status"], status);
+            assert_eq!(body["error"]["upstream_status"], status);
+            assert_eq!(body["error"]["detail"], "invalid tool schema");
+            assert_eq!(body["request_id"], "trace_sse_status");
+        }
+    }
+
     #[test]
-    fn stream_mode_requires_a_valid_request_and_keeps_auth_and_body_statuses() {
-        assert!(stream_requested(
-            br#"{"stream":true,"messages":[{"content":"large history"}]}"#
-        ));
+    fn stream_mode_requires_a_valid_request_and_covers_supplier_http_errors() {
+        assert!(stream_requested(br#"{"stream":true,"messages":[]}"#));
         for body in [
             br#"{"stream":false}"#.as_slice(),
             br#"{"stream":"true"}"#,
@@ -981,8 +1086,42 @@ mod tests {
         ] {
             assert!(!stream_requested(body));
         }
+        for status in 400..=599 {
+            assert!(uses_sse_error(
+                StatusCode::from_u16(status).unwrap(),
+                Some(status)
+            ));
+        }
         for status in [401, 403, 405, 413] {
-            assert!(!uses_sse_error(StatusCode::from_u16(status).unwrap()));
+            assert!(!uses_sse_error(StatusCode::from_u16(status).unwrap(), None));
+        }
+        assert!(!uses_sse_error(StatusCode::OK, None));
+    }
+
+    #[test]
+    fn stream_diagnostics_preserve_explicit_supplier_errors() {
+        for status in [401, 402, 403, 413, 422, 500, 503, 504, 529] {
+            let envelope = stream_error_envelope(
+                "supplier error",
+                "upstream_unavailable",
+                "upstream_dispatch",
+                Some(status),
+                "trace_stream_status",
+            );
+            assert_eq!(envelope["error"]["status"], status);
+            assert_eq!(envelope["error"]["upstream_status"], status);
+            let event = format!("event: error\ndata: {envelope}\n\n");
+            let Some((
+                _,
+                PreludeEvent::Error {
+                    status: parsed_status,
+                    ..
+                },
+            )) = next_event(event.as_bytes(), 0)
+            else {
+                panic!("expected stream error");
+            };
+            assert_eq!(parsed_status.as_u16(), status);
         }
     }
 
@@ -1077,9 +1216,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upstream_payload_stream_error_keeps_real_413_and_gateway_502() {
+    async fn upstream_payload_errors_preserve_http_status_and_diagnostics() {
         for (status, raw, code, client_status) in [
-            (413, "payload too large", "request_payload_exceeded", 400),
+            (413, "payload too large", "request_payload_exceeded", 413),
             (502, "Internal Server Error", "upstream_unavailable", 502),
         ] {
             let response = Response::builder()
@@ -1088,10 +1227,7 @@ mod tests {
                     serde_json::json!({"error":{"message":raw}}).to_string(),
                 ))
                 .unwrap();
-            let body = body_sse_error(
-                adapt_claude_stream_response(response, "trace_failure", "claude-sonnet-4.6").await,
-            )
-            .await;
+            let body = body_json(adapt_claude_response(response, "trace_failure").await).await;
             assert_eq!(body["error"]["upstream_status"], status);
             assert_eq!(body["error"]["status"], client_status);
             assert_eq!(body["error"]["code"], code);
@@ -1156,7 +1292,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opaque_upstream_400_becomes_actionable_gateway_envelope() {
+    async fn opaque_upstream_400_preserves_http_status_and_diagnostics() {
         let response = Response::builder()
             .status(400)
             .header(header::CONTENT_TYPE, "application/json")
@@ -1165,10 +1301,10 @@ mod tests {
             ))
             .unwrap();
         let adapted = adapt_claude_response(response, "trace_test").await;
-        assert_eq!(adapted.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(adapted.status(), StatusCode::BAD_REQUEST);
         let body = body_json(adapted).await;
-        assert_eq!(body["error"]["type"], "api_error");
-        assert_eq!(body["error"]["code"], "upstream_unavailable");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["code"], "invalid_request");
         assert_eq!(body["error"]["upstream_status"], 400);
         assert!(body["error"]["message"]
             .as_str()
@@ -1337,31 +1473,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upstream_413_avoids_claude_codes_inbound_body_limit_message() {
+    async fn upstream_413_preserves_payload_status() {
         let response = Response::builder()
             .status(413)
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(r#"{"error":{"message":"payload too large"}}"#))
             .unwrap();
         let adapted = adapt_claude_response(response, "trace_payload").await;
-        assert_eq!(adapted.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(adapted.status(), StatusCode::PAYLOAD_TOO_LARGE);
         let body = body_json(adapted).await;
         assert_eq!(body["error"]["code"], "request_payload_exceeded");
         assert_eq!(body["error"]["upstream_status"], 413);
     }
 
     #[tokio::test]
-    async fn upstream_auth_status_is_not_presented_as_client_auth_failure() {
+    async fn upstream_auth_status_is_preserved_with_upstream_diagnostics() {
         let response = Response::builder()
             .status(401)
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(r#"{"error":{"message":"Unauthorized"}}"#))
             .unwrap();
         let adapted = adapt_claude_response(response, "trace_auth").await;
-        assert_eq!(adapted.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(adapted.status(), StatusCode::UNAUTHORIZED);
         let body = body_json(adapted).await;
         assert_eq!(body["error"]["upstream_status"], 401);
-        assert_eq!(body["error"]["type"], "overloaded_error");
+        assert_eq!(body["error"]["type"], "authentication_error");
         assert_eq!(body["error"]["code"], "upstream_authentication_failed");
     }
 
@@ -1376,7 +1512,7 @@ mod tests {
             )))
             .unwrap();
         let adapted = adapt_claude_response(response, "trace_non_200").await;
-        assert_eq!(adapted.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(adapted.status(), StatusCode::BAD_REQUEST);
         assert_eq!(adapted.headers()[header::CONTENT_TYPE], "application/json");
         let body = body_json(adapted).await;
         assert_eq!(body["error"]["code"], "upstream_unavailable");

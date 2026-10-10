@@ -267,14 +267,15 @@ pub async fn claude_messages(
         }
         Err(error) => {
             #[cfg(feature = "crs")]
-            let error = if stream_requested && crs::uses_sse_error(error.status) {
-                ApiError {
-                    client_status: Some(200),
-                    ..error
-                }
-            } else {
-                error
-            };
+            let error =
+                if stream_requested && crs::uses_sse_error(error.status, error.upstream_status) {
+                    ApiError {
+                        client_status: Some(200),
+                        ..error
+                    }
+                } else {
+                    error
+                };
             record_failed_request(
                 &state,
                 &trace_id,
@@ -285,7 +286,8 @@ pub async fn claude_messages(
                 &error,
             );
             #[cfg(feature = "crs")]
-            let use_sse = stream_requested && crs::uses_sse_error(error.status);
+            let use_sse =
+                stream_requested && crs::uses_sse_error(error.status, error.upstream_status);
             let response = error.with_request_id(&trace_id).into_response();
             #[cfg(feature = "crs")]
             if use_sse {

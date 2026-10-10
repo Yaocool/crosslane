@@ -2314,6 +2314,9 @@ fn upstream_api_error(
     let model_disabled = error.endpoint == "model-policy";
     let upstream_status = error.status;
     let upstream_throttle = error.is_throttle();
+    let upstream_auth = error.is_auth();
+    let upstream_quota = error.is_quota();
+    let retryable = error.is_retriable() || upstream_auth || upstream_quota;
     let model_unavailable = error.is_model_temporarily_unavailable();
     let request_rejection = error.is_request_rejection();
     let account_error = !request_rejection
@@ -2325,33 +2328,12 @@ fn upstream_api_error(
     let status = if model_resolution_error || model_disabled {
         StatusCode::BAD_REQUEST
     } else {
-        match error.status {
-            // An actionable upstream 413 describes Kiro's translated payload,
-            // not necessarily a Claude request body over 32 MiB. Preserve the
-            // upstream status in diagnostics, but use 400 so Claude Code shows
-            // the request-specific message. With CRS compatibility, opaque
-            // 413s are gateway failures instead.
-            Some(413)
-                if format == ErrorFormat::Claude
-                    && (!cfg!(feature = "crs")
-                        || upstream_bad_request_is_actionable(&error.message, format)) =>
-            {
-                StatusCode::BAD_REQUEST
-            }
-            Some(413) if format == ErrorFormat::Claude => StatusCode::BAD_GATEWAY,
-            Some(413) => StatusCode::PAYLOAD_TOO_LARGE,
-            Some(400) if upstream_bad_request_is_actionable(&error.message, format) => {
-                StatusCode::BAD_REQUEST
-            }
-            // crosslane already validates the public request and enforces its context
-            // window before dispatch. A remaining opaque upstream 400 (including
-            // an empty body or "Internal Server Error") is an integration/upstream
-            // failure, not an actionable Claude Code request error.
-            Some(400) => StatusCode::BAD_GATEWAY,
-            Some(401 | 403) => StatusCode::SERVICE_UNAVAILABLE,
-            Some(402 | 429) => StatusCode::TOO_MANY_REQUESTS,
-            _ => StatusCode::BAD_GATEWAY,
-        }
+        // Preserve the supplier's HTTP status independently of error prose.
+        // Transport failures have no upstream HTTP response and use local 502.
+        error
+            .status
+            .and_then(|status| StatusCode::from_u16(status).ok())
+            .unwrap_or(StatusCode::BAD_GATEWAY)
     };
     let message = if error.message.trim().is_empty() {
         "Upstream service error, please retry later".to_owned()
@@ -2359,13 +2341,7 @@ fn upstream_api_error(
         error.message
     };
     let mut output = ApiError::new(status, message, format);
-    output.retry_after = !model_resolution_error
-        && matches!(
-            status,
-            StatusCode::BAD_GATEWAY
-                | StatusCode::SERVICE_UNAVAILABLE
-                | StatusCode::TOO_MANY_REQUESTS
-        );
+    output.retry_after = !model_resolution_error && !model_disabled && retryable;
     output.log_context = Box::new(context);
     output.upstream_status = upstream_status;
     output.error_stage = "upstream_dispatch";
@@ -2381,13 +2357,18 @@ fn upstream_api_error(
         output.account_error = false;
     } else if model_unavailable {
         output.error_code = "upstream_model_unavailable";
+    } else if upstream_auth {
+        output.error_code = "upstream_authentication_failed";
+    } else if upstream_quota && !upstream_throttle {
+        output.error_code = "upstream_quota_exhausted";
     } else if upstream_status == Some(429) || upstream_throttle {
         output.error_code = "upstream_rate_limited";
-    } else if upstream_status == Some(413)
-        && (!cfg!(feature = "crs") || status == StatusCode::BAD_REQUEST)
-    {
+    } else if upstream_status == Some(413) {
         output.error_code = "request_payload_exceeded";
-    } else if !request_rejection {
+    } else if !request_rejection
+        || (upstream_status == Some(400)
+            && !upstream_bad_request_is_actionable(&output.message, format))
+    {
         output.error_code = "upstream_unavailable";
     }
     output
@@ -2561,6 +2542,7 @@ impl IntoResponse for ApiError {
         }
         #[cfg(feature = "crs")]
         if self.format == ErrorFormat::Claude {
+            envelope["error"]["status"] = json!(status.as_u16());
             envelope["error"]["stage"] = json!(self.error_stage);
             if let Some(reason) = super::crs::context_rejection_reason(&self.message) {
                 envelope["error"]["upstream_reason"] = json!(reason);

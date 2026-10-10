@@ -331,7 +331,7 @@ async fn streaming_candidate_failure_is_recorded_and_stops_further_calls() {
         .collect::<Vec<_>>();
     assert_eq!(requests.len(), 2, "{stats}");
     assert!(
-        requests.iter().any(|request| request["status"] == 502
+        requests.iter().any(|request| request["status"] == 400
             && request["diagnostics"]["upstream_status"] == 400
             && request["diagnostics"]["client_status"] == 200),
         "{stats}"

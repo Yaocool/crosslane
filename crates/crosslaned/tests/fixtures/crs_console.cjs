@@ -15,6 +15,7 @@ const account = { apiUrl: upstream, apiKey, maxConcurrentTasks: 0, disableAutoPr
 const accountService = {
   getAccount: async () => account,
   _createProxyAgent: () => null,
+  checkQuotaUsage: async () => null,
   isAccountRateLimited: async () => false,
   isAccountOverloaded: async () => false
 }

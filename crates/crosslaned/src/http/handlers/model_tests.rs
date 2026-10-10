@@ -759,7 +759,7 @@ fn retry_limit_is_never_expanded_by_account_count() {
 }
 
 #[test]
-fn opaque_upstream_bad_requests_are_reported_as_gateway_failures() {
+fn opaque_upstream_bad_requests_preserve_supplier_status() {
     for message in [
         "Internal Server Error",
         "",
@@ -777,12 +777,7 @@ fn opaque_upstream_bad_requests_are_reported_as_gateway_failures() {
             RequestLogContext::default(),
             ErrorFormat::Claude,
         );
-        let expected = if !cfg!(feature = "crs") && message.starts_with("ValidationException") {
-            StatusCode::BAD_REQUEST
-        } else {
-            StatusCode::BAD_GATEWAY
-        };
-        assert_eq!(error.status, expected, "{message:?}");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST, "{message:?}");
         assert_eq!(error.upstream_status, Some(400));
         let body = error_envelope(
             ErrorFormat::Claude,
@@ -790,14 +785,7 @@ fn opaque_upstream_bad_requests_are_reported_as_gateway_failures() {
             &error.message,
             None,
         );
-        assert_eq!(
-            body["error"]["type"],
-            if expected == StatusCode::BAD_GATEWAY {
-                "api_error"
-            } else {
-                "invalid_request_error"
-            }
-        );
+        assert_eq!(body["error"]["type"], "invalid_request_error");
         if message == "ValidationException: Internal Server Error" {
             assert_eq!(
                 body["error"]["message"],
@@ -852,12 +840,12 @@ async fn crs_kiro_error_body_carries_upstream_status_code_and_trace() {
         ErrorFormat::Claude,
     );
     let response = error.with_request_id("trace_kiro").into_response();
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
         .await
         .expect("body");
     let body: Value = serde_json::from_slice(&bytes).expect("json");
-    assert_eq!(body["error"]["type"], "api_error");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
     assert_eq!(body["error"]["code"], "upstream_unavailable");
     assert_eq!(body["error"]["upstream_status"], 400);
     assert_eq!(body["request_id"], "trace_kiro");
@@ -878,7 +866,7 @@ fn upstream_request_rejections_never_poison_an_account() {
         RequestLogContext::default(),
         ErrorFormat::Claude,
     );
-    assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(error.error_code, "tool_budget_exceeded");
     assert!(!error.account_error);
 }
@@ -894,7 +882,7 @@ fn temporarily_unavailable_models_are_retryable_without_poisoning_accounts() {
         RequestLogContext::default(),
         ErrorFormat::Claude,
     );
-    assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(error.error_code, "upstream_model_unavailable");
     assert!(error.retry_after);
     assert!(!error.account_error);
@@ -1023,46 +1011,64 @@ fn only_real_inbound_body_limits_use_request_too_large() {
 }
 
 #[test]
-fn upstream_413_preserves_diagnostics_without_triggering_claude_32mb_ui() {
-    let error = upstream_api_error(
-        KiroError {
-            status: Some(413),
-            endpoint: "test".into(),
-            message: "translated upstream payload is too large".into(),
-        },
-        RequestLogContext::default(),
-        ErrorFormat::Claude,
-    );
-    assert_eq!(error.status, StatusCode::BAD_REQUEST);
-    assert_eq!(error.upstream_status, Some(413));
-    assert_eq!(error.error_code, "request_payload_exceeded");
+fn upstream_413_preserves_supplier_status_and_diagnostics() {
+    for format in [ErrorFormat::Claude, ErrorFormat::OpenAi] {
+        for message in [
+            "translated upstream payload is too large",
+            "Internal Server Error",
+        ] {
+            let error = upstream_api_error(
+                KiroError {
+                    status: Some(413),
+                    endpoint: "test".into(),
+                    message: message.into(),
+                },
+                RequestLogContext::default(),
+                format,
+            );
+            assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+            assert_eq!(error.upstream_status, Some(413));
+            assert_eq!(error.error_code, "request_payload_exceeded");
+        }
+    }
+}
 
-    let opaque = upstream_api_error(
+#[test]
+fn supplier_http_errors_are_preserved_across_protocols() {
+    for format in [ErrorFormat::Claude, ErrorFormat::OpenAi] {
+        for status in [
+            400, 401, 402, 403, 404, 408, 409, 413, 422, 429, 500, 502, 503, 504, 529, 599,
+        ] {
+            let error = upstream_api_error(
+                KiroError {
+                    status: Some(status),
+                    endpoint: "test".into(),
+                    message: "supplier error".into(),
+                },
+                RequestLogContext::default(),
+                format,
+            );
+            assert_eq!(error.status.as_u16(), status);
+            assert_eq!(error.upstream_status, Some(status));
+            let response = error.with_request_id("trace_status").into_response();
+            assert_eq!(response.status().as_u16(), status);
+            assert_eq!(
+                response.headers()["x-crosslane-upstream-status"],
+                status.to_string()
+            );
+        }
+    }
+    let transport = upstream_api_error(
         KiroError {
-            status: Some(413),
+            status: None,
             endpoint: "test".into(),
-            message: "Internal Server Error".into(),
+            message: "connection interrupted".into(),
         },
         RequestLogContext::default(),
         ErrorFormat::Claude,
     );
-    assert_eq!(
-        opaque.status,
-        if cfg!(feature = "crs") {
-            StatusCode::BAD_GATEWAY
-        } else {
-            StatusCode::BAD_REQUEST
-        }
-    );
-    assert_eq!(opaque.upstream_status, Some(413));
-    assert_eq!(
-        opaque.error_code,
-        if cfg!(feature = "crs") {
-            "upstream_unavailable"
-        } else {
-            "request_payload_exceeded"
-        }
-    );
+    assert_eq!(transport.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(transport.upstream_status, None);
 }
 
 #[test]

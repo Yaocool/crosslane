@@ -1187,22 +1187,11 @@ fn provider_api_error(
             | crosslane_provider::ProviderErrorKind::Upstream
     );
     let upstream_status = error.status;
-    #[cfg(feature = "crs")]
-    let status = if format == ErrorFormat::Claude {
-        super::super::crs::normalized_upstream_status(
-            upstream_status,
-            &crosslane_translate::sanitize_error_message(&error.message),
-        )
-    } else {
-        upstream_status
-    };
-    #[cfg(not(feature = "crs"))]
-    let status = upstream_status;
-    let mut api = ApiError::new(status, error.message, format);
+    let mut api = ApiError::new(upstream_status, error.message, format);
     if upstream_failure {
         api.error_stage = "upstream_dispatch";
     }
-    api.retry_after = error.retryable || status != upstream_status;
+    api.retry_after = error.retryable;
     api.account_error = error.account_error;
     api.upstream_status = Some(upstream_status.as_u16());
     #[cfg(feature = "crs")]
@@ -1267,7 +1256,7 @@ mod tests {
 
     #[cfg(feature = "crs")]
     #[test]
-    fn crs_maps_opaque_provider_errors_without_mislabeling_client_requests() {
+    fn crs_preserves_supplier_errors_without_http_status_mapping() {
         use crosslane_provider::ProviderErrorKind;
 
         let opaque = provider_api_error(
@@ -1282,8 +1271,8 @@ mod tests {
             "model",
             None,
         );
-        assert_eq!(opaque.status, StatusCode::BAD_GATEWAY);
-        assert_eq!(opaque.error_code, "upstream_unavailable");
+        assert_eq!(opaque.status, StatusCode::BAD_REQUEST);
+        assert_eq!(opaque.error_code, "invalid_request");
         assert_eq!(opaque.upstream_status, Some(400));
 
         let actionable = provider_api_error(
