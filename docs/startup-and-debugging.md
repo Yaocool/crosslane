@@ -105,7 +105,14 @@ not currently expose a reliable per-account remaining-credit balance, so Kiro
 credit scoring does not apply.
 
 `account list` includes Copilot's plan, API token deadline, quota reset date,
-observed AIU per account, and the upstream `credits_used` value separately.
+observed AIU per account, and the upstream monthly `credits_used` value separately.
+Token-based quotas display AI credits, preferring `credits_used` for consumption
+and fractional `quota_remaining` for the balance. Legacy quotas retain request
+units. Business placeholders (`unlimited: true`, zero entitlement and balance)
+display unknown totals and balances rather than `0/0` or `100% remaining`.
+JSON responses add `details.quota_summary` with personal scope, unit, used,
+total, remaining, remaining percentage, unlimited flag, and cache status; unknown
+quantities are null. Raw `details.info.quota_snapshots` remain available.
 `account show ID --provider copilot` also displays
 GitHub access/refresh token deadlines, the quota query time, and the AIU tracking
 period; `--json` retains the safe upstream quota fields. An API token deadline

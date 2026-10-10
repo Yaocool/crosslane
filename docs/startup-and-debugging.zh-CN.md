@@ -90,7 +90,13 @@ crosslane account list --provider copilot
 Copilot 当前没有可靠的单账号剩余额度数据，因此不按 Kiro credits 打分。
 
 `account list` 会显示 Copilot 套餐、API Token 到期时间、额度重置时间及各账号
-在本机累计的 AIU，上游 `credits_used` 已用值单独展示。`account show ID --provider copilot`
+在本机累计的 AIU，上游 `credits_used` 月用量单独展示。按 token 计费的额度使用 credits
+单位，已用量优先取 `credits_used`，余额优先取保留小数的 `quota_remaining`；旧版额度
+保留请求数单位。Business 的占位数据（`unlimited: true` 且总额、余额为零）显示
+“总额/余额未知”，不显示 `0/0` 或“剩余 100%”。JSON 新增 `details.quota_summary`，
+包含个人范围、单位、已用量、总额、余额、剩余百分比、不限额标记及缓存状态；未知数值
+为 null，原始 `details.info.quota_snapshots` 保留。
+`account show ID --provider copilot`
 还会显示 GitHub 访问凭据和
 刷新凭据的有效期、额度查询时间及 AIU 统计时间范围；`--json` 保留安全的上游额度字段。
 API Token 会自动续期，其到期时间不是订阅到期时间。上游未返回的有效期和计费数据

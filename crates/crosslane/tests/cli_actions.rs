@@ -1034,6 +1034,54 @@ async fn account_list_sends_a_boolean_enabled_filter() {
 }
 
 #[tokio::test]
+async fn copilot_account_list_projects_legacy_daemon_data_for_json_and_humans() {
+    let account = json!({
+        "provider_id":"work-cp","provider_kind":"copilot","id":"acc_business",
+        "display_name":"business-fixture","enabled":true,"health":"available","auth_state":"ready",
+        "details":{"info":{"plan":"business","token_based_billing":true,
+            "quota_snapshots":{"premium_interactions":{"unlimited":true,
+                "entitlement":0,"remaining":0,"quota_remaining":0,
+                "percent_remaining":100,"credits_used":1}}},
+            "local_aiu_usage":{"total_nano_aiu":83_000_000}}
+    });
+    for json_output in [true, false] {
+        let workspace = tempfile::tempdir().unwrap();
+        let (output, requests) = run_in_workspace_scoped(
+            workspace.path(),
+            &["account", "list"],
+            vec![json!({
+                "schema_version":2,"scope":{"provider":"work-cp"},
+                "accounts":[account.clone()],"complete":true
+            })],
+            json_output,
+            Some("work-cp"),
+        )
+        .await;
+        assert_success(&output);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, method::V2_ACCOUNT_LIST);
+        let text = String::from_utf8(output.stdout).unwrap();
+        if json_output {
+            let output: Value = serde_json::from_str(&text).unwrap();
+            let details = &output["accounts"][0]["details"];
+            assert_eq!(details["info"], account["details"]["info"]);
+            assert_eq!(details["quota_summary"]["used"], 1.0);
+            assert_eq!(details["quota_summary"]["unit"], "ai_credits");
+            assert!(details["quota_summary"]["total"].is_null());
+            assert!(details["quota_summary"]["remaining"].is_null());
+            assert!(details["quota_summary"]["percent_remaining"].is_null());
+            assert_eq!(details["local_aiu_usage"]["total_nano_aiu"], 83_000_000);
+        } else {
+            assert!(text.contains("总额/余额未知"), "{text}");
+            assert!(text.contains("上游月用量(credits_used)"), "{text}");
+            assert!(text.contains("0.083"), "{text}");
+            assert!(!text.contains("剩余 100%"), "{text}");
+            assert!(!text.contains("0/0"), "{text}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn account_overage_enable_updates_config_and_uses_the_minimal_rpc_sequence() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let config_file = workspace.path().join("config.toml");

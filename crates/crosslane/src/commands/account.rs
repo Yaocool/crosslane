@@ -4,6 +4,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::Subcommand;
 use crosslane_core::account::Account;
 use crosslane_core::ids::{new_account_id, new_machine_id};
+use crosslane_ipc::copilot::{enrich_account, CopilotQuotaSummary, CopilotQuotaUnit};
 use crosslane_ipc::protocol::{
     method, AccountImportResult, AccountServiceBinding, AccountServicesResult, AccountSummary,
     AccountTagBatchResult, AccountTagResult, ConfigShowResult, CopilotBrowserCredentials,
@@ -504,24 +505,35 @@ fn metadata_timestamp(value: &serde_json::Value) -> String {
 }
 
 fn copilot_quota_display(info: &serde_json::Value) -> String {
-    let quota = &info["quota_snapshots"]["premium_interactions"];
-    let display = if quota["unlimited"] == true {
-        "个人不限".into()
-    } else if quota["token_based_billing"] != true && info["token_based_billing"] != true {
-        match (quota["entitlement"].as_f64(), quota["remaining"].as_f64()) {
-            (Some(limit), Some(remaining))
-                if limit > 0.0 && remaining <= limit && remaining >= 0.0 =>
-            {
-                format!("{:.2}/{limit:.2} 请求", limit - remaining)
-            }
-            _ => "未知".into(),
+    let quota = CopilotQuotaSummary::from_info(info);
+    let display = match quota.unit {
+        Some(CopilotQuotaUnit::AiCredits) => match quota.total {
+            Some(total) => format!(
+                "{}/{total} credits (余 {})",
+                quota
+                    .used
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "未知".into()),
+                quota
+                    .remaining
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "未知".into()),
+            ),
+            None => quota
+                .percent_remaining
+                .map(|percent| format!("总额/余额未知 (剩余 {percent:.2}%)"))
+                .unwrap_or_else(|| "总额/余额未知".into()),
+        },
+        Some(CopilotQuotaUnit::PremiumRequests) if quota.unlimited == Some(true) => {
+            "个人不限".into()
         }
-    } else if let Some(percent) = quota["percent_remaining"].as_f64() {
-        format!("剩余 {percent:.2}%")
-    } else {
-        "未知".into()
+        Some(CopilotQuotaUnit::PremiumRequests) => match (quota.used, quota.total) {
+            (Some(used), Some(total)) => format!("{used:.2}/{total:.2} 请求"),
+            _ => "未知".into(),
+        },
+        None => "未知".into(),
     };
-    if info["quota_error"].as_str().is_some() {
+    if quota.cached {
         format!("{display}(缓存)")
     } else {
         display
@@ -531,6 +543,7 @@ fn copilot_quota_display(info: &serde_json::Value) -> String {
 fn copilot_upstream_usage_display(info: &serde_json::Value) -> String {
     let used = info["quota_snapshots"]["premium_interactions"]["credits_used"]
         .as_f64()
+        .filter(|value| value.is_finite() && *value >= 0.0)
         .map(|value| value.to_string())
         .unwrap_or_else(|| "未知".into());
     if info["quota_error"].as_str().is_some() {
@@ -582,7 +595,7 @@ fn print_provider_detail(account: &ProviderAccountSummary) {
         println!("套餐      {}", info["plan"].as_str().unwrap_or("未知"));
         println!("SKU       {}", info["sku"].as_str().unwrap_or("未知"));
         println!(
-            "上游已用  {}（credits_used，按上游口径）",
+            "上游月用量 {}（credits_used，按上游口径）",
             copilot_upstream_usage_display(info)
         );
         println!(
@@ -1243,7 +1256,7 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
         } => {
             let has_filters =
                 tag.is_some() || status.is_some() || provider_kind.is_some() || enabled_only;
-            let list: ProviderAccountListResult = client
+            let mut list: ProviderAccountListResult = client
                 .call(
                     method::V2_ACCOUNT_LIST,
                     serde_json::json!({
@@ -1256,6 +1269,9 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
                     }),
                 )
                 .await?;
+            for account in &mut list.accounts {
+                enrich_account(account);
+            }
             if json {
                 print_json(&list)?;
             } else if list.accounts.is_empty() {
@@ -1277,7 +1293,7 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
                             "Token到期(UTC)",
                             "AIU(本机累计)",
                             "额度重置",
-                            "上游已用(credits_used)",
+                            "上游月用量(credits_used)",
                         ],
                         &build_provider_list_rows(&list.accounts),
                     )
@@ -1287,7 +1303,7 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
                     .iter()
                     .any(|account| account.provider_kind == "copilot")
                 {
-                    println!("Copilot Token 为自动续期的 API Token；AIU 为本机累计，上游已用取 credits_used，不换算为 AIU。个人不限不代表组织余额无限。有效期详情见 account show。");
+                    println!("Copilot 上游月用量取 credits_used；AIU 为本机累计，二者不混算。Business 的零上限/余额和 unlimited 不能用于推断总 credits 或组织余额；缺失额度显示未知。API Token 自动续期，其到期时间不是订阅到期时间。详情见 account show。");
                 }
             }
             if !json {
@@ -1301,12 +1317,13 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
         }
         AccountCommand::Overage { command } => run_overage(client, command, json).await?,
         AccountCommand::Show { id, provider } => {
-            let detail: ProviderAccountSummary = client
+            let mut detail: ProviderAccountSummary = client
                 .call(
                     method::V2_ACCOUNT_SHOW,
                     serde_json::json!({"id": id,"provider":provider}),
                 )
                 .await?;
+            enrich_account(&mut detail);
             if json {
                 print_json(&detail)?;
             } else {
@@ -2507,7 +2524,7 @@ mod tests {
             account(serde_json::Value::Null, serde_json::Value::Null),
             account(info, serde_json::json!({"total_nano_aiu":0})),
         ]);
-        assert_eq!(rows[0][5], "个人不限");
+        assert_eq!(rows[0][5], "总额/余额未知");
         assert_eq!(rows[0][8], "business");
         assert_eq!(rows[0][9], "2026-01-01T00:00:00Z");
         assert_eq!(rows[0][10], "0.017");
@@ -2533,6 +2550,28 @@ mod tests {
                 "quota_error":"HTTP 429"
             })),
             "60.00/300.00 请求(缓存)"
+        );
+        assert_eq!(
+            copilot_quota_display(&serde_json::json!({"token_based_billing":true,
+                "quota_snapshots":{"premium_interactions":{
+                    "unlimited":false,"entitlement":1500,"remaining":1498,
+                    "quota_remaining":1498.75,"credits_used":1}}
+            })),
+            "1/1500 credits (余 1498.75)"
+        );
+        assert_eq!(
+            copilot_quota_display(&serde_json::json!({"token_based_billing":true,
+                "quota_error":"HTTP 429","quota_snapshots":{"premium_interactions":{
+                    "unlimited":true,"entitlement":0,"remaining":0,
+                    "percent_remaining":100,"credits_used":1}}
+            })),
+            "总额/余额未知(缓存)"
+        );
+        assert_eq!(
+            copilot_upstream_usage_display(&serde_json::json!({
+                "quota_snapshots":{"premium_interactions":{"credits_used":-1}}
+            })),
+            "未知"
         );
     }
 

@@ -135,6 +135,7 @@ pub(super) async fn handle_account_list(state: &Arc<AppState>, params: Value) ->
     let config = state.config.current();
     for account in &mut accounts {
         if account.provider_kind == "copilot" {
+            crosslane_ipc::copilot::enrich_account(account);
             account.details["local_aiu_usage"] = json!(state
                 .meter
                 .account_aiu_usage(&account.provider_id, &account.id));

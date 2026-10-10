@@ -26,7 +26,8 @@ async fn copilot_account_list_tracks_safe_metadata_and_json_stream_aiu() {
                 "copilot_plan":"business","access_type_sku":"business-seat","token_based_billing":true,
                 "quota_reset_date_utc":"2026-11-01T00:00:00.000Z",
                 "quota_snapshots":{"premium_interactions":{
-                    "unlimited":true,"entitlement":0,"remaining":0,"credits_used":0
+                    "unlimited":true,"entitlement":0,"remaining":0,"quota_remaining":0,
+                    "percent_remaining":100,"token_based_billing":true,"credits_used":1
                 }},"unknown_private_field":"must-not-be-stored"
             }),
         ),
@@ -87,7 +88,15 @@ async fn copilot_account_list_tracks_safe_metadata_and_json_stream_aiu() {
     );
     assert_eq!(
         details["info"]["quota_snapshots"]["premium_interactions"]["credits_used"],
-        0.0
+        1.0
+    );
+    assert_eq!(
+        details["quota_summary"],
+        json!({
+            "source":"copilot_internal/user","scope":"personal","unit":"ai_credits",
+            "used":1.0,"total":null,"remaining":null,"percent_remaining":null,
+            "unlimited":true,"cached":false
+        })
     );
     assert!(details["local_aiu_usage"].is_null());
     for secret in [
@@ -159,6 +168,10 @@ async fn copilot_account_list_tracks_safe_metadata_and_json_stream_aiu() {
     assert_eq!(
         mixed["accounts"][0]["details"]["local_aiu_usage"],
         details["local_aiu_usage"]
+    );
+    assert_eq!(
+        mixed["accounts"][0]["details"]["quota_summary"],
+        details["quota_summary"]
     );
     daemon.stop().await;
 }
