@@ -62,6 +62,9 @@ pub struct CopilotSettings {
     pub model_cache_ttl_secs: i64,
     pub model_max_stale_secs: i64,
     pub model_refresh_concurrency: usize,
+    pub stream_read_timeout_ms: u64,
+    pub oauth_refresh_timeout_ms: u64,
+    pub account_queue_wait_timeout_ms: u64,
     pub allow_insecure_http: bool,
     pub allowed_endpoint_hosts: Vec<String>,
     pub api_endpoint_fallback: Option<String>,
@@ -123,6 +126,10 @@ impl CopilotSettings {
                         .unwrap_or(0)
                 },
             ),
+            stream_read_timeout_ms: number("stream_read_timeout_ms").unwrap_or(600_000),
+            oauth_refresh_timeout_ms: number("oauth_refresh_timeout_ms").unwrap_or(30_000),
+            account_queue_wait_timeout_ms: number("account_queue_wait_timeout_ms")
+                .unwrap_or(30_000),
             allow_insecure_http: boolean("allow_insecure_http").unwrap_or(false),
             allowed_endpoint_hosts,
             api_endpoint_fallback: string("api_endpoint_fallback"),
@@ -200,6 +207,20 @@ impl CopilotSettings {
             return Err(internal_error(
                 "Copilot settings.model_refresh_concurrency must be greater than zero",
             ));
+        }
+        for (name, value) in [
+            ("stream_read_timeout_ms", self.stream_read_timeout_ms),
+            ("oauth_refresh_timeout_ms", self.oauth_refresh_timeout_ms),
+            (
+                "account_queue_wait_timeout_ms",
+                self.account_queue_wait_timeout_ms,
+            ),
+        ] {
+            if value == 0 {
+                return Err(internal_error(format!(
+                    "Copilot settings.{name} must be greater than zero"
+                )));
+            }
         }
         for host in &self.allowed_endpoint_hosts {
             if host.trim().is_empty() || host.contains('/') || host.contains(char::is_whitespace) {
@@ -441,6 +462,7 @@ impl CopilotProvider {
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(15))
+            .read_timeout(Duration::from_millis(settings.stream_read_timeout_ms))
             .pool_idle_timeout(Duration::from_secs(30))
             .build()
             .map_err(|error| internal_error(format!("build Copilot HTTP client: {error}")))?;
@@ -1423,6 +1445,9 @@ impl CopilotProvider {
             .header("accept", "application/json")
             .header("user-agent", &self.settings.user_agent)
             .form(&form)
+            .timeout(Duration::from_millis(
+                self.settings.oauth_refresh_timeout_ms,
+            ))
             .send()
             .await
             .map_err(transport_error)?;
@@ -1767,7 +1792,12 @@ impl CopilotProvider {
             .iter()
             .map(|(_, _, _, slot)| Box::pin(Arc::clone(&slot.semaphore).acquire_owned()))
             .collect::<Vec<_>>();
-        let (permit, index, _) = futures::future::select_all(waiters).await;
+        let (permit, index, _) = tokio::time::timeout(
+            Duration::from_millis(self.settings.account_queue_wait_timeout_ms),
+            futures::future::select_all(waiters),
+        )
+        .await
+        .map_err(|_| ProviderError::overloaded("timed out waiting for a Copilot account slot"))?;
         let (_, _, account, slot) = candidates.swap_remove(index);
         let permit = permit.map_err(|_| {
             ProviderError::unavailable(format!(
@@ -2811,10 +2841,15 @@ fn response_from_reqwest(
     let headers = filtered_response_headers(response.headers());
     let mut upstream = response.bytes_stream();
     let stream = async_stream::try_stream! {
-        let _permit = permit;
+        let mut permit = Some(permit);
         while let Some(chunk) = upstream.next().await {
-            yield chunk.map_err(transport_error)?;
+            let chunk = chunk.map_err(|error| {
+                drop(permit.take());
+                transport_error(error)
+            })?;
+            yield chunk;
         }
+        drop(permit.take());
     };
     ProviderResponse {
         status: StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),

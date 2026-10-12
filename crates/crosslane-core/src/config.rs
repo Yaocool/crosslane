@@ -2038,6 +2038,12 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# =====================================
 # api_token_refresh_before_secs = 300
 # 模型目录刷新同时查询的账号数；大账号池可按上游容量提高，必须大于零。
 # model_refresh_concurrency = 32
+# Copilot 上游连续无数据的读取超时；不会限制持续有数据的流总时长。
+# stream_read_timeout_ms = 600000
+# GitHub OAuth 刷新请求的总超时。
+# oauth_refresh_timeout_ms = 30000
+# 账号并发名额全部占用时的最长排队时间。
+# account_queue_wait_timeout_ms = 30000
 # token 响应缺少 endpoints.api 时使用的回退地址；Enterprise 专用实例按需配置。
 # api_endpoint_fallback = "https://api.enterprise.githubcopilot.com"
 # 动态 token 返回自定义 Copilot endpoint 时允许的额外主机。

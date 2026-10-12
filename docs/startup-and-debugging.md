@@ -322,6 +322,21 @@ requests with usable snapshots wait for discovery.
 model_refresh_concurrency = 32
 ```
 
+Copilot accepts these positive millisecond values in the corresponding
+`[provider.settings]` table:
+
+```toml
+stream_read_timeout_ms = 600000
+oauth_refresh_timeout_ms = 30000
+account_queue_wait_timeout_ms = 30000
+```
+
+The stream timeout bounds continuous inactivity, including waiting for response
+headers, and permits longer streams that keep making progress. The OAuth
+deadline covers headers and body; the queue deadline cancels admission with a
+local `503` / `server_overloaded`, without a supplier status or an account-health
+penalty.
+
 Kiro releases the previous transport slot before retrying or continuing a
 stream. Local slot exhaustion returns `503` / `server_overloaded` without
 account switching or an account-health penalty. A hollow continuation after tool results retains its separate bounded

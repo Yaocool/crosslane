@@ -65,6 +65,53 @@ impl DelayedUpstream {
             task,
         }
     }
+
+    async fn start_copilot() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let release = Arc::new(Notify::new());
+        let finished = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (gate, done, count) = (release.clone(), finished.clone(), calls.clone());
+        let token_endpoint = url.clone();
+        let app = axum::Router::new()
+            .route("/user", get(|| async { axum::Json(json!({"id":7,"login":"latency-test"})) }))
+            .route("/copilot_internal/v2/token", get(move || {
+                let endpoint = token_endpoint.clone();
+                async move { axum::Json(json!({"token":"fake-api-token","expires_at":4_000_000_000i64,"endpoints":{"api":endpoint}})) }
+            }))
+            .route("/models", get(|| async { axum::Json(json!({"data":[{
+                "id":"gpt-test","capabilities":{"supported_endpoints":["/chat/completions","/v1/messages","/responses"]}
+            }]})) }))
+            .route("/chat/completions", post(move || {
+                let (gate, done, count) = (gate.clone(), done.clone(), count.clone());
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let stream = async_stream::stream! {
+                        let first = json!({"id":"chatcmpl-latency","object":"chat.completion.chunk","model":"gpt-test",
+                            "choices":[{"index":0,"delta":{"role":"assistant","content":"Visible answer begins now. "},"finish_reason":null}]});
+                        yield Ok::<_, Infallible>(Bytes::from(format!("data: {first}\n\n")));
+                        gate.notified().await;
+                        done.store(true, Ordering::SeqCst);
+                        let last = json!({"id":"chatcmpl-latency","object":"chat.completion.chunk","model":"gpt-test",
+                            "choices":[{"index":0,"delta":{},"finish_reason":"stop"}],
+                            "usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}});
+                        yield Ok::<_, Infallible>(Bytes::from(format!("data: {last}\n\ndata: [DONE]\n\n")));
+                    };
+                    ([("content-type", "text/event-stream")], Body::from_stream(stream)).into_response()
+                }
+            }));
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        Self {
+            url,
+            release,
+            finished,
+            calls,
+            task,
+        }
+    }
 }
 
 impl Drop for DelayedUpstream {
@@ -477,5 +524,95 @@ async fn latency_local_slot_timeout_does_not_retry_or_cool_accounts() {
     })
     .await
     .expect("released upstream must finish");
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn latency_copilot_queue_timeout_preserves_local_errors_across_protocols() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    let upstream = DelayedUpstream::start_copilot().await;
+    let port = unused_tcp_port();
+    let daemon = Daemon::start_copilot(port, &upstream.url).await;
+    model_policy::configure(&daemon, |config| {
+        config.provider[0].pool.max_concurrent_per_account = 1;
+        config.provider[0]
+            .settings
+            .insert("account_queue_wait_timeout_ms".into(), json!(100));
+    })
+    .await;
+    expect_ok(
+        daemon
+            .call(
+                "v2.account.importToken",
+                json!({"provider":"copilot","token":"fake-github-token"}),
+            )
+            .await,
+    );
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let mut request = WireProtocol::Chat.request(true);
+    request["model"] = json!("gpt-test");
+    let first = client
+        .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .bearer_auth(daemon.api_key.as_deref().unwrap())
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200);
+    let mut first = first.bytes_stream();
+    let mut output = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !String::from_utf8_lossy(&output).contains("Visible answer begins now.") {
+            output.extend_from_slice(&first.next().await.unwrap().unwrap());
+        }
+    })
+    .await
+    .expect("first stream must occupy the account slot");
+    for protocol in WireProtocol::ALL {
+        for stream in [false, true] {
+            let mut request = protocol.request(stream);
+            request["model"] = json!("gpt-test");
+            let response = client
+                .post(format!("http://127.0.0.1:{port}{}", protocol.route()))
+                .bearer_auth(daemon.api_key.as_deref().unwrap())
+                .json(&request)
+                .send()
+                .await
+                .unwrap();
+            assert_capacity_response(response, protocol, stream).await;
+        }
+    }
+    let mut request = WireProtocol::Anthropic.request(false);
+    request["model"] = json!("gpt-test");
+    let response = client
+        .post(format!("http://127.0.0.1:{port}/v1/messages/count_tokens"))
+        .bearer_auth(daemon.api_key.as_deref().unwrap())
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_capacity_response(response, WireProtocol::Anthropic, false).await;
+    assert_eq!(upstream.calls.load(Ordering::SeqCst), 1);
+    assert!(!upstream.finished.load(Ordering::SeqCst));
+    let accounts = expect_ok(
+        daemon
+            .call("v2.account.list", json!({"provider":"copilot"}))
+            .await,
+    );
+    assert!(
+        accounts["accounts"][0]["last_error"].is_null(),
+        "{accounts}"
+    );
+    upstream.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(chunk) = first.next().await {
+            chunk.unwrap();
+        }
+    })
+    .await
+    .expect("the held stream must still complete");
     daemon.stop().await;
 }

@@ -330,7 +330,12 @@ fn fully_populated_config() -> Config {
         "api_token_refresh_before_secs".into(),
         serde_json::json!(300),
     );
-    for (name, value) in [("model_refresh_concurrency", 32)] {
+    for (name, value) in [
+        ("model_refresh_concurrency", 32),
+        ("stream_read_timeout_ms", 600_000),
+        ("oauth_refresh_timeout_ms", 30_000),
+        ("account_queue_wait_timeout_ms", 30_000),
+    ] {
         provider
             .settings
             .insert(name.into(), serde_json::json!(value));

@@ -269,6 +269,18 @@ Copilot 业务模型查询优先复用启用账号在 `provider.models.max_stale
 model_refresh_concurrency = 32
 ```
 
+可在对应 Copilot 实例的 `[provider.settings]` 中设置以下正整数，单位为毫秒：
+
+```toml
+stream_read_timeout_ms = 600000
+oauth_refresh_timeout_ms = 30000
+account_queue_wait_timeout_ms = 30000
+```
+
+读取超时限制连续无数据的时间，包括等待响应头；持续收到数据的长流不会被总时长
+限制截断。OAuth 刷新总超时覆盖响应头和响应体；排队超时会取消等待，返回本地
+`503` / `server_overloaded`，不标记供应商状态或影响账号健康。
+
 Kiro 在流式重试或续答前释放上一轮连接名额。本地槽位耗尽返回 `503` /
 `server_overloaded`，不会换账号重复等待或扣减账号健康。工具结果后的空回复仍保留独立的
 有界语义重试。工具结果续答出现有效文本后立即流出；工具参数校验完成后直接发送，

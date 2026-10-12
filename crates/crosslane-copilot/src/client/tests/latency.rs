@@ -9,6 +9,48 @@ struct StreamingServer {
     task: JoinHandle<()>,
 }
 
+impl StreamingServer {
+    async fn start(
+        content_type: &str,
+        first: &str,
+        remaining: Vec<String>,
+        interval: Duration,
+    ) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let content_type = content_type.to_owned();
+        let first = first.to_owned();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = socket.read(&mut buf).await.unwrap();
+                if count == 0 {
+                    return;
+                }
+                request.extend_from_slice(&buf[..count]);
+            }
+            let header = format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\n\r\n");
+            socket.write_all(header.as_bytes()).await.unwrap();
+            for (index, chunk) in std::iter::once(first).chain(remaining).enumerate() {
+                if index > 0 {
+                    tokio::time::sleep(interval).await;
+                }
+                let wire = format!("{:x}\r\n{chunk}\r\n", chunk.len());
+                if socket.write_all(wire.as_bytes()).await.is_err() {
+                    return;
+                }
+                socket.flush().await.unwrap();
+            }
+            // Keeping the transport open exposes an idle read or OAuth total
+            // deadline even when response headers and a body prefix arrived.
+            std::future::pending::<()>().await;
+        });
+        Self { url, task }
+    }
+}
+
 impl Drop for StreamingServer {
     fn drop(&mut self) {
         self.task.abort();
@@ -279,4 +321,141 @@ async fn catalog_older_than_max_stale_is_not_used_for_requests() {
         )
         .await
         .is_none());
+}
+
+#[tokio::test]
+async fn oauth_refresh_deadline_covers_the_body_and_releases_the_account_lock() {
+    let server = MockServer::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    mount_account_exchange(&server, "github-token").await;
+    let mut provider = mock_provider_with_settings(&server, directory.path(), |settings| {
+        settings.oauth_refresh_timeout_ms = 100;
+        settings.stream_read_timeout_ms = 5_000;
+    })
+    .await;
+    provider
+        .import_token("github-token".into(), None)
+        .await
+        .unwrap();
+    let slow = StreamingServer::start("application/json", "{", vec![], Duration::ZERO).await;
+    provider.settings.oauth_base = slow.url.clone();
+    provider.token_cache.write().await.clear();
+    let mut account = provider.accounts.read().await[0].clone();
+    account.credentials.github_expires_at = Some(now_secs() - 1);
+    account.credentials.github_refresh_token = Some("fake-refresh-token".into());
+    let error = tokio::time::timeout(Duration::from_secs(2), provider.api_token(&account))
+        .await
+        .expect("OAuth body must have a total deadline")
+        .unwrap_err();
+    assert_eq!(error.kind, ProviderErrorKind::Transport);
+    assert!(error.retryable);
+    let refresh_lock = provider.refresh_locks.lock().await[&account.id].clone();
+    assert!(
+        refresh_lock.try_lock().is_ok(),
+        "failed refresh must release singleflight lock"
+    );
+}
+
+#[tokio::test]
+async fn idle_stream_times_out_and_releases_its_account_slot() {
+    let server = MockServer::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let provider = mock_provider_with_settings(&server, directory.path(), |settings| {
+        settings.stream_read_timeout_ms = 100;
+    })
+    .await;
+    let slow = StreamingServer::start(
+        "text/event-stream",
+        "data: first\n\n",
+        vec![],
+        Duration::ZERO,
+    )
+    .await;
+    let slot = Arc::new(Semaphore::new(1));
+    let permit = Arc::clone(&slot).acquire_owned().await.unwrap();
+    let response = provider.http.get(&slow.url).send().await.unwrap();
+    let response = response_from_reqwest(response, "acc_test".into(), permit);
+    let ProviderResponseBody::Stream(mut stream) = response.body else {
+        panic!("stream body");
+    };
+    assert!(stream.next().await.unwrap().is_ok());
+    let error = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("idle stream must stop")
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.kind, ProviderErrorKind::Transport);
+    assert!(error.retryable);
+    assert_eq!(slot.available_permits(), 1);
+}
+
+#[tokio::test]
+async fn progressing_stream_can_outlive_the_idle_deadline() {
+    let server = MockServer::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let provider = mock_provider_with_settings(&server, directory.path(), |settings| {
+        settings.stream_read_timeout_ms = 500;
+    })
+    .await;
+    let slow = StreamingServer::start(
+        "text/event-stream",
+        "data: first\n\n",
+        (0..7).map(|index| format!("data: {index}\n\n")).collect(),
+        Duration::from_millis(100),
+    )
+    .await;
+    let response = provider.http.get(&slow.url).send().await.unwrap();
+    let mut stream = response.bytes_stream();
+    let started = Instant::now();
+    let mut received = Vec::new();
+    while !String::from_utf8_lossy(&received).contains("data: 6\n\n") {
+        let chunk = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        received.extend_from_slice(&chunk);
+    }
+    assert!(started.elapsed() > Duration::from_millis(500));
+}
+
+#[tokio::test]
+async fn account_queue_timeout_cancels_the_waiter_without_affecting_health() {
+    let server = MockServer::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    mount_account_exchange(&server, "github-token").await;
+    let provider = mock_provider_with_settings(&server, directory.path(), |settings| {
+        settings.max_concurrent_per_account = 1;
+        settings.account_queue_wait_timeout_ms = 100;
+    })
+    .await;
+    let account = provider
+        .import_token("github-token".into(), None)
+        .await
+        .unwrap();
+    let (_, permit, _) = provider
+        .acquire_account(&[], "gpt-test", ProviderProtocol::OpenAiChat, false, None)
+        .await
+        .unwrap();
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        provider.acquire_account(&[], "gpt-test", ProviderProtocol::OpenAiChat, false, None),
+    )
+    .await
+    .expect("account admission must be bounded")
+    .unwrap_err();
+    assert_eq!(error.kind, ProviderErrorKind::Overloaded);
+    assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!error.account_error);
+    assert!(provider
+        .account(&account.id)
+        .await
+        .unwrap()
+        .last_error
+        .is_none());
+    drop(permit);
+    assert!(provider
+        .acquire_account(&[], "gpt-test", ProviderProtocol::OpenAiChat, false, None)
+        .await
+        .is_ok());
 }
