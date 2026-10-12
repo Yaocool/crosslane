@@ -244,6 +244,58 @@ async fn assert_early_tool_result_text(fail_tail: bool) {
 }
 
 #[tokio::test]
+async fn latency_empty_tool_result_retry_reuses_a_single_stream_slot() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    mount_context_alignment_models(&mock).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(move |_: &wiremock::Request| {
+            let body = if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                event_stream_frame(
+                    "reasoningContentEvent",
+                    json!({"reasoningContentEvent":{"text":"discarded empty attempt"}}),
+                )
+            } else {
+                generation_body("Recovered correctly.")
+            };
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/vnd.amazon.eventstream")
+                .set_body_bytes(body)
+        })
+        .mount(&mock)
+        .await;
+    let port = unused_tcp_port();
+    let daemon =
+        Daemon::start_http(port, &format!("{}/generateAssistantResponse", mock.uri())).await;
+    import_context_alignment_account(&daemon, 0.0).await;
+    model_policy::configure(&daemon, |config| {
+        config.upstream.pool.stream_max_connections = 1;
+        config.upstream.stream_slot_wait_timeout_ms = 100;
+    })
+    .await;
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .bearer_auth(daemon.api_key.as_deref().unwrap())
+        .header("user-agent", "claude-cli/2.1.260 (external, e2e)")
+        .json(&tool_result_request())
+        .send()
+        .await
+        .unwrap();
+    let body = response.text().await.unwrap();
+    assert!(body.contains("Recovered correctly."), "{body}");
+    assert!(!body.contains("discarded empty attempt"), "{body}");
+    assert!(
+        !body.contains("waiting for an upstream stream slot"),
+        "{body}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    daemon.stop().await;
+}
+
+#[tokio::test]
 async fn latency_tool_calls_ignore_legacy_post_eof_delay() {
     let _guard = HTTP_TEST_LOCK.lock().await;
     let mock = MockServer::start().await;

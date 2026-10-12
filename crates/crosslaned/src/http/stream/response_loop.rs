@@ -72,8 +72,9 @@ pub fn response(
     mut context: StreamContext,
 ) -> Response {
     let mut effective_thinking = upstream.thinking_enabled();
-    let (initial_endpoint, initial_response, mut upstream_permit) = upstream.into_parts();
-    let mut source = initial_response.bytes_stream();
+    let (initial_endpoint, initial_response, initial_permit) = upstream.into_parts();
+    let mut upstream_permit = Some(initial_permit);
+    let mut source = Some(initial_response.bytes_stream());
     let mut endpoint = initial_endpoint.name.to_string();
     let mut keepalive = context.state.keepalive.subscribe();
     let upstream_config = context.state.runtime_config_snapshot().upstream;
@@ -193,7 +194,7 @@ pub fn response(
                 .with_omitted_summary(payload.thinking_summary_omitted());
             loop {
                 tokio::select! {
-                    chunk = source.next() => match chunk {
+                    chunk = source.as_mut().expect("active upstream stream").next() => match chunk {
                         Some(Ok(chunk)) => {
                             upstream_metrics.observe_chunk(chunk.len());
                             buffer.extend_from_slice(&chunk);
@@ -371,6 +372,10 @@ pub fn response(
                     }
                 }
             }
+            // End the previous transport before any token refresh, server tool,
+            // retry, or continuation can acquire another streaming slot.
+            drop(source.take());
+            drop(upstream_permit.take());
             if stop_filter.matched().is_none() {
                 let mut events = Vec::new();
                 for event in leak_filter.finish() {
@@ -566,10 +571,10 @@ pub fn response(
                                 effective_thinking = retry.thinking_enabled();
                                 let (next_endpoint, next_response, next_permit) = retry.into_parts();
                                 endpoint = next_endpoint.name.to_string();
-                                source = next_response.bytes_stream();
+                                source = Some(next_response.bytes_stream());
                                 upstream_metrics.reset();
                                 stream_failure = None;
-                                upstream_permit = next_permit;
+                                upstream_permit = Some(next_permit);
                                 buffer.clear();
                                 decoder = EventStreamDecoder;
                                 decoded = DecodedResponse::default();
@@ -687,10 +692,10 @@ pub fn response(
                                         let (next_endpoint, next_response, next_permit) =
                                             retry.into_parts();
                                         endpoint = next_endpoint.name.to_string();
-                                        source = next_response.bytes_stream();
+                                        source = Some(next_response.bytes_stream());
                                         upstream_metrics.reset();
                                         stream_failure = None;
-                                        upstream_permit = next_permit;
+                                        upstream_permit = Some(next_permit);
                                         buffer.clear();
                                         decoder = EventStreamDecoder;
                                         decoded = DecodedResponse::default();
@@ -951,10 +956,10 @@ pub fn response(
                             effective_thinking = retry.thinking_enabled();
                             let (next_endpoint, next_response, next_permit) = retry.into_parts();
                             endpoint = next_endpoint.name.to_string();
-                            source = next_response.bytes_stream();
+                            source = Some(next_response.bytes_stream());
                             upstream_metrics.reset();
                             stream_failure = None;
-                            upstream_permit = next_permit;
+                            upstream_permit = Some(next_permit);
                             buffer.clear();
                             decoder = EventStreamDecoder;
                             decoded = DecodedResponse::default();
@@ -1100,10 +1105,10 @@ pub fn response(
                             effective_thinking = next.thinking_enabled();
                             let (next_endpoint, next_response, next_permit) = next.into_parts();
                             endpoint = next_endpoint.name.to_string();
-                            source = next_response.bytes_stream();
+                            source = Some(next_response.bytes_stream());
                             upstream_metrics.reset();
                             stream_failure = None;
-                            upstream_permit = next_permit;
+                            upstream_permit = Some(next_permit);
                             buffer.clear();
                             decoder = EventStreamDecoder;
                             stop_filter = StopSequenceFilter::new(&context.stop_sequences);
@@ -1642,10 +1647,10 @@ pub fn response(
                         effective_thinking = next.thinking_enabled();
                         let (next_endpoint, next_response, next_permit) = next.into_parts();
                         endpoint = next_endpoint.name.to_string();
-                        source = next_response.bytes_stream();
+                        source = Some(next_response.bytes_stream());
                         upstream_metrics.reset();
                         stream_failure = None;
-                        upstream_permit = next_permit;
+                        upstream_permit = Some(next_permit);
                         buffer.clear();
                         decoder = EventStreamDecoder;
                         search_round += 1;
@@ -1851,10 +1856,10 @@ pub fn response(
                         effective_thinking = next.thinking_enabled();
                         let (next_endpoint, next_response, next_permit) = next.into_parts();
                         endpoint = next_endpoint.name.to_string();
-                        source = next_response.bytes_stream();
+                        source = Some(next_response.bytes_stream());
                         upstream_metrics.reset();
                         stream_failure = None;
-                        upstream_permit = next_permit;
+                        upstream_permit = Some(next_permit);
                         buffer.clear();
                         decoder = EventStreamDecoder;
                         continue 'rounds;
@@ -1962,10 +1967,10 @@ pub fn response(
                     effective_thinking = next.thinking_enabled();
                     let (next_endpoint, next_response, next_permit) = next.into_parts();
                     endpoint = next_endpoint.name.to_string();
-                    source = next_response.bytes_stream();
+                    source = Some(next_response.bytes_stream());
                     upstream_metrics.reset();
                     stream_failure = None;
-                    upstream_permit = next_permit;
+                    upstream_permit = Some(next_permit);
                     buffer.clear();
                     decoder = EventStreamDecoder;
                     auto_round += 1;
