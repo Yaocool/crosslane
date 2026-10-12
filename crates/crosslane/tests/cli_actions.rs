@@ -389,6 +389,33 @@ async fn task_scope_is_enforced_and_shown_without_changing_json_contracts() {
 }
 
 #[tokio::test]
+async fn model_mapping_all_scope_preserves_every_rule() {
+    let rules = json!([
+        {"name":"legacy","type":"alias","source_models":["fast"],"target_models":["claude-test"]},
+        {"name":"copilot-fast","type":"alias","source_models":["fast"],"target_models":["gpt-test"],"providers":["copilot"]}
+    ]);
+    let result =
+        json!({"path":"/tmp/config.toml","raw":"","effective_json":{"model_mapping":rules}});
+    for (scope, expected) in [
+        (None, 2),
+        (Some("all"), 2),
+        (Some("kiro"), 1),
+        (Some("copilot"), 1),
+    ] {
+        let mut args = vec!["model-map", "list"];
+        if let Some(scope) = scope {
+            args.extend(["--provider", scope]);
+        }
+        let (output, requests) = run(&args, vec![result.clone()]).await;
+        assert_success(&output);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, method::CONFIG_SHOW);
+        let rules: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(rules.as_array().unwrap().len(), expected, "{scope:?}");
+    }
+}
+
+#[tokio::test]
 async fn editing_resources_does_not_take_permission_changes_from_shell_defaults() {
     let initial = r#"
 [[provider]]

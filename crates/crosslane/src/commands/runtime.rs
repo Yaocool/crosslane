@@ -3602,7 +3602,7 @@ pub async fn run_model_map(
         ModelMapCommand::List { provider } => {
             let config = effective_config(client).await?;
             let mut rules = config.model_mapping;
-            if let Some(provider) = provider.as_deref() {
+            if let Some(provider) = provider.as_deref().filter(|id| *id != "all") {
                 rules.retain(|rule| {
                     if rule.providers.is_empty() {
                         provider == "kiro"
