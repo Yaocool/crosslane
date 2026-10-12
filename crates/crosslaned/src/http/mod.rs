@@ -12,6 +12,7 @@ pub(crate) mod prompt_cache;
 mod response;
 pub(crate) mod responses;
 pub(crate) mod stream;
+mod timing;
 mod usage;
 
 use std::collections::{HashMap, HashSet};
@@ -270,7 +271,8 @@ async fn trace_requests(
     );
     let mut response = next.run(request).instrument(span).await;
     let status = response.status();
-    let duration_ms = started.elapsed().as_millis() as u64;
+    let response_ready = Instant::now();
+    let duration_ms = response_ready.duration_since(started).as_millis() as u64;
     let response_request_id = response
         .headers()
         .get(REQUEST_ID_HEADER)
@@ -363,7 +365,24 @@ async fn trace_requests(
             value,
         );
     }
-    response
+    timing::trace_response(
+        response,
+        timing::RequestCompletion {
+            started,
+            response_ready,
+            trace_id,
+            service_id,
+            service_name,
+            request_id: response_request_id,
+            http_method: method.to_string(),
+            http_path: path,
+            user_agent,
+            http_status: status.as_u16(),
+            error_code,
+            error_stage,
+            upstream_status,
+        },
+    )
 }
 
 async fn cors(request: axum::extract::Request, next: Next) -> Response {
@@ -957,6 +976,213 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn request_completion_covers_body_read_success_failure_and_empty_responses() {
+        let (_directory, state) = test_state(Config::default()).await;
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let writer = Arc::clone(&captured);
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(move || LogCapture(Arc::clone(&writer)))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let slow_body = async_stream::stream! {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"{"));
+        };
+        let broken_body = futures::stream::iter([
+            Ok(bytes::Bytes::from_static(b"{")),
+            Err(std::io::Error::other("fixture body failure")),
+        ]);
+        let requests = [
+            (
+                Request::get("/health").body(Body::empty()).unwrap(),
+                StatusCode::OK,
+            ),
+            (
+                Request::post("/v1/messages")
+                    .body(Body::from_stream(slow_body))
+                    .unwrap(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                Request::post("/v1/messages")
+                    .body(Body::from_stream(broken_body))
+                    .unwrap(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/v1/messages")
+                    .body(Body::empty())
+                    .unwrap(),
+                StatusCode::NO_CONTENT,
+            ),
+        ];
+        let mut trace_ids = Vec::new();
+        for (request, status) in requests {
+            let response = router(state.clone()).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), status);
+            trace_ids.push(
+                response.headers()[TRACE_ID_HEADER]
+                    .to_str()
+                    .unwrap()
+                    .to_owned(),
+            );
+            to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        }
+        let output = captured.lock().unwrap().clone();
+        let entries = std::str::from_utf8(&output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        for (index, trace_id) in trace_ids.iter().enumerate() {
+            let completed = entries
+                .iter()
+                .filter(|entry| {
+                    entry["fields"]["event"] == "http.response.completed"
+                        && entry["fields"]["trace_id"] == *trace_id
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(completed.len(), 1);
+            let fields = &completed[0]["fields"];
+            assert_eq!(fields["outcome"], "completed");
+            assert!(
+                fields["duration_ms"].as_u64().unwrap()
+                    >= fields["response_ready_ms"].as_u64().unwrap()
+            );
+            if index == 1 || index == 2 {
+                let body_read = entries
+                    .iter()
+                    .find(|entry| {
+                        entry["fields"]["event"] == "http.request.body_read"
+                            && entry["fields"]["trace_id"] == *trace_id
+                    })
+                    .unwrap();
+                assert_eq!(body_read["fields"]["body_bytes"], 1);
+                assert_eq!(
+                    body_read["fields"]["outcome"],
+                    if index == 1 { "completed" } else { "failed" }
+                );
+                if index == 1 {
+                    assert!(body_read["fields"]["body_read_ms"].as_u64().unwrap() >= 20);
+                    assert!(fields["duration_ms"].as_u64().unwrap() >= 20);
+                }
+            }
+            if index == 3 {
+                assert_eq!(fields["response_bytes"], 0);
+                assert!(fields.get("first_byte_ms").is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn timing_preserves_request_body_limits_and_releases_failed_reservations() {
+        const BODY_BUDGET_BYTES: usize = 128 * 1024 * 1024;
+        let (_directory, state) = test_state(Config::default()).await;
+        for path in [
+            "/v1/messages",
+            "/v1/messages/count_tokens",
+            "/v1/chat/completions",
+            "/v1/responses",
+        ] {
+            let occupied = state.body_budget.reserve(BODY_BUDGET_BYTES).unwrap();
+            let response = router(state.clone())
+                .oneshot(Request::post(path).body(Body::from("{}")).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+            assert!(body_json(response).await["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("memory budget"));
+            drop(occupied);
+
+            let broken = futures::stream::iter([
+                Ok(bytes::Bytes::from_static(b"{")),
+                Err(std::io::Error::other("fixture body failure")),
+            ]);
+            let response = router(state.clone())
+                .oneshot(Request::post(path).body(Body::from_stream(broken)).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+            assert!(body_json(response).await["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("failed to read request body"));
+
+            let chunk = bytes::Bytes::from(vec![b'x'; 1024 * 1024]);
+            let oversized =
+                futures::stream::iter((0..51).map(move |_| Ok::<_, std::io::Error>(chunk.clone())));
+            let response = router(state.clone())
+                .oneshot(
+                    Request::post(path)
+                        .body(Body::from_stream(oversized))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE, "{path}");
+            let body = body_json(response).await;
+            assert_eq!(
+                body["error"]["type"],
+                if path.contains("messages") {
+                    "request_too_large"
+                } else {
+                    "invalid_request_error"
+                },
+                "{body}"
+            );
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("50 MiB"),
+                "{body}"
+            );
+            drop(
+                state
+                    .body_budget
+                    .reserve(BODY_BUDGET_BYTES)
+                    .expect("all failed reads must release their body reservations"),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn timing_preserves_the_request_body_idle_deadline() {
+        let (_directory, state) = test_state(Config::default()).await;
+        let stalled = async_stream::stream! {
+            yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"{"));
+            std::future::pending::<()>().await;
+        };
+        let response = tokio::time::timeout(
+            Duration::from_secs(20),
+            router(state.clone()).oneshot(
+                Request::post("/v1/chat/completions")
+                    .body(Body::from_stream(stalled))
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("the inbound body read must retain its idle deadline")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert!(body_json(response).await["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("request body read timed out"));
+        drop(
+            state
+                .body_budget
+                .reserve(128 * 1024 * 1024)
+                .expect("a timed-out read must release the partial body"),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn request_failures_log_client_user_agent_at_warn_and_error() {
         let mut config = Config::default();
         config.server.max_connections = 1;
@@ -1075,6 +1301,11 @@ mod tests {
                     .expect("trace ID")
                     .to_owned(),
             );
+            // Complete the error response so this test checks one rejection
+            // warning, rather than also simulating a client cancellation.
+            to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .expect("error response body");
         }
         drop(guard);
         let request_logs = state.stats.snapshot(None).recent_requests;

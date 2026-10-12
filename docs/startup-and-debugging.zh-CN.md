@@ -271,6 +271,30 @@ crosslane stats --detail --since 1h
 `upstream.account.selected` 和完成事件会记录 `provider_id`、`account_id`；
 用 `trace_id` 可串联同一请求的账号切换记录。
 
+每个 HTTP 请求结束时都会记录一次 `http.response.completed`，覆盖流式响应、拒绝请求
+和响应体中断。耗时单位均为毫秒：
+
+| 字段 / 事件 | 含义 |
+| --- | --- |
+| `duration_ms` | 从服务器收到请求头，到响应体结束或被丢弃的总耗时，包含请求上传和所有来源尝试 |
+| `response_ready_ms` | 从收到请求到响应头准备好的耗时；原有 `http.response.ready.duration_ms` 也是这个含义 |
+| `first_byte_ms` | 从收到请求到首个非空响应数据帧交给 HTTP 传输层的耗时；无数据的响应不记录此字段 |
+| `response_body_ms` | 响应头准备好后，到响应体结束或被丢弃的耗时 |
+| `response_bytes` | 结束或中断前交给 HTTP 传输层的响应字节数 |
+| `http.request.body_read.body_read_ms` | 读取请求体的耗时；读取失败时也记录已收到的 `body_bytes` |
+| `proxy.stream.preflight.duration_ms` | CRS 流预检耗时，仅在启用 `crs` 的构建中记录 |
+
+结束状态 `outcome` 为 `completed`、`cancelled` 或 `body_error`，表示 HTTP 响应体的
+传输状态。HTTP 200 内的 SSE 错误仍需结合来源或流错误事件判断。首帧可能是 SSE 开场
+事件或保活帧，因此 `first_byte_ms` 不等于模型首个 token 的等待时间；这些指标也不代表
+客户端实际接收或界面渲染完成的时间。
+原有 `proxy.*` 完成事件和 `crosslane stats` 保留操作耗时口径，可能从请求体上传后开始
+计时，也可能包含内部子请求。排查整个请求的总延迟应看最终 HTTP 事件。若
+`body_read_ms` 很大，或出现 HTTP 408 `request body read timed out`，延迟发生在模型
+调度前，应先检查客户端上传及网络、代理链路。CRS 流预检在等待内容或早期错误期间，
+可能暂存 SSE 开场事件最多 5 秒。
+请求体读取按数据块设置 15 秒空闲超时；持续有数据到达时，总上传时长可以超过 15 秒。
+
 | 现象 | 优先检查 |
 | --- | --- |
 | `health` 失败 | daemon/容器状态和日志 |

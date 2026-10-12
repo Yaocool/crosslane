@@ -4,7 +4,7 @@
 //! Streaming errors use HTTP 200 SSE so CRS Console retains their details.
 //! Errors after an SSE response starts remain in the already committed stream.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::{to_bytes, Body, Bytes};
 use axum::http::{header, HeaderValue, StatusCode};
@@ -235,7 +235,16 @@ pub(super) async fn adapt_claude_response(response: Response, request_id: &str) 
         .unwrap_or_default()
         .trim();
     if content_type.eq_ignore_ascii_case("text/event-stream") {
-        preflight_stream(response, request_id).await
+        let started = Instant::now();
+        let response = preflight_stream(response, request_id).await;
+        tracing::info!(
+            event = "proxy.stream.preflight",
+            trace_id = request_id,
+            duration_ms = started.elapsed().as_millis() as u64,
+            http_status = response.status().as_u16(),
+            "CRS stream preflight completed"
+        );
+        response
     } else {
         normalize_json_success(response, request_id).await
     }

@@ -322,6 +322,34 @@ HTTP 200, so inspect its final event.
 `upstream.account.selected` and completion events include `provider_id` and
 `account_id`; use `trace_id` to follow account retries for one request.
 
+`http.response.completed` records one final transport timing for every HTTP
+request, including streamed responses, rejected requests, and dropped bodies.
+All timings are in milliseconds:
+
+| Field / event | Measurement |
+| --- | --- |
+| `duration_ms` | From receiving request headers until the response body finishes or is dropped; includes request upload and all provider attempts |
+| `response_ready_ms` | From request arrival until response headers are ready; the existing `http.response.ready.duration_ms` has this meaning |
+| `first_byte_ms` | From request arrival until the first nonempty response data frame is handed to the HTTP transport; absent for bodies with no data |
+| `response_body_ms` | From response headers becoming ready until the body finishes or is dropped |
+| `response_bytes` | Bytes handed to the HTTP transport before completion or interruption |
+| `http.request.body_read.body_read_ms` | Time reading the incoming request body; `body_bytes` counts received bytes even if reading fails |
+| `proxy.stream.preflight.duration_ms` | Time spent in CRS stream preflight (only in builds with `crs`) |
+
+The completion `outcome` is `completed`, `cancelled`, or `body_error`. It describes
+HTTP body delivery, so an HTTP 200 SSE error still needs its provider/stream error
+event checked. The first data frame can be an SSE prelude or keepalive, rather than
+the first model token; delivery timings do not measure client receipt or rendering.
+Existing `proxy.*` completion events and `crosslane stats` retain their operation
+timings, which can start after request upload and can include internal subrequests.
+Use the final HTTP event when investigating total request latency. Large
+`body_read_ms` values or HTTP 408 `request body read timed out` indicate a delay
+before model dispatch; compare client upload and the network/proxy path before
+tuning provider timeouts. CRS preflight can retain the initial SSE prelude for up
+to five seconds while waiting for content or an early error.
+Incoming body reads have a 15-second idle timeout for each chunk; an upload that
+keeps making progress can take longer than 15 seconds in total.
+
 ### Kiro request size and automatic compaction
 
 Anthropic requests have a 50 MiB HTTP body limit. The translated Kiro payload

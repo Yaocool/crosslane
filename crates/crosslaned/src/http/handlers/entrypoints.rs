@@ -377,47 +377,67 @@ pub(super) async fn read_bounded_body(
     format: ErrorFormat,
 ) -> Result<(HeaderMap, Bytes, crate::state::BodyGuard), ApiError> {
     const MAX_BODY_BYTES: usize = 50 * 1024 * 1024;
-    let (parts, body) = request.into_parts();
-    let mut stream = Body::into_data_stream(body);
-    let mut bytes = bytes::BytesMut::new();
-    let mut reservation = state
-        .body_budget
-        .reserve(0)
-        .ok_or_else(|| ApiError::overloaded(format))?;
-    while let Some(chunk) = tokio::time::timeout(Duration::from_secs(15), stream.next())
-        .await
-        .map_err(|_| {
-            ApiError::new(
-                StatusCode::REQUEST_TIMEOUT,
-                "request body read timed out",
-                format,
-            )
-        })?
-    {
-        let chunk = chunk.map_err(|error| {
-            ApiError::new(
-                StatusCode::BAD_REQUEST,
-                format!("failed to read request body: {error}"),
-                format,
-            )
-        })?;
-        if bytes.len().saturating_add(chunk.len()) > MAX_BODY_BYTES {
-            return Err(ApiError::new(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "request body exceeds the 50 MiB limit",
-                format,
-            ));
+    let trace_id = request_trace_id(&request);
+    let started = Instant::now();
+    let mut body_bytes = 0usize;
+    let result = async {
+        let (parts, body) = request.into_parts();
+        let mut stream = Body::into_data_stream(body);
+        let mut bytes = bytes::BytesMut::new();
+        let mut reservation = state
+            .body_budget
+            .reserve(0)
+            .ok_or_else(|| ApiError::overloaded(format))?;
+        while let Some(chunk) = tokio::time::timeout(Duration::from_secs(15), stream.next())
+            .await
+            .map_err(|_| {
+                ApiError::new(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "request body read timed out",
+                    format,
+                )
+            })?
+        {
+            let chunk = chunk.map_err(|error| {
+                ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("failed to read request body: {error}"),
+                    format,
+                )
+            })?;
+            body_bytes = body_bytes.saturating_add(chunk.len());
+            if bytes.len().saturating_add(chunk.len()) > MAX_BODY_BYTES {
+                return Err(ApiError::new(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request body exceeds the 50 MiB limit",
+                    format,
+                ));
+            }
+            if !reservation.reserve_more(chunk.len()) {
+                return Err(ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "request body memory budget exceeded",
+                    format,
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
         }
-        if !reservation.reserve_more(chunk.len()) {
-            return Err(ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "request body memory budget exceeded",
-                format,
-            ));
-        }
-        bytes.extend_from_slice(&chunk);
+        Ok((parts.headers, bytes.freeze(), reservation))
     }
-    Ok((parts.headers, bytes.freeze(), reservation))
+    .await;
+    tracing::info!(
+        event = "http.request.body_read",
+        trace_id,
+        body_read_ms = started.elapsed().as_millis() as u64,
+        body_bytes,
+        outcome = if result.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        },
+        "client request body read finished"
+    );
+    result
 }
 
 fn request_model_hint(body: &[u8]) -> String {
