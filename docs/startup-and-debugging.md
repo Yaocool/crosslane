@@ -322,6 +322,12 @@ requests with usable snapshots wait for discovery.
 model_refresh_concurrency = 32
 ```
 
+A hollow continuation after tool results retains its separate bounded
+semantic retry. Valid text from a tool-result continuation streams immediately.
+Completed tool arguments are sent after validation without an extra delay;
+`features.tool_call_buffer_delay_ms` remains accepted for old configurations but
+is ignored and defaults to zero.
+
 ## Logs and troubleshooting
 
 ```bash

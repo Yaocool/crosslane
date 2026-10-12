@@ -122,7 +122,6 @@ pub struct StreamContext {
     pub payload: KiroPayload,
     pub auto_continue_rounds: u32,
     pub buffer_tool_calls: bool,
-    pub tool_call_buffer_delay_ms: u64,
     pub enable_tool_leak_filter: bool,
     /// Actual per-request decision. Beta headers only advertise capability and
     /// remain present when Claude Code sends `thinking.type = "disabled"`.

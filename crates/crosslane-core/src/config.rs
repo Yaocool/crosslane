@@ -374,7 +374,7 @@ pub struct FeaturesConfig {
     pub enhance_system_prompt: bool,
     /// 是否缓冲工具调用。
     pub buffer_tool_calls: bool,
-    /// 工具调用缓冲延迟。
+    /// 旧配置兼容字段；工具参数校验完成后立即发送，不再额外休眠。
     pub tool_call_buffer_delay_ms: u64,
     /// thinking 输出格式。
     pub thinking_output_format: ThinkingOutputFormat,
@@ -403,7 +403,7 @@ impl Default for FeaturesConfig {
             enable_prompt_cache: false,
             enhance_system_prompt: true,
             buffer_tool_calls: true,
-            tool_call_buffer_delay_ms: 500,
+            tool_call_buffer_delay_ms: 0,
             thinking_output_format: ThinkingOutputFormat::Claude,
             adaptive_thinking: false,
             max_thinking_budget_tokens: 8192,
@@ -2239,8 +2239,8 @@ enable_prompt_cache = false
 enhance_system_prompt = true
 # 是否缓冲流式工具调用片段，降低参数 JSON 被拆碎或乱序的概率。
 buffer_tool_calls = true
-# 工具调用缓冲等待时间；仅在 buffer_tool_calls=true 时使用。
-tool_call_buffer_delay_ms = 500
+# 仅为兼容旧配置保留；工具参数校验完成后立即发送，此字段不再增加等待。
+tool_call_buffer_delay_ms = 0
 # 思考内容输出格式；"claude" 输出 thinking block，"openai" 输出 reasoning_content。
 thinking_output_format = "claude"
 # 仅为兼容旧配置保留；逐轮按客户端请求转换 thinking，不再自动跳过工具结果/控制轮次。

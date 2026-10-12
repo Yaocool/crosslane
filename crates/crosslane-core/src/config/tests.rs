@@ -38,7 +38,7 @@ fn defaults_match_the_spec() {
     assert!(!config.features.enable_prompt_cache);
     assert!(config.features.enhance_system_prompt);
     assert!(config.features.buffer_tool_calls);
-    assert_eq!(config.features.tool_call_buffer_delay_ms, 500);
+    assert_eq!(config.features.tool_call_buffer_delay_ms, 0);
     assert!(!config.features.adaptive_thinking);
     assert_eq!(config.features.max_thinking_budget_tokens, 8192);
     assert!(config.features.enable_web_tools);

@@ -29,6 +29,9 @@ fn sse_error_payload(body: &str) -> serde_json::Value {
 #[path = "end_to_end/model_policy.rs"]
 mod model_policy;
 
+#[path = "end_to_end/latency.rs"]
+mod latency;
+
 #[path = "end_to_end/copilot_model_aliases.rs"]
 mod copilot_model_aliases;
 

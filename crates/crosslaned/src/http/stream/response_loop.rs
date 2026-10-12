@@ -15,6 +15,26 @@ use super::{
     ThinkingContentFilter, ToolLeakFilter, UpstreamStreamMetrics, Value,
 };
 
+/// Keep hollow reasoning-only continuations retryable without delaying valid
+/// visible text until EOF. Returning the whole prefix preserves event order.
+fn guard_tool_result_output(
+    guarded: &mut bool,
+    buffered: &mut Vec<String>,
+    confirms_valid_text: bool,
+    output: Vec<String>,
+) -> Vec<String> {
+    if !*guarded {
+        return output;
+    }
+    buffered.extend(output);
+    if confirms_valid_text {
+        *guarded = false;
+        std::mem::take(buffered)
+    } else {
+        Vec::new()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn retry_mapped_model(
     locked: bool,
@@ -152,9 +172,9 @@ pub fn response(
         'rounds: loop {
             // A Kiro round following tool output is not semantically complete
             // until it contains visible text, another tool call, or a terminal
-            // reason. Buffer its client events so a hollow reasoning-only
-            // attempt can be retried without leaking duplicate reasoning.
-            let guards_tool_result_round = current_message_has_tool_results(&payload);
+            // reason. Buffer reasoning-only attempts, but release the guard as
+            // soon as valid text appears so successful turns remain streaming.
+            let mut guards_tool_result_round = current_message_has_tool_results(&payload);
             let mut guarded_output = Vec::new();
             let mut claude_checkpoint = guards_tool_result_round.then(|| claude.clone());
             let mut pending_initial_checkpoint =
@@ -219,6 +239,7 @@ pub fn response(
                                             if matches!(&event, KiroEvent::Reasoning { .. } | KiroEvent::Citations { .. } | KiroEvent::ToolUse { .. }) {
                                                 let pending = stop_filter.finish();
                                                 if !pending.is_empty() {
+                                                    let confirms_valid_text = !pending.trim().is_empty();
                                                     let output = stream_event(
                                                         &protocol,
                                                         &mut claude,
@@ -232,13 +253,13 @@ pub fn response(
                                                         &mut pending_initial,
                                                         output,
                                                     );
-                                                    if guards_tool_result_round {
-                                                        guarded_output.extend(output);
-                                                    } else {
-                                                        data_started |= !output.is_empty();
-                                                        for data in output {
-                                                            yield Ok::<Bytes, Infallible>(Bytes::from(data));
-                                                        }
+                                                    let output = guard_tool_result_output(
+                                                        &mut guards_tool_result_round, &mut guarded_output,
+                                                        confirms_valid_text, output,
+                                                    );
+                                                    data_started |= !output.is_empty();
+                                                    for data in output {
+                                                        yield Ok::<Bytes, Infallible>(Bytes::from(data));
                                                     }
                                                 }
                                             }
@@ -254,6 +275,7 @@ pub fn response(
                                                         &context.openai_tools,
                                                     )
                                                 }) {
+                                                    let confirms_valid_text = matches!(visible_event, KiroEvent::AssistantResponse { content } if !content.trim().is_empty());
                                                     let output = stream_event(
                                                         &protocol,
                                                         &mut claude,
@@ -267,13 +289,13 @@ pub fn response(
                                                         &mut pending_initial,
                                                         output,
                                                     );
-                                                    if guards_tool_result_round {
-                                                        guarded_output.extend(output);
-                                                    } else {
-                                                        data_started |= !output.is_empty();
-                                                        for data in output {
-                                                            yield Ok::<Bytes, Infallible>(Bytes::from(data));
-                                                        }
+                                                    let output = guard_tool_result_output(
+                                                        &mut guards_tool_result_round, &mut guarded_output,
+                                                        confirms_valid_text, output,
+                                                    );
+                                                    data_started |= !output.is_empty();
+                                                    for data in output {
+                                                        yield Ok::<Bytes, Infallible>(Bytes::from(data));
                                                     }
                                                 }
                                             }
@@ -372,6 +394,7 @@ pub fn response(
                     ) {
                         let pending = stop_filter.finish();
                         if !pending.is_empty() {
+                            let confirms_valid_text = !pending.trim().is_empty();
                             let output = stream_event(
                                 &protocol,
                                 &mut claude,
@@ -382,13 +405,13 @@ pub fn response(
                                 &context.openai_tools,
                             );
                             let output = prepend_pending_initial(&mut pending_initial, output);
-                            if guards_tool_result_round {
-                                guarded_output.extend(output);
-                            } else {
-                                data_started |= !output.is_empty();
-                                for data in output {
-                                    yield Ok::<Bytes, Infallible>(Bytes::from(data));
-                                }
+                            let output = guard_tool_result_output(
+                                &mut guards_tool_result_round, &mut guarded_output,
+                                confirms_valid_text, output,
+                            );
+                            data_started |= !output.is_empty();
+                            for data in output {
+                                yield Ok::<Bytes, Infallible>(Bytes::from(data));
                             }
                         }
                     }
@@ -401,6 +424,7 @@ pub fn response(
                                 &context.openai_tools,
                             )
                         }) {
+                            let confirms_valid_text = matches!(visible_event, KiroEvent::AssistantResponse { content } if !content.trim().is_empty());
                             let output = stream_event(
                                 &protocol,
                                 &mut claude,
@@ -411,13 +435,13 @@ pub fn response(
                                 &context.openai_tools,
                             );
                             let output = prepend_pending_initial(&mut pending_initial, output);
-                            if guards_tool_result_round {
-                                guarded_output.extend(output);
-                            } else {
-                                data_started |= !output.is_empty();
-                                for data in output {
-                                    yield Ok::<Bytes, Infallible>(Bytes::from(data));
-                                }
+                            let output = guard_tool_result_output(
+                                &mut guards_tool_result_round, &mut guarded_output,
+                                confirms_valid_text, output,
+                            );
+                            data_started |= !output.is_empty();
+                            for data in output {
+                                yield Ok::<Bytes, Infallible>(Bytes::from(data));
                             }
                         }
                     }
@@ -440,11 +464,15 @@ pub fn response(
                 }
             }
             if failed.is_some() {
-                if let Some(checkpoint) = claude_checkpoint.take() {
-                    claude = checkpoint;
-                }
-                if let Some(checkpoint) = pending_initial_checkpoint.take() {
-                    pending_initial = checkpoint;
+                // Once semantic output has been emitted, neither replay the
+                // attempt nor restore the pre-output protocol state.
+                if !data_started {
+                    if let Some(checkpoint) = claude_checkpoint.take() {
+                        claude = checkpoint;
+                    }
+                    if let Some(checkpoint) = pending_initial_checkpoint.take() {
+                        pending_initial = checkpoint;
+                    }
                 }
                 let failure_text = failed.as_deref().unwrap_or_default().to_string();
                 let failed_account_id = context.lease.account_id();
@@ -2027,15 +2055,6 @@ pub fn response(
             if buffer_tool_calls
                 || context.openai_tools.values().any(|identity| identity.kind == "custom")
             {
-                if context.buffer_tool_calls
-                    && context.tool_call_buffer_delay_ms > 0
-                    && !decoded.tools.is_empty()
-                {
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        context.tool_call_buffer_delay_ms,
-                    ))
-                    .await;
-                }
                 for tool in decoded.tools.values() {
                     let event = KiroEvent::ToolUse {
                         id: tool.id.clone(),
