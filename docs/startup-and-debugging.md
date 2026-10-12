@@ -210,6 +210,8 @@ Responses namespace function tools use unique upstream names and restore their
 original namespace and name in client output. Claude Code's `thinking.display:
 "updates"` is adapted to upstream `summarized` while retaining thinking settings;
 `omitted` continues to hide thinking output.
+Copilot Messages requests omit the unsupported Anthropic `safeguards` extension,
+including on token-counting requests, so newer Claude Code requests are accepted.
 
 Copilot handles ordinary generation even when a Responses catalog advertises
 `web_search`. An actual search call switches both search and the turn's following

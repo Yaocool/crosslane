@@ -2363,7 +2363,9 @@ fn prepare_provider_request(
         }
     }
     if request.protocol == ProviderProtocol::ClaudeMessages {
-        for field in ["fallbacks", "container", "mcp_servers"] {
+        // These first-party extensions have no matching Copilot beta support.
+        // Keep their request envelopes consistent with the forwarded betas.
+        for field in ["fallbacks", "container", "mcp_servers", "safeguards"] {
             object.remove(field);
         }
         let has_context_management_beta = request
@@ -4167,7 +4169,8 @@ mod tests {
             "output_config": {"effort": "high"},
             "tools": [{"name": "lookup", "description": "Lookup", "input_schema": {"type": "object"}}],
             "context_management": {"edits": []},
-            "mcp_servers": [{"name": "unsupported"}]
+            "mcp_servers": [{"name": "unsupported"}],
+            "safeguards": [{"type": "dangerous_tool_use", "classifier_context": "synthetic context"}]
         });
         let messages_upstream = serde_json::json!({
             "model": "gpt-test",
@@ -4183,10 +4186,14 @@ mod tests {
             "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}],
             "stream": true
         });
-        let count = serde_json::json!({
+        let count_upstream = serde_json::json!({
             "model": "gpt-test",
             "messages": message_history
         });
+        let mut count = count_upstream.clone();
+        count["safeguards"] = serde_json::json!([
+            {"type": "dangerous_tool_use", "classifier_context": "synthetic context"}
+        ]);
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .and(header("authorization", "Bearer copilot-api-token"))
@@ -4231,7 +4238,7 @@ mod tests {
                     "per-turn-control-2026-10-10",
                 ],
             ))
-            .and(wiremock::matchers::body_json(count.clone()))
+            .and(wiremock::matchers::body_json(count_upstream))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "input_tokens": 5
             })))

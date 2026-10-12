@@ -171,6 +171,8 @@ Claude 上游不接受工具 schema 根部的 `oneOf`、`allOf`、`anyOf` 时，
 Responses 的 namespace 函数工具在上游使用唯一函数名，返回客户端时恢复原来的 namespace
 和名称。Claude Code 的 `thinking.display: "updates"` 会适配为上游支持的 `summarized`，
 保留 thinking 设置；`omitted` 仍隐藏思考内容。
+Copilot Messages 请求会移除上游不支持的 Anthropic `safeguards` 扩展，token counting
+请求也使用相同适配，避免新版 Claude Code 请求被拒绝。
 
 Copilot 普通生成请求保持原来源，即使 Responses 工具列表声明了 `web_search`。
 模型实际调用搜索后，搜索及本轮后续回答交给 Kiro，不回退到 Copilot。Claude Code 的
