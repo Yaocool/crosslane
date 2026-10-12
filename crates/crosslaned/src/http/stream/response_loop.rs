@@ -538,10 +538,9 @@ pub fn response(
                     "upstream stream failed"
                 );
                 let config = context.state.config.current();
-                let retry_limit = config
-                    .upstream
-                    .max_retries
-                    .max(context.account_ids.len() as u32);
+                // This budget includes same-account auth/model retries. Pool
+                // size only bounds candidate switches; it cannot add retries.
+                let retry_limit = config.upstream.max_retries;
                 let may_switch = (!is_quota || config.pool.auto_switch_on_quota_exhausted)
                     && !is_request_rejection
                     && failure_details.scope != StreamFailureScope::Proxy;
@@ -566,6 +565,7 @@ pub fn response(
                         );
                         let account = context.lease.account().await;
                         payload.profile_arn.clone_from(&account.profile_arn);
+                        pre_data_retries += 1;
                         match context.state.generate(&account, &payload).await {
                             Ok(retry) => {
                                 upstream_access_token = account.credentials.access_token.clone();
@@ -581,7 +581,6 @@ pub fn response(
                                 decoded = DecodedResponse::default();
                                 stop_filter = StopSequenceFilter::new(&context.stop_sequences);
                                 failed = None;
-                                pre_data_retries += 1;
                                 tracing::info!(
                                     trace_id = %context.trace_id,
                                     request_id = %context.request_id,
@@ -685,6 +684,7 @@ pub fn response(
                                 context.mapped_model.clone_from(&fallback);
                                 context.kiro_model.clone_from(&resolved);
                                 super::super::handlers::set_payload_model(&mut payload, &resolved);
+                                pre_data_retries += 1;
                                 match context.state.generate(&account, &payload).await {
                                     Ok(retry) => {
                                         upstream_access_token =
@@ -703,7 +703,6 @@ pub fn response(
                                         stop_filter =
                                             StopSequenceFilter::new(&context.stop_sequences);
                                         failed = None;
-                                        pre_data_retries += 1;
                                         continue 'rounds;
                                     }
                                     Err(error) => {
@@ -952,6 +951,7 @@ pub fn response(
                         200u64.saturating_mul(1u64 << exponent).min(5_000),
                     ))
                     .await;
+                    pre_data_retries += 1;
                     match context.state.generate(&account, &payload).await {
                         Ok(retry) => {
                             upstream_access_token = account.credentials.access_token.clone();
@@ -967,7 +967,6 @@ pub fn response(
                             decoded = DecodedResponse::default();
                             stop_filter = StopSequenceFilter::new(&context.stop_sequences);
                             failed = None;
-                            pre_data_retries += 1;
                             continue 'rounds;
                         }
                         Err(error) => {

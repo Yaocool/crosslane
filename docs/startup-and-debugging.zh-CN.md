@@ -282,10 +282,16 @@ account_queue_wait_timeout_ms = 30000
 `503` / `server_overloaded`，不标记供应商状态或影响账号健康。
 
 Kiro 在流式重试或续答前释放上一轮连接名额。本地槽位耗尽返回 `503` /
-`server_overloaded`，不会换账号重复等待或扣减账号健康。工具结果后的空回复仍保留独立的
+`server_overloaded`，不会换账号重复等待或扣减账号健康。在首个有效内容前，重试次数
+遵循 `upstream.max_retries`，账号数量不会扩大预算；工具结果后的空回复仍保留独立的
 有界语义重试。工具结果续答出现有效文本后立即流出；工具参数校验完成后直接发送，
 不再额外休眠。`features.tool_call_buffer_delay_ms` 为兼容旧配置保留，默认值为零，
 已不参与请求等待。
+
+上述控制适用于 Anthropic Messages、OpenAI Chat Completions 和 Responses。
+请求鉴权、客户端检查、模型权限和 50 MiB 请求体上限保持原有规则；工具参数校验和
+各协议的完成/失败事件格式保持不变。启用 `crs` 时，Messages 的流式服务错误仍使用
+HTTP 200 SSE，并在 `error.status` 中携带实际状态，例如本地过载的 503。
 
 ## 日志与排障
 

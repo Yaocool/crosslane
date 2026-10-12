@@ -339,11 +339,20 @@ penalty.
 
 Kiro releases the previous transport slot before retrying or continuing a
 stream. Local slot exhaustion returns `503` / `server_overloaded` without
-account switching or an account-health penalty. A hollow continuation after tool results retains its separate bounded
+account switching or an account-health penalty. Before the first semantic
+output, retries use `upstream.max_retries`; account count cannot increase this
+budget. A hollow continuation after tool results retains its separate bounded
 semantic retry. Valid text from a tool-result continuation streams immediately.
 Completed tool arguments are sent after validation without an extra delay;
 `features.tool_call_buffer_delay_ms` remains accepted for old configurations but
 is ignored and defaults to zero.
+
+These controls cover Anthropic Messages, OpenAI Chat Completions, and Responses.
+Authentication, client checks, model permissions, and the 50 MiB request-body
+limit retain their existing rules. Tool argument validation and protocol-specific
+completion/failure event formats are preserved. With `crs`, streaming Messages
+service errors still use HTTP 200 SSE and carry the actual status in
+`error.status`, for example 503 for local overload.
 
 ## Logs and troubleshooting
 

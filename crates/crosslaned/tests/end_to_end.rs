@@ -32,6 +32,9 @@ mod model_policy;
 #[path = "end_to_end/latency.rs"]
 mod latency;
 
+#[path = "end_to_end/latency_retry.rs"]
+mod latency_retry;
+
 #[path = "end_to_end/copilot_model_aliases.rs"]
 mod copilot_model_aliases;
 

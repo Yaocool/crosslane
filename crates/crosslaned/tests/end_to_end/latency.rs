@@ -616,3 +616,43 @@ async fn latency_copilot_queue_timeout_preserves_local_errors_across_protocols()
     .expect("the held stream must still complete");
     daemon.stop().await;
 }
+
+#[tokio::test]
+async fn latency_stream_retry_budget_is_not_increased_by_account_count() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    mount_context_alignment_models(&mock).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(move |_: &wiremock::Request| {
+            count.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/vnd.amazon.eventstream")
+                .set_body_bytes(vec![0, 0, 0, 32, 0, 0, 0, 0])
+        })
+        .mount(&mock)
+        .await;
+    let port = unused_tcp_port();
+    let daemon =
+        Daemon::start_http(port, &format!("{}/generateAssistantResponse", mock.uri())).await;
+    import_context_alignment_account(&daemon, 0.0).await;
+    import_more_accounts(&daemon).await;
+    for retries in [0, 1] {
+        model_policy::configure(&daemon, |config| {
+            config.upstream.max_retries = retries;
+        })
+        .await;
+        calls.store(0, Ordering::SeqCst);
+        let response = reqwest::Client::new().post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .bearer_auth(daemon.api_key.as_deref().unwrap())
+            .header("user-agent", "claude-cli/2.1.260 (external, e2e)")
+            .json(&json!({"model":"source-large","messages":[{"role":"user","content":"Hello"}],"max_tokens":32,"stream":true}))
+            .send().await.unwrap();
+        let body = response.text().await.unwrap();
+        assert!(body.contains("error"), "{body}");
+        assert_eq!(calls.load(Ordering::SeqCst), retries as usize + 1, "{body}");
+    }
+    daemon.stop().await;
+}
