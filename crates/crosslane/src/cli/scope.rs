@@ -28,12 +28,17 @@ impl Scope {
 }
 
 pub(super) fn for_path(path: &[&str]) -> Scope {
+    if path.contains(&"help") {
+        return Scope::Navigation;
+    }
     match path {
         [] | ["help" | "guide" | "completions", ..] => Scope::Navigation,
         ["health" | "version" | "restart" | "stop" | "uninstall" | "config", ..]
         | ["logs", "trace" | "files" | "path"]
+        | ["alert"]
+        | ["alert", "config" | "events" | "platforms" | "list" | "logs"]
         | ["models", "disable" | "enable"] => Scope::Global,
-        ["diagnose" | "alert", ..]
+        ["diagnose", ..]
         | ["account", "overage" | "add-sso" | "add-api-key" | "import" | "regen-machine-id", ..] => {
             Scope::Kiro
         }
@@ -41,7 +46,9 @@ pub(super) fn for_path(path: &[&str]) -> Scope {
         ["provider", "show" | "add" | "edit" | "enable" | "disable" | "delete"]
         | ["service", "show" | "enable" | "disable" | "delete" | "apikeys"]
         | ["apikey", "show" | "rm" | "enable" | "disable" | "limit" | "reset-usage"]
+        | ["alert", "add" | "edit" | "delete" | "test"]
         | ["model-map", "show" | "delete" | "enable" | "disable"] => Scope::Resource,
+        ["tasks", "list"] => Scope::Global,
         ["tasks", ..] | ["account" | "logs" | "models"] => Scope::Mixed,
         _ => Scope::Shared,
     }
@@ -61,13 +68,33 @@ pub(super) fn decorate(command: &mut Command, path: &mut Vec<String>) {
     let scope = for_path(&path.iter().map(String::as_str).collect::<Vec<_>>());
     let path_segments = path.iter().map(String::as_str).collect::<Vec<_>>();
     let tasks_list = matches!(path_segments.as_slice(), ["tasks", "list"]);
+    // Both help flags show the complete document, including long descriptions
+    // and examples. Register group-local help explicitly: Clap's root-level
+    // disable_help_subcommand setting is inherited by every child.
+    *command = command.clone().disable_help_flag(true).arg(
+        clap::Arg::new("help")
+            .short('h')
+            .long("help")
+            .action(clap::ArgAction::HelpLong)
+            .help("显示完整帮助与示例"),
+    );
+    if !path.is_empty() && command.get_subcommands().next().is_some() {
+        *command = command
+            .clone()
+            .subcommand(super::help::group_help_command(path));
+    }
     if command
         .get_arguments()
         .any(|arg| arg.get_id() == "provider")
     {
-        *command = command
-            .clone()
-            .mut_arg("provider", |arg| arg.short('p').value_name("ID"));
+        *command = command.clone().mut_arg("provider", |arg| {
+            let arg = if arg.get_help().is_none() {
+                arg.help("提供源实例 ID；用于选择来源或消歧账号，见 provider list。")
+            } else {
+                arg
+            };
+            arg.short('p').value_name("ID")
+        });
     } else if (matches!(scope, Scope::Global | Scope::Resource) || tasks_list)
         && !matches!(path_segments.as_slice(), ["models", "disable" | "enable"])
     {
@@ -101,16 +128,29 @@ pub(super) fn decorate(command: &mut Command, path: &mut Vec<String>) {
         ["service" | "apikey" | "model-map", "edit"]
     ) {
         "此处 --provider/-p 整体替换资源允许使用的实例范围，可重复或逗号分隔。"
+    } else if matches!(path_segments.as_slice(), ["models", "disable" | "enable"]) {
+        "模型禁用/启用作用于全部提供源；只接受 --provider all 作为全局范围标记。"
+    } else if matches!(path_segments.as_slice(), ["alert", ..]) {
+        "告警目标和通知平台是共享资源，不按 provider 筛选；当前可订阅的账号额度/token 事件来自 Kiro。"
     } else {
         match scope {
         Scope::Resource => "使用命令自身的 ID/名称参数定位或创建资源；不接受 --provider 筛选，CROSSLANE_PROVIDER 不影响本操作。",
-        Scope::Global => "不按提供源筛选。模型禁用/启用作用于全部提供源；配置模块适用范围见 config list。",
+        Scope::Global => "不按提供源筛选，不接受 --provider；CROSSLANE_PROVIDER 不影响本操作。",
         Scope::Kiro => "Kiro 专项操作；不能用于 Copilot 实例。",
         Scope::Copilot => "--provider/-p 填 GitHub Copilot 实例的 ID。",
-        Scope::Shared | Scope::Mixed | Scope::Navigation => "支持来源选择的命令用 --provider/-p 指定实例 ID；具体选项见本命令的 Options。用 provider list 查看实际 ID。",
+        Scope::Navigation => "帮助、指南和补全不需要运行 daemon。",
+        Scope::Shared | Scope::Mixed => "--provider/-p 使用 provider list 中的实例 ID；默认范围见本命令的参数说明。",
         }
     };
-    let identity = "示例中的 kiro/copilot 是实例 ID 示例；自定义实例请替换为实际 ID，GitHub Copilot 是类型名称。";
+    let identity = if matches!(
+        scope,
+        Scope::Shared | Scope::Mixed | Scope::Kiro | Scope::Copilot
+    ) || path_segments.as_slice() == ["provider", "add"]
+    {
+        "\n示例中的 kiro/copilot 是实例 ID；自定义实例请替换为 provider list 中的 ID。"
+    } else {
+        ""
+    };
     let edit_scope = if matches!(
         path_segments.as_slice(),
         ["service" | "apikey" | "model-map", "edit"]
@@ -119,8 +159,19 @@ pub(super) fn decorate(command: &mut Command, path: &mut Vec<String>) {
     } else {
         ""
     };
+    let guide = match path.first().map(String::as_str) {
+        Some("restart" | "stop" | "uninstall") => "docker",
+        Some("ready") => "health",
+        Some("help" | "guide" | "completions") | None => "",
+        Some(group) => group,
+    };
+    let guide_hint = if guide.is_empty() || existing.contains("操作说明：") {
+        String::new()
+    } else {
+        format!("\n\n操作说明：crosslane guide {guide}")
+    };
     *command = command.clone().after_help(format!(
-        "适用范围：{}。{detail}\n{identity}{edit_scope}\n\n{existing}",
+        "适用范围：{}。{detail}{identity}{edit_scope}\n\n{existing}{guide_hint}",
         scope.label()
     ));
     for child in command.get_subcommands_mut() {
@@ -163,4 +214,18 @@ pub(crate) fn task_scope(name: &str) -> &'static str {
         }
         _ => "未知（由 daemon 定义）",
     }
+}
+
+pub(crate) const MANUAL_TASKS: [&str; 7] = [
+    "token_refresh",
+    "status_check",
+    "health_recheck",
+    "model_cache_refresh",
+    "stats_persist",
+    "daily_reset",
+    "proxy_service_reconcile",
+];
+
+pub(crate) fn manual_task_parser() -> clap::builder::PossibleValuesParser {
+    clap::builder::PossibleValuesParser::new(MANUAL_TASKS)
 }

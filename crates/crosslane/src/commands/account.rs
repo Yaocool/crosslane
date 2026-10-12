@@ -49,6 +49,9 @@ pub enum AccountOverageCommand {
         no_refresh: bool,
     },
     /// 关闭代理侧 overage；保留已配置的每账号上限供下次启用。
+    #[command(
+        after_help = "仅关闭代理侧 overage 使用策略，保留每账号上限。\n\n示例：\n  crosslane account overage disable"
+    )]
     Disable,
 }
 
@@ -159,9 +162,14 @@ pub enum AccountCommand {
         label: Option<String>,
     },
     /// 向正在运行的远端 Copilot 浏览器提交 MFA 验证码。
+    #[command(
+        after_help = "配合 account add 的远端浏览器登录使用；--task 使用该登录过程提示的任务 ID。验证码从标准输入读取。\n\n示例：\n  crosslane account login-code --provider copilot --task LOGIN_TASK_ID --code-stdin < /secure/mfa-code"
+    )]
     LoginCode {
+        /// 正在进行登录的 Copilot 提供源实例 ID。
         #[arg(long, default_value = "", hide_default_value = true)]
         provider: String,
+        /// account add 登录过程中返回的任务 ID。
         #[arg(long)]
         task: String,
         /// 从标准输入读取一行验证码。
@@ -195,9 +203,14 @@ pub enum AccountCommand {
         tags: Vec<String>,
     },
     /// 导入 Kiro headless API key，从 KIRO_API_KEY 环境变量或标准输入读取。
+    #[command(
+        after_help = "兼容 Kiro 导入入口；统一入口为 account add --provider kiro --auth api-key --token-stdin。省略 --key-stdin 时读取 KIRO_API_KEY。\n\n示例：\n  crosslane account add-api-key --email user@example.com --key-stdin < /secure/kiro-key"
+    )]
     AddApiKey {
+        /// 用于标识该 Kiro 账号的邮箱。
         #[arg(long)]
         email: String,
+        /// Kiro API key 所属的 AWS 区域。
         #[arg(long, default_value = "us-east-1")]
         region: String,
         /// 从标准输入读取 key，避免在命令行参数中暴露凭据。
@@ -233,6 +246,7 @@ pub enum AccountCommand {
         /// IAM Identity Center start URL；未提供时读取 `[sso].start_url`。
         #[arg(long)]
         start_url: Option<String>,
+        /// Kiro IAM Identity Center 所属的 AWS 区域。
         #[arg(long, default_value = "us-east-1")]
         region: String,
         /// 必须显式声明，从标准输入读取一行密码；密码不会进入命令行历史。
@@ -325,7 +339,9 @@ pub enum AccountCommand {
         group(clap::ArgGroup::new("refresh_target").required(true).multiple(false).args(["id", "all"]))
     )]
     Refresh {
+        /// 账号 ID、邮箱或 provider/account_id；与 --all 二选一。
         id: Option<String>,
+        /// 刷新所选来源的全部账号；省略来源时覆盖全部实例。
         #[arg(long, conflicts_with = "id")]
         all: bool,
         /// 限定提供源；--all 时默认聚合全部来源。
@@ -338,7 +354,9 @@ pub enum AccountCommand {
         group(clap::ArgGroup::new("probe_target").required(true).multiple(false).args(["id", "all"]))
     )]
     Probe {
+        /// 账号 ID、邮箱或 provider/account_id；与 --all 二选一。
         id: Option<String>,
+        /// 探测所选来源的全部账号。
         #[arg(long, conflicts_with = "id")]
         all: bool,
         /// 限定提供源；批量操作可显式使用 all。
@@ -351,7 +369,9 @@ pub enum AccountCommand {
         group(clap::ArgGroup::new("reset_health_target").required(true).multiple(false).args(["id", "all"]))
     )]
     ResetHealth {
+        /// 账号 ID、邮箱或 provider/account_id；与 --all 二选一。
         id: Option<String>,
+        /// 重置所选来源的全部账号健康状态。
         #[arg(long, conflicts_with = "id")]
         all: bool,
         /// 限定提供源；批量操作可显式使用 all。

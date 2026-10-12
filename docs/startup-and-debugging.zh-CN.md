@@ -41,6 +41,36 @@ crosslane ready
 升级前停止写入并备份完整数据卷。镜像回退不会撤销数据变更。`crosslane stop` 可停止部署
 并保留数据；移除前先查看 `crosslane uninstall --help`。
 
+## 命令导航与归属
+
+`-h`、`--help` 和 `help` 都显示完整参数及示例，帮助不需要运行 daemon：
+
+```bash
+crosslane service edit -h
+crosslane help service edit
+crosslane service help edit
+crosslane help --all
+crosslane help account --all
+```
+
+| 命令组 | 管理对象 |
+| --- | --- |
+| `provider` | 上游实例、驱动设置、默认模型和回退策略 |
+| `account` | 上游登录账号、凭证、健康状态与标签 |
+| `service` | 业务监听、允许来源、客户端 Key 绑定和账号池 |
+| `apikey` | 客户端访问凭据、来源/模型权限、限额与用量 |
+| `models` / `model-map` | 模型目录与全局禁用 / 客户端模型名映射规则 |
+| `tasks` / `alert` | 周期任务 / 共享通知目标及当前 Kiro 告警事件 |
+
+无参数的顶层命令组显示帮助；自动化中使用 `--json` 时必须指定操作。`account overage`
+兼容旧版默认 `show` 行为。`tasks list` 标明可手工运行的任务，`tasks run` 的帮助和
+Shell 补全仅列出可手工运行项；watcher 和 adaptive_admission 由调度器运行。
+
+查询中的 `--provider` 选择实例，创建/编辑 service、apikey、model-map 时则设置或替换
+来源权限。权限编辑必须显式传参，`CROSSLANE_PROVIDER` 不会覆盖已有资源的权限。
+全局命令和直接通过 ID/名称定位的资源命令不接受来源筛选，也不受这个环境默认值影响；
+模型全局禁用/启用兼容 `--provider all` 标记。告警目标通过名称定位，当前账号事件来自 Kiro。
+
 ## 账号
 
 ### Kiro

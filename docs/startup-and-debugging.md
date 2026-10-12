@@ -48,6 +48,40 @@ rollback does not reverse data changes. Use `crosslane stop` to stop the
 deployment without removing its data; read `crosslane uninstall --help` before
 removing it.
 
+## Command navigation and ownership
+
+`-h`, `--help`, and `help` show complete options and examples without a running daemon:
+
+```bash
+crosslane service edit -h
+crosslane help service edit
+crosslane service help edit
+crosslane help --all
+crosslane help account --all
+```
+
+| Command group | Managed resources |
+| --- | --- |
+| `provider` | Upstream instances, driver settings, default models, and fallback policy |
+| `account` | Upstream logins, credentials, health, and tags |
+| `service` | Business listeners, allowed providers, client key bindings, and account pools |
+| `apikey` | Client credentials, provider/model permissions, limits, and usage |
+| `models` / `model-map` | Model discovery and global disabling / client model mapping rules |
+| `tasks` / `alert` | Scheduled tasks / shared notification targets and current Kiro events |
+
+Bare top-level groups display help; scripts using `--json` must select an action.
+`account overage` retains its legacy default `show` behavior. `tasks list` identifies
+manually runnable tasks; `tasks run` help and Shell completion list only those tasks.
+The watcher and adaptive admission tasks run only under the scheduler.
+
+Queries use `--provider` to select an instance. Creating or editing a service, client
+key, or mapping uses it to set or replace provider permissions. Permission edits
+require an explicit option; `CROSSLANE_PROVIDER` never replaces existing permissions.
+Global commands and resources addressed directly by ID/name reject provider filtering
+and ignore that environment default. Global model disabling/enabling accepts the
+compatibility marker `--provider all`. Alert targets are addressed by name; current
+account events come from Kiro.
+
 ## Accounts
 
 ### Kiro

@@ -216,6 +216,89 @@ fn nested_help_uses_the_same_clap_command_definition() {
 }
 
 #[test]
+fn every_command_supports_consistent_help_without_runtime_setup() {
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join(".env"), "BROKEN='unterminated\n").unwrap();
+    let tree = stdout(&run(workspace.path(), &["help", "--all"]));
+    let paths = tree
+        .lines()
+        .filter(|line| line.starts_with("  ") && line.contains(" ["))
+        .map(|line| {
+            line.split(" [")
+                .next()
+                .unwrap()
+                .split('（')
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert!(paths.len() > 100, "incomplete tree: {tree}");
+    for path in &paths {
+        let mut direct_args = path.clone();
+        direct_args.push("--help");
+        let direct = run(workspace.path(), &direct_args);
+        assert!(
+            direct.status.success(),
+            "{direct_args:?}: {}",
+            stderr(&direct)
+        );
+        let mut short_args = path.clone();
+        short_args.push("-h");
+        let short = run(workspace.path(), &short_args);
+        assert!(short.status.success(), "{short_args:?}: {}", stderr(&short));
+        assert_eq!(stdout(&direct), stdout(&short), "{path:?}");
+        let mut routed_args = vec!["help"];
+        routed_args.extend_from_slice(path);
+        let routed = run(workspace.path(), &routed_args);
+        assert!(
+            routed.status.success(),
+            "{routed_args:?}: {}",
+            stderr(&routed)
+        );
+        assert_eq!(stdout(&direct), stdout(&routed), "{path:?}");
+        if path.len() > 1 {
+            let mut nested_args = path[..path.len() - 1].to_vec();
+            nested_args.extend(["help", path[path.len() - 1]]);
+            let nested = run(workspace.path(), &nested_args);
+            assert!(
+                nested.status.success(),
+                "{nested_args:?}: {}",
+                stderr(&nested)
+            );
+            assert_eq!(stdout(&direct), stdout(&nested), "{path:?}");
+        }
+    }
+    let subtree = run(workspace.path(), &["help", "account", "--all"]);
+    assert!(subtree.status.success(), "{}", stderr(&subtree));
+    let subtree = stdout(&subtree);
+    assert!(subtree.contains("account overage enable"));
+    assert!(!subtree.contains("service create"));
+    assert!(!subtree.contains("account help"));
+    let alias = run(workspace.path(), &["help", "model", "--all"]);
+    assert!(alias.status.success(), "{}", stderr(&alias));
+    assert!(stdout(&alias).contains("models resolve"));
+}
+
+#[test]
+fn alert_reference_commands_ignore_the_provider_environment() {
+    let workspace = tempfile::tempdir().unwrap();
+    for action in ["config", "events", "platforms"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_crosslane"))
+            .args(["alert", action])
+            .current_dir(workspace.path())
+            .env("CROSSLANE_PROVIDER", "work-cp")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{action}: {}", stderr(&output));
+    }
+    let output = run(workspace.path(), &["alert", "list", "--provider", "kiro"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr(&output).contains("不接受 --provider"));
+}
+
+#[test]
 fn full_tree_and_completions_expose_public_commands_only() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let tree = run(workspace.path(), &["help", "--all"]);

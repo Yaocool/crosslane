@@ -23,9 +23,16 @@ pub fn parse_navigation_or_exit(args: impl IntoIterator<Item = OsString>) -> Cli
 }
 
 fn parse(args: impl IntoIterator<Item = OsString>, require_provider: bool) -> Cli {
-    let matches = command()
-        .try_get_matches_from(args)
+    let mut definition = command();
+    let matches = definition
+        .try_get_matches_from_mut(args)
         .unwrap_or_else(|error| error.exit());
+    if help::handle_nested_help(&matches).unwrap_or_else(|error| {
+        eprintln!("crosslane: {error}");
+        std::process::exit(1);
+    }) {
+        std::process::exit(0);
+    }
     let mut cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
     let path = scope::selected_path(&matches);
     let selected_scope = scope::for_path(&path);
@@ -175,7 +182,6 @@ fn validate_scope(cli: &Cli, require_provider: bool) -> Result<(), String> {
     let kiro_only = matches!(
         &cli.command,
         Some(Command::Diagnose { .. })
-            | Some(Command::Alert { .. })
             | Some(Command::Account {
                 command: Some(
                     AccountCommand::Overage { .. }
@@ -201,7 +207,7 @@ pub async fn handle_local(cli: &Cli) -> Result<bool> {
         }
         Some(Command::Help { all, path }) => {
             if *all {
-                help::print_all_commands();
+                help::print_all_commands(path)?;
             } else {
                 help::print_command_help(path)?;
             }

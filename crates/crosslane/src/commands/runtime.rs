@@ -46,8 +46,10 @@ pub enum ServiceCommand {
         after_help = "省略 --provider 时保持 Kiro-only；服务与自动生成的 API key 使用相同来源范围。--account-tag 筛选服务允许的 Kiro/Copilot 账号。省略 --port 时，首个服务配置为 server.port（监听可由 CROSSLANE_HTTP_PORT 覆盖），之后使用现有 service 最大生效端口加 1；可用 --port 显式指定。\n\n示例：\n  crosslane service create --name kiro --provider kiro --default-provider kiro\n  crosslane service create --name copilot --provider copilot --default-provider copilot\n  crosslane service create --name unified --provider kiro --provider copilot --default-provider kiro"
     )]
     Create {
+        /// 代理服务的唯一可读名称。
         #[arg(long)]
         name: String,
+        /// 监听地址；省略时使用 server.host。
         #[arg(long)]
         host: Option<String>,
         /// 监听端口，范围 1024..=65535；省略时为现有 service 最大生效端口加 1，首个服务配置为 server.port。
@@ -64,8 +66,10 @@ pub enum ServiceCommand {
             default_value_t = false
         )]
         skip_user_agent_check: bool,
+        /// 自动生成的首个客户端 Key 名称；默认 <服务名称>-default。
         #[arg(long)]
         api_key_name: Option<String>,
+        /// 首个客户端 Key 的密钥格式。
         #[arg(
             long,
             default_value = "sk",
@@ -219,15 +223,20 @@ pub enum ApiKeyCommand {
     #[command(
         after_help = "参数接受 API key ID 或名称。\n\n示例：\n  crosslane apikey show ci\n  crosslane --json apikey show ak_ab12"
     )]
-    Show { id: String },
+    Show {
+        /// 客户端 Key 的稳定 ID 或名称，见 apikey list。
+        id: String,
+    },
     /// 创建 API key；明文只在创建结果中显示一次。
     #[command(
         visible_alias = "create",
         after_help = "默认随机生成密钥，省略 --provider 时仅允许 Kiro。使用 --key 可恢复误删的原密钥；注意命令行参数可能进入 shell 历史和进程列表。\n\n示例：\n  crosslane apikey add --name kiro-key --provider kiro\n  crosslane apikey add --name copilot-key --provider copilot\n  crosslane apikey add --name unified-key --provider kiro --provider copilot\n  crosslane apikey add --name team --credits-limit 100"
     )]
     Add {
+        /// 客户端 Key 的可读名称。
         #[arg(long)]
         name: String,
+        /// 生成的密钥格式：sk- 前缀、token_ 前缀或无前缀。
         #[arg(
             long,
             default_value = "sk",
@@ -237,6 +246,7 @@ pub enum ApiKeyCommand {
         /// 使用指定的 API key 明文，而不是随机生成。
         #[arg(long, value_name = "API_KEY")]
         key: Option<String>,
+        /// 此 Key 跨全部来源共用的累计 Credits 上限；省略时不限。
         #[arg(long, value_parser = parse_non_negative_credits)]
         credits_limit: Option<f64>,
         /// 是否允许该 key 在所有已绑定服务上跳过客户端 User-Agent 校验。
@@ -259,6 +269,7 @@ pub enum ApiKeyCommand {
         after_help = "--provider 替换允许来源；--clear-providers 恢复 Kiro-only。--model 可使用 provider/model glob；参数接受 key ID 或名称。\n\n示例：\n  crosslane apikey edit ci --provider copilot --model 'copilot/*'\n  crosslane apikey edit ci --provider kiro --provider copilot\n  crosslane apikey edit ci --skip-user-agent-check true"
     )]
     Edit {
+        /// 客户端 Key 的稳定 ID 或名称，见 apikey list。
         id: String,
         /// 设置是否允许该 key 跳过客户端 User-Agent 校验。
         #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
@@ -266,11 +277,13 @@ pub enum ApiKeyCommand {
         /// 替换允许使用的提供源。
         #[arg(id = "provider", long = "provider", value_delimiter = ',')]
         providers: Vec<String>,
+        /// 清除来源权限配置，恢复仅允许 Kiro。
         #[arg(long)]
         clear_providers: bool,
         /// 替换允许的模型 glob。
         #[arg(long = "model", value_delimiter = ',')]
         models: Vec<String>,
+        /// 清除模型范围限制，允许权限范围内的全部模型。
         #[arg(long)]
         clear_models: bool,
     },
@@ -280,6 +293,7 @@ pub enum ApiKeyCommand {
         after_help = "参数接受 API key ID 或名称。\n\n示例：\n  crosslane apikey rm ak_ab12\n  crosslane apikey delete ci\n\n执行前需输入 y 或 yes 确认。"
     )]
     Rm {
+        /// 客户端 Key 的稳定 ID 或名称，见 apikey list。
         id: String,
         /// 跳过交互确认，用于自动化。
         #[arg(short = 'y', long)]
@@ -289,18 +303,26 @@ pub enum ApiKeyCommand {
     #[command(
         after_help = "示例：\n  crosslane apikey enable ak_ab12\n  crosslane --json apikey enable ak_ab12"
     )]
-    Enable { id: String },
+    Enable {
+        /// 客户端 Key 的稳定 ID 或名称，见 apikey list。
+        id: String,
+    },
     /// 停用 API key，但保留配置与历史用量。
     #[command(
         after_help = "示例：\n  crosslane apikey disable ak_ab12\n  crosslane --json apikey disable ak_ab12"
     )]
-    Disable { id: String },
+    Disable {
+        /// 客户端 Key 的稳定 ID 或名称，见 apikey list。
+        id: String,
+    },
     /// 设置或清除 API key 跨来源共用的累计 Credits 上限。
     #[command(
         after_help = "此上限作用于同一 key 的 Kiro 与 Copilot 累计用量，不按来源分别配置。`--clear` 恢复不限；`--credits 0` 阻止新消耗。\n\n示例：\n  crosslane apikey limit ci --credits 100\n  crosslane apikey limit ci --clear"
     )]
     Limit {
+        /// 客户端 Key 的稳定 ID 或名称。
         id: String,
+        /// 跨全部来源共用的累计 Credits 上限，0 阻止新消耗。
         #[arg(
             long,
             required_unless_present = "clear",
@@ -317,7 +339,9 @@ pub enum ApiKeyCommand {
         after_help = "省略 --provider 时统计全部来源；可按 kiro 或 copilot 限定。\n\n示例：\n  crosslane apikey usage ak_ab12 --provider kiro\n  crosslane apikey usage ak_ab12 --provider copilot"
     )]
     Usage {
+        /// 客户端 Key 的稳定 ID 或名称。
         id: String,
+        /// 只统计该提供源实例；省略或 all 聚合全部来源。
         #[arg(long)]
         provider: Option<String>,
     },
@@ -326,9 +350,12 @@ pub enum ApiKeyCommand {
         after_help = "省略 --provider 时显示全部来源。\n\n示例：\n  crosslane apikey history ak_ab12 --provider kiro\n  crosslane apikey history ak_ab12 --provider copilot --tail 200"
     )]
     History {
+        /// 客户端 Key 的稳定 ID 或名称。
         id: String,
+        /// 最多显示多少条最近请求，范围 1..=1000。
         #[arg(long, default_value_t = 50, value_parser = parse_cli_tail)]
         tail: usize,
+        /// 只查询该提供源实例；省略或 all 显示全部来源。
         #[arg(long)]
         provider: Option<String>,
     },
@@ -337,6 +364,7 @@ pub enum ApiKeyCommand {
         after_help = "示例：\n  crosslane apikey reset-usage ak_ab12\n\n执行前需输入 y 或 yes 确认。"
     )]
     ResetUsage {
+        /// 客户端 Key 的稳定 ID 或名称。
         id: String,
         /// 跳过交互确认，用于自动化。
         #[arg(short = 'y', long)]
@@ -507,8 +535,13 @@ pub enum AlertCommand {
         clear_custom_template: bool,
     },
     /// 删除告警目标，执行前需输入 y 或 yes 确认。
-    #[command(name = "delete", visible_alias = "rm")]
+    #[command(
+        name = "delete",
+        visible_alias = "rm",
+        after_help = "删除通知目标，事件定义和历史投递记录保留。\n\n示例：\n  crosslane alert delete alerts\n  crosslane alert rm alerts --yes"
+    )]
     Delete {
+        /// 告警目标名称，见 alert list。
         name: String,
         /// 跳过交互确认，用于自动化。
         #[arg(short = 'y', long)]
@@ -520,13 +553,16 @@ pub enum AlertCommand {
         group(clap::ArgGroup::new("alert_test_target").required(true).multiple(false).args(["name", "all"]))
     )]
     Test {
+        /// 告警目标名称；与 --all 二选一。
         name: Option<String>,
+        /// 向全部已配置目标发送测试通知。
         #[arg(long, conflicts_with = "name")]
         all: bool,
     },
     /// 查看最近的告警投递记录。
     #[command(after_help = "示例：\n  crosslane alert logs\n  crosslane alert logs --tail 200")]
     Logs {
+        /// 最多显示多少条投递记录，范围 1..=1000。
         #[arg(long, default_value_t = 50, value_parser = parse_cli_tail)]
         tail: usize,
     },
@@ -584,6 +620,11 @@ pub async fn simple_rpc(
                 vec![
                     name.clone(),
                     crate::cli::scope::task_scope(name).into(),
+                    if crate::cli::scope::MANUAL_TASKS.contains(&name.as_str()) {
+                        "是".into()
+                    } else {
+                        "否（仅调度器）".into()
+                    },
                     task["interval_ms"]
                         .as_u64()
                         .map(|ms| format!("{ms} ms"))
@@ -598,7 +639,10 @@ pub async fn simple_rpc(
             .collect::<Vec<_>>();
         println!(
             "{}",
-            render_table(&["任务", "适用范围", "周期", "上次执行", "结果"], &rows)
+            render_table(
+                &["任务", "适用范围", "可手工运行", "周期", "上次执行", "结果"],
+                &rows
+            )
         );
     } else {
         print_human_value(&value);

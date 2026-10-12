@@ -124,6 +124,9 @@ fn topic_text(topic: &str) -> Result<&'static str> {
   Copilot 专项：account add --provider copilot --auth device-flow（或 --token-stdin）；OAuth/endpoint 设置属于 Copilot provider 实例。
   全局：health、version、config、logs trace/files/path、daemon 生命周期；其中 config 模块各有适用范围，见 crosslane guide config。
 
+资源归属：provider 是上游实例，account 是上游账号，apikey 是客户端访问凭据，service 是业务监听和账号池，model-map 是模型路由规则。配置的实际实例 ID 用 provider list 查看。
+参数说明：crosslane help service edit / crosslane service help edit / crosslane service edit -h；局部命令树：crosslane help account --all。无参数的顶层命令组显示帮助；account overage 保留旧版默认 show 行为。
+
 提供源实例
   crosslane provider list
   crosslane provider show kiro
@@ -220,7 +223,7 @@ Copilot API 地址优先使用账号 token 返回的 endpoint；仅当缺失且�
             "`crosslane subscriptions --provider kiro [账号]` 查询 Kiro 上游企业订阅计划；省略账号时使用可调度 Kiro 账号。Copilot 不提供权威订阅/席位数据，`--provider copilot` 或 `all` 中该来源返回 supported=false；Copilot 可用性请用 `account probe --provider copilot` 和 `models list --provider copilot` 检查。"
         }
         "tasks" => {
-            "`crosslane tasks list` 查看全部任务。`token_refresh/status_check/health_recheck` 操作 Kiro 账号池；`model_cache_refresh` 可用 `tasks run model_cache_refresh --provider <ID>` 按来源刷新；`stats_persist/daily_reset/proxy_service_reconcile` 为全局任务。Kiro 任务只接受 --provider kiro；全局任务不接受 --provider。Copilot API token 在其 provider 内独立按需刷新，不使用 Kiro 的 token_refresh 任务。"
+            "`crosslane tasks list` 查看全部任务及可手工运行列；`tasks run --help` 列出接受的任务名，Shell 补全也提供这些名称。account_file_watcher/adaptive_admission 仅由调度器运行。`token_refresh/status_check/health_recheck` 操作 Kiro 账号池；`model_cache_refresh` 可用 `tasks run model_cache_refresh --provider <ID>` 按来源刷新；`stats_persist/daily_reset/proxy_service_reconcile` 为全局任务。Kiro 任务只接受 --provider kiro；全局任务不接受 --provider。Copilot API token 在其 provider 内独立按需刷新，不使用 Kiro 的 token_refresh 任务。"
         }
         "stats" => {
             "`crosslane stats` 默认聚合 Kiro/Copilot 的持久化请求统计；`--provider <ID>` 限定来源，`--detail --by provider` 比较来源分组。可用 `--since 1h` 或带时区的 `--start/--end` 查询时间段；`--by model|account|apikey|endpoint` 查看其他维度。"
@@ -229,7 +232,7 @@ Copilot API 地址优先使用账号 token 返回的 endpoint；仅当缺失且�
             "`crosslane logs show/follow --provider <ID>` 查看对应来源的结构化请求日志；省略来源时显示全部，并可配合 --account、--level 和 --tail。`logs trace <TRACE_ID>` 按 trace ID 跨全部来源和日志分片查询，不提供来源参数；`logs files/path` 管理全局日志文件和路径。"
         }
         "alert" => {
-            "`crosslane alert events` 当前列出的额度保护、额度耗尽、服务额度耗尽和 token 刷新失败事件来自 Kiro 账号池；不能作为 Copilot Enterprise 席位、授权或额度监控。`alert platforms/config` 和 `add/edit/delete/list/test/logs` 管理这些事件的通知目标；通知平台本身是共享机制，但当前没有 Copilot 专项告警事件。"
+            "`crosslane alert events` 当前列出的额度保护、额度耗尽、服务额度耗尽和 token 刷新失败事件来自 Kiro 账号池；不能作为 Copilot Enterprise 席位、授权或额度监控。`alert platforms/config` 和 `add/edit/delete/list/test/logs` 管理这些事件的通知目标；通知平台本身是共享机制，但当前没有 Copilot 专项告警事件。通知目标通过名称定位，不接受 --provider；CROSSLANE_PROVIDER 不影响告警操作。"
         }
         "models" => {
             "`crosslane models list` 默认聚合全部来源；`--provider kiro --refresh` 和 `--provider copilot --refresh` 分别刷新并查看 Kiro、Copilot 的模型、输入上下文和输出上限，`-` 表示上游未返回对应元数据。`--mapped` 同时显示显式映射结果。`crosslane models resolve <MODEL_ID> --provider <ID>` 显示指定来源中的映射与最终模型；还可配合 `--api-key` 和 `--refresh`。`model` 与 `models` 等价。`model disable/enable <MODEL_ID...>` 全局禁用/启用模型（跨全部 provider，使用不带来源前缀的 ID；若有 CROSSLANE_PROVIDER 请覆盖 --provider all）。禁用规则保存在 models.disabled，热更新生效，配置重置保留。CLI 列表标记不可用，公共列表隐藏；直接请求、映射、默认模型、回退、重试和内部探测均在发送前拦截。已发送请求无法撤回。"

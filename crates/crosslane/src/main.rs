@@ -21,7 +21,7 @@ use crate::output::{format_relative, format_timestamp, print_json, render_table}
     disable_help_subcommand = true,
     about = "Kiro 与 GitHub Copilot 模型代理管理工具",
     long_about = "查看 Kiro、GitHub Copilot 提供源及服务状态，管理账号、模型、API key 与配置。\n\n示例：\n  crosslane provider list\n  crosslane account list --provider kiro\n  crosslane account list --provider copilot\n  crosslane models list --provider all\n  crosslane guide kiro\n  crosslane guide copilot",
-    after_help = "来源与命令适用范围：guide provider、guide kiro、guide copilot\n常用查询：status、health、ready、stats、pool、subscriptions\n命令组：provider、account、config、apikey、service、alert、logs、models、model-map、tasks、diagnose\n宿主机操作：restart、stop、uninstall\n帮助与补全：help、guide、completions"
+    after_help = "命令归属：\n  provider：上游实例及驱动设置；account：上游登录账号与凭证\n  service：业务监听、来源范围和账号池；apikey：访问业务接口的客户端 Key\n  models：模型目录、解析和全局禁用；model-map：客户端模型名的映射规则\n  status/health/ready/stats/pool/logs：运行观测；tasks：周期任务\n  config：运行配置；alert：告警通知目标；diagnose/subscriptions：Kiro 专项\n  restart/stop/uninstall：Docker 宿主机操作\n\n帮助入口：crosslane <命令路径> --help、crosslane help <命令路径>\n完整命令树：crosslane help --all；局部命令树：crosslane help account --all\n接入说明：crosslane guide kiro、crosslane guide copilot"
 )]
 struct Cli {
     /// 提供源实例 ID（见 provider list）；可放在任意子命令前后，也可用 CROSSLANE_PROVIDER。
@@ -174,6 +174,7 @@ enum Command {
         after_help = "仅 Kiro 返回权威订阅计划；Copilot 返回 supported=false。Copilot 账号授权与可用模型请用 account probe/models list 检查。\n\n示例：\n  crosslane subscriptions --provider kiro\n  crosslane subscriptions --provider all\n  crosslane account probe --provider copilot <ACCOUNT_ID>"
     )]
     Subscriptions {
+        /// Kiro 账号 ID 或邮箱；省略时使用可调度账号查询订阅计划。
         id: Option<String>,
         /// 查询指定提供源；`all` 汇总并标明不支持订阅查询的来源。
         #[arg(long, default_value = "kiro")]
@@ -262,11 +263,11 @@ enum Command {
     },
     /// 查看命令帮助。
     #[command(
-        after_help = "示例：\n  crosslane help\n  crosslane help logs\n  crosslane help logs trace\n  crosslane help --all"
+        after_help = "help 放在根命令或命令组内均可；-h 与 --help 都显示完整说明。\n\n示例：\n  crosslane help\n  crosslane help logs trace\n  crosslane logs help trace\n  crosslane help --all\n  crosslane help account --all"
     )]
     Help {
-        /// 递归列出全部公开命令。
-        #[arg(long, conflicts_with = "path")]
+        /// 递归列出全部公开命令；指定命令路径时只列出该组。
+        #[arg(long)]
         all: bool,
         /// 要查看的命令路径，例如 logs trace。
         #[arg(value_name = "COMMAND", num_args = 0..)]
@@ -277,6 +278,7 @@ enum Command {
         after_help = "示例：\n  crosslane guide\n  crosslane guide kiro\n  crosslane guide copilot\n  crosslane guide provider"
     )]
     Guide {
+        /// 指南主题；省略时列出全部主题。参数细节请用 help。
         #[arg(value_enum)]
         topic: Option<crate::cli::guide::Topic>,
     },
@@ -284,7 +286,10 @@ enum Command {
     #[command(
         after_help = "示例：\n  crosslane completions bash\n  crosslane completions zsh\n  crosslane completions fish"
     )]
-    Completions { shell: CompletionShell },
+    Completions {
+        /// 目标 Shell；输出可保存为补全脚本后加载。
+        shell: CompletionShell,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -321,6 +326,9 @@ impl StatsGroup {
 #[derive(Debug, Subcommand)]
 enum ProviderCommand {
     /// 列出 Kiro/Copilot 实例及运行状态。
+    #[command(
+        after_help = "省略来源显示全部实例；--provider 按实例 ID 筛选，--provider-kind 按驱动类型筛选。\n\n示例：\n  crosslane provider list\n  crosslane provider list --provider-kind copilot\n  crosslane --json provider list"
+    )]
     List {
         /// 按实例 ID 筛选；省略或 all 显示全部。
         #[arg(long)]
@@ -330,7 +338,13 @@ enum ProviderCommand {
         provider_kind: Option<String>,
     },
     /// 显示 Kiro/Copilot 实例的能力和运行状态（不显示凭证设置）。
-    Show { id: String },
+    #[command(
+        after_help = "实例 ID 来自 provider list；驱动配置请用 config show provider 查看。\n\n示例：\n  crosslane provider show copilot\n  crosslane --json provider show kiro"
+    )]
+    Show {
+        /// 提供源实例 ID，见 provider list。
+        id: String,
+    },
     /// 添加一个提供源实例。
     #[command(
         visible_alias = "create",
@@ -346,11 +360,13 @@ enum ProviderCommand {
         /// 驱动设置，格式为 KEY=TOML_VALUE，可重复。
         #[arg(long = "setting", value_name = "KEY=VALUE")]
         settings: Vec<String>,
-        /// 单账号并发上限；0 表示继承全局账号池上限。
+        /// 单账号并发上限；0 使用对应驱动的默认值。
         #[arg(long)]
         max_concurrent_per_account: Option<usize>,
+        /// 默认回退模型 ID；应从该实例的 models list 中选择。
         #[arg(long)]
         default_model: Option<String>,
+        /// 创建实例但暂不接收新请求。
         #[arg(long)]
         disabled: bool,
     },
@@ -359,6 +375,7 @@ enum ProviderCommand {
         after_help = "--setting 接受 KEY=TOML_VALUE；Copilot OAuth/endpoint 设置属于该 Copilot 实例，不写入 Kiro 的 [sso]/[upstream]。修改 client_id 后，既有账号可能需要重新授权。\n\n示例：\n  crosslane provider edit copilot --setting 'client_id=\"Iv1.your-app\"'\n  crosslane provider edit copilot --setting 'api_endpoint_fallback=\"https://api.enterprise.githubcopilot.com\"'"
     )]
     Edit {
+        /// 要修改的提供源实例 ID，见 provider list。
         id: String,
         /// 设置或覆盖驱动设置，格式为 KEY=TOML_VALUE，可重复。
         #[arg(long = "setting", value_name = "KEY=VALUE")]
@@ -366,13 +383,16 @@ enum ProviderCommand {
         /// 删除驱动设置，可重复或逗号分隔。
         #[arg(long = "remove-setting", value_delimiter = ',')]
         remove_settings: Vec<String>,
-        /// 单账号并发上限；0 表示继承全局账号池上限。
+        /// 单账号并发上限；0 使用对应驱动的默认值。
         #[arg(long)]
         max_concurrent_per_account: Option<usize>,
+        /// 修改默认回退模型 ID。
         #[arg(long)]
         default_model: Option<String>,
+        /// 是否启用未识别模型的默认回退。
         #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
         enable_model_fallback: Option<bool>,
+        /// 是否允许显式模型映射跨到其他提供源；仍受服务和 Key 权限约束。
         #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
         allow_cross_provider_fallback: Option<bool>,
         /// 自动路由单次尝试的等待上限（毫秒）；0 表示不设上限。
@@ -380,12 +400,27 @@ enum ProviderCommand {
         failover_timeout_ms: Option<u64>,
     },
     /// 启用提供源实例。
-    Enable { id: String },
+    #[command(after_help = "示例：\n  crosslane provider enable copilot")]
+    Enable {
+        /// 提供源实例 ID，见 provider list。
+        id: String,
+    },
     /// 停用提供源实例，但保留配置和账号。
-    Disable { id: String },
+    #[command(
+        after_help = "停止接收该实例的新请求，账号和配置保留。\n\n示例：\n  crosslane provider disable copilot"
+    )]
+    Disable {
+        /// 提供源实例 ID，见 provider list。
+        id: String,
+    },
     /// 删除 Kiro/Copilot 实例配置；账号文件保留在数据目录中。
-    #[command(name = "delete", visible_alias = "rm")]
+    #[command(
+        name = "delete",
+        visible_alias = "rm",
+        after_help = "删除前需解除服务、客户端 Key 和模型映射对该实例的引用；账号文件保留。\n\n示例：\n  crosslane provider delete copilot\n  crosslane provider rm copilot --yes"
+    )]
     Delete {
+        /// 提供源实例 ID，见 provider list。
         id: String,
         /// 跳过交互确认，用于自动化。
         #[arg(short = 'y', long)]
@@ -409,6 +444,7 @@ enum ModelsCommand {
         after_help = "如设置了 CROSSLANE_PROVIDER，请用 --provider all 明确执行全局操作。\n\n示例：\n  crosslane model enable gpt-4.1 --provider all"
     )]
     Enable {
+        /// 不带 provider 前缀的模型 ID；支持一次指定多个。
         #[arg(required = true, num_args = 1..)]
         models: Vec<String>,
     },
@@ -566,25 +602,32 @@ enum ModelMapCommand {
         after_help = "省略 --provider 时仅作用于 Kiro；--below-credits-percent 只支持 Kiro，不能用于 Copilot。Copilot 目标模型请从 `models list --provider copilot` 的结果选择。\n\n示例：\n  crosslane model-map add --name kiro-low-credit --source 'claude-opus-*' --target claude-sonnet-4 --provider kiro --below-credits-percent 10\n  crosslane model-map add --name copilot-fast --source team-fast --target MODEL_ID_FROM_COPILOT_LIST --provider copilot"
     )]
     Add {
+        /// 规则唯一名称，后续 edit/delete 使用此值。
         #[arg(long)]
         name: String,
+        /// replace 替换模型，alias 增加模型别名，loadbalance 按权重选择目标。
         #[arg(
             long,
             default_value = "replace",
             value_parser = ["replace", "alias", "loadbalance"]
         )]
         kind: String,
+        /// 客户端模型 ID 或 glob；可重复或逗号分隔，glob 请加引号。
         #[arg(long = "source", value_delimiter = ',', required = true)]
         source_models: Vec<String>,
+        /// 目标模型 ID；可重复或逗号分隔，可用 provider/model 指定来源。
         #[arg(long = "target", value_delimiter = ',', required = true)]
         target_models: Vec<String>,
+        /// 匹配优先级，数值越小越先匹配。
         #[arg(long, default_value_t = 0)]
         priority: i32,
+        /// loadbalance 目标权重，顺序与 --target 相同；可重复或逗号分隔。
         #[arg(long = "weight", value_delimiter = ',')]
         weights: Vec<u32>,
         /// Kiro 账号剩余 credits 百分比低于此值时生效；Copilot 不支持。
         #[arg(long, value_parser = parse_percent)]
         below_credits_percent: Option<f64>,
+        /// 限定客户端 Key 的稳定 ID；省略时对全部 Key 生效。
         #[arg(long = "api-key", value_delimiter = ',')]
         api_key_ids: Vec<String>,
         /// 规则作用的提供源，可重复或逗号分隔；省略时保持旧版 Kiro 范围。
@@ -593,6 +636,7 @@ enum ModelMapCommand {
         /// 规则作用的代理服务，可重复或逗号分隔。
         #[arg(long = "service", value_delimiter = ',')]
         service_ids: Vec<String>,
+        /// 创建规则但暂不启用。
         #[arg(long)]
         disabled: bool,
     },
@@ -603,44 +647,66 @@ enum ModelMapCommand {
     Edit {
         /// 当前规则名。
         name: String,
+        /// 新规则名称。
         #[arg(long)]
         rename: Option<String>,
+        /// 修改规则类型。
         #[arg(long, value_parser = ["replace", "alias", "loadbalance"])]
         kind: Option<String>,
+        /// 整体替换源模型 ID/glob 列表。
         #[arg(long = "source", value_delimiter = ',')]
         source_models: Vec<String>,
+        /// 整体替换目标模型列表。
         #[arg(long = "target", value_delimiter = ',')]
         target_models: Vec<String>,
+        /// 修改匹配优先级，数值越小越先匹配。
         #[arg(long)]
         priority: Option<i32>,
+        /// 整体替换 loadbalance 目标权重。
         #[arg(long = "weight", value_delimiter = ',')]
         weights: Vec<u32>,
+        /// 删除目标权重，恢复均等权重。
         #[arg(long)]
         clear_weights: bool,
+        /// 修改 Kiro 剩余额度百分比阈值。
         #[arg(long, value_parser = parse_percent)]
         below_credits_percent: Option<f64>,
+        /// 删除额度阈值，恢复无额度条件。
         #[arg(long)]
         clear_credits_threshold: bool,
+        /// 整体替换适用的客户端 Key ID 列表。
         #[arg(long = "api-key", value_delimiter = ',')]
         api_key_ids: Vec<String>,
+        /// 清除 Key 范围限制，对全部 Key 生效。
         #[arg(long)]
         clear_api_keys: bool,
+        /// 整体替换适用的提供源实例 ID 列表。
         #[arg(id = "provider", long = "provider", value_delimiter = ',')]
         providers: Vec<String>,
+        /// 清除来源范围配置，恢复 Kiro-only。
         #[arg(long)]
         clear_providers: bool,
+        /// 整体替换适用的代理服务 ID 列表。
         #[arg(long = "service", value_delimiter = ',')]
         service_ids: Vec<String>,
+        /// 清除服务范围限制，对全部服务生效。
         #[arg(long)]
         clear_services: bool,
+        /// 启用该规则。
         #[arg(long, conflicts_with = "disable")]
         enable: bool,
+        /// 停用该规则，保留配置。
         #[arg(long, conflicts_with = "enable")]
         disable: bool,
     },
     /// 删除模型映射规则，执行前需输入 y 或 yes 确认。
-    #[command(name = "delete", visible_alias = "rm")]
+    #[command(
+        name = "delete",
+        visible_alias = "rm",
+        after_help = "仅删除指定规则，不修改模型目录或全局禁用列表。\n\n示例：\n  crosslane model-map delete team-fast\n  crosslane model-map rm team-fast --yes"
+    )]
     Delete {
+        /// 要删除的规则名称。
         name: String,
         /// 跳过交互确认，用于自动化。
         #[arg(short = 'y', long)]
@@ -651,9 +717,12 @@ enum ModelMapCommand {
         after_help = "默认测试 Kiro 规则；Copilot 必须显式传入 --provider copilot，额度百分比条件仅适用于 Kiro。\n\n示例：\n  crosslane model-map test claude-opus-4 --provider kiro --remaining-credits-percent 8\n  crosslane model-map test team-fast --provider copilot"
     )]
     Test {
+        /// 客户端传入的模型 ID。
         model: String,
+        /// 模拟 Kiro 剩余额度百分比（0..=100）。
         #[arg(long, value_parser = parse_percent)]
         remaining_credits_percent: Option<f64>,
+        /// 客户端 Key 的稳定 ID，用于匹配规则的 Key 范围条件。
         #[arg(long)]
         api_key: Option<String>,
         /// 按该提供源测试；默认保持旧版 Kiro 语义。
@@ -677,6 +746,8 @@ enum TaskCommand {
         after_help = "可手工运行：token_refresh/status_check/health_recheck（仅 Kiro）、model_cache_refresh（可按来源）、stats_persist/daily_reset/proxy_service_reconcile（全局）。account_file_watcher 和 adaptive_admission 仅由调度器运行。Kiro 任务只接受 --provider kiro；全局任务不接受 --provider。\n\n示例：\n  crosslane tasks run status_check\n  crosslane tasks run model_cache_refresh --provider copilot\n  crosslane tasks run proxy_service_reconcile"
     )]
     Run {
+        /// 可手工运行的任务名；watcher 和 adaptive_admission 仅由调度器运行。
+        #[arg(value_name = "TASK", value_parser = crate::cli::scope::manual_task_parser())]
         name: String,
         /// 限定模型缓存刷新提供源；Kiro 任务只接受 kiro，全局任务不接受该参数。
         #[arg(long)]
@@ -706,6 +777,7 @@ enum DiagnoseCommand {
         after_help = "示例：\n  crosslane diagnose endpoints\n  crosslane diagnose endpoints --region us-west-2"
     )]
     Endpoints {
+        /// Kiro 上游端点所在 AWS 区域。
         #[arg(long, default_value = "us-east-1")]
         region: String,
     },
@@ -839,7 +911,10 @@ enum ConfigCommand {
     #[command(
         after_help = "示例：\n  crosslane config validate\n  crosslane config validate ./config.toml"
     )]
-    Validate { file: Option<String> },
+    Validate {
+        /// 要校验的 TOML 文件；省略时使用当前配置路径。
+        file: Option<String>,
+    },
 }
 
 #[tokio::main]

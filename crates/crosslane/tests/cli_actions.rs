@@ -371,7 +371,13 @@ async fn task_scope_is_enforced_and_shown_without_changing_json_contracts() {
     let (output, _) = run_human(&["tasks", "list"], vec![tasks.clone()]).await;
     assert_success(&output);
     let text = String::from_utf8(output.stdout).unwrap();
-    for label in ["适用范围", "仅 Kiro", "Kiro / GitHub Copilot", "全局"] {
+    for label in [
+        "适用范围",
+        "可手工运行",
+        "仅 Kiro",
+        "Kiro / GitHub Copilot",
+        "全局",
+    ] {
         assert!(text.contains(label), "{text}");
     }
     let (output, _) = run(&["tasks", "list"], vec![tasks.clone()]).await;
