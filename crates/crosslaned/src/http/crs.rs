@@ -809,7 +809,9 @@ fn status_for_error(code: &str, kind: Option<&str>) -> StatusCode {
             StatusCode::TOO_MANY_REQUESTS
         }
         "upstream_idle_timeout" => StatusCode::GATEWAY_TIMEOUT,
-        "upstream_authentication_failed" | "upstream_overloaded" => StatusCode::SERVICE_UNAVAILABLE,
+        "upstream_authentication_failed" | "upstream_overloaded" | "server_overloaded" => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
         _ => match kind {
             Some("invalid_request_error") => StatusCode::BAD_REQUEST,
             Some("rate_limit_error") => StatusCode::TOO_MANY_REQUESTS,

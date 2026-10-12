@@ -1,5 +1,26 @@
 use super::*;
 
+#[test]
+fn local_stream_slot_failure_keeps_proxy_scope_and_no_upstream_status() {
+    let error = crosslane_kiro::KiroError::stream_slot_timeout(30_000);
+    assert!(!error.is_retriable());
+    let details = classify_stream_failure(&error.to_string(), None);
+    assert_eq!(details.scope, StreamFailureScope::Proxy);
+    assert_eq!(details.upstream_status, None);
+    assert_eq!(details.error_code, "server_overloaded");
+    assert!(!details.account_error());
+    let supplier = crosslane_kiro::KiroError {
+        status: Some(503),
+        endpoint: "Amazon Q".into(),
+        message: "unavailable".into(),
+    };
+    assert!(supplier.is_retriable());
+    assert_ne!(
+        classify_stream_failure(&supplier.to_string(), None).scope,
+        StreamFailureScope::Proxy
+    );
+}
+
 fn replay_codec() -> WebSearchReplayCodec {
     WebSearchReplayCodec::from_key([0x6B; 32])
 }

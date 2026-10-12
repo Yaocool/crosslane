@@ -269,7 +269,8 @@ Copilot 业务模型查询优先复用启用账号在 `provider.models.max_stale
 model_refresh_concurrency = 32
 ```
 
-Kiro 在流式重试或续答前释放上一轮连接名额。工具结果后的空回复仍保留独立的
+Kiro 在流式重试或续答前释放上一轮连接名额。本地槽位耗尽返回 `503` /
+`server_overloaded`，不会换账号重复等待或扣减账号健康。工具结果后的空回复仍保留独立的
 有界语义重试。工具结果续答出现有效文本后立即流出；工具参数校验完成后直接发送，
 不再额外休眠。`features.tool_call_buffer_delay_ms` 为兼容旧配置保留，默认值为零，
 已不参与请求等待。

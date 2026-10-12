@@ -11,8 +11,8 @@ use super::{
     web_search_continue_payload_batch, web_search_replay_failure, Body, Bytes, BytesMut,
     ClaudeToolSearchBudget, ClaudeWebSearchTrace, DecodedResponse, Decoder, EventStreamDecoder,
     HashSet, HeaderValue, Infallible, KiroEvent, KiroResponse, KiroToolUse, Response, StatusCode,
-    StopSequenceFilter, StreamContext, StreamExt, StreamFailureDiagnostics, StreamProtocol,
-    ThinkingContentFilter, ToolLeakFilter, UpstreamStreamMetrics, Value,
+    StopSequenceFilter, StreamContext, StreamExt, StreamFailureDiagnostics, StreamFailureScope,
+    StreamProtocol, ThinkingContentFilter, ToolLeakFilter, UpstreamStreamMetrics, Value,
 };
 
 /// Keep hollow reasoning-only continuations retryable without delaying valid
@@ -543,7 +543,8 @@ pub fn response(
                     .max_retries
                     .max(context.account_ids.len() as u32);
                 let may_switch = (!is_quota || config.pool.auto_switch_on_quota_exhausted)
-                    && !is_request_rejection;
+                    && !is_request_rejection
+                    && failure_details.scope != StreamFailureScope::Proxy;
                 let mut account_health_handled = false;
                 if !data_started && pre_data_retries < retry_limit && may_switch && is_auth {
                     let mut disable_account = true;
@@ -732,7 +733,8 @@ pub fn response(
                 let is_quota = failure_details.is_quota_error();
                 let is_request_rejection = failure_details.is_request_rejection();
                 let may_switch = (!is_quota || config.pool.auto_switch_on_quota_exhausted)
-                    && !is_request_rejection;
+                    && !is_request_rejection
+                    && failure_details.scope != StreamFailureScope::Proxy;
                 if !account_health_handled {
                     record_account_scoped_stream_failure(
                         &context.state,

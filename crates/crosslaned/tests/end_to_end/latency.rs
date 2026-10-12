@@ -17,6 +17,10 @@ struct DelayedUpstream {
 }
 
 impl DelayedUpstream {
+    async fn start() -> Self {
+        Self::start_with_failed_tail(false).await
+    }
+
     async fn start_with_failed_tail(fail_tail: bool) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!(
@@ -166,6 +170,70 @@ fn sse_events(body: &str) -> Vec<Value> {
         .filter_map(|line| line.strip_prefix("data: "))
         .filter_map(|line| serde_json::from_str(line).ok())
         .collect()
+}
+
+async fn assert_capacity_response(
+    response: reqwest::Response,
+    protocol: WireProtocol,
+    stream: bool,
+) {
+    let crs_sse = cfg!(feature = "crs") && matches!(protocol, WireProtocol::Anthropic) && stream;
+    assert_eq!(
+        response.status(),
+        if crs_sse { 200 } else { 503 },
+        "{protocol:?}, stream={stream}"
+    );
+    assert_eq!(
+        response.headers()["x-crosslane-error-code"],
+        "server_overloaded"
+    );
+    assert_eq!(response.headers()["x-crosslane-error-stage"], "admission");
+    assert_eq!(response.headers()["x-crosslane-account-error"], "false");
+    assert_eq!(response.headers()["retry-after"], "1");
+    assert!(!response
+        .headers()
+        .contains_key("x-crosslane-upstream-status"));
+    let request_id = response.headers()["request-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let body = response.text().await.unwrap();
+    let envelope: Value = if crs_sse {
+        sse_events(&body)
+            .into_iter()
+            .find(|event| event["type"] == "error")
+            .unwrap()
+    } else {
+        serde_json::from_str(&body).unwrap()
+    };
+    assert_eq!(envelope["request_id"], request_id, "{body}");
+    assert_eq!(
+        envelope["error"]["type"],
+        if matches!(protocol, WireProtocol::Anthropic) {
+            "overloaded_error"
+        } else {
+            "server_error"
+        },
+        "{body}"
+    );
+    if cfg!(feature = "crs") && matches!(protocol, WireProtocol::Anthropic) {
+        assert_eq!(envelope["error"]["status"], 503, "{body}");
+        assert_eq!(envelope["error"]["code"], "server_overloaded", "{body}");
+    }
+}
+
+async fn import_more_accounts(daemon: &Daemon) {
+    let accounts = ["acc_11111111", "acc_22222222"].map(|id| json!({
+        "id":id,"email":format!("{id}@example.com"),"machine_id":"1".repeat(64),
+        "credentials":{"access_token":"fake-token","region":"us-east-1","expires_at":4_000_000_000i64,"auth_method":"idc"},
+        "usage":{"current":0,"limit":100,"percent_used":0,"updated_at":1},"subscription":{"kind":"pro"},"created_at":1
+    }));
+    expect_ok(
+        daemon
+            .call("account.import", json!({"accounts": accounts}))
+            .await,
+    );
+    expect_ok(daemon.call("models", json!({})).await);
 }
 
 #[tokio::test]
@@ -331,5 +399,83 @@ async fn latency_tool_calls_ignore_legacy_post_eof_delay() {
     .expect("complete tool arguments must not wait for a legacy delay");
     assert!(body.contains("tool_use"), "{body}");
     assert!(body.contains("README.md"), "{body}");
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn latency_local_slot_timeout_does_not_retry_or_cool_accounts() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    let upstream = DelayedUpstream::start().await;
+    let port = unused_tcp_port();
+    let daemon = Daemon::start_http(port, &upstream.url).await;
+    import_context_alignment_account(&daemon, 0.0).await;
+    import_more_accounts(&daemon).await;
+    model_policy::configure(&daemon, |config| {
+        config.upstream.pool.stream_max_connections = 1;
+        config.upstream.stream_slot_wait_timeout_ms = 100;
+    })
+    .await;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let first = client
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .bearer_auth(daemon.api_key.as_deref().unwrap())
+        .header("user-agent", "claude-cli/2.1.260 (external, e2e)")
+        .json(&tool_result_request())
+        .send()
+        .await
+        .unwrap();
+    // Native SSE sends headers before polling its body. Wait for semantic
+    // output so both builds exercise the same occupied-transport boundary.
+    let mut first = first.bytes_stream();
+    let mut first_output = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !String::from_utf8_lossy(&first_output).contains("Visible answer begins now.") {
+            first_output.extend_from_slice(&first.next().await.unwrap().unwrap());
+        }
+    })
+    .await
+    .expect("first stream must reach visible content");
+    assert!(!upstream.finished.load(Ordering::SeqCst));
+    for protocol in WireProtocol::ALL {
+        for stream in [false, true] {
+            let response = client
+                .post(format!("http://127.0.0.1:{port}{}", protocol.route()))
+                .bearer_auth(daemon.api_key.as_deref().unwrap())
+                .header("user-agent", protocol.user_agent())
+                .json(&protocol.request(stream))
+                .send()
+                .await
+                .unwrap();
+            assert_capacity_response(response, protocol, stream).await;
+        }
+    }
+    assert_eq!(upstream.calls.load(Ordering::SeqCst), 1);
+    let accounts = expect_ok(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            daemon.call("account.list", json!({})),
+        )
+        .await
+        .expect("health query must remain responsive"),
+    );
+    assert!(
+        accounts["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|account| account["health"] == "available"),
+        "{accounts}"
+    );
+    upstream.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(chunk) = first.next().await {
+            chunk.unwrap();
+        }
+    })
+    .await
+    .expect("released upstream must finish");
     daemon.stop().await;
 }

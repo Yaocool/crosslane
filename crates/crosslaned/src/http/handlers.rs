@@ -2316,6 +2316,14 @@ fn upstream_api_error(
     context: RequestLogContext,
     format: ErrorFormat,
 ) -> ApiError {
+    if error.is_local_overload() {
+        let mut output = ApiError::new(StatusCode::SERVICE_UNAVAILABLE, error.message, format);
+        output.retry_after = true;
+        output.log_context = Box::new(context);
+        output.error_code = "server_overloaded";
+        output.error_stage = "admission";
+        return output;
+    }
     let model_resolution_error = error.endpoint == "model-resolution";
     let model_disabled = error.endpoint == "model-policy";
     let upstream_status = error.status;

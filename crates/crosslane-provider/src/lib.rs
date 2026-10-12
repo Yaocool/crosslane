@@ -60,6 +60,8 @@ pub enum ProviderErrorKind {
     Authorization,
     RateLimited,
     Unavailable,
+    /// Local admission capacity was exhausted before contacting the supplier.
+    Overloaded,
     InvalidRequest,
     Unsupported,
     Transport,
@@ -101,6 +103,16 @@ impl ProviderError {
     pub fn unavailable(message: impl Into<String>) -> Self {
         let mut error = Self::new(
             ProviderErrorKind::Unavailable,
+            StatusCode::SERVICE_UNAVAILABLE,
+            message,
+        );
+        error.retryable = true;
+        error
+    }
+
+    pub fn overloaded(message: impl Into<String>) -> Self {
+        let mut error = Self::new(
+            ProviderErrorKind::Overloaded,
             StatusCode::SERVICE_UNAVAILABLE,
             message,
         );

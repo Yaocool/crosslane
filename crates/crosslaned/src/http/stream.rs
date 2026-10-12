@@ -1576,6 +1576,14 @@ fn classify_stream_failure(
     message: &str,
     diagnostics: Option<&StreamFailureDiagnostics>,
 ) -> StreamFailureDetails {
+    if crosslane_kiro::client::text_is_local_overload(message) {
+        return StreamFailureDetails {
+            upstream_status: None,
+            error_code: "server_overloaded",
+            error_stage: "admission",
+            scope: StreamFailureScope::Proxy,
+        };
+    }
     let lower = message.to_ascii_lowercase();
     let upstream_status = extract_upstream_status(&lower);
 

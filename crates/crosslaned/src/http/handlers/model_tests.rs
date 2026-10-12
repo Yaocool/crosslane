@@ -1034,6 +1034,23 @@ fn upstream_413_preserves_supplier_status_and_diagnostics() {
 }
 
 #[test]
+fn local_capacity_error_returns_503_without_supplier_or_account_failure() {
+    for format in [ErrorFormat::Claude, ErrorFormat::OpenAi] {
+        let error = upstream_api_error(
+            KiroError::stream_slot_timeout(30_000),
+            RequestLogContext::default(),
+            format,
+        );
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.upstream_status, None);
+        assert_eq!(error.error_code, "server_overloaded");
+        assert_eq!(error.error_stage, "admission");
+        assert!(!error.account_error);
+        assert!(error.retry_after);
+    }
+}
+
+#[test]
 fn supplier_http_errors_are_preserved_across_protocols() {
     for format in [ErrorFormat::Claude, ErrorFormat::OpenAi] {
         for status in [

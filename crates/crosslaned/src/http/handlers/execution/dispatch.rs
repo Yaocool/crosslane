@@ -485,6 +485,18 @@ async fn dispatch_upstream(
                     payload: request_payload,
                 })));
             }
+            Err(error) if error.is_local_overload() => {
+                tracing::warn!(event = "proxy.capacity_exceeded", trace_id,
+                    error = %error, "local upstream stream capacity exhausted");
+                return Err(dispatch_error(
+                    error,
+                    &mapped_model,
+                    &actual_model,
+                    &model_path,
+                    model_mapping_rule,
+                    attempt_logs,
+                ));
+            }
             Err(error) if error.is_auth() => {
                 attempt_logs.push(upstream_attempt_log(
                     attempt + 1,
@@ -545,6 +557,16 @@ async fn dispatch_upstream(
                             })));
                         }
                         Err(retry_error) => {
+                            if retry_error.is_local_overload() {
+                                return Err(dispatch_error(
+                                    retry_error,
+                                    &mapped_model,
+                                    &actual_model,
+                                    &model_path,
+                                    model_mapping_rule,
+                                    attempt_logs,
+                                ));
+                            }
                             attempt_logs.push(upstream_attempt_log(
                                 attempt + 1,
                                 &refreshed,
@@ -755,6 +777,16 @@ async fn dispatch_upstream(
                                         )));
                                     }
                                     Err(fallback_error) => {
+                                        if fallback_error.is_local_overload() {
+                                            return Err(dispatch_error(
+                                                fallback_error,
+                                                &mapped_model,
+                                                &actual_model,
+                                                &model_path,
+                                                model_mapping_rule,
+                                                attempt_logs,
+                                            ));
+                                        }
                                         attempt_logs.push(upstream_attempt_log(
                                             attempt + 1,
                                             &account,

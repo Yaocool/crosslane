@@ -1197,6 +1197,11 @@ fn provider_api_error(
     api.retry_after = error.retryable;
     api.account_error = error.account_error;
     api.upstream_status = Some(upstream_status.as_u16());
+    if error.kind == crosslane_provider::ProviderErrorKind::Overloaded {
+        api.error_code = "server_overloaded";
+        api.error_stage = "admission";
+        api.upstream_status = None;
+    }
     #[cfg(feature = "crs")]
     if format == ErrorFormat::Claude
         && matches!(

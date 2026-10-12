@@ -30,6 +30,7 @@ const KIRO_BUILDER_ID_PROFILE_ARN: &str =
     "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
 const KIRO_SOCIAL_PROFILE_ARN: &str =
     "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK";
+const LOCAL_STREAM_SLOT_ENDPOINT: &str = "crosslane.stream-slot";
 
 #[derive(Clone)]
 pub struct KiroError {
@@ -69,6 +70,20 @@ impl std::fmt::Debug for KiroError {
 impl std::error::Error for KiroError {}
 
 impl KiroError {
+    /// A local capacity failure has no supplier response and must not affect
+    /// account health or cause another attempt against the same semaphore.
+    pub fn stream_slot_timeout(timeout_ms: u64) -> Self {
+        Self {
+            status: Some(503),
+            endpoint: LOCAL_STREAM_SLOT_ENDPOINT.into(),
+            message: format!("timed out after {timeout_ms} ms waiting for an upstream stream slot"),
+        }
+    }
+
+    pub fn is_local_overload(&self) -> bool {
+        self.endpoint == LOCAL_STREAM_SLOT_ENDPOINT && self.status == Some(503)
+    }
+
     pub fn is_auth(&self) -> bool {
         matches!(self.status, Some(401 | 403)) || text_is_auth_error(&self.message)
     }
@@ -95,12 +110,21 @@ impl KiroError {
     }
 
     pub fn is_retriable(&self) -> bool {
-        self.status.is_none() || self.is_throttle() || matches!(self.status, Some(500..=599))
+        !self.is_local_overload()
+            && (self.status.is_none()
+                || self.is_throttle()
+                || matches!(self.status, Some(500..=599)))
     }
 
     pub fn is_request_rejection(&self) -> bool {
         matches!(self.status, Some(400 | 413 | 422)) || text_is_request_rejection(&self.message)
     }
+}
+
+/// Stream assembly retains the structured local endpoint in KiroError's
+/// display form. Do not classify arbitrary supplier 503s as local overload.
+pub fn text_is_local_overload(message: &str) -> bool {
+    message.starts_with("Kiro crosslane.stream-slot returned Some(503): ")
 }
 
 pub fn text_is_auth_error(message: &str) -> bool {
@@ -1066,14 +1090,7 @@ impl KiroClient {
             Arc::clone(&self.stream_slots).acquire_owned(),
         )
         .await
-        .map_err(|_| KiroError {
-            status: None,
-            endpoint: endpoint.name.into(),
-            message: format!(
-                "timed out after {} ms waiting for an upstream stream slot",
-                self.upstream.stream_slot_wait_timeout_ms
-            ),
-        })?
+        .map_err(|_| KiroError::stream_slot_timeout(self.upstream.stream_slot_wait_timeout_ms))?
         .map_err(build_error)?;
         let stream_slot_wait_ms = slot_wait_started.elapsed().as_millis() as u64;
         let mut wire = serde_json::to_value(&payload).map_err(build_error)?;
