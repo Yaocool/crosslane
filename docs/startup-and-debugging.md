@@ -80,7 +80,8 @@ require an explicit option; `CROSSLANE_PROVIDER` never replaces existing permiss
 Global commands and resources addressed directly by ID/name reject provider filtering
 and ignore that environment default. Global model disabling/enabling accepts the
 compatibility marker `--provider all`. Alert targets are addressed by name; current
-account events come from Kiro.
+account events come from Kiro. Empty edits and conflicting set/clear options fail
+before connecting to the daemon, with a link to the relevant command help.
 
 ## Accounts
 

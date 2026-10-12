@@ -104,7 +104,45 @@ fn parse(args: impl IntoIterator<Item = OsString>, require_provider: bool) -> Cl
     if let Err(error) = validate_scope(&cli, require_provider || wrapper_local_only()) {
         clap::Error::raw(clap::error::ErrorKind::ValueValidation, error).exit();
     }
+    validate_edit_changes(&definition, &matches, &path, explicit_provider);
     cli
+}
+
+fn validate_edit_changes(
+    definition: &clap::Command,
+    matches: &clap::ArgMatches,
+    path: &[&str],
+    explicit_provider: bool,
+) {
+    let [group @ ("provider" | "service" | "apikey" | "alert" | "model-map"), "edit"] = path else {
+        return;
+    };
+    let leaf = matches.subcommand().unwrap().1.subcommand().unwrap().1;
+    let command = definition
+        .find_subcommand(group)
+        .unwrap()
+        .find_subcommand("edit")
+        .unwrap();
+    // ArgMatches also contains derive-generated argument groups. Only actual
+    // options count as edits; the required resource selector does not.
+    let changes = command.get_arguments().any(|arg| {
+        let id = arg.get_id();
+        (arg.get_long().is_some() || arg.get_short().is_some())
+            && !matches!(
+                id.as_str(),
+                "id" | "name" | "target" | "provider" | "socket" | "json"
+            )
+            && leaf.value_source(id.as_str()) == Some(clap::parser::ValueSource::CommandLine)
+    });
+    let changes =
+        changes || (explicit_provider && matches!(*group, "service" | "apikey" | "model-map"));
+    if !changes {
+        clap::Error::raw(
+            clap::error::ErrorKind::MissingRequiredArgument,
+            format!("没有指定修改项；请用 `crosslane help {group} edit` 查看可修改参数"),
+        )
+        .exit();
+    }
 }
 
 pub fn command() -> clap::Command {

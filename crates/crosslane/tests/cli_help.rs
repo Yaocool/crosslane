@@ -282,6 +282,72 @@ fn every_command_supports_consistent_help_without_runtime_setup() {
 }
 
 #[test]
+fn invalid_edits_and_scheduler_only_tasks_fail_before_runtime_setup() {
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join(".env"), "BROKEN='unterminated\n").unwrap();
+    for args in [
+        &["provider", "edit", "kiro"][..],
+        &["service", "edit", "main"][..],
+        &["apikey", "edit", "ci"][..],
+        &[
+            "apikey",
+            "edit",
+            "ci",
+            "--model",
+            "copilot/*",
+            "--clear-models",
+        ][..],
+        &["alert", "edit", "ops"][..],
+        &["model-map", "edit", "rule"][..],
+        &[
+            "model-map",
+            "edit",
+            "rule",
+            "--weight",
+            "1",
+            "--clear-weights",
+        ][..],
+        &[
+            "model-map",
+            "edit",
+            "rule",
+            "--api-key",
+            "ak_test",
+            "--clear-api-keys",
+        ][..],
+        &[
+            "model-map",
+            "edit",
+            "rule",
+            "--service",
+            "svc_test",
+            "--clear-services",
+        ][..],
+        &[
+            "model-map",
+            "edit",
+            "rule",
+            "--below-credits-percent",
+            "10",
+            "--clear-credits-threshold",
+        ][..],
+        &["tasks", "run", "account_file_watcher"][..],
+        &["tasks", "run", "adaptive_admission"][..],
+        &["tasks", "run", "missing"][..],
+    ] {
+        let output = run(workspace.path(), args);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+        assert!(!stderr(&output).contains("unterminated"), "{args:?}");
+        assert!(stdout(&output).is_empty(), "{args:?}");
+    }
+}
+
+#[test]
 fn alert_reference_commands_ignore_the_provider_environment() {
     let workspace = tempfile::tempdir().unwrap();
     for action in ["config", "events", "platforms"] {

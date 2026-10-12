@@ -663,19 +663,27 @@ enum ModelMapCommand {
         #[arg(long)]
         priority: Option<i32>,
         /// 整体替换 loadbalance 目标权重。
-        #[arg(long = "weight", value_delimiter = ',')]
+        #[arg(
+            long = "weight",
+            value_delimiter = ',',
+            conflicts_with = "clear_weights"
+        )]
         weights: Vec<u32>,
         /// 删除目标权重，恢复均等权重。
         #[arg(long)]
         clear_weights: bool,
         /// 修改 Kiro 剩余额度百分比阈值。
-        #[arg(long, value_parser = parse_percent)]
+        #[arg(long, value_parser = parse_percent, conflicts_with = "clear_credits_threshold")]
         below_credits_percent: Option<f64>,
         /// 删除额度阈值，恢复无额度条件。
         #[arg(long)]
         clear_credits_threshold: bool,
         /// 整体替换适用的客户端 Key ID 列表。
-        #[arg(long = "api-key", value_delimiter = ',')]
+        #[arg(
+            long = "api-key",
+            value_delimiter = ',',
+            conflicts_with = "clear_api_keys"
+        )]
         api_key_ids: Vec<String>,
         /// 清除 Key 范围限制，对全部 Key 生效。
         #[arg(long)]
@@ -687,7 +695,11 @@ enum ModelMapCommand {
         #[arg(long)]
         clear_providers: bool,
         /// 整体替换适用的代理服务 ID 列表。
-        #[arg(long = "service", value_delimiter = ',')]
+        #[arg(
+            long = "service",
+            value_delimiter = ',',
+            conflicts_with = "clear_services"
+        )]
         service_ids: Vec<String>,
         /// 清除服务范围限制，对全部服务生效。
         #[arg(long)]

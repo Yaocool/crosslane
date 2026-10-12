@@ -281,7 +281,7 @@ pub enum ApiKeyCommand {
         #[arg(long)]
         clear_providers: bool,
         /// 替换允许的模型 glob。
-        #[arg(long = "model", value_delimiter = ',')]
+        #[arg(long = "model", value_delimiter = ',', conflicts_with = "clear_models")]
         models: Vec<String>,
         /// 清除模型范围限制，允许权限范围内的全部模型。
         #[arg(long)]
