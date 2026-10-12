@@ -166,6 +166,11 @@ crosslane help apikey edit
 
 ## 桌面端工具与网页搜索
 
+Copilot Responses 流保留首次出现的响应 ID，并按输出序号统一消息 ID，使增量、
+结束事件和最终输出快照指向同一条消息。Copilot 在事件间改变不透明 ID 时，
+桌面客户端仍能合并流式内容与完成消息，避免回答显示两遍。
+消息阶段、工具调用 ID、引用和 `copilot_usage` 保持原样。
+
 Claude 上游不接受工具 schema 根部的 `oneOf`、`allOf`、`anyOf` 时，Crosslane
 将组合约束移到等价的条件子 schema，保留分支必填字段、定义引用和闭合对象约束。
 Responses 的 namespace 函数工具在上游使用唯一函数名，返回客户端时恢复原来的 namespace

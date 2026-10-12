@@ -1969,6 +1969,11 @@ impl CopilotProvider {
                     self.set_provider_runtime_error(None);
                 }
                 let response = response_from_reqwest(response, account.id.clone(), permit);
+                let response = if upstream_protocol == ProviderProtocol::OpenAiResponses {
+                    super::responses::normalize_response(response, prepared.streaming)
+                } else {
+                    response
+                };
                 if upstream_protocol == request.protocol {
                     return Ok(response);
                 }
@@ -3431,6 +3436,104 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn native_responses_keep_one_item_identity_across_deltas_and_completion() {
+        let server = MockServer::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        mount_account_exchange(&server, "github-token").await;
+        let provider = mock_provider(&server, directory.path()).await;
+        provider
+            .import_token("github-token".into(), None)
+            .await
+            .unwrap();
+        // Copilot encrypts the same upstream ID independently in each event.
+        // A client that reconciles streamed text with completed items by ID
+        // must see one message, including the terminal response snapshot.
+        let upstream = [
+            serde_json::json!({"type":"response.created","sequence_number":0,"response":{"id":"opaque-response-start","output":[]}}),
+            serde_json::json!({"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"id":"opaque-item-start","type":"message","role":"assistant","phase":"final_answer","status":"in_progress","content":[]}}),
+            serde_json::json!({"type":"response.content_part.added","sequence_number":2,"output_index":0,"content_index":0,"item_id":"opaque-item-part","part":{"type":"output_text","text":"","annotations":[]}}),
+            serde_json::json!({"type":"response.output_text.delta","sequence_number":3,"output_index":0,"content_index":0,"item_id":"opaque-item-delta","delta":"Hello"}),
+            serde_json::json!({"type":"response.output_text.done","sequence_number":4,"output_index":0,"content_index":0,"item_id":"opaque-item-text-done","text":"Hello"}),
+            serde_json::json!({"type":"response.output_item.done","sequence_number":5,"output_index":0,"item":{"id":"opaque-item-done","type":"message","role":"assistant","phase":"final_answer","status":"completed","content":[{"type":"output_text","text":"Hello","annotations":[]}]}}),
+            serde_json::json!({"type":"response.completed","sequence_number":6,"response":{"id":"opaque-response-done","status":"completed","output":[{"id":"opaque-item-snapshot","type":"message","role":"assistant","phase":"final_answer","status":"completed","content":[{"type":"output_text","text":"Hello","annotations":[]}]}],"usage":{"input_tokens":4,"output_tokens":2}},"copilot_usage":{"total_nano_aiu":7}}),
+        ];
+        let wire = upstream
+            .iter()
+            .map(|event| {
+                format!(
+                    "event: {}\ndata: {event}\n\n",
+                    event["type"].as_str().unwrap()
+                )
+            })
+            .collect::<String>();
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(wire, "text/event-stream"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let response = provider.execute(ProviderRequest {
+            protocol: ProviderProtocol::OpenAiResponses,
+            model: "gpt-test".into(),
+            original_model: None,
+            path: "/v1/responses".into(),
+            headers: HeaderMap::new(),
+            body: bytes::Bytes::from_static(b"{\"model\":\"gpt-test\",\"input\":\"hi\",\"stream\":true,\"previous_response_id\":\"previous-opaque-id\"}"),
+            trace_id: "native-responses-identity".into(),
+            service_id: "test".into(),
+            account_pool: None,
+            api_key_id: None,
+            client_context: Default::default(),
+        }).await.unwrap();
+        let ProviderResponseBody::Stream(mut stream) = response.body else {
+            panic!("native SSE must remain streaming");
+        };
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            bytes.extend_from_slice(&chunk.unwrap());
+        }
+        let text = String::from_utf8(bytes).unwrap();
+        let events = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|data| serde_json::from_str::<Value>(data).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), upstream.len());
+        for (index, event) in events.iter().enumerate() {
+            assert_eq!(event["sequence_number"], index);
+            if let Some(id) = event.get("item_id") {
+                assert_eq!(id, "opaque-item-start");
+            }
+            if let Some(item) = event.get("item") {
+                assert_eq!(item["id"], "opaque-item-start");
+                assert_eq!(item["phase"], "final_answer");
+            }
+            if let Some(response) = event.get("response") {
+                assert_eq!(response["id"], "opaque-response-start");
+            }
+        }
+        assert_eq!(
+            events[6]["response"]["output"][0]["id"],
+            "opaque-item-start"
+        );
+        assert_eq!(
+            events[6]["response"]["output"][0]["content"][0]["text"],
+            "Hello"
+        );
+        assert_eq!(events[6]["copilot_usage"]["total_nano_aiu"], 7);
+        let request = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|request| request.method == "POST")
+            .unwrap();
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["previous_response_id"], "previous-opaque-id");
+        server.verify().await;
     }
 
     #[tokio::test]

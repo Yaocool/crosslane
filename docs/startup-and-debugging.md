@@ -203,6 +203,12 @@ crosslane help apikey edit
 
 ## Desktop tools and web search
 
+Copilot Responses streams retain the first upstream response ID and one item ID
+per output index across deltas, completion events, and the final output snapshot.
+This lets desktop clients reconcile streamed text with completed messages without
+showing the answer twice when Copilot changes its opaque IDs between events.
+Message phases, tool call IDs, citations, and `copilot_usage` remain unchanged.
+
 For Claude upstreams that reject root `oneOf`, `allOf`, or `anyOf` tool schemas,
 Crosslane moves those constraints into an equivalent conditional subschema,
 preserving required branches, local definitions, and closed object constraints.
