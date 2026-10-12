@@ -696,7 +696,9 @@ impl Default for ProviderBalanceConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProviderModelsConfig {
+    /// Background model discovery's target refresh interval.
     pub cache_ttl_ms: u64,
+    /// Maximum age of catalog snapshots eligible for request routing.
     pub max_stale_ms: u64,
 }
 
@@ -2034,6 +2036,8 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# =====================================
 # oauth_base = "https://github.com"
 # Copilot API token 到期前提前刷新的秒数。
 # api_token_refresh_before_secs = 300
+# 模型目录刷新同时查询的账号数；大账号池可按上游容量提高，必须大于零。
+# model_refresh_concurrency = 32
 # token 响应缺少 endpoints.api 时使用的回退地址；Enterprise 专用实例按需配置。
 # api_endpoint_fallback = "https://api.enterprise.githubcopilot.com"
 # 动态 token 返回自定义 Copilot endpoint 时允许的额外主机。
@@ -2057,9 +2061,9 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# =====================================
 # idle_window_ms = 300000
 
 # [provider.models]
-# 模型发现缓存有效期。
+# 后台模型目录刷新的目标间隔。
 # cache_ttl_ms = 300000
-# 上游发现失败时允许继续使用旧缓存的最长时间。
+# 业务查询允许复用旧目录快照的最长时间；过期目录不用于请求路由。
 # max_stale_ms = 1800000
 
 # [provider.routing]

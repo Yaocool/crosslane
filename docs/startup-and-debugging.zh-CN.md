@@ -255,6 +255,20 @@ Kiro overage 默认关闭。
 `crosslane account overage enable --max-credits 500`；关闭时运行
 `crosslane account overage disable`。上游限制和已在处理中的请求仍可能影响最终用量。
 
+## 请求延迟控制
+
+Copilot 业务模型查询优先复用启用账号在 `provider.models.max_stale_ms` 范围内的
+目录快照，由周期任务或显式刷新更新目录。其他账号缺少目录时，不会阻塞已有可用
+快照的请求；首次发现或全部快照过期时仍需查询上游，过期模型不会用于授权和选号。
+目录刷新按 `provider.settings.model_refresh_concurrency` 控制同时查询的账号数，
+默认 32，实际并发不超过启用账号数。大账号池可提高该值，例如 64；上游出现限流时
+可调低。该值必须大于零，不影响已有可用快照的业务查询。
+
+```toml
+[provider.settings]
+model_refresh_concurrency = 32
+```
+
 ## 日志与排障
 
 ```bash

@@ -305,6 +305,23 @@ per account, run `crosslane account overage enable --max-credits 500`; use
 `crosslane account overage disable` to turn it off. Upstream limits and requests
 already in progress can still affect final usage.
 
+## Request latency controls
+
+Copilot model lookups reuse an enabled account's catalog up to
+`provider.models.max_stale_ms` while scheduled or explicit refreshes update it.
+A missing catalog on another account does not block requests with a usable
+snapshot. Cold or fully expired catalogs still require discovery; expired
+models cannot authorize or schedule a request. Refresh concurrency is controlled
+by `provider.settings.model_refresh_concurrency` (default: 32, no more than the
+enabled account count). Large pools can raise it, for example to 64; lower it if
+the upstream rate limits discovery. It must be positive and does not make
+requests with usable snapshots wait for discovery.
+
+```toml
+[provider.settings]
+model_refresh_concurrency = 32
+```
+
 ## Logs and troubleshooting
 
 ```bash

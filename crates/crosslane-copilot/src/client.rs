@@ -16,7 +16,7 @@ use crosslane_provider::{
     ProviderAdapter, ProviderError, ProviderErrorKind, ProviderRequest, ProviderResponse,
     ProviderResponseBody,
 };
-use futures::StreamExt;
+use futures::{stream, StreamExt};
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -61,6 +61,7 @@ pub struct CopilotSettings {
     pub balance: ProviderBalanceConfig,
     pub model_cache_ttl_secs: i64,
     pub model_max_stale_secs: i64,
+    pub model_refresh_concurrency: usize,
     pub allow_insecure_http: bool,
     pub allowed_endpoint_hosts: Vec<String>,
     pub api_endpoint_fallback: Option<String>,
@@ -113,6 +114,15 @@ impl CopilotSettings {
                 .unwrap_or(i64::MAX),
             model_max_stale_secs: i64::try_from(config.models.max_stale_ms.div_ceil(1_000))
                 .unwrap_or(i64::MAX),
+            model_refresh_concurrency: config.settings.get("model_refresh_concurrency").map_or(
+                32,
+                |value| {
+                    value
+                        .as_u64()
+                        .and_then(|value| usize::try_from(value).ok())
+                        .unwrap_or(0)
+                },
+            ),
             allow_insecure_http: boolean("allow_insecure_http").unwrap_or(false),
             allowed_endpoint_hosts,
             api_endpoint_fallback: string("api_endpoint_fallback"),
@@ -184,6 +194,11 @@ impl CopilotSettings {
         if self.model_cache_ttl_secs <= 0 || self.model_max_stale_secs < self.model_cache_ttl_secs {
             return Err(internal_error(
                 "Copilot model max_stale must be greater than or equal to cache_ttl",
+            ));
+        }
+        if self.model_refresh_concurrency == 0 {
+            return Err(internal_error(
+                "Copilot settings.model_refresh_concurrency must be greater than zero",
             ));
         }
         for host in &self.allowed_endpoint_hosts {
@@ -2071,11 +2086,14 @@ impl ProviderAdapter for CopilotProvider {
             .collect::<BTreeSet<_>>();
         if !refresh {
             let cache = self.model_cache.read().await;
-            if cache_is_fresh(&cache, &enabled_ids, self.settings.model_cache_ttl_secs) {
+            // Normal requests use the same bounded-stale snapshots as account
+            // scheduling. Background/explicit refreshes enforce the fresh TTL;
+            // a missing or unhealthy unrelated account must not stall traffic.
+            if cache_has_usable_snapshot(&cache, &enabled_ids, self.settings.model_max_stale_secs) {
                 return Ok(aggregate_model_cache(
                     &cache,
                     &enabled_ids,
-                    self.settings.model_cache_ttl_secs,
+                    self.settings.model_max_stale_secs,
                 ));
             }
         }
@@ -2085,32 +2103,38 @@ impl ProviderAdapter for CopilotProvider {
         let _refresh = self.model_refresh.lock().await;
         if !refresh {
             let cache = self.model_cache.read().await;
-            if cache_is_fresh(&cache, &enabled_ids, self.settings.model_cache_ttl_secs) {
+            if cache_has_usable_snapshot(&cache, &enabled_ids, self.settings.model_max_stale_secs) {
                 return Ok(aggregate_model_cache(
                     &cache,
                     &enabled_ids,
-                    self.settings.model_cache_ttl_secs,
+                    self.settings.model_max_stale_secs,
                 ));
             }
         }
 
         let mut discovered = BTreeMap::<String, (String, Vec<ProviderModel>)>::new();
         let mut errors = BTreeMap::<String, String>::new();
-        for account in &accounts {
-            match self.api_token(account).await {
+        let mut refreshes = stream::iter(accounts.into_iter().map(|account| async move {
+            let result = match self.api_token(&account).await {
                 Ok(token) => match self
                     .fetch_models_with_token(&token, Some(&account.id))
                     .await
                 {
-                    Ok(models) => {
-                        discovered.insert(account.id.clone(), (token.endpoint, models));
-                    }
-                    Err(error) => {
-                        errors.insert(account.id.clone(), error.to_string());
-                    }
+                    Ok(models) => Ok((token.endpoint, models)),
+                    Err(error) => Err(error),
                 },
+                Err(error) => Err(error),
+            };
+            (account.id.clone(), result)
+        }))
+        .buffer_unordered(self.settings.model_refresh_concurrency);
+        while let Some((account_id, result)) = refreshes.next().await {
+            match result {
+                Ok(snapshot) => {
+                    discovered.insert(account_id, snapshot);
+                }
                 Err(error) => {
-                    errors.insert(account.id.clone(), error.to_string());
+                    errors.insert(account_id, error.to_string());
                 }
             }
         }
@@ -2546,10 +2570,14 @@ async fn save_model_cache(
         .map_err(|error| internal_error(format!("save {}: {error}", path.display())))
 }
 
-fn cache_is_fresh(cache: &ModelCache, enabled_ids: &BTreeSet<String>, max_age_secs: i64) -> bool {
+fn cache_has_usable_snapshot(
+    cache: &ModelCache,
+    enabled_ids: &BTreeSet<String>,
+    max_age_secs: i64,
+) -> bool {
     let now = now_secs();
     !enabled_ids.is_empty()
-        && enabled_ids.iter().all(|account_id| {
+        && enabled_ids.iter().any(|account_id| {
             cache
                 .accounts
                 .get(account_id)
@@ -2914,6 +2942,8 @@ fn not_found_account(id: &str) -> ProviderError {
 
 #[cfg(test)]
 mod tests {
+    mod latency;
+
     use super::*;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2976,6 +3006,14 @@ mod tests {
     }
 
     async fn mock_provider(server: &MockServer, directory: &Path) -> CopilotProvider {
+        mock_provider_with_settings(server, directory, |_| {}).await
+    }
+
+    async fn mock_provider_with_settings(
+        server: &MockServer,
+        directory: &Path,
+        configure: impl FnOnce(&mut CopilotSettings),
+    ) -> CopilotProvider {
         let mut config = ProviderConfig {
             id: "copilot".into(),
             kind: "copilot".into(),
@@ -2993,10 +3031,12 @@ mod tests {
         tokio::fs::create_dir_all(accounts_path.parent().unwrap())
             .await
             .unwrap();
+        let mut settings = CopilotSettings::from_config(&config);
+        configure(&mut settings);
         CopilotProvider::load(
             ProviderId::parse("copilot").unwrap(),
             true,
-            CopilotSettings::from_config(&config),
+            settings,
             accounts_path,
         )
         .await

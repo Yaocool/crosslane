@@ -330,6 +330,11 @@ fn fully_populated_config() -> Config {
         "api_token_refresh_before_secs".into(),
         serde_json::json!(300),
     );
+    for (name, value) in [("model_refresh_concurrency", 32)] {
+        provider
+            .settings
+            .insert(name.into(), serde_json::json!(value));
+    }
     provider.settings.insert(
         "api_endpoint_fallback".into(),
         serde_json::json!("https://api.enterprise.githubcopilot.com"),
