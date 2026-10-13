@@ -22,6 +22,139 @@ fn summary_response(request: &wiremock::Request) -> ResponseTemplate {
 }
 
 #[tokio::test]
+async fn failed_summary_parts_are_repartitioned_once_without_replaying_successful_siblings() {
+    let _http_guard = HTTP_TEST_LOCK.lock().await;
+    for (stream, repeat_failure, incomplete_output) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (true, true, false),
+        (false, false, true),
+        (true, false, true),
+    ] {
+        let mock = MockServer::start().await;
+        mount_context_alignment_models(&mock).await;
+        let failures = Arc::new(AtomicUsize::new(0));
+        let correction_calls = Arc::new(AtomicUsize::new(0));
+        let fail_count = Arc::clone(&failures);
+        let later_count = Arc::clone(&correction_calls);
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(move |request: &wiremock::Request| {
+                let payload: Value = serde_json::from_slice(&request.body).unwrap();
+                let current = payload["conversationState"]["currentMessage"]["userInputMessage"]["content"].as_str().unwrap();
+                let history = payload["conversationState"]["history"].to_string();
+                let text = if current.contains("durable conversation checkpoint") {
+                    if history.contains("project=cobalt-731")
+                        && (repeat_failure || fail_count.fetch_add(1, Ordering::SeqCst) == 0)
+                    {
+                        let body = if incomplete_output {
+                            generation_body("<summary>INCOMPLETE_SHOULD_NEVER_BE_PUBLISHED")
+                        } else {
+                            let mut body = generation_body("<summary>INCOMPLETE_SHOULD_NEVER_BE_PUBLISHED</summary>");
+                            body.extend(event_stream_frame("invalidStateEvent", json!({
+                                "reason":"SERVICE_UNAVAILABLE", "message":"Service temporarily unavailable, please retry"
+                            })));
+                            body
+                        };
+                        return ResponseTemplate::new(200)
+                            .insert_header("content-type", "application/vnd.amazon.eventstream")
+                            .set_body_bytes(body);
+                    }
+                    if history.contains("parameter=77 replaces 42") {
+                        later_count.fetch_add(1, Ordering::SeqCst);
+                        "<summary>Explicit correction: parameter=77 replaces 42.</summary>"
+                    } else if history.contains("project=cobalt-731") {
+                        "<summary>project=cobalt-731; privacy=NO_UPLOAD; parameter=42.</summary>"
+                    } else {
+                        "<summary>Intervening synthetic observations, no changed decision.</summary>"
+                    }
+                } else {
+                    let complete = format!("{history}\n{current}");
+                    assert!(complete.contains("project=cobalt-731"));
+                    assert!(complete.contains("privacy=NO_UPLOAD"));
+                    assert!(complete.contains("parameter=77 replaces 42"));
+                    assert!(!complete.contains("INCOMPLETE_SHOULD_NEVER_BE_PUBLISHED"));
+                    "Complete summary: project=cobalt-731; privacy=NO_UPLOAD; parameter=77."
+                };
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/vnd.amazon.eventstream")
+                    .set_body_bytes(generation_body(text))
+            }).mount(&mock).await;
+        let port = unused_tcp_port();
+        let daemon =
+            Daemon::start_http(port, &format!("{}/generateAssistantResponse", mock.uri())).await;
+        import_context_alignment_account(&daemon, 0.0).await;
+        configure(&daemon, |config| {
+            config.context.auto_compact_on_overflow = false;
+            config.pool.max_concurrent_per_account = 2;
+        })
+        .await;
+        let source = format!("project=cobalt-731; privacy=NO_UPLOAD; parameter=42.\n{}\nExplicit correction: parameter=77 replaces 42.", "synthetic record ".repeat(70_000));
+        let response = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .header("x-api-key", daemon.api_key.as_deref().unwrap())
+            .header("user-agent", "claude-cli/2.1.296 (external, sdk-cli)")
+            .json(
+                &json!({"model":"mapped-small","max_tokens":1024,"stream":stream,
+                "messages":[{"role":"user","content":source},
+                    {"role":"assistant","content":"Acknowledged."},
+                    {"role":"user","content":COMPACT_PROMPT}]}),
+            )
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        if repeat_failure {
+            assert_eq!(status, if stream { 200 } else { 422 }, "{body}");
+            assert!(body.contains("compaction_failed"), "{body}");
+            assert!(!body.contains("\"type\":\"compaction\""), "{body}");
+        } else {
+            assert_eq!(status, 200, "{body}");
+            assert!(body.contains("privacy=NO_UPLOAD; parameter=77"), "{body}");
+            assert_eq!(
+                correction_calls.load(Ordering::SeqCst),
+                1,
+                "the successful later source part must not be generated again"
+            );
+            let stats = expect_ok(
+                daemon
+                    .call("stats", json!({"detail":true,"recent":20}))
+                    .await,
+            );
+            let logs = stats["stats"]["recent_requests"].as_array().unwrap();
+            assert_eq!(
+                logs.iter()
+                    .filter(|log| log["path"] == "/internal/compact" && log["status"] == 502)
+                    .count(),
+                1
+            );
+            assert!(logs
+                .iter()
+                .filter(|log| log["path"] == "/internal/compact")
+                .all(|log| log["credits"] == 0.25));
+        }
+        assert!(
+            !body.contains("INCOMPLETE_SHOULD_NEVER_BE_PUBLISHED"),
+            "{body}"
+        );
+        let generations = mock
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.url.path() == "/generateAssistantResponse")
+            .count();
+        assert!(
+            generations <= 6,
+            "summary part retries were not bounded: {generations}"
+        );
+        daemon.stop().await;
+    }
+}
+
+#[tokio::test]
 async fn partitioned_compaction_reconciles_missing_fact_claims_and_accounts_for_merge_failure() {
     let _http_guard = HTTP_TEST_LOCK.lock().await;
     const FACTS: &str = "project=cobalt-731; recovery_tag=mango-482; checksum=spruce-956";
@@ -117,7 +250,13 @@ async fn partitioned_compaction_reconciles_missing_fact_claims_and_accounts_for_
         let status = response.status();
         let body = response.text().await.unwrap();
         assert_eq!(status, reqwest::StatusCode::OK, "{body}");
-        assert!(body.contains(CLIENT_SUMMARY), "{body}");
+        if fail_merge {
+            assert!(body.contains("compaction_failed"), "{body}");
+            assert!(!body.contains(CLIENT_SUMMARY), "{body}");
+            assert!(!body.contains("\"type\":\"compaction\""), "{body}");
+        } else {
+            assert!(body.contains(CLIENT_SUMMARY), "{body}");
+        }
         assert_eq!(merges.load(Ordering::SeqCst), usize::from(!native_summary));
         let stats = expect_ok(
             daemon
@@ -338,21 +477,24 @@ async fn client_summary_input_threshold_rejection_partitions_complete_source_and
                     .ends_with("-merge")
             })
             .collect();
-        assert!(parts.len() > 1, "recovery must use partitioned summaries");
+        assert!(
+            !parts.is_empty(),
+            "recovery must inspect the complete source"
+        );
         parts.sort_by_key(|payload| {
             payload
                 .conversation_state
                 .conversation_id
                 .rsplit_once("-part-")
-                .unwrap()
-                .1
+                .map(|(_, index)| index)
+                .unwrap_or("0")
                 .parse::<usize>()
                 .unwrap()
         });
         let mut transcript = String::new();
         let mut source_tool_call_found = false;
         for part in parts {
-            assert!(tokenizer.estimate_kiro_payload(part).await.unwrap() <= 148_500);
+            assert!(tokenizer.estimate_kiro_payload(part).await.unwrap() <= 742_500);
             for message in &part.conversation_state.history {
                 if let Some(user) = &message.user_input_message {
                     transcript.push_str(&user.content);

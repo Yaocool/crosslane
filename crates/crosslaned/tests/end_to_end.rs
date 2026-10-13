@@ -463,7 +463,7 @@ impl wiremock::Respond for SlowCompactionResponder {
             .insert_header("content-type", "application/vnd.amazon.eventstream")
             .set_body_bytes(generation_body(content));
         if summary {
-            response.set_delay(Duration::from_millis(100))
+            response.set_delay(Duration::from_millis(1200))
         } else {
             response
         }
@@ -2505,7 +2505,7 @@ async fn upstream_context_rejection_partitions_compacts_and_retries_once() {
     assert!(first_main_bytes > 0);
     assert!(summary_bytes > 0);
     assert!(
-        summary_bytes < first_main_bytes,
+        summary_bytes <= 8 * 1024 * 1024,
         "summary request was not bounded: {summary_bytes} >= {first_main_bytes}"
     );
 
@@ -2515,8 +2515,8 @@ async fn upstream_context_rejection_partitions_compacts_and_retries_once() {
             .iter()
             .filter(|request| request.url.path() == "/generateAssistantResponse")
             .count(),
-        5,
-        "expected first main request, two bounded summary parts, consolidation, and one main retry"
+        3,
+        "expected first main request, one model-sized complete summary, and one main retry"
     );
 
     daemon.stop().await;
@@ -2595,9 +2595,9 @@ priority = 10
     assert_eq!(body["content"][0]["type"], "compaction");
     assert!(body["content"][0]["content"]
         .as_str()
-        .is_some_and(|content| content.contains("extractive fallback checkpoint")));
+        .is_some_and(|content| content.contains("System-generated conversation checkpoint")));
     assert_eq!(body["content"][1]["text"], "main request completed");
-    assert!(body["usage"].get("iterations").is_none());
+    assert!(body["usage"].get("iterations").is_some());
     let applied = &body["context_management"]["applied_edits"][0];
     assert_eq!(applied["reason"], "model_mapping_overflow");
     assert!(
@@ -2615,8 +2615,8 @@ priority = 10
         .collect::<Vec<_>>();
     assert_eq!(
         payloads.len(),
-        1,
-        "multiwave automatic compaction must skip doomed summary requests"
+        2,
+        "model-sized complete summary plus the main generation"
     );
     let summaries = payloads
         .iter()
@@ -2626,7 +2626,7 @@ priority = 10
                 .is_some_and(|content| content.contains("durable conversation checkpoint"))
         })
         .collect::<Vec<_>>();
-    assert!(summaries.is_empty());
+    assert_eq!(summaries.len(), 1);
     let main = payloads
         .iter()
         .find(|payload| {
@@ -2655,7 +2655,9 @@ priority = 10
         main["conversationState"]["history"][1]["assistantResponseMessage"]["content"],
         "I will follow these instructions."
     );
-    assert!(main.to_string().contains("extractive fallback checkpoint"));
+    assert!(main
+        .to_string()
+        .contains("migrate compact to semantic Kiro summaries"));
 
     daemon.stop().await;
 }
@@ -2801,7 +2803,7 @@ async fn timed_out_compaction_summary_is_still_accounted() {
 name = "large-to-small-timeout"
 type = "replace"
 source_models = ["source-large"]
-target_models = ["mapped-small"]
+target_models = ["resolved-tiny"]
 priority = 10
 "#,
     )
@@ -2814,7 +2816,7 @@ priority = 10
         &config_path,
         raw.replace(
             "compaction_summary_timeout_ms = 120000",
-            "compaction_summary_timeout_ms = 1",
+            "compaction_summary_timeout_ms = 1000",
         ),
     )
     .await
@@ -2835,7 +2837,7 @@ priority = 10
             "max_tokens":64,
             "stream":false,
             "messages":[
-                {"role":"user","content":"old context ".repeat(140000)},
+                {"role":"user","content":"old context ".repeat(500)},
                 {"role":"assistant","content":"an earlier conclusion"},
                 {"role":"user","content":"continue after the summary timeout"}
             ]
@@ -2843,15 +2845,12 @@ priority = 10
         .send()
         .await
         .expect("call summary timeout path");
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
     let body: serde_json::Value = response.json().await.expect("Claude response JSON");
-    assert_eq!(body["content"][0]["type"], "compaction");
-    assert_eq!(
-        body["content"][1]["text"],
-        "main request completed while summary accounting continued"
-    );
+    assert_eq!(body["error"]["code"], "compaction_failed");
+    assert!(body.get("content").is_none());
 
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let stats = expect_ok(
             daemon
@@ -2934,13 +2933,11 @@ priority = 10
         .send()
         .await
         .expect("call malformed summary stream path");
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
     let body: serde_json::Value = response.json().await.expect("Claude response JSON");
-    assert_eq!(body["content"][0]["type"], "compaction");
-    assert_eq!(
-        body["content"][1]["text"],
-        "main request completed after the failed summary was accounted"
-    );
+    assert_eq!(body["error"]["code"], "compaction_failed");
+    assert!(body.get("content").is_none());
+
     let stats = expect_ok(
         daemon
             .call("stats", serde_json::json!({"detail":true,"recent":20}))
@@ -2953,14 +2950,9 @@ priority = 10
         .filter(|request| request["path"] == "/internal/compact")
         .collect::<Vec<_>>();
     assert!(!compacts.is_empty() && compacts.len() <= 2);
-    assert_eq!(
-        body["usage"]["iterations"][0]["input_tokens"],
-        compacts.len() as u64 * 100
-    );
-    assert_eq!(
-        body["usage"]["iterations"][0]["output_tokens"],
-        compacts.len() as u64 * 20
-    );
+    assert!(compacts
+        .iter()
+        .all(|compact| compact["input_tokens"] == 100 && compact["output_tokens"] == 20));
     let compact = stats["stats"]["recent_requests"]
         .as_array()
         .and_then(|requests| {
@@ -3075,7 +3067,7 @@ priority = 10
 }
 
 #[tokio::test]
-async fn mapped_compaction_is_reapplied_for_a_smaller_resolved_window_without_resummarizing() {
+async fn oversized_semantic_checkpoint_is_rejected_without_clipping_or_main_generation() {
     let _http_guard = HTTP_TEST_LOCK.lock().await;
     for native_summary in [false, true] {
         let mock = MockServer::start().await;
@@ -3133,81 +3125,38 @@ priority = 10
         .send()
         .await
         .expect("call two-window compact path");
-        assert_eq!(response.status(), reqwest::StatusCode::OK);
-        let body: serde_json::Value = response.json().await.expect("Claude response JSON");
-        assert_eq!(body["content"][0]["type"], "compaction");
-        assert!(body["content"][0]["content"]
-            .as_str()
-            .is_some_and(|content| content.contains("checkpoint shortened to fit context")));
-
-        let requests = mock.received_requests().await.expect("received requests");
-        let payloads = requests
+        assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "compaction_failed");
+        assert!(
+            body.get("content").is_none(),
+            "must not clip an oversized checkpoint"
+        );
+        let requests = mock.received_requests().await.unwrap();
+        let generated: Vec<serde_json::Value> = requests
             .iter()
-            .filter_map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).ok())
-            .filter(|payload| payload.get("conversationState").is_some())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            payloads.len(),
-            4,
-            "two summary parts, consolidation, and one main request"
-        );
-        assert_eq!(
-            payloads
+            .filter(|request| request.url.path() == "/generateAssistantResponse")
+            .map(|request| serde_json::from_slice(&request.body).unwrap())
+            .collect();
+        assert!(!generated.is_empty() && generated.len() <= 4);
+        assert!(
+            generated
                 .iter()
-                .filter(|payload| payload["conversationState"]["currentMessage"]
-                    ["userInputMessage"]["content"]
-                    .as_str()
-                    .is_some_and(|content| content.contains("durable conversation checkpoint")))
-                .count(),
-            3,
-            "resolved-window replanning must reuse the consolidated summary without resummarizing"
-        );
-        assert_eq!(
-            payloads
-                .iter()
-                .filter(|payload| payload["conversationState"]["conversationId"]
-                    .as_str()
-                    .is_some_and(|id| id.ends_with("-merge")))
-                .count(),
-            1,
-            "consolidation must run only once"
-        );
-        if native_summary {
-            let merge = payloads
-                .iter()
-                .find(|payload| {
-                    payload["conversationState"]["conversationId"]
+                .all(
+                    |payload| payload["conversationState"]["currentMessage"]["userInputMessage"]
+                        ["content"]
                         .as_str()
-                        .is_some_and(|id| id.ends_with("-merge"))
-                })
-                .unwrap();
-            assert!(
-                merge["inferenceConfig"]["maxTokens"].as_u64().unwrap() < 4096,
-                "resolved-window consolidation must use the smaller output budget"
-            );
-        }
-        let main = payloads
-            .iter()
-            .find(|payload| {
-                payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
-                    .as_str()
-                    .is_some_and(|content| {
-                        content.contains("finish after semantic reuse")
-                            && !content.contains("durable conversation checkpoint")
-                    })
-            })
-            .expect("main request");
-        assert_eq!(
-            main["conversationState"]["currentMessage"]["userInputMessage"]["modelId"],
-            "resolved-tiny"
+                        .unwrap()
+                        .contains("durable conversation checkpoint")
+                ),
+            "no ordinary generation after an incomplete checkpoint"
         );
-
         daemon.stop().await;
     }
 }
 
 #[tokio::test]
-async fn a_second_smaller_resolved_window_fails_without_a_compaction_loop() {
+async fn too_small_summary_window_fails_without_a_compaction_loop() {
     let _http_guard = HTTP_TEST_LOCK.lock().await;
     let mock = MockServer::start().await;
     mount_context_alignment_models(&mock).await;
@@ -3254,9 +3203,8 @@ async fn a_second_smaller_resolved_window_fails_without_a_compaction_loop() {
     );
     configure_context_alignment(
         &daemon,
-        // Force capacity preflight to choose extractive fallback so the
-        // summary operation cannot affect which account the second main
-        // preflight selects.
+        // The complete source cannot fit this summary model's bounded parts.
+        // Fail before ordinary generation rather than selecting a lossy fallback.
         "resolved-tiny",
         r#"
 [[model_mapping]]
@@ -3312,26 +3260,14 @@ priority = 10
                 .map(str::to_owned)
         })
         .collect::<Vec<_>>();
-    assert_eq!(
-        status,
-        reqwest::StatusCode::BAD_REQUEST,
-        "unexpected response {body}; generated models: {generated_models:?}"
-    );
-    let message = body["error"]["message"].as_str().expect("error message");
-    assert!(
-        message.contains("resolved-tiny"),
-        "unexpected error: {message}; generated models: {generated_models:?}"
-    );
-    assert!(message.contains("prompt is too long"));
-    assert!(
-        message.contains(" > 495"),
-        "unexpected safe window: {message}"
-    );
+    assert_eq!(status, reqwest::StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], "compaction_failed");
+    assert!(body.get("content").is_none());
 
     assert_eq!(
         generated_models.len(),
         0,
-        "both account checks must fail before Kiro and no third attempt is allowed"
+        "a summary capacity failure must not dispatch ordinary generation"
     );
 
     daemon.stop().await;

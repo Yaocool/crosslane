@@ -50,7 +50,16 @@ pub(super) fn enrich_error_envelope(
     } else {
         detail.clone()
     };
-    let hint = error_hint(code);
+    let hint = if code == "context_length_exceeded"
+        && envelope["error"]["context"]["minimum_input_tokens"]
+            .as_u64()
+            .zip(envelope["error"]["context"]["maximum_input_tokens"].as_u64())
+            .is_some_and(|(minimum, maximum)| minimum > maximum)
+    {
+        "Reduce or split the current input, paginate tool results, or shorten required system/tool content. Compacting older history cannot make this input fit."
+    } else {
+        error_hint(code)
+    };
     let mut message = cause.chars().take(512).collect::<String>();
     if envelope["error"]["recovery"] == "compaction_retry_failed" {
         message.push_str(" Compaction was attempted, but the retry still failed.");
@@ -95,6 +104,9 @@ fn error_hint(code: &str) -> &'static str {
     match code {
         "context_length_exceeded" => {
             "Run /compact, reduce large tool results or attachments, or start a new session."
+        }
+        "compaction_failed" => {
+            "The original context is intact. Retry compact or process the source in smaller sections; no incomplete checkpoint was saved."
         }
         "request_payload_exceeded" | "request_body_too_large" => {
             "Reduce request content, attachments, or tool definitions."
@@ -1672,5 +1684,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bytes, input);
+    }
+}
+
+#[cfg(test)]
+mod overflow_hint_regressions {
+    use super::*;
+    #[test]
+    fn current_input_overflow_does_not_recommend_compacting_older_history() {
+        let mut envelope = serde_json::json!({"error":{"message":"prompt is too long: 1200000 tokens > 990000",
+            "context":{"current_message_tokens":1200000,"minimum_input_tokens":1200010,"maximum_input_tokens":990000}}});
+        enrich_error_envelope(
+            &mut envelope,
+            "context_length_exceeded",
+            None,
+            Some("trace_hint"),
+        );
+        assert!(!envelope["error"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("Run /compact"));
+        assert!(envelope["error"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("cannot make this input fit"));
+        assert_eq!(envelope["error"]["retryable"], false);
     }
 }

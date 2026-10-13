@@ -406,19 +406,51 @@ defaults to 8 MiB (`context.max_upstream_payload_bytes`). Input windows use the
 selected model's metadata when available, with `safe_input_ratio` (default 0.95)
 for ordinary requests and `compact_safe_input_ratio` (default 0.99) after compaction.
 
-With `context.auto_compact_on_overflow` enabled (the default), oversized history
-is locally compacted before byte-budget rejection, without requiring a client
-compact instruction. Token overflows still use semantic summaries with a local
-extractive fallback. System instructions, loaded tool definitions, current input,
-and the complete tool chain needed by current results remain intact. Indivisible
-input that still exceeds a hard limit receives a specific HTTP 400 error.
+With `context.auto_compact_on_overflow` enabled (the default), history that exceeds
+byte or token budgets is summarized semantically before dispatch. A completed
+checkpoint covers all discarded source records, including middle facts and later
+corrections. Summary timeouts, capacity limits, upstream failures and checkpoints
+that cannot fit return `compaction_failed` (422) without replacing the original
+context. Crosslane never promotes a clipped head/tail excerpt to a completed
+compaction boundary. System instructions, loaded tools, current input and its
+required tool chain remain intact. If this indivisible input exceeds the window,
+the 400 context error identifies `current_message` or `required_context` and
+recommends reducing/splitting input or paginating results; compacting older history
+cannot solve that condition.
 
-Tool Search previews the space recoverable from history before loading tools,
-then checks the complete continuation including new definitions and results.
-Oversized continuations use local compaction without acquiring a second account
-slot for a summary. Streaming checkpoints are followed by references for previously
-loaded tools so later tool results can still use them. Verified history-prefix
-replay caches the latest checkpoint for clients that discard compaction blocks.
+Summary budgets use the selected model's window, with the configured window as a
+fallback only. The latest user turn is a partitionable source record rather than
+instruction overhead repeated in every part. Every part fits both estimated token
+and serialized byte limits; at most 16 initial parts and two concurrent requests
+share one operation deadline. A native upstream context rejection allows one repartition of
+the full source into smaller parts within that same deadline and usage accounting.
+If an upstream summary stream reports temporary service unavailability, or a large
+source part returns an incomplete summary wrapper, only that failed source part is
+retried once, using smaller parts for a large input. Small malformed summaries fail
+explicitly. Successful sibling summaries are retained, partial output is discarded, and every attempt is
+accounted. Child requests run sequentially within the existing concurrency limit
+and deadline. `proxy.compaction.summary_part_retry.started` identifies this recovery
+and its reason. Failure metadata distinguishes upstream stream errors from summary
+validation and records wrapper counts without logging summary content.
+`proxy.upstream.context_usage` logs upstream context percentages or native input
+counts separately from local estimates; content-dependent tokenizer differences
+must not be interpreted as a fixed byte or token limit.
+
+Tool Search checks the complete continuation including new definitions and
+results. While holding an account slot, it may publish only a complete verbatim
+checkpoint that fits the budget. Otherwise it preserves history and rejects the
+oversized continuation instead of discarding source facts or opening another
+summary request. Verified history-prefix replay restores complete checkpoints for
+clients that discard compaction blocks.
+
+An ordinary Kiro response with no assistant output is retried once, then returned
+as an explicit error if still empty. Valid text, tool calls, reasoning and terminal
+semantics remain supported. Streaming retries do not replay visible output or
+publish duplicate compaction boundaries. With `features.buffer_tool_calls=false`,
+ordinary tool argument fragments still stream immediately; an error after visible
+output ends that stream without replaying the upstream call.
+Nonstreaming rounds release the completed upstream connection slot before
+retrying or continuing server tools, including with a one-connection pool.
 
 Large-text token estimates use bounded UTF-8 chunks with a small boundary
 allowance, avoiding tokenizer exceptions on long whitespace spans. Actual messages
@@ -437,7 +469,8 @@ not report an exact token limit and is not treated as an account failure.
 
 Claude Code's native summary request reconciles complete, chronologically ordered
 source checkpoints during its final generation. Crosslane also places these records
-next to the final summary instruction, after any retained verbatim history. This avoids a duplicate upstream
+next to the final summary instruction, after the source history. Native final summaries omit optional verbatim duplicates
+already covered by the checkpoint. This avoids a duplicate upstream
 consolidation request. Explicit values from any part take precedence over another
 part's local absence claims; only explicit later corrections or changed decisions
 supersede earlier facts. These checkpoints are never clipped. If they cannot fit

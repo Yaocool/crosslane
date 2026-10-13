@@ -1226,7 +1226,7 @@ async fn mapped_overflow_decision_uses_the_mapped_safe_window() {
 }
 
 #[tokio::test]
-async fn multiwave_summary_input_falls_back_without_dispatching_semantic_work() {
+async fn multiwave_summary_failure_preserves_context_without_lossy_fallback() {
     let directory = tempfile::tempdir().expect("tempdir");
     let paths = crosslane_core::paths::Paths::from_env_values(
         Some(directory.path().to_str().expect("utf8")),
@@ -1276,7 +1276,7 @@ async fn multiwave_summary_input_falls_back_without_dispatching_semantic_work() 
         maximum_tokens: 9_900,
     };
 
-    let run = match run_compaction(
+    let error = match run_compaction(
         &state,
         CompactionRequest {
             trace_id: "trace_capacity",
@@ -1303,27 +1303,12 @@ async fn multiwave_summary_input_falls_back_without_dispatching_semantic_work() 
     )
     .await
     {
-        Ok(run) => run,
-        Err(error) => panic!("extractive fallback failed: {}", error.message),
+        Ok(_) => panic!("incomplete checkpoints must not be committed"),
+        Err(error) => error,
     };
-    assert_eq!(run.mode, "extractive_fallback");
-    assert_eq!(run.fallback_reason, Some("summary_multiple_waves"));
-    let source_tokens = state
-        .tokenizer
-        .estimate_kiro_payload(&source_payload)
-        .await
-        .expect("source tokens") as u64;
-    let summary_tokens = run.summary_input_tokens.expect("summary tokens");
-    // Diagnostics describe the full source transcript, not a lossy pre-excerpt.
-    // Each planned part is checked against the model window before the proxy
-    // decides that multiple dispatch waves cannot finish within one deadline.
-    assert!(summary_tokens > 9_900);
-    assert!(summary_tokens >= source_tokens);
-    assert!(run.stats.compacted_tokens <= decision.target_tokens as usize);
-    assert!(matches!(
-        run.artifact,
-        Some(CompactionArtifact::Extractive { .. })
-    ));
+    assert_eq!(error.error_code, "compaction_failed");
+    assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(error.message.contains("original context was preserved"));
 
     let mut minimum_payload = source_payload.clone();
     minimum_payload.retain_protected_history();
@@ -1612,4 +1597,70 @@ fn fallback_models_use_catalog_and_keep_configured_targets() {
         .iter()
         .any(|model| model.model_id == "claude-sonnet-4.6"));
     assert!(models.iter().any(|model| model.model_id == "private-model"));
+}
+
+#[test]
+fn ordinary_empty_round_is_bounded_without_replaying_valid_terminal_output() {
+    let payload: KiroPayload = serde_json::from_value(json!({
+        "conversationState":{"chatTriggerType":"MANUAL","conversationId":"empty",
+            "currentMessage":{"userInputMessage":{"content":"hello","modelId":"model","origin":"AI_EDITOR"}}}
+    })).unwrap();
+    let mut decoded = DecodedResponse::default();
+    assert_eq!(
+        empty_tool_result_disposition(&payload, &decoded, false, 0),
+        EmptyToolResultDisposition::Retry
+    );
+    assert_eq!(
+        empty_tool_result_disposition(&payload, &decoded, false, 1),
+        EmptyToolResultDisposition::Fail
+    );
+    decoded.reasoning = "valid ordinary reasoning".into();
+    assert_eq!(
+        empty_tool_result_disposition(&payload, &decoded, false, 0),
+        EmptyToolResultDisposition::Accept
+    );
+    decoded.reasoning.clear();
+    decoded.stop_reason = Some("refusal".into());
+    assert_eq!(
+        empty_tool_result_disposition(&payload, &decoded, false, 0),
+        EmptyToolResultDisposition::Accept
+    );
+    decoded.stop_reason = None;
+    assert_eq!(
+        empty_tool_result_disposition(&payload, &decoded, true, 0),
+        EmptyToolResultDisposition::Accept
+    );
+}
+
+#[tokio::test]
+async fn lossless_local_compaction_refuses_to_discard_middle_facts() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = crosslane_core::paths::Paths::from_env_values(
+        Some(directory.path().to_str().unwrap()),
+        None,
+        None,
+        None,
+    );
+    crosslane_store::bootstrap::ensure_layout(&paths)
+        .await
+        .unwrap();
+    let accounts = crosslane_store::accounts::AccountStore::load(&paths.accounts_file)
+        .await
+        .unwrap();
+    let state = Arc::new(AppState::new(
+        paths,
+        crosslane_store::config_loader::ConfigHandle::new(crosslane_core::config::Config::default()),
+        accounts,
+    ));
+    let request: ClaudeRequest = serde_json::from_value(json!({"model":"model","max_tokens":64,
+        "messages":[{"role":"user","content":format!("{}MIDDLE=keep-me; corrected=77{}", "old log ".repeat(3000), "old log ".repeat(3000))},
+            {"role":"assistant","content":"ack"},{"role":"user","content":"continue"}]
+    })).unwrap();
+    let mut payload = claude_to_kiro(&request, &TranslationOptions::new("model", "AI_EDITOR"));
+    let original = serde_json::to_vec(&payload).unwrap();
+    assert!(compact_history_for_limits(&state, &mut payload, 3000, 8192)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(serde_json::to_vec(&payload).unwrap(), original);
 }

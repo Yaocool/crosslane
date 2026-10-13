@@ -387,11 +387,13 @@ async fn byte_overflow_compacts_history_before_admission_and_preserves_hard_limi
             assert_eq!(content[0]["type"], "compaction");
             assert_eq!(
                 generations.len(),
-                1,
-                "byte recovery is local, without an upstream summary request"
+                8,
+                "byte recovery covers two complete parts, consolidation and generation"
             );
-            assert!(generations[0].body.len() <= 32 * 1024);
-            let payload: Value = serde_json::from_slice(&generations[0].body).unwrap();
+            assert!(generations
+                .iter()
+                .all(|request| request.body.len() <= 32 * 1024));
+            let payload: Value = serde_json::from_slice(&generations.last().unwrap().body).unwrap();
             let current = &payload["conversationState"]["currentMessage"]["userInputMessage"];
             assert_eq!(current["content"], "Continue");
             assert_eq!(
@@ -470,13 +472,18 @@ async fn default_byte_limit_allows_compaction_of_history_larger_than_eight_mib()
         .into_iter()
         .filter(|request| request.url.path() == "/generateAssistantResponse")
         .collect();
-    assert_eq!(generations.len(), 1);
-    assert!(generations[0].body.len() <= 8 * 1024 * 1024);
+    assert!(
+        generations.len() >= 4,
+        "complete parts, consolidation and generation"
+    );
+    assert!(generations
+        .iter()
+        .all(|request| request.body.len() <= 8 * 1024 * 1024));
     daemon.stop().await;
 }
 
 #[tokio::test]
-async fn tool_search_continuations_compact_locally_and_replay_the_latest_checkpoint() {
+async fn tool_search_continuations_preserve_history_when_a_complete_checkpoint_cannot_fit() {
     let _http_guard = HTTP_TEST_LOCK.lock().await;
     for stream in [false, true] {
         let request = json!({
@@ -518,7 +525,7 @@ async fn tool_search_continuations_compact_locally_and_replay_the_latest_checkpo
                         body.extend(event_stream_frame("toolUseEvent", json!({"toolUseId":"search-2","name":"tool_search_tool_regex","input":"{\"pattern\":\"lookup_records\"}","stop":true})));
                     }
                     2 => {
-                        body.extend(event_stream_frame("toolUseEvent", json!({"toolUseId":"lookup-1","name":"lookup_records","input":"{\"query\":\"cobalt\"}","stop":true})));
+                        body.extend(event_stream_frame("assistantResponseEvent", json!({"content":"Tool budget reached; existing facts intact."})));
                     }
                     _ => body.extend(event_stream_frame("assistantResponseEvent", json!({"content":"Completed the client tool result."}))),
                 }
@@ -547,133 +554,25 @@ async fn tool_search_continuations_compact_locally_and_replay_the_latest_checkpo
         let status = response.status();
         let body = response.text().await.unwrap();
         assert_eq!(status, reqwest::StatusCode::OK, "{body}");
-        let content = if stream {
-            claude_content_from_sse(&body)
-        } else {
-            serde_json::from_str::<Value>(&body).unwrap()["content"]
-                .as_array()
-                .unwrap()
-                .clone()
-        };
-        let checkpoint = content
-            .iter()
-            .position(|block| block["type"] == "compaction")
-            .expect("continuation checkpoint");
-        let references = content
-            .iter()
-            .position(|block| {
-                block["type"] == "tool_search_tool_result"
-                    && block["content"]["tool_references"][0]["tool_name"] == "lookup_records"
-            })
-            .expect("new tool references");
-        let call = content
-            .iter()
-            .position(|block| block["type"] == "tool_use" && block["name"] == "lookup_records")
-            .expect("loaded client tool call");
         assert!(
-            checkpoint < references && references < call,
-            "checkpoint must precede new references and client tools: {content:?}"
+            body.contains("Tool budget reached; existing facts intact."),
+            "{body}"
         );
-        assert_eq!(
-            content[references]["content"]["tool_references"][0]["tool_name"],
-            "lookup_records"
+        assert!(
+            body.contains("matching tool definitions exceed the remaining request budget"),
+            "{body}"
         );
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            3,
-            "initial generation and two continuations, without a summary call"
-        );
-        let payloads: Vec<Value> = mock
-            .received_requests()
-            .await
-            .unwrap()
+        assert!(!body.contains("\"type\":\"compaction\""), "{body}");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let requests = mock.received_requests().await.unwrap();
+        let payloads: Vec<Value> = requests
             .iter()
             .filter(|request| request.url.path() == "/generateAssistantResponse")
             .map(|request| serde_json::from_slice(&request.body).unwrap())
             .collect();
-        assert!(payloads[2].to_string().len() < payloads[0].to_string().len());
-        let current = &payloads[2]["conversationState"]["currentMessage"]["userInputMessage"];
-        assert!(current["userInputMessageContext"]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|tool| tool["toolSpecification"]["name"] == "lookup_records"));
-        assert_eq!(
-            current["userInputMessageContext"]["toolResults"][0]["toolUseId"],
-            "search-2"
-        );
-        assert!(payloads[2]["conversationState"]["history"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|message| message["assistantResponseMessage"]["toolUses"]
-                .as_array()
-                .is_some_and(|tools| tools.iter().any(|tool| tool["toolUseId"] == "search-2"))));
-        assert!(
-            content[checkpoint + 1..]
-                .iter()
-                .any(|block| block["type"] == "tool_search_tool_result"
-                    && block["content"]["tool_references"][0]["tool_name"] == "tiny_helper"),
-            "restore earlier loaded references after the latest boundary"
-        );
-        // Both honoring a checkpoint and discarding it must preserve the
-        // previous tool references and the current client tool/result pair.
-        for keep_checkpoint in [true, false] {
-            let mut request = request.clone();
-            let mut content = content.clone();
-            if !keep_checkpoint {
-                content.retain(|block| block["type"] != "compaction");
-            }
-            request["stream"] = json!(false);
-            request["messages"].as_array_mut().unwrap().extend([
-            json!({"role":"assistant","content":content}),
-            json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"lookup-1","content":"Record cobalt found"}]})
-        ]);
-            let response = client
-                .post(format!("http://127.0.0.1:{port}/v1/messages"))
-                .header("x-api-key", daemon.api_key.as_deref().unwrap())
-                .header("user-agent", "claude-cli/2.1.260 (external, e2e)")
-                .header("x-claude-code-session-id", "tool-compaction-session")
-                .json(&request)
-                .send()
-                .await
-                .unwrap();
-            let status = response.status();
-            let body = response.text().await.unwrap();
-            assert_eq!(status, reqwest::StatusCode::OK, "{body}");
-            assert!(body.contains("Completed the client tool result."), "{body}");
-            assert_eq!(
-                calls.load(Ordering::SeqCst),
-                if keep_checkpoint { 4 } else { 5 }
-            );
-            let requests = mock.received_requests().await.unwrap();
-            let callback: Value = serde_json::from_slice(
-                &requests
-                    .iter()
-                    .rev()
-                    .find(|request| request.url.path() == "/generateAssistantResponse")
-                    .unwrap()
-                    .body,
-            )
-            .unwrap();
-            assert_eq!(
-                callback["conversationState"]["currentMessage"]["userInputMessage"]
-                    ["userInputMessageContext"]["toolResults"][0]["toolUseId"],
-                "lookup-1"
-            );
-            let tools = callback["conversationState"]["currentMessage"]["userInputMessage"]
-                ["userInputMessageContext"]["tools"]
-                .as_array()
-                .unwrap();
-            for name in ["tiny_helper", "lookup_records"] {
-                assert!(
-                    tools
-                        .iter()
-                        .any(|tool| tool["toolSpecification"]["name"] == name),
-                    "loaded references must survive compaction and checkpoint replay"
-                );
-            }
-        }
+        assert!(payloads.iter().all(|payload| payload
+            .to_string()
+            .contains("Remember the previous decision")));
         daemon.stop().await;
     }
 }

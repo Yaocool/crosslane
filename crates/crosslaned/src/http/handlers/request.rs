@@ -1,22 +1,23 @@
 use super::{
     apply_context_management_edits, authenticate, claude_loaded_tools,
     claude_pending_server_tool_uses, claude_to_kiro, claude_validation_error,
-    claude_web_tool_names, compact_history_for_limits, compact_trigger_tokens,
-    enforce_claude_user_agent, enforce_codex_user_agent, enforce_context, enforce_payload_budget,
-    estimate_context_management_input_tokens, estimated_credits, execute_kiro_web_search,
-    execute_upstream, initial_compaction_decision, is_claude_user_agent, loaded_tool_bytes,
-    loaded_tool_count, loaded_tool_names, logged_user_agent, matches_type_family, nonstream_claude,
-    nonstream_openai, normalize_compaction_boundary, openai_to_kiro, openai_tool_identities,
-    prepare_kiro_payload, prepare_upstream, prepend_attempt_logs, prepend_execute_error_attempts,
-    reapply_compaction, reserve_credits, resolved_compaction_decision, resume_tool_search_payload,
+    claude_web_tool_names, compact_history_for_limits, compact_target_from_maximum,
+    compact_trigger_tokens, context_maximum, enforce_claude_user_agent, enforce_codex_user_agent,
+    enforce_context, enforce_payload_budget, estimate_context_management_input_tokens,
+    estimated_credits, execute_kiro_web_search, execute_upstream, initial_compaction_decision,
+    is_claude_user_agent, loaded_tool_bytes, loaded_tool_count, loaded_tool_names,
+    logged_user_agent, matches_type_family, nonstream_claude, nonstream_openai,
+    normalize_compaction_boundary, openai_to_kiro, openai_tool_identities, prepare_kiro_payload,
+    prepare_upstream, prepend_attempt_logs, prepend_execute_error_attempts, reapply_compaction,
+    reserve_credits, resolved_compaction_decision, resume_tool_search_payload,
     resume_web_search_payload, run_compaction, serialized_payload_bytes, stream,
     tool_search_budget_with_compaction, upstream_error, upstream_overflow_compaction_decision,
     validate_claude, validate_claude_generation, validate_openai, ApiError, AppState, Arc, Bytes,
     ClaudeRequest, ClaudeServerEvent, ClaudeToolSearchCatalog, ClaudeWebSearchTrace,
-    CompactionReason, CompactionRequest, Duration, Engine, ErrorFormat, ExecuteError, HeaderMap,
-    Instant, IpAddr, OpenAiRequest, RequestDiagnostics, Response, ServiceHttpState, StatusCode,
-    StreamContext, StreamExt, StreamProtocol, TranslationOptions, UpstreamExecution, Url, Uuid,
-    Value,
+    CompactionDecision, CompactionReason, CompactionRequest, Duration, Engine, ErrorFormat,
+    ExecuteError, HeaderMap, Instant, IpAddr, OpenAiRequest, RequestDiagnostics, Response,
+    ServiceHttpState, StatusCode, StreamContext, StreamExt, StreamProtocol, TranslationOptions,
+    UpstreamExecution, Url, Uuid, Value,
 };
 use crosslane_core::provider::ProviderProtocol;
 use crosslane_translate::model::{map_model_for_provider, ModelMappingContext, ModelRoute};
@@ -492,6 +493,7 @@ async fn handle_claude_route_inner(
     })?;
     request = next_request;
     let mut early_compaction = None;
+    let mut early_compaction_iteration = None;
     let initial_payload_bytes = serialized_payload_bytes(&payload, ErrorFormat::Claude)?;
     if initial_payload_bytes > config.context.max_upstream_payload_bytes
         && config.context.auto_compact_on_overflow
@@ -499,25 +501,45 @@ async fn handle_claude_route_inner(
     {
         // Admission is a byte budget. Account-dependent model resolution below
         // remains responsible for deciding the actual token window.
-        early_compaction = compact_history_for_limits(
+        let maximum = context_maximum(&state, true, &route.mapped);
+        let byte_decision = CompactionDecision {
+            reasons: vec![CompactionReason::MappedWindowOverflow],
+            model: route.mapped.clone(),
+            trigger_tokens: context_maximum(&state, false, &route.mapped),
+            target_tokens: compact_target_from_maximum(maximum),
+            maximum_tokens: maximum,
+        };
+        let summary_model = if config.context.compaction_summary_model.trim().is_empty() {
+            route.mapped.as_str()
+        } else {
+            config.context.compaction_summary_model.trim()
+        };
+        let run = run_compaction(
             &state,
-            &mut payload,
-            u64::MAX,
-            config.context.max_upstream_payload_bytes,
+            CompactionRequest {
+                trace_id: &trace_id,
+                client_context: Some(client_context),
+                key_id: key_id.as_deref(),
+                account_ids: Arc::clone(&account_ids),
+                allowed_models: &allowed_models,
+                service_id: Some(&service.service.id),
+                source_payload: &payload,
+                decision: &byte_decision,
+                summary_model,
+                summary_timeout_ms: config.context.compaction_summary_timeout_ms,
+                preserve_recent_turns: config.context.compaction_preserve_recent_turns,
+                explicit_client_compaction: false,
+            },
         )
-        .await
-        .map_err(|message| {
-            ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                message,
-                ErrorFormat::Claude,
-            )
-        })?;
+        .await?;
+        payload = run.payload;
+        early_compaction_iteration = run.iteration_usage;
+        early_compaction = (run.stats.removed_messages > 0).then_some(run.stats);
         if let Some(stats) = &early_compaction {
             tracing::info!(
                 trace_id = %trace_id,
                 compaction_reason = "payload_budget_overflow",
-                compaction_mode = "extractive_fallback",
+                compaction_mode = "complete_checkpoint",
                 original_payload_bytes = initial_payload_bytes,
                 original_input_tokens = stats.original_tokens,
                 compacted_input_tokens = stats.compacted_tokens,
@@ -746,7 +768,7 @@ async fn handle_claude_route_inner(
             tracing::info!(
                 trace_id = %trace_id,
                 compaction_reason = "pending_server_tools_payload_overflow",
-                compaction_mode = "extractive_fallback",
+                compaction_mode = "complete_checkpoint",
                 original_input_tokens = stats.original_tokens,
                 compacted_input_tokens = stats.compacted_tokens,
                 removed_messages = stats.removed_messages,
@@ -826,7 +848,7 @@ async fn handle_claude_route_inner(
     let mut auto_compaction_original_input_tokens = early_compaction
         .as_ref()
         .map(|stats| stats.original_tokens as u64);
-    let mut compaction_iteration = None;
+    let mut compaction_iteration = early_compaction_iteration;
     if let Some(decision) = initial_compaction_decision(
         &state,
         &resolved_model,

@@ -211,11 +211,13 @@ fn is_network_error(lower: &str) -> bool {
         "connection reset",
         "premature close",
         "other side closed",
-        "terminated",
         "operation was aborted",
     ]
     .iter()
     .any(|word| lower.contains(word))
+        || lower
+            .split(|character: char| !character.is_ascii_alphabetic())
+            .any(|word| word == "terminated")
 }
 
 fn redact_endpoint_names(message: &str) -> String {
@@ -291,6 +293,16 @@ fn openai_error_type(status: u16) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incomplete_summary_errors_are_not_misclassified_as_network_disconnects() {
+        let message = "Kiro returned an unterminated <summary> block";
+        assert_eq!(sanitize_error_message(message), message);
+        assert_eq!(
+            sanitize_error_message("upstream connection terminated"),
+            "Service temporarily unavailable, please retry"
+        );
+    }
 
     #[test]
     fn model_logs_discard_invalid_values_and_redact_keys() {

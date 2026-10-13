@@ -208,14 +208,14 @@ async fn compaction_failure_accounting_does_not_duplicate_warnings_or_invent_cre
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), 200);
+        assert_eq!(response.status(), 422);
         let trace = response.headers()["request-id"]
             .to_str()
             .unwrap()
             .to_owned();
         let response: Value = response.json().await.unwrap();
-        assert_eq!(response["content"][0]["type"], "compaction");
-        assert_eq!(response["content"][1]["text"], "main request completed");
+        assert_eq!(response["error"]["code"], "compaction_failed");
+        assert!(response.get("content").is_none());
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let stats = expect_ok(
@@ -373,7 +373,8 @@ async fn compaction_checkpoints_round_trip_without_another_summary() {
             ("python", true),
             ("claude", false),
         ] {
-            let before = summaries.load(Ordering::SeqCst);
+            let mut before = summaries.load(Ordering::SeqCst);
+            invalid_summary.store(fallback, Ordering::SeqCst);
             let mut request = json!({"model":"mapped-small","max_tokens":64,"stream":stream,
                 "messages":[{"role":"user","content":"earlier context ".repeat(70000)},
                     {"role":"assistant","content":"remember 4729"},{"role":"user","content":"continue"}]});
@@ -390,8 +391,30 @@ async fn compaction_checkpoints_round_trip_without_another_summary() {
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(response.status(), 200);
+            assert_eq!(
+                response.status(),
+                if fallback && !stream { 422 } else { 200 }
+            );
             let body = response.text().await.unwrap();
+            let body = if fallback {
+                assert!(body.contains("compaction_failed"), "{body}");
+                assert!(!body.contains("\"type\":\"compaction\""));
+                assert!(summaries.load(Ordering::SeqCst) > before);
+                before = summaries.load(Ordering::SeqCst);
+                invalid_summary.store(false, Ordering::SeqCst);
+                let recovered = client
+                    .post(format!("http://127.0.0.1:{port}/v1/messages"))
+                    .header("x-api-key", daemon.api_key.as_deref().unwrap())
+                    .header("user-agent", agent)
+                    .json(&request)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(recovered.status(), 200);
+                recovered.text().await.unwrap()
+            } else {
+                body
+            };
             let blocks = if stream {
                 accumulate(&body, kind)
             } else {
@@ -457,7 +480,7 @@ async fn compaction_checkpoints_round_trip_without_another_summary() {
         .iter()
         .filter(|log| log["path"] == "/internal/compact")
         .collect::<Vec<_>>();
-    assert_eq!(summaries.len(), 8);
+    assert_eq!(summaries.len(), 12);
     assert_eq!(
         summaries
             .iter()

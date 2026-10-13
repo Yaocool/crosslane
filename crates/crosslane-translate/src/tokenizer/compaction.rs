@@ -19,12 +19,25 @@ impl TokenCountCache {
     /// assigned to a part; exceeding a bound returns an error, never a prefix.
     pub async fn partition_compaction_summary(
         &self,
+        payload: KiroPayload,
+        maximum: usize,
+    ) -> Result<Vec<KiroPayload>, String> {
+        self.partition_compaction_summary_with_limits(payload, maximum, usize::MAX)
+            .await
+    }
+
+    /// Enforce serialized bytes as well as estimated tokens before dispatch.
+    pub async fn partition_compaction_summary_with_limits(
+        &self,
         mut payload: KiroPayload,
         maximum: usize,
+        maximum_bytes: usize,
     ) -> Result<Vec<KiroPayload>, String> {
         let mut normalized = payload.clone();
         sanitize_kiro_tool_history(&mut normalized);
-        if self.estimate_kiro_payload(&normalized).await? <= maximum {
+        if self.estimate_kiro_payload(&normalized).await? <= maximum
+            && payload_bytes(&normalized)? <= maximum_bytes
+        {
             return Ok(vec![normalized]);
         }
         payload
@@ -38,7 +51,9 @@ impl TokenCountCache {
         let mut parts = Vec::new();
         let mut part = payload.clone();
         let base_tokens = self.estimate_kiro_payload(&payload).await?;
+        let base_bytes = payload_bytes(&payload)?;
         let mut part_tokens = base_tokens;
+        let mut part_bytes = base_bytes;
         while let Some(message) = pending.pop_front() {
             // Count each record once, including its worst-case alternating-role
             // framing. Recounting the entire growing chunk is quadratic for
@@ -50,11 +65,17 @@ impl TokenCountCache {
                 .estimate_kiro_payload(&candidate)
                 .await?
                 .saturating_sub(base_tokens);
-            if part_tokens.saturating_add(message_tokens) <= maximum {
+            let message_bytes = payload_bytes(&candidate)?
+                .saturating_sub(base_bytes)
+                .saturating_add(16);
+            if part_tokens.saturating_add(message_tokens) <= maximum
+                && part_bytes.saturating_add(message_bytes) <= maximum_bytes
+            {
                 // Keep the unnormalized records while packing so synthesized
                 // role placeholders do not accumulate between attempts.
                 part.conversation_state.history.push(message);
                 part_tokens = part_tokens.saturating_add(message_tokens);
+                part_bytes = part_bytes.saturating_add(message_bytes);
                 continue;
             }
             if !part.conversation_state.history.is_empty() {
@@ -65,6 +86,7 @@ impl TokenCountCache {
                 }
                 part = payload.clone();
                 part_tokens = base_tokens;
+                part_bytes = base_bytes;
                 pending.push_front(message);
                 continue;
             }
@@ -74,10 +96,14 @@ impl TokenCountCache {
             let mut overhead = payload.clone();
             overhead.conversation_state.history.push(empty_message);
             sanitize_kiro_tool_history(&mut overhead);
+            let overhead_bytes = payload_bytes(&overhead)?;
             let overhead = self.estimate_kiro_payload(&overhead).await?;
             // Also leave room for independently encoded fragment boundaries.
             let budget = maximum.saturating_sub(overhead).saturating_sub(32);
-            if budget < 32 {
+            let byte_budget = maximum_bytes
+                .saturating_sub(overhead_bytes)
+                .saturating_sub(32);
+            if budget < 32 || byte_budget < 32 {
                 return Err(
                     "summary instructions or an indivisible document exceed its model window"
                         .into(),
@@ -85,7 +111,9 @@ impl TokenCountCache {
             }
             let mut template = message;
             let content = std::mem::take(history_text_mut(&mut template)?);
-            let fragments = self.split_summary_text(content, budget).await?;
+            let fragments = self
+                .split_summary_text_with_limits(content, budget, byte_budget)
+                .await?;
             if fragments.len() < 2 {
                 return Err("summary message cannot fit its model window".into());
             }
@@ -114,7 +142,9 @@ impl TokenCountCache {
         let count = parts.len();
         let output_budget = payload.max_output_tokens().unwrap_or(1024);
         for (index, part) in parts.iter_mut().enumerate() {
-            if self.estimate_kiro_payload(part).await? > maximum {
+            if self.estimate_kiro_payload(part).await? > maximum
+                || payload_bytes(part)? > maximum_bytes
+            {
                 return Err("normalized summary part exceeds its model window".into());
             }
             part.conversation_state.conversation_id = format!(
@@ -129,10 +159,21 @@ impl TokenCountCache {
         Ok(parts)
     }
 
+    #[cfg(test)]
     async fn split_summary_text(
         &self,
         text: String,
         maximum: usize,
+    ) -> Result<Vec<String>, String> {
+        self.split_summary_text_with_limits(text, maximum, usize::MAX)
+            .await
+    }
+
+    async fn split_summary_text_with_limits(
+        &self,
+        text: String,
+        maximum: usize,
+        maximum_bytes: usize,
     ) -> Result<Vec<String>, String> {
         let tokenizer = Arc::clone(&self.tokenizer);
         tokio::task::spawn_blocking(move || {
@@ -150,6 +191,16 @@ impl TokenCountCache {
                     }
                     if let Ok(fragment) = tokenizer.decode(tokens[start..end].to_vec()) {
                         let estimate = estimated_text_tokens(&tokenizer, &fragment);
+                        let bytes = serde_json::to_vec(&fragment)
+                            .map_err(|error| error.to_string())?
+                            .len()
+                            .saturating_sub(2);
+                        if bytes > maximum_bytes {
+                            end = start
+                                + ((end - start).saturating_mul(maximum_bytes) / bytes)
+                                    .min(end - start - 1);
+                            continue;
+                        }
                         if estimate <= maximum {
                             break fragment;
                         }
@@ -168,6 +219,12 @@ impl TokenCountCache {
     }
 }
 
+fn payload_bytes(payload: &KiroPayload) -> Result<usize, String> {
+    serde_json::to_vec(payload)
+        .map(|bytes| bytes.len())
+        .map_err(|error| error.to_string())
+}
+
 fn history_text_mut(message: &mut KiroHistoryMessage) -> Result<&mut String, String> {
     if let Some(user) = &mut message.user_input_message {
         return Ok(&mut user.content);
@@ -182,6 +239,57 @@ fn history_text_mut(message: &mut KiroHistoryMessage) -> Result<&mut String, Str
 mod tests {
     use super::*;
     use crate::{claude_to_kiro, compaction_summary_payload, ClaudeRequest, TranslationOptions};
+
+    #[tokio::test]
+    async fn oversized_current_source_is_partitioned_once_with_byte_and_token_limits() {
+        let cache = TokenCountCache::new(16).unwrap();
+        let current = format!("CURRENT_EARLY=alpha\n{}CURRENT_MIDDLE=beta; parameter=77 replaces 42\n{}CURRENT_LATE=gamma", " ".repeat(12_000), " log 雪🦀\n".repeat(400));
+        let request: ClaudeRequest = serde_json::from_value(serde_json::json!({
+            "model":"source", "max_tokens":64,
+            "messages":[{"role":"user","content":"OLD_FACT=anchor; parameter=42"},
+                {"role":"assistant","content":"ack"}, {"role":"user","content":current}]
+        }))
+        .unwrap();
+        let source = claude_to_kiro(&request, &TranslationOptions::new("target", "AI_EDITOR"));
+        let plan = cache
+            .plan_kiro_compaction(&source, 6000, 0)
+            .await
+            .unwrap()
+            .unwrap();
+        let summary = compaction_summary_payload(&source, &plan, "target");
+        let expected = summary
+            .conversation_state
+            .history
+            .iter()
+            .filter_map(|m| m.user_input_message.as_ref())
+            .map(|m| m.content.as_str())
+            .collect::<String>();
+        let parts = cache
+            .partition_compaction_summary_with_limits(summary, 6000, 6000)
+            .await
+            .unwrap();
+        assert!(parts.len() > 1);
+        let mut actual = String::new();
+        for part in parts {
+            assert!(cache.estimate_kiro_payload(&part).await.unwrap() <= 6000);
+            assert!(payload_bytes(&part).unwrap() <= 6000);
+            let instruction = &part
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content;
+            assert!(!instruction.contains("CURRENT_MIDDLE"));
+            for user in part
+                .conversation_state
+                .history
+                .iter()
+                .filter_map(|m| m.user_input_message.as_ref())
+            {
+                actual.push_str(&user.content);
+            }
+        }
+        assert_eq!(actual, expected);
+    }
 
     #[tokio::test]
     async fn partitions_preserve_every_character_and_stay_within_the_window() {
@@ -205,12 +313,13 @@ mod tests {
             .unwrap()
             .unwrap();
         let summary = compaction_summary_payload(&source, &plan, "target");
-        let expected = summary.conversation_state.history[0]
-            .user_input_message
-            .as_ref()
-            .unwrap()
-            .content
-            .clone();
+        let expected = summary
+            .conversation_state
+            .history
+            .iter()
+            .filter_map(|message| message.user_input_message.as_ref())
+            .map(|user| user.content.as_str())
+            .collect::<String>();
         let parts = cache
             .partition_compaction_summary(summary, 3000)
             .await

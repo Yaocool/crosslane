@@ -47,7 +47,7 @@ pub(in crate::http) async fn compact_history_for_limits(
         let mut candidate = payload.clone();
         let result = state
             .tokenizer
-            .compact_kiro_payload_with_limits(
+            .compact_kiro_payload_losslessly_with_limits(
                 &mut candidate,
                 usize::try_from(target).unwrap_or(usize::MAX),
                 maximum_bytes,
@@ -55,9 +55,8 @@ pub(in crate::http) async fn compact_history_for_limits(
             )
             .await;
         let mut stats = match result {
-            Ok(stats) if stats.removed_messages > 0 => stats,
-            Ok(_) => return Ok(None),
-            Err(error) if error.contains("local compaction did not reach target") => continue,
+            Ok(Some(stats)) if stats.removed_messages > 0 => stats,
+            Ok(_) => continue,
             Err(error) => return Err(error),
         };
         prepare_kiro_payload(&mut candidate, "compaction", "local budget recovery")
@@ -213,7 +212,7 @@ async fn generate_compaction_summary(
                             .to_owned()
                             .into())
                     } else {
-                        generate_compaction_summary_inner(
+                        generate_compaction_summary_part(
                             state,
                             account_ids,
                             trace_id,
@@ -224,6 +223,8 @@ async fn generate_compaction_summary(
                             model,
                             payload,
                             cancel,
+                            summary_input_limit,
+                            deadline,
                         )
                         .await
                     };
@@ -394,6 +395,153 @@ async fn generate_compaction_summary(
         }
     }
     result
+}
+
+/// A discarded partial checkpoint can be retried because no source boundary
+/// has been published. Retry only this source part; keep successful siblings
+/// and settle every accepted attempt independently.
+#[allow(clippy::too_many_arguments)]
+async fn generate_compaction_summary_part(
+    state: &Arc<AppState>,
+    account_ids: &std::collections::HashSet<String>,
+    trace_id: &str,
+    client_context: &crosslane_core::client_context::ClientContext,
+    key_id: Option<&str>,
+    allowed_models: &[String],
+    service_id: Option<&str>,
+    summary_model: &str,
+    payload: KiroPayload,
+    cancel: CancellationToken,
+    input_limit: usize,
+    deadline: Instant,
+) -> Result<GeneratedCompactionSummary, CompactionSummaryFailure> {
+    let first = generate_compaction_summary_inner(
+        state,
+        account_ids,
+        trace_id,
+        client_context,
+        key_id,
+        allowed_models,
+        service_id,
+        summary_model,
+        payload.clone(),
+        cancel.clone(),
+    )
+    .await;
+    let failure = match first {
+        Ok(summary) => return Ok(summary),
+        Err(failure) => failure,
+    };
+    let transient = failure
+        .message
+        .to_ascii_lowercase()
+        .contains("service temporarily unavailable");
+    let incomplete = failure.message == "Kiro returned an unterminated <summary> block";
+    // Authentication, tools and cancellation must never trigger recovery.
+    // Small malformed outputs fail explicitly; a large source part that
+    // produces an incomplete wrapper may be split once without using any of
+    // that partial output. Upstream context rejection is handled separately.
+    if (!transient && !incomplete) || cancel.is_cancelled() || Instant::now() >= deadline {
+        return Err(failure);
+    }
+    let mut usage = failure.usage.unwrap_or(CompactionIterationUsage {
+        input_tokens: 0,
+        output_tokens: 0,
+    });
+    let input_tokens = state
+        .tokenizer
+        .estimate_kiro_payload(&payload)
+        .await
+        .map_err(|message| CompactionSummaryFailure {
+            message,
+            usage: Some(usage),
+        })?;
+    let retry_limit = input_limit / 2;
+    if incomplete && input_tokens <= retry_limit {
+        return Err(failure);
+    }
+    let parts = if retry_limit >= 1024 && input_tokens > retry_limit {
+        state
+            .tokenizer
+            .partition_compaction_summary_with_limits(
+                payload,
+                retry_limit,
+                state.config.current().context.max_upstream_payload_bytes,
+            )
+            .await
+            .map_err(|message| CompactionSummaryFailure {
+                message,
+                usage: Some(usage),
+            })?
+    } else {
+        vec![payload]
+    };
+    tracing::info!(
+        event = "proxy.compaction.summary_part_retry.started",
+        trace_id,
+        summary_model,
+        retry_reason = if incomplete {
+            "incomplete_large_summary"
+        } else {
+            "upstream_transient"
+        },
+        retry_part_count = parts.len(),
+        original_input_tokens = input_tokens,
+        summary_chunk_input_limit = retry_limit,
+        "retrying only a failed summary part from complete source, preserving successful siblings"
+    );
+    let mut summaries = Vec::with_capacity(parts.len());
+    // Sequential child dispatch preserves the parent's two-request concurrency
+    // ceiling and operation deadline. There is no recursive or second retry.
+    for part in parts {
+        if cancel.is_cancelled() || Instant::now() >= deadline {
+            return Err(CompactionSummaryFailure {
+                message: "Kiro compaction summary timed out during failed-part recovery".into(),
+                usage: Some(usage),
+            });
+        }
+        match generate_compaction_summary_inner(
+            state,
+            account_ids,
+            trace_id,
+            client_context,
+            key_id,
+            allowed_models,
+            service_id,
+            summary_model,
+            part,
+            cancel.clone(),
+        )
+        .await
+        {
+            Ok(summary) => {
+                usage.input_tokens = usage
+                    .input_tokens
+                    .saturating_add(summary.usage.input_tokens);
+                usage.output_tokens = usage
+                    .output_tokens
+                    .saturating_add(summary.usage.output_tokens);
+                summaries.push(summary.content);
+            }
+            Err(mut failure) => {
+                if let Some(part) = failure.usage {
+                    usage.input_tokens = usage.input_tokens.saturating_add(part.input_tokens);
+                    usage.output_tokens = usage.output_tokens.saturating_add(part.output_tokens);
+                }
+                failure.usage = Some(usage);
+                return Err(failure);
+            }
+        }
+    }
+    Ok(GeneratedCompactionSummary {
+        content: if summaries.len() == 1 {
+            summaries.remove(0)
+        } else {
+            ordered_compaction_summary_parts(&summaries)
+        },
+        deferred_parts: None,
+        usage,
+    })
 }
 
 fn ordered_compaction_summary_parts(summaries: &[String]) -> String {
@@ -768,6 +916,7 @@ async fn generate_compaction_summary_inner(
     drop(source);
     drop(upstream_permit);
     let received_output = produced_output(&decoded);
+    decoded.log_context_usage(trace_id, input_tokens);
     fill_missing_usage(state, &mut decoded, &payload).await;
     let parsed_summary = if let Some(error) = collection_error.clone() {
         Err(error)
@@ -861,8 +1010,8 @@ async fn generate_compaction_summary_inner(
         });
     }
     if let Err(error) = &parsed_summary {
-        // run_compaction already emitted the fallback warning (or will do so
-        // when this returns). Accounting is the same event's informational tail.
+        // The request boundary reports the failure. Accounting is that same
+        // event's informational tail, not a duplicate warning.
         tracing::info!(
             trace_id,
             account_id,
@@ -878,6 +1027,11 @@ async fn generate_compaction_summary_inner(
             canceled = cancel.is_cancelled(),
             duration_ms = started.elapsed().as_millis() as u64,
             reason = %sanitize_error_message(error),
+            failure_kind = if collection_error.is_some() { "upstream_stream" } else { "summary_validation" },
+            summary_output_bytes = decoded.text.len(),
+            summary_open_tag_count = decoded.text.matches("<summary>").count(),
+            summary_close_tag_count = decoded.text.matches("</summary>").count(),
+            summary_starts_with_open_tag = decoded.text.trim().starts_with("<summary>"),
             "Kiro semantic compaction summary failed after partial usage was accounted"
         );
     } else {
@@ -1008,68 +1162,20 @@ pub(super) fn upstream_overflow_compaction_decision(
 }
 
 fn conservative_summary_context_maximum(state: &Arc<AppState>, model: &str) -> u64 {
-    let context = &state.config.current().context;
-    let configured =
-        (f64::from(context.max_input_tokens) * context.compact_safe_input_ratio) as u64;
-    configured.max(1).min(context_maximum(state, true, model))
+    // Resolved model metadata is also authoritative for summaries. The global
+    // window is a fallback for unknown models, not a cap on a 1M model.
+    context_maximum(state, true, model).max(1)
 }
 
-async fn extractive_compaction(
-    state: &Arc<AppState>,
-    source_payload: &KiroPayload,
-    target_tokens: u64,
-    preserve_recent_turns: usize,
-    context_limit: Option<&CompactionDecision>,
-) -> Result<(KiroPayload, crosslane_translate::ContextCompactionStats), ApiError> {
-    let mut payload = source_payload.clone();
-    let compacted = state
-        .tokenizer
-        .compact_kiro_payload_with_limits(
-            &mut payload,
-            target_tokens as usize,
-            state.config.current().context.max_upstream_payload_bytes,
-            preserve_recent_turns,
-        )
-        .await;
-    let mut stats = match compacted {
-        Ok(stats) => stats,
-        Err(error)
-            if error.contains("local compaction did not reach target")
-                && context_limit.is_some() =>
-        {
-            let decision = context_limit.expect("checked above");
-            super::enforce_payload_budget(
-                state,
-                0,
-                super::serialized_payload_bytes(&payload, ErrorFormat::Claude)?,
-                0,
-                false,
-                ErrorFormat::Claude,
-            )?;
-            let actual = state
-                .tokenizer
-                .estimate_kiro_payload(&payload)
-                .await
-                .unwrap_or(decision.maximum_tokens as usize + 1) as u64;
-            return Err(upstream_error(
-                ExecuteError::ContextLimit(ContextLimitError {
-                    model: decision.model.clone(),
-                    input_tokens: actual.max(decision.maximum_tokens.saturating_add(1)),
-                    maximum: decision.maximum_tokens,
-                }),
-                ErrorFormat::Claude,
-            ));
-        }
-        Err(error) => {
-            return Err(ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                error,
-                ErrorFormat::Claude,
-            ));
-        }
-    };
-    finalize_compaction_payload(state, &mut payload, &mut stats, "extractive compaction").await?;
-    Ok((payload, stats))
+fn compaction_failure(reason: &str) -> ApiError {
+    let mut error = ApiError::new(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        format!("Compaction could not produce a complete checkpoint; original context was preserved. {}", sanitize_error_message(reason)),
+        ErrorFormat::Claude,
+    );
+    error.error_code = "compaction_failed";
+    error.error_stage = "compaction";
+    error
 }
 
 async fn finalize_compaction_payload(
@@ -1106,6 +1212,14 @@ pub(super) async fn compaction_operation_target(
 ) -> Result<u64, ApiError> {
     let mut minimum_payload = source_payload.clone();
     minimum_payload.retain_required_history();
+    super::enforce_payload_budget(
+        state,
+        0,
+        super::serialized_payload_bytes(&minimum_payload, ErrorFormat::Claude)?,
+        0,
+        false,
+        ErrorFormat::Claude,
+    )?;
     let minimum_tokens = state
         .tokenizer
         .estimate_kiro_payload(&minimum_payload)
@@ -1171,7 +1285,11 @@ pub(super) async fn run_compaction(
         .plan_kiro_compaction(
             source_payload,
             operation_target as usize,
-            preserve_recent_turns,
+            if explicit_client_compaction {
+                0
+            } else {
+                preserve_recent_turns
+            },
         )
         .await
         .map_err(|error| {
@@ -1228,32 +1346,23 @@ pub(super) async fn run_compaction(
                 ErrorFormat::Claude,
             )
         })? as u64;
-    let summary_parts = state
-        .tokenizer
-        .partition_compaction_summary(summary_payload, summary_chunk_input_limit as usize)
-        .await;
-    // Token limits alone do not bound JSON bytes (whitespace and attachments
-    // are typical counterexamples). Never dispatch an oversized summary part.
-    let summary_parts = summary_parts.and_then(|parts| {
-        let maximum = state.config.current().context.max_upstream_payload_bytes;
-        for part in &parts {
-            if super::serialized_payload_bytes(part, ErrorFormat::Claude)
-                .map_err(|error| error.message)?
-                > maximum
-            {
-                return Err("summary input exceeds the upstream payload byte budget".into());
-            }
-        }
-        Ok(parts)
-    });
-    let mut fallback_reason = None;
-    let mut semantic_summary = None;
-    let mut iteration_usage = None;
-    if let Ok(summary_parts) = summary_parts {
+    let mut summary_chunk_input_limit = summary_chunk_input_limit;
+    let mut previous_usage = CompactionIterationUsage {
+        input_tokens: 0,
+        output_tokens: 0,
+    };
+    let mut attempts = 0u8;
+    let mut generated = loop {
+        let summary_parts = state.tokenizer.partition_compaction_summary_with_limits(
+            summary_payload.clone(), summary_chunk_input_limit as usize,
+            state.config.current().context.max_upstream_payload_bytes,
+        ).await.map_err(|reason| {
+            tracing::warn!(trace_id, summary_model, summary_input_tokens, summary_context_maximum,
+                reason = %sanitize_error_message(&reason),
+                "complete summary input cannot fit its bounds; original context preserved");
+            compaction_failure(&reason)
+        })?;
         let summary_chunk_count = summary_parts.len();
-        let summary_concurrency = compaction_summary_concurrency(state);
-        let client_requested = explicit_client_compaction
-            || decision.reasons.contains(&CompactionReason::ClientTrigger);
         tracing::info!(
             trace_id,
             summary_model,
@@ -1261,70 +1370,73 @@ pub(super) async fn run_compaction(
             summary_context_maximum,
             summary_chunk_input_limit,
             summary_chunk_count,
-            summary_concurrency,
+            summary_concurrency = compaction_summary_concurrency(state),
             "complete compaction summary input partitioned within its model window"
         );
-        if summary_chunk_count > summary_concurrency && !client_requested {
-            // Each near-window-sized part can consume most of the one global
-            // deadline. Starting multiple waves makes timeout-and-discard the
-            // expected result and also burns upstream capacity for no usable
-            // checkpoint during automatic overflow recovery. Explicit client
-            // compaction still requests semantic work and retains its contract.
-            fallback_reason = Some("summary_multiple_waves");
-            tracing::info!(
-                trace_id,
-                summary_model,
-                summary_chunk_count,
-                summary_concurrency,
-                summary_timeout_ms,
-                "automatic semantic compaction needs multiple dispatch waves; using extractive fallback"
-            );
-        } else {
-            match generate_compaction_summary(
-                state,
-                Arc::clone(&account_ids),
-                trace_id,
-                &client_context.cloned().unwrap_or_default(),
-                key_id,
-                allowed_models,
-                service_id,
-                summary_model,
-                summary_parts,
-                plan.summary_max_tokens(),
-                summary_chunk_input_limit as usize,
-                explicit_client_compaction,
-                summary_timeout_ms,
-            )
-            .await
-            {
-                Ok(summary) => semantic_summary = Some(summary),
-                Err(error) => {
-                    iteration_usage = error.usage;
-                    fallback_reason = Some(if error.message.contains("timed out") {
-                        "summary_timeout"
-                    } else {
-                        "summary_upstream_error"
-                    });
-                    tracing::warn!(
-                        trace_id,
-                        reason = %sanitize_error_message(&error.message),
-                        "semantic compaction request failed; using extractive fallback"
-                    );
+        let remaining_ms =
+            summary_timeout_ms.saturating_sub(summary_started.elapsed().as_millis() as u64);
+        if remaining_ms == 0 {
+            return Err(compaction_failure("summary operation deadline expired"));
+        }
+        let result = generate_compaction_summary(
+            state,
+            Arc::clone(&account_ids),
+            trace_id,
+            &client_context.cloned().unwrap_or_default(),
+            key_id,
+            allowed_models,
+            service_id,
+            summary_model,
+            summary_parts,
+            plan.summary_max_tokens(),
+            summary_chunk_input_limit as usize,
+            explicit_client_compaction,
+            remaining_ms,
+        )
+        .await;
+        match result {
+            Ok(mut summary) => {
+                summary.usage.input_tokens = summary
+                    .usage
+                    .input_tokens
+                    .saturating_add(previous_usage.input_tokens);
+                summary.usage.output_tokens = summary
+                    .usage
+                    .output_tokens
+                    .saturating_add(previous_usage.output_tokens);
+                break summary;
+            }
+            Err(failure) => {
+                if let Some(usage) = failure.usage {
+                    previous_usage.input_tokens = previous_usage
+                        .input_tokens
+                        .saturating_add(usage.input_tokens);
+                    previous_usage.output_tokens = previous_usage
+                        .output_tokens
+                        .saturating_add(usage.output_tokens);
                 }
+                if attempts == 0 && super::is_context_length_error(&failure.message) {
+                    // Kiro's native tokenizer/request constraints can differ
+                    // from the catalog and local estimator. Repartition the
+                    // original source once, without clipping any characters or
+                    // resetting the operation deadline or accounting.
+                    attempts += 1;
+                    summary_chunk_input_limit = (summary_chunk_input_limit / 2).max(1);
+                    tracing::warn!(trace_id, summary_model, summary_chunk_input_limit,
+                        reason = %sanitize_error_message(&failure.message),
+                        "upstream rejected summary input; retrying complete source with smaller parts");
+                    continue;
+                }
+                tracing::debug!(trace_id, reason = %sanitize_error_message(&failure.message),
+                    "complete semantic compaction failed; original context preserved");
+                return Err(compaction_failure(&failure.message));
             }
         }
-    } else if let Err(reason) = summary_parts {
-        fallback_reason = Some("summary_capacity_insufficient");
-        tracing::warn!(
-            trace_id, summary_model, summary_input_tokens, summary_context_maximum,
-            reason = %sanitize_error_message(&reason),
-            "semantic compaction summary cannot fit its bounds; using extractive fallback"
-        );
-    }
+    };
+    let mut failure_reason: String;
 
-    if let Some(mut generated) = semantic_summary {
+    {
         loop {
-            iteration_usage = Some(generated.usage);
             let mut payload = source_payload.clone();
             let apply_started = Instant::now();
             let applied = if generated.deferred_parts.is_some() {
@@ -1388,20 +1500,20 @@ pub(super) async fn run_compaction(
                             iteration_usage: Some(generated.usage),
                         });
                     }
-                    fallback_reason = Some("semantic_target_not_reached_after_tool_history_repair");
+                    failure_reason = "complete semantic checkpoint exceeds the target after tool-history preparation".to_owned();
                     tracing::warn!(
                     trace_id,
                     compacted_tokens = stats.compacted_tokens,
                     target_tokens = operation_target,
-                    "semantic compaction exceeded the target after tool-history preparation; using extractive fallback"
+                    "semantic compaction exceeded the target after tool-history preparation; original context preserved"
                 );
                 }
                 Err(error) => {
-                    fallback_reason = Some("semantic_target_not_reached");
+                    failure_reason = error.clone();
                     tracing::warn!(
                         trace_id,
                         reason = %sanitize_error_message(&error),
-                        "semantic compaction could not satisfy the target; using extractive fallback"
+                        "semantic compaction could not satisfy the target; original context preserved"
                     );
                 }
             }
@@ -1422,47 +1534,16 @@ pub(super) async fn run_compaction(
             {
                 Ok(summary) => generated = summary,
                 Err(error) => {
-                    iteration_usage = error.usage;
+                    failure_reason = error.message.clone();
                     tracing::warn!(trace_id, reason = %sanitize_error_message(&error.message),
-                    "complete source checkpoints could not be consolidated; using extractive fallback");
+                    "complete source checkpoints could not be consolidated; original context preserved");
                     break;
                 }
             }
         }
     }
 
-    let (payload, stats) = extractive_compaction(
-        state,
-        source_payload,
-        operation_target,
-        preserve_recent_turns,
-        Some(decision),
-    )
-    .await?;
-    if stats.compacted_tokens as u64 > decision.maximum_tokens {
-        return Err(upstream_error(
-            ExecuteError::ContextLimit(ContextLimitError {
-                model: decision.model.clone(),
-                input_tokens: stats.compacted_tokens as u64,
-                maximum: decision.maximum_tokens,
-            }),
-            ErrorFormat::Claude,
-        ));
-    }
-    Ok(CompactionRun {
-        payload,
-        stats,
-        artifact: Some(CompactionArtifact::Extractive {
-            source_payload: source_payload.clone(),
-            preserve_recent_turns,
-            usage: iteration_usage,
-        }),
-        mode: "extractive_fallback",
-        summary_model: Some(summary_model.to_owned()),
-        summary_input_tokens: Some(summary_input_tokens),
-        fallback_reason,
-        iteration_usage,
-    })
+    Err(compaction_failure(&failure_reason))
 }
 
 pub(super) async fn reapply_compaction(
@@ -1471,10 +1552,7 @@ pub(super) async fn reapply_compaction(
     decision: &CompactionDecision,
     request: Option<&CompactionRequest<'_>>,
 ) -> Result<CompactionRun, ApiError> {
-    let source_payload = match artifact {
-        CompactionArtifact::Semantic { source_payload, .. }
-        | CompactionArtifact::Extractive { source_payload, .. } => source_payload,
-    };
+    let CompactionArtifact::Semantic { source_payload, .. } = artifact;
     let operation_target = compaction_operation_target(state, source_payload, decision).await?;
     if let CompactionArtifact::Semantic {
         plan,
@@ -1593,19 +1671,8 @@ pub(super) async fn reapply_compaction(
             }
             Err(error) => {
                 tracing::warn!(trace_id = request.trace_id, reason = %sanitize_error_message(&error.message),
-                    "resolved complete checkpoints could not be consolidated; using extractive fallback");
-                let artifact = CompactionArtifact::Extractive {
-                    source_payload: source_payload.clone(),
-                    preserve_recent_turns: request.preserve_recent_turns,
-                    usage: error.usage,
-                };
-                return Box::pin(reapply_compaction(
-                    state,
-                    &artifact,
-                    decision,
-                    Some(request),
-                ))
-                .await;
+                    "resolved complete checkpoints could not be consolidated; original context preserved");
+                return Err(compaction_failure(&error.message));
             }
         }
     }
@@ -1699,21 +1766,6 @@ pub(super) async fn reapply_compaction(
             )
             .await?;
             (payload, stats, "semantic", Some(*usage))
-        }
-        CompactionArtifact::Extractive {
-            source_payload,
-            preserve_recent_turns,
-            usage,
-        } => {
-            let (payload, stats) = extractive_compaction(
-                state,
-                source_payload,
-                operation_target,
-                *preserve_recent_turns,
-                Some(decision),
-            )
-            .await?;
-            (payload, stats, "extractive_fallback", *usage)
         }
     };
     if stats.compacted_tokens as u64 > decision.maximum_tokens {

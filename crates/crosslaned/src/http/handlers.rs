@@ -306,11 +306,6 @@ enum CompactionArtifact {
         summary_deadline: Option<Instant>,
         usage: CompactionIterationUsage,
     },
-    Extractive {
-        source_payload: KiroPayload,
-        preserve_recent_turns: usize,
-        usage: Option<CompactionIterationUsage>,
-    },
 }
 
 struct CompactionRun {
@@ -2540,9 +2535,18 @@ impl ApiError {
         // Diagnostics are best-effort and must never replace the original
         // context error if the tokenizer worker is unavailable.
         if let Ok(tokens) = state.tokenizer.context_token_breakdown(payload).await {
+            let overflow_scope = if tokens.minimum_input_tokens <= maximum_input_tokens {
+                "history"
+            } else if tokens.current_message_tokens > maximum_input_tokens {
+                "current_message"
+            } else {
+                "required_context"
+            }
+            .to_owned();
             self.context_overflow = Some(Box::new(crate::stats::ContextOverflowDiagnostics {
                 tokens,
                 maximum_input_tokens,
+                overflow_scope,
             }));
         }
         self
@@ -2560,6 +2564,9 @@ impl IntoResponse for ApiError {
         );
         if let Some(context) = &self.context_overflow {
             envelope["error"]["context"] = json!(context);
+            if context.tokens.minimum_input_tokens > context.maximum_input_tokens {
+                envelope["error"]["hint"] = json!("Reduce or split the current input, paginate tool results, or shorten required system/tool content. Compacting older history cannot make this input fit.");
+            }
         }
         #[cfg(feature = "crs")]
         if self.format == ErrorFormat::Claude {

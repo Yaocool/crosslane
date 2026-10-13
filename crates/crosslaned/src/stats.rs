@@ -37,6 +37,8 @@ pub struct ContextOverflowDiagnostics {
     #[serde(flatten)]
     pub tokens: crosslane_translate::ContextTokenBreakdown,
     pub maximum_input_tokens: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub overflow_scope: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
