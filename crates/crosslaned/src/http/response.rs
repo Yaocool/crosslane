@@ -36,6 +36,8 @@ pub struct DecodedResponse {
     /// Latest local checkpoint produced while resolving server tools.
     pub automatic_compaction: Option<crosslane_translate::ContextCompactionStats>,
     pub usage: UsageInfo,
+    pub upstream_input_tokens: Option<u64>,
+    pub upstream_context_usage_percentage: Option<f64>,
     /// Explicit Claude stop reason for proxy-managed server loops (for example
     /// `pause_turn`). When absent the ordinary tool/max/end inference applies.
     pub stop_reason: Option<String>,
@@ -44,6 +46,19 @@ pub struct DecodedResponse {
 }
 
 impl DecodedResponse {
+    pub fn log_context_usage(&self, trace_id: &str, estimated_input_tokens: u64) {
+        if self.upstream_input_tokens.is_some() || self.upstream_context_usage_percentage.is_some()
+        {
+            tracing::info!(
+                event = "proxy.upstream.context_usage",
+                trace_id,
+                estimated_input_tokens,
+                upstream_input_tokens = self.upstream_input_tokens,
+                upstream_context_usage_percentage = self.upstream_context_usage_percentage,
+                "upstream context accounting observed independently of local token estimates"
+            );
+        }
+    }
     /// Removes buffered tool calls matching `predicate` in their stable map order.
     pub fn take_tool_uses_where(
         &mut self,
@@ -1089,10 +1104,25 @@ impl DecodedResponse {
                 tool.complete |= stop;
             }
             KiroEvent::MessageMetadata { usage } | KiroEvent::Usage { usage } => {
-                merge_usage(&mut self.usage, &usage)
+                merge_usage(&mut self.usage, &usage);
+                if self.usage.input_tokens > 0 {
+                    self.upstream_input_tokens = Some(self.usage.input_tokens);
+                }
             }
             KiroEvent::Error { message, .. } => return Err(message),
-            KiroEvent::Other { .. } => {}
+            KiroEvent::Other {
+                event_type,
+                payload,
+            } => {
+                if event_type == "contextUsageEvent" {
+                    let body = payload.get("contextUsageEvent").unwrap_or(&payload);
+                    self.upstream_context_usage_percentage = body
+                        .get("contextUsagePercentage")
+                        .or_else(|| body.get("percentage"))
+                        .and_then(Value::as_f64)
+                        .filter(|value| value.is_finite() && *value >= 0.0);
+                }
+            }
         }
         Ok(())
     }

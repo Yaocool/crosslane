@@ -238,13 +238,16 @@ pub(super) async fn collect_nonstream_rounds(
         .count() as u32;
     loop {
         let effective_thinking = thinking_enabled && upstream.thinking_enabled();
-        let (endpoint_definition, response, _upstream_permit) = upstream.into_parts();
+        let (endpoint_definition, response, upstream_permit) = upstream.into_parts();
         let endpoint = endpoint_definition.name.to_string();
         let events = state
             .kiro()
             .collect_events(response)
             .await
             .map_err(ExecuteError::Upstream)?;
+        // The collected body has reached EOF. Free its connection slot before
+        // an empty-response retry or server-tool continuation opens another one.
+        drop(upstream_permit);
         let event_count = events.len();
         let mut leak_filter =
             ToolLeakFilter::for_payload(config.features.enable_tool_leak_filter, &payload);
@@ -308,6 +311,14 @@ pub(super) async fn collect_nonstream_rounds(
                 })
             })?;
         }
+        decoded.log_context_usage(
+            trace_id,
+            state
+                .tokenizer
+                .estimate_kiro_payload(&payload)
+                .await
+                .unwrap_or(0) as u64,
+        );
         fill_missing_usage(state, &mut decoded, &payload).await;
         if decoded.stop_sequence.is_some() {
             accumulated_text.push_str(&decoded.text);
@@ -343,7 +354,7 @@ pub(super) async fn collect_nonstream_rounds(
                     account_id = %lease.account_id(),
                     endpoint,
                     retry = empty_tool_result_retries,
-                    "upstream returned an empty assistant turn after tool results; retrying"
+                    "upstream returned no assistant output; retrying once"
                 );
                 merge_round_usage(&mut accumulated_usage, &decoded.usage);
                 decoded = DecodedResponse::default();
@@ -358,7 +369,7 @@ pub(super) async fn collect_nonstream_rounds(
                     &mut payload,
                     compact,
                     &endpoint,
-                    "empty tool-result retry",
+                    "empty assistant retry",
                     tool_search.is_some(),
                 )
                 .await
@@ -386,13 +397,12 @@ pub(super) async fn collect_nonstream_rounds(
                     trace_id,
                     account_id = %lease.account_id(),
                     endpoint,
-                    "upstream repeated an empty assistant turn after tool results"
+                    "upstream repeated an empty assistant turn"
                 );
                 return Err(ExecuteError::Upstream(KiroError {
                     status: None,
                     endpoint,
-                    message: "upstream returned no assistant text or tool call after tool results"
-                        .into(),
+                    message: "upstream returned no assistant output after a bounded retry".into(),
                 }));
             }
         }

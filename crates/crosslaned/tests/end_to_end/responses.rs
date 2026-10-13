@@ -631,7 +631,7 @@ async fn responses_fail_after_repeated_empty_tool_result_turns() {
             );
         } else {
             assert_eq!(status, reqwest::StatusCode::BAD_GATEWAY, "{body}");
-            assert!(body.contains("no assistant text or tool call"), "{body}");
+            assert!(body.contains("no assistant output"), "{body}");
         }
     }
 

@@ -79,19 +79,22 @@ pub(super) fn current_message_has_tool_results(payload: &KiroPayload) -> bool {
         .is_some_and(|context| !context.tool_results.is_empty())
 }
 
-/// A successful transport response is not a valid assistant continuation when
-/// it follows tool output but contains neither client-visible text nor another
-/// tool call. Retrying once avoids falsely completing Codex tasks on a known
-/// transient Kiro response while keeping the failure bounded.
+/// A transport success without any assistant output is not a completed turn.
+/// Tool continuations additionally require text, a tool call, or a terminal
+/// reason; ordinary reasoning-only output remains valid and is never replayed.
 pub(super) fn empty_tool_result_disposition(
     payload: &KiroPayload,
     decoded: &DecodedResponse,
     output_exhausted: bool,
     retries: u8,
 ) -> EmptyToolResultDisposition {
-    let invalid_empty_continuation = current_message_has_tool_results(payload)
-        && decoded.text.trim().is_empty()
+    let invalid_empty_continuation = decoded.text.trim().is_empty()
         && decoded.tools.is_empty()
+        && ((decoded.reasoning.trim().is_empty()
+            && decoded.reasoning_signature.is_none()
+            && decoded.redacted_thinking.is_empty()
+            && decoded.citations.is_empty())
+            || current_message_has_tool_results(payload))
         && decoded.stop_reason.is_none()
         && decoded.stop_sequence.is_none()
         && !output_exhausted;

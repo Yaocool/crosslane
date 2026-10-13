@@ -15,19 +15,19 @@ use super::{
     StreamProtocol, ThinkingContentFilter, ToolLeakFilter, UpstreamStreamMetrics, Value,
 };
 
-/// Keep hollow reasoning-only continuations retryable without delaying valid
-/// visible text until EOF. Returning the whole prefix preserves event order.
+/// Keep empty attempts retryable without delaying valid visible output until
+/// EOF. Returning the whole prefix preserves event order.
 fn guard_tool_result_output(
     guarded: &mut bool,
     buffered: &mut Vec<String>,
-    confirms_valid_text: bool,
+    confirms_valid_output: bool,
     output: Vec<String>,
 ) -> Vec<String> {
     if !*guarded {
         return output;
     }
     buffered.extend(output);
-    if confirms_valid_text {
+    if confirms_valid_output {
         *guarded = false;
         std::mem::take(buffered)
     } else {
@@ -175,7 +175,11 @@ pub fn response(
             // until it contains visible text, another tool call, or a terminal
             // reason. Buffer reasoning-only attempts, but release the guard as
             // soon as valid text appears so successful turns remain streaming.
-            let mut guards_tool_result_round = current_message_has_tool_results(&payload);
+            let tool_result_round = current_message_has_tool_results(&payload);
+            // Hold a compaction prelude until this attempt produces valid
+            // output. Empty ordinary attempts can then retry without emitting
+            // duplicate boundaries or assistant blocks.
+            let mut guards_tool_result_round = true;
             let mut guarded_output = Vec::new();
             let mut claude_checkpoint = guards_tool_result_round.then(|| claude.clone());
             let mut pending_initial_checkpoint =
@@ -276,7 +280,11 @@ pub fn response(
                                                         &context.openai_tools,
                                                     )
                                                 }) {
-                                                    let confirms_valid_text = matches!(visible_event, KiroEvent::AssistantResponse { content } if !content.trim().is_empty());
+                                                    // Unbuffered ordinary tool arguments are already
+                                                    // client-visible output and must keep streaming.
+                                                    let confirms_valid_output = matches!(visible_event, KiroEvent::AssistantResponse { content } if !content.trim().is_empty())
+                                                        || (!tool_result_round && (matches!(visible_event, KiroEvent::Reasoning { content, .. } if !content.trim().is_empty())
+                                                            || matches!(visible_event, KiroEvent::ToolUse { .. })));
                                                     let output = stream_event(
                                                         &protocol,
                                                         &mut claude,
@@ -292,7 +300,7 @@ pub fn response(
                                                     );
                                                     let output = guard_tool_result_output(
                                                         &mut guards_tool_result_round, &mut guarded_output,
-                                                        confirms_valid_text, output,
+                                                        confirms_valid_output, output,
                                                     );
                                                     data_started |= !output.is_empty();
                                                     for data in output {
@@ -429,7 +437,9 @@ pub fn response(
                                 &context.openai_tools,
                             )
                         }) {
-                            let confirms_valid_text = matches!(visible_event, KiroEvent::AssistantResponse { content } if !content.trim().is_empty());
+                            let confirms_valid_output = matches!(visible_event, KiroEvent::AssistantResponse { content } if !content.trim().is_empty())
+                                || (!tool_result_round && (matches!(visible_event, KiroEvent::Reasoning { content, .. } if !content.trim().is_empty())
+                                    || matches!(visible_event, KiroEvent::ToolUse { .. })));
                             let output = stream_event(
                                 &protocol,
                                 &mut claude,
@@ -442,7 +452,7 @@ pub fn response(
                             let output = prepend_pending_initial(&mut pending_initial, output);
                             let output = guard_tool_result_output(
                                 &mut guards_tool_result_round, &mut guarded_output,
-                                confirms_valid_text, output,
+                                confirms_valid_output, output,
                             );
                             data_started |= !output.is_empty();
                             for data in output {
@@ -1007,6 +1017,7 @@ pub fn response(
                     }
                 }
             }
+            decoded.log_context_usage(&context.trace_id, context.input_tokens);
             fill_missing_usage(&context.state, &mut decoded, &payload).await;
             if stop_filter.matched().is_some() {
                 for data in std::mem::take(&mut guarded_output) {
@@ -1047,7 +1058,7 @@ pub fn response(
                         account_id = %context.lease.account_id(),
                         endpoint,
                         retry = empty_tool_result_retries,
-                        "upstream returned an empty assistant turn after tool results; retrying"
+                        "upstream returned no assistant output; retrying once"
                     );
                     accumulate_usage(&mut accumulated_usage, &decoded.usage);
                     decoded = DecodedResponse::default();
@@ -1063,7 +1074,7 @@ pub fn response(
                         &mut payload,
                         context.compact,
                         &endpoint,
-                        "empty tool-result retry",
+                        "empty assistant retry",
                         context.tool_search.is_some(),
                     )
                     .await
@@ -1145,14 +1156,14 @@ pub fn response(
                         pending_initial = checkpoint;
                     }
                     let message =
-                        "upstream returned no assistant text or tool call after tool results";
+                        "upstream returned no assistant output after a bounded retry";
                     tracing::error!(
                         trace_id = %context.trace_id,
                         request_id = %context.request_id,
                         user_agent = %context.user_agent,
                         account_id = %context.lease.account_id(),
                         endpoint,
-                        "upstream repeated an empty assistant turn after tool results"
+                        "upstream repeated an empty assistant turn"
                     );
                     failed = Some(message.into());
                     yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(

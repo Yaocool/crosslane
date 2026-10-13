@@ -22,6 +22,10 @@ impl DelayedUpstream {
     }
 
     async fn start_with_failed_tail(fail_tail: bool) -> Self {
+        Self::start_with_output_prefix(fail_tail, false).await
+    }
+
+    async fn start_with_output_prefix(fail_tail: bool, tool_call: bool) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!(
             "http://{}/generateAssistantResponse",
@@ -42,13 +46,23 @@ impl DelayedUpstream {
                 async move {
                     count.fetch_add(1, Ordering::SeqCst);
                     let stream = async_stream::stream! {
-                        yield Ok::<_, Infallible>(Bytes::from(event_stream_frame(
-                            "assistantResponseEvent", json!({"content":"Visible answer begins now. "}),
-                        )));
+                        let first = if tool_call {
+                            event_stream_frame("toolUseEvent", json!({
+                                "toolUseId":"call_read", "name":"read_file",
+                                "input":"{\"path\":\"", "stop":false
+                            }))
+                        } else {
+                            event_stream_frame("assistantResponseEvent", json!({"content":"Visible answer begins now. "}))
+                        };
+                        yield Ok::<_, Infallible>(Bytes::from(first));
                         gate.notified().await;
                         done.store(true, Ordering::SeqCst);
                         let tail = if fail_tail { vec![0,0,0,32,0,0,0,0] }
-                            else { generation_body("And ends here.") };
+                            else if tool_call {
+                                event_stream_frame("toolUseEvent", json!({
+                                    "toolUseId":"call_read", "input":"README.md\"}", "stop":true
+                                }))
+                            } else { generation_body("And ends here.") };
                         yield Ok::<_, Infallible>(Bytes::from(tail));
                     };
                     ([("content-type", "application/vnd.amazon.eventstream")], Body::from_stream(stream)).into_response()
@@ -291,6 +305,106 @@ async fn latency_tool_result_stream_releases_valid_text_before_upstream_eof() {
 #[tokio::test]
 async fn latency_tool_result_stream_does_not_replay_after_visible_text_and_failed_tail() {
     assert_early_tool_result_text(true).await;
+}
+
+#[tokio::test]
+async fn latency_unbuffered_tool_arguments_stream_before_upstream_eof() {
+    assert_early_tool_arguments(false).await;
+}
+
+#[tokio::test]
+async fn latency_unbuffered_tool_arguments_do_not_replay_after_failed_tail() {
+    assert_early_tool_arguments(true).await;
+}
+
+async fn assert_early_tool_arguments(fail_tail: bool) {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    for protocol in WireProtocol::ALL {
+        let upstream = DelayedUpstream::start_with_output_prefix(fail_tail, true).await;
+        let port = unused_tcp_port();
+        let daemon = Daemon::start_http(port, &upstream.url).await;
+        import_context_alignment_account(&daemon, 0.0).await;
+        model_policy::configure(&daemon, |config| {
+            config.features.buffer_tool_calls = false;
+        })
+        .await;
+        let mut request = protocol.request(true);
+        match protocol {
+            WireProtocol::Anthropic | WireProtocol::Chat => {
+                request["messages"] = json!([{"role":"user", "content":"Read the file."}]);
+            }
+            WireProtocol::Responses => request["input"] = json!("Read the file."),
+        }
+        let response = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}{}", protocol.route()))
+            .bearer_auth(daemon.api_key.as_deref().unwrap())
+            .header("user-agent", protocol.user_agent())
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let mut stream = response.bytes_stream();
+        let mut output = Vec::new();
+        let arguments = |event: &Value| {
+            match protocol {
+                WireProtocol::Anthropic => event.pointer("/delta/partial_json"),
+                WireProtocol::Chat => {
+                    event.pointer("/choices/0/delta/tool_calls/0/function/arguments")
+                }
+                WireProtocol::Responses
+                    if event["type"] == "response.function_call_arguments.delta" =>
+                {
+                    event.get("delta")
+                }
+                WireProtocol::Responses => None,
+            }
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                output.extend_from_slice(
+                    &stream
+                        .next()
+                        .await
+                        .expect("tool arguments before EOF")
+                        .unwrap(),
+                );
+                if sse_events(&String::from_utf8_lossy(&output))
+                    .iter()
+                    .filter_map(&arguments)
+                    .any(|value| value.contains("{\"path\":\""))
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("unbuffered tool arguments must arrive before releasing the upstream tail");
+        assert!(!upstream.finished.load(Ordering::SeqCst));
+        upstream.release.notify_one();
+        while let Some(chunk) = stream.next().await {
+            output.extend_from_slice(&chunk.unwrap());
+        }
+        let body = String::from_utf8(output).unwrap();
+        let arguments = sse_events(&body)
+            .iter()
+            .filter_map(arguments)
+            .collect::<String>();
+        assert_eq!(
+            arguments,
+            if fail_tail {
+                "{\"path\":\""
+            } else {
+                "{\"path\":\"README.md\"}"
+            },
+            "{body}"
+        );
+        protocol.assert_terminal(&body, fail_tail);
+        assert_eq!(upstream.calls.load(Ordering::SeqCst), 1);
+        daemon.stop().await;
+    }
 }
 
 async fn assert_early_tool_result_text(fail_tail: bool) {

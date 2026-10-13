@@ -77,6 +77,9 @@ mod manual_compaction;
 #[path = "end_to_end/automatic_compaction.rs"]
 mod automatic_compaction;
 
+#[path = "end_to_end/empty_responses.rs"]
+mod empty_responses;
+
 struct Daemon {
     child: Child,
     socket: PathBuf,
