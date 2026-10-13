@@ -370,6 +370,12 @@ Kiro 返回 `CONTENT_LENGTH_EXCEEDS_THRESHOLD` 或 `Input content length exceeds
 客户端主动请求摘要时，关闭自动压缩仍可恢复。摘要恢复会分段处理完整原文，并保留客户端
 摘要指令。该上游错误没有报告准确的 token 限制，也不会被当作账号故障。
 
+语义摘要需要多个原文分段时，Crosslane 会先将各段摘要合并为一个 checkpoint，再重试。
+任何分段中明确给出的事实都会纳入合并；后段声称“没看到”某个值，不能否定前段已经给出的值。
+合并沿用现有摘要的总超时、输入限制和用量结算，并记录
+`proxy.compaction.summary_merge.started` 与 `proxy.compaction.summary_merge.completed`。
+只有一个分段时，不增加上游请求。
+
 ### 客户端与会话归属
 
 所有构建都支持客户端识别，无需启用 `crs` feature。Claude Code 从旧格式或 JSON 字符串格式的

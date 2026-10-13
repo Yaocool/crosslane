@@ -435,6 +435,14 @@ with automatic compaction disabled. Summary recovery partitions the complete
 source and preserves the client's summary instruction. The upstream error does
 not report an exact token limit and is not treated as an account failure.
 
+When a semantic summary needs multiple source parts, Crosslane consolidates their
+summaries into one checkpoint before retrying. Facts explicitly supplied by any
+part are retained; a later part's claim that it cannot see a value does not erase
+that value. Consolidation shares the existing summary deadline, input limits and
+usage accounting. Its logs use `proxy.compaction.summary_merge.started` and
+`proxy.compaction.summary_merge.completed`. Single-part summaries do not make an
+extra upstream request.
+
 ### Anonymous client and conversation attribution
 
 Client context is available in every build, independently of the `crs` feature.

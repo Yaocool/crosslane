@@ -10,7 +10,7 @@ use super::{
 use crate::sanitize_kiro_tool_history;
 
 const MAX_SUMMARY_PARTS: usize = 16;
-const PART_INSTRUCTION: &str = "\n\nThis is a contiguous part of a larger conversation, in chronological order. Preserve exact identifiers and decisions found in this part. Missing facts may occur in other parts: do not infer that they are absent, unknown, or null. Another model will receive all part summaries in order; later decisions supersede earlier ones.";
+const PART_INSTRUCTION: &str = "\n\nThis is a contiguous part of a larger conversation. Report the concrete facts and exact identifiers found in THIS part. Other facts and earlier work may occur in other parts: omit claims that they are absent, unknown, null, not provided, or only examples merely because they are not visible here. Do not request those facts again. Another model will consolidate all part summaries in chronological order. Only explicit later corrections or changed decisions supersede earlier facts; missing information in this part is not a correction.";
 
 impl TokenCountCache {
     /// Keeps the complete summary input when it fits. Otherwise packs whole

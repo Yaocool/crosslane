@@ -2512,8 +2512,8 @@ async fn upstream_context_rejection_partitions_compacts_and_retries_once() {
             .iter()
             .filter(|request| request.url.path() == "/generateAssistantResponse")
             .count(),
-        4,
-        "expected first main request, two bounded summary parts, and one main retry"
+        5,
+        "expected first main request, two bounded summary parts, consolidation, and one main retry"
     );
 
     daemon.stop().await;
@@ -2758,8 +2758,8 @@ priority = 10
     assert_eq!(
         body.matches("Task Overview: preserve the compacted stream across a retry.")
             .count(),
-        2,
-        "the single checkpoint must contain both chronological part summaries"
+        1,
+        "the checkpoint must contain one consolidated summary of both source parts"
     );
     assert!(
         body.contains("main request completed after retry"),
@@ -3142,7 +3142,11 @@ priority = 10
         .filter_map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).ok())
         .filter(|payload| payload.get("conversationState").is_some())
         .collect::<Vec<_>>();
-    assert_eq!(payloads.len(), 3, "two summary parts plus one main request");
+    assert_eq!(
+        payloads.len(),
+        4,
+        "two summary parts, consolidation, and one main request"
+    );
     assert_eq!(
         payloads
             .iter()
@@ -3153,8 +3157,18 @@ priority = 10
                     .is_some_and(|content| content.contains("durable conversation checkpoint"))
             )
             .count(),
-        2,
-        "resolved-window replanning must reuse both original summary parts"
+        3,
+        "resolved-window replanning must reuse the consolidated summary without resummarizing"
+    );
+    assert_eq!(
+        payloads
+            .iter()
+            .filter(|payload| payload["conversationState"]["conversationId"]
+                .as_str()
+                .is_some_and(|id| id.ends_with("-merge")))
+            .count(),
+        1,
+        "consolidation must run only once"
     );
     let main = payloads
         .iter()

@@ -1,3 +1,4 @@
+use super::model_policy::configure;
 use super::*;
 use serde_json::{json, Value};
 
@@ -18,6 +19,118 @@ fn summary_response(request: &wiremock::Request) -> ResponseTemplate {
     ResponseTemplate::new(200)
         .insert_header("content-type", "application/vnd.amazon.eventstream")
         .set_body_bytes(generation_body(content))
+}
+
+#[tokio::test]
+async fn partitioned_compaction_reconciles_missing_fact_claims_and_accounts_for_merge_failure() {
+    let _http_guard = HTTP_TEST_LOCK.lock().await;
+    const FACTS: &str = "project=cobalt-731; recovery_tag=mango-482; checksum=spruce-956";
+    const LOCAL_ABSENCE: &str = "UNKNOWN_VALUES_CLAIM: project, recovery_tag and checksum were not provided in this part. Request them again.";
+    for (stream, fail_merge) in [(false, false), (true, true)] {
+        let mock = MockServer::start().await;
+        mount_context_alignment_models(&mock).await;
+        let merges = Arc::new(AtomicUsize::new(0));
+        let merge_count = Arc::clone(&merges);
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(move |request: &wiremock::Request| {
+                let payload: Value = serde_json::from_slice(&request.body).unwrap();
+                let state = &payload["conversationState"];
+                let current = state["currentMessage"]["userInputMessage"]["content"]
+                    .as_str()
+                    .unwrap();
+                let summary = if state["conversationId"].as_str().unwrap().ends_with("-merge") {
+                    merge_count.fetch_add(1, Ordering::SeqCst);
+                    assert!(current.contains(FACTS));
+                    assert!(current.contains(LOCAL_ABSENCE));
+                    assert!(current.contains("cannot negate an explicit value in another part"));
+                    assert!(state["history"].as_array().is_none_or(Vec::is_empty));
+                    if fail_merge {
+                        "".to_owned()
+                    } else {
+                        format!("<summary>{FACTS}</summary>")
+                    }
+                } else if current.contains("durable conversation checkpoint") {
+                    if state["history"].to_string().contains("cobalt-731") {
+                        format!("<summary>{FACTS}</summary>")
+                    } else {
+                        format!("<summary>{LOCAL_ABSENCE}</summary>")
+                    }
+                } else {
+                    let history = state["history"].to_string();
+                    assert!(history.contains("cobalt-731"));
+                    assert!(history.contains("mango-482"));
+                    assert!(history.contains("spruce-956"));
+                    assert!(
+                        !history.contains("UNKNOWN_VALUES_CLAIM"),
+                        "a local absence claim must not replace known facts in the final client summary"
+                    );
+                    CLIENT_SUMMARY.to_owned()
+                };
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/vnd.amazon.eventstream")
+                    .set_body_bytes(generation_body(&summary))
+            })
+            .mount(&mock)
+            .await;
+        let port = unused_tcp_port();
+        let daemon =
+            Daemon::start_http(port, &format!("{}/generateAssistantResponse", mock.uri())).await;
+        import_context_alignment_account(&daemon, 0.0).await;
+        configure(&daemon, |config| {
+            // Consolidation must wait for parts to release their account slots.
+            config.pool.max_concurrent_per_account = 1;
+            config.context.auto_compact_on_overflow = false;
+        })
+        .await;
+        let records = "gateway synthetic record\n".repeat(32_000);
+        let response = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .header("x-api-key", daemon.api_key.as_deref().unwrap())
+            .header("user-agent", "claude-cli/2.1.296 (external, sdk-cli)")
+            .json(&json!({
+                "model":"mapped-small", "max_tokens":1024, "stream":stream,
+                "messages":[
+                    {"role":"user","content":format!("{FACTS}\n{records}")},
+                    {"role":"assistant","content":"Acknowledged."},
+                    {"role":"user","content":records},
+                    {"role":"assistant","content":"Acknowledged."},
+                    {"role":"user","content":COMPACT_PROMPT}
+                ]
+            }))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+        assert!(body.contains(CLIENT_SUMMARY), "{body}");
+        assert_eq!(merges.load(Ordering::SeqCst), 1);
+        let stats = expect_ok(
+            daemon
+                .call("stats", json!({"detail":true,"recent":20}))
+                .await,
+        );
+        let logs = stats["stats"]["recent_requests"].as_array().unwrap();
+        assert!(
+            logs.iter().any(|log| {
+                log["path"] == "/internal/compact"
+                    && log["status"] == if fail_merge { 502 } else { 200 }
+            }),
+            "consolidation must settle its own usage and failure: {stats}"
+        );
+        let requests = mock.received_requests().await.unwrap();
+        let tokenizer = crosslane_translate::TokenCountCache::new(16).unwrap();
+        for request in requests
+            .iter()
+            .filter(|r| r.url.path() == "/generateAssistantResponse")
+        {
+            let payload: crosslane_translate::KiroPayload =
+                serde_json::from_slice(&request.body).unwrap();
+            assert!(tokenizer.estimate_kiro_payload(&payload).await.unwrap() <= 126_720);
+        }
+        daemon.stop().await;
+    }
 }
 
 #[tokio::test]
@@ -119,7 +232,15 @@ async fn manual_compact_after_an_oversized_tool_result_reaches_the_summary_model
             new_payloads.len() >= 3,
             "partitioned summaries plus the client's summary request"
         );
-        let mut parts: Vec<_> = new_payloads[..new_payloads.len() - 1].iter().collect();
+        let mut parts: Vec<_> = new_payloads[..new_payloads.len() - 1]
+            .iter()
+            .filter(|payload| {
+                !payload["conversationState"]["conversationId"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("-merge")
+            })
+            .collect();
         parts.sort_by_key(|payload| {
             payload["conversationState"]["conversationId"]
                 .as_str()
@@ -192,7 +313,15 @@ async fn client_summary_input_threshold_rejection_partitions_complete_source_and
             "the published 1M window must admit the initial request"
         );
         assert!(serde_json::to_vec(initial).unwrap().len() < 8 * 1024 * 1024);
-        let mut parts: Vec<_> = payloads[1..payloads.len() - 1].iter().collect();
+        let mut parts: Vec<_> = payloads[1..payloads.len() - 1]
+            .iter()
+            .filter(|payload| {
+                !payload
+                    .conversation_state
+                    .conversation_id
+                    .ends_with("-merge")
+            })
+            .collect();
         assert!(parts.len() > 1, "recovery must use partitioned summaries");
         parts.sort_by_key(|payload| {
             payload
@@ -465,7 +594,15 @@ async fn manual_compact_partitions_oversized_system_and_tool_definitions() {
                 new_payloads.len() >= 3,
                 "{label}: partitioned source plus the final client summary"
             );
-            let mut parts: Vec<_> = new_payloads[..new_payloads.len() - 1].iter().collect();
+            let mut parts: Vec<_> = new_payloads[..new_payloads.len() - 1]
+                .iter()
+                .filter(|payload| {
+                    !payload["conversationState"]["conversationId"]
+                        .as_str()
+                        .unwrap()
+                        .ends_with("-merge")
+                })
+                .collect();
             parts.sort_by_key(|payload| {
                 payload["conversationState"]["conversationId"]
                     .as_str()
