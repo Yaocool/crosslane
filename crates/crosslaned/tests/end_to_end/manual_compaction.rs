@@ -67,6 +67,9 @@ async fn partitioned_compaction_reconciles_missing_fact_claims_and_accounts_for_
                     assert!(history.contains("mango-482"));
                     assert!(history.contains("spruce-956"));
                     if native_summary {
+                        assert!(current.contains(FACTS));
+                        assert!(current.contains(LOCAL_ABSENCE));
+                        assert!(current.contains("Before writing the final summary, reconcile ALL source records"));
                         assert!(history.contains(LOCAL_ABSENCE));
                         assert!(history.contains("Source part summaries in chronological order"));
                         assert!(history.contains("cannot negate an explicit value in another part"));
@@ -278,7 +281,10 @@ async fn manual_compact_after_an_oversized_tool_result_reaches_the_summary_model
         );
         let current = &new_payloads.last().unwrap()["conversationState"]["currentMessage"]
             ["userInputMessage"];
-        assert_eq!(current["content"], COMPACT_PROMPT);
+        assert!(current["content"]
+            .as_str()
+            .unwrap()
+            .starts_with(COMPACT_PROMPT));
         assert!(current["userInputMessageContext"]["toolResults"]
             .as_array()
             .is_none_or(Vec::is_empty));
@@ -368,14 +374,14 @@ async fn client_summary_input_threshold_rejection_partitions_complete_source_and
         );
         let retried = payloads.last().unwrap();
         assert!(tokenizer.estimate_kiro_payload(retried).await.unwrap() <= 190_000);
-        assert_eq!(
+        assert!(
             retried
                 .conversation_state
                 .current_message
                 .user_input_message
-                .content,
-            prompt,
-            "the client summary instruction must survive recovery"
+                .content
+                .starts_with(&prompt),
+            "the complete client summary instruction must survive recovery"
         );
     }
 }
@@ -655,13 +661,12 @@ async fn manual_compact_partitions_oversized_system_and_tool_definitions() {
                 .user_input_message
                 .user_input_message_context
                 .is_none());
-            assert_eq!(
-                main.conversation_state
-                    .current_message
-                    .user_input_message
-                    .content,
-                COMPACT_PROMPT
-            );
+            assert!(main
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content
+                .starts_with(COMPACT_PROMPT));
             assert!(tokenizer.estimate_kiro_payload(&main).await.unwrap() < 63_360);
             seen_payloads = payloads.len();
         }

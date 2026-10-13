@@ -436,7 +436,8 @@ source and preserves the client's summary instruction. The upstream error does
 not report an exact token limit and is not treated as an account failure.
 
 Claude Code's native summary request reconciles complete, chronologically ordered
-source checkpoints during its final generation. This avoids a duplicate upstream
+source checkpoints during its final generation. Crosslane also places these records
+next to the final summary instruction, after any retained verbatim history. This avoids a duplicate upstream
 consolidation request. Explicit values from any part take precedence over another
 part's local absence claims; only explicit later corrections or changed decisions
 supersede earlier facts. These checkpoints are never clipped. If they cannot fit

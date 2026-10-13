@@ -408,6 +408,20 @@ fn ordered_compaction_summary_parts(summaries: &[String]) -> String {
     )
 }
 
+fn attach_summary_parts_to_final_instruction(payload: &mut KiroPayload, summary: &str) {
+    let instruction = &mut payload
+        .conversation_state
+        .current_message
+        .user_input_message
+        .content;
+    // Recent verbatim turns can be very long. Keep all source checkpoints next
+    // to the final instruction too, so local absence claims and recent noise
+    // cannot hide an earlier part's explicit facts from the final summarizer.
+    instruction.push_str("\n\nComplete source checkpoints for this final summary:\n");
+    instruction.push_str(summary);
+    instruction.push_str("\n\nBefore writing the final summary, reconcile ALL source records above. Carry forward every concrete fact and exact identifier from ANY source part. Unknown/absent/not-visible claims are local to their own part and cannot erase values stated elsewhere. Only an explicit later correction, deletion or changed decision supersedes an earlier value. Preserve the latest corrected values, governing constraints and pending work. Follow the original client's summary format and return text only.");
+}
+
 fn compaction_summary_merge_payload(
     mut template: KiroPayload,
     summaries: &[String],
@@ -1314,6 +1328,7 @@ pub(super) async fn run_compaction(
             let mut payload = source_payload.clone();
             let apply_started = Instant::now();
             let applied = if generated.deferred_parts.is_some() {
+                attach_summary_parts_to_final_instruction(&mut payload, &generated.content);
                 state
                     .tokenizer
                     .apply_complete_semantic_compaction(
@@ -1471,6 +1486,7 @@ pub(super) async fn reapply_compaction(
     } = artifact
     {
         let mut payload = source_payload.clone();
+        attach_summary_parts_to_final_instruction(&mut payload, summary);
         let mut applied = state
             .tokenizer
             .apply_complete_semantic_compaction(
@@ -1482,6 +1498,7 @@ pub(super) async fn reapply_compaction(
             .await;
         if applied.is_err() && operation_target < decision.maximum_tokens {
             payload.clone_from(source_payload);
+            attach_summary_parts_to_final_instruction(&mut payload, summary);
             applied = state
                 .tokenizer
                 .apply_complete_semantic_compaction(
