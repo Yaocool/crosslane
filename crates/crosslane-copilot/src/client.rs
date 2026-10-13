@@ -2048,63 +2048,37 @@ impl CopilotProvider {
     }
 }
 
-#[async_trait]
-impl ProviderAdapter for CopilotProvider {
-    fn descriptor(&self) -> ProviderDescriptor {
-        let account_count = self.accounts.try_read().map_or_else(
-            |_| {
-                self.account_limits
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .len()
-            },
-            |accounts| accounts.iter().filter(|account| account.enabled).count(),
-        );
-        let error = self
-            .last_error
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        ProviderDescriptor {
-            id: self.id.clone(),
-            kind: "copilot".into(),
-            enabled: self.enabled,
-            status: if !self.enabled {
-                "disabled"
-            } else if account_count == 0 {
-                "needs_account"
-            } else if error.is_some() {
-                "degraded"
-            } else {
-                "ready"
-            }
-            .into(),
-            error,
-            capabilities: ProviderCapabilities {
-                protocols: vec![
-                    ProviderProtocol::ClaudeMessages,
-                    ProviderProtocol::OpenAiChat,
-                    ProviderProtocol::OpenAiResponses,
-                ],
-                device_flow: true,
-                token_import: true,
-                model_discovery: true,
-                token_counting: CapabilitySupport::Adapted,
-                usage: CapabilitySupport::Native,
-            },
-        }
+impl CopilotProvider {
+    /// Discover and aggregate models only through this service's enabled
+    /// accounts. Pool membership is fixed before any refresh starts.
+    pub async fn models_for_service(
+        &self,
+        pool: &crosslane_core::config::ProxyServiceConfig,
+        refresh: bool,
+    ) -> Result<Vec<ProviderModel>, ProviderError> {
+        let account_ids = self.pool_account_ids(Some(pool)).await;
+        self.models_in(refresh, account_ids.as_ref()).await
     }
 
-    async fn models(&self, refresh: bool) -> Result<Vec<ProviderModel>, ProviderError> {
+    async fn models_in(
+        &self,
+        refresh: bool,
+        account_ids: Option<&BTreeSet<String>>,
+    ) -> Result<Vec<ProviderModel>, ProviderError> {
         let accounts = self
             .accounts
             .read()
             .await
             .iter()
-            .filter(|account| account.enabled)
+            .filter(|account| {
+                account.enabled && account_ids.is_none_or(|ids| ids.contains(&account.id))
+            })
             .cloned()
             .collect::<Vec<_>>();
         if accounts.is_empty() {
+            if account_ids.is_some() {
+                return Ok(Vec::new());
+            }
             return Err(ProviderError::unavailable(format!(
                 "provider {} has no enabled Copilot account",
                 self.id
@@ -2175,10 +2149,15 @@ impl ProviderAdapter for CopilotProvider {
         // a concurrent removal cannot be resurrected in the model cache.
         let _mutation = self.mutation.lock().await;
         let mut stored = self.accounts.write().await;
-        let enabled_ids = stored
+        let all_enabled_ids = stored
             .iter()
             .filter(|account| account.enabled)
             .map(|account| account.id.clone())
+            .collect::<BTreeSet<_>>();
+        let enabled_ids = all_enabled_ids
+            .iter()
+            .filter(|id| account_ids.is_none_or(|ids| ids.contains(*id)))
+            .cloned()
             .collect::<BTreeSet<_>>();
         discovered.retain(|account_id, _| enabled_ids.contains(account_id));
         errors.retain(|account_id, _| enabled_ids.contains(account_id));
@@ -2193,8 +2172,10 @@ impl ProviderAdapter for CopilotProvider {
                 },
             );
         }
+        // A service refresh preserves usable snapshots belonging to other
+        // services, while still pruning removed, disabled, or expired accounts.
         cache_snapshot.accounts.retain(|account_id, entry| {
-            enabled_ids.contains(account_id)
+            all_enabled_ids.contains(account_id)
                 && now.saturating_sub(entry.updated_at) < self.settings.model_max_stale_secs
         });
         let has_usable_snapshot = enabled_ids
@@ -2235,10 +2216,15 @@ impl ProviderAdapter for CopilotProvider {
                 .collect::<Vec<_>>()
                 .join("; ")
         });
-        *self
-            .last_error
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = combined_error.clone();
+        if account_ids.is_none() {
+            *self
+                .last_error
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = combined_error.clone();
+        }
+        if enabled_ids.is_empty() && account_ids.is_some() {
+            return Ok(models);
+        }
 
         if discovered.is_empty() && !has_usable_snapshot {
             return Err(ProviderError::unavailable(format!(
@@ -2247,6 +2233,58 @@ impl ProviderAdapter for CopilotProvider {
             )));
         }
         Ok(models)
+    }
+}
+
+#[async_trait]
+impl ProviderAdapter for CopilotProvider {
+    fn descriptor(&self) -> ProviderDescriptor {
+        let account_count = self.accounts.try_read().map_or_else(
+            |_| {
+                self.account_limits
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .len()
+            },
+            |accounts| accounts.iter().filter(|account| account.enabled).count(),
+        );
+        let error = self
+            .last_error
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        ProviderDescriptor {
+            id: self.id.clone(),
+            kind: "copilot".into(),
+            enabled: self.enabled,
+            status: if !self.enabled {
+                "disabled"
+            } else if account_count == 0 {
+                "needs_account"
+            } else if error.is_some() {
+                "degraded"
+            } else {
+                "ready"
+            }
+            .into(),
+            error,
+            capabilities: ProviderCapabilities {
+                protocols: vec![
+                    ProviderProtocol::ClaudeMessages,
+                    ProviderProtocol::OpenAiChat,
+                    ProviderProtocol::OpenAiResponses,
+                ],
+                device_flow: true,
+                token_import: true,
+                model_discovery: true,
+                token_counting: CapabilitySupport::Adapted,
+                usage: CapabilitySupport::Native,
+            },
+        }
+    }
+
+    async fn models(&self, refresh: bool) -> Result<Vec<ProviderModel>, ProviderError> {
+        self.models_in(refresh, None).await
     }
 
     async fn execute(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
@@ -3117,6 +3155,113 @@ mod tests {
             .expect(1)
             .mount(server)
             .await;
+    }
+
+    #[tokio::test]
+    async fn service_model_refresh_preserves_other_pools_and_never_uses_their_snapshots() {
+        let server = MockServer::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        mount_account_exchange(&server, "github-token").await;
+        let provider = mock_provider(&server, directory.path()).await;
+        let inside = provider
+            .import_token("github-token".into(), None)
+            .await
+            .unwrap();
+        let mut outside = provider.accounts.read().await[0].clone();
+        outside.id = "acc_outside".into();
+        outside.github_user_id += 1;
+        outside.tags = vec!["team-b".into()];
+        outside.credentials.github_access_token = "unusable-outside-token".into();
+        outside.supported_models = vec!["gpt-outside".into()];
+        {
+            let mut accounts = provider.accounts.write().await;
+            accounts[0].tags = vec!["team-a".into()];
+            accounts.push(outside.clone());
+        }
+        {
+            let mut cache = provider.model_cache.write().await;
+            let mut snapshot = cache.accounts[&inside.id].clone();
+            snapshot.models[0].id = "gpt-outside".into();
+            cache.accounts.insert(outside.id.clone(), snapshot);
+        }
+        let service = crosslane_core::config::ProxyServiceConfig {
+            account_tag: Some("team-a".into()),
+            allowed_providers: vec!["copilot".into()],
+            ..Default::default()
+        };
+        *provider.last_error.write().unwrap() = Some("unrelated provider error".into());
+
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header("authorization", "Bearer copilot-api-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data":[{"id":"gpt-test","capabilities":{"supported_endpoints":["/chat/completions"]}}]
+            })))
+            .expect(1)
+            .mount(&server).await;
+        let models = provider.models_for_service(&service, true).await.unwrap();
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            ["gpt-test"]
+        );
+        assert_eq!(
+            provider.model_cache.read().await.accounts[&outside.id].models[0].id,
+            "gpt-outside"
+        );
+        assert!(provider
+            .account(&outside.id)
+            .await
+            .unwrap()
+            .last_error
+            .is_none());
+        assert_eq!(
+            provider.last_error.read().unwrap().as_deref(),
+            Some("unrelated provider error")
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url.path(), "/models");
+
+        // A fresh out-of-pool snapshot cannot satisfy discovery when every
+        // in-pool snapshot is expired and its refresh fails.
+        provider
+            .model_cache
+            .write()
+            .await
+            .accounts
+            .get_mut(&inside.id)
+            .unwrap()
+            .updated_at = now_secs() - provider.settings.model_max_stale_secs - 1;
+        server.reset().await;
+        let error = provider
+            .models_for_service(&service, false)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, ProviderErrorKind::Unavailable);
+        assert!(provider
+            .model_cache
+            .read()
+            .await
+            .accounts
+            .contains_key(&outside.id));
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url.path(), "/models");
+
+        let empty = crosslane_core::config::ProxyServiceConfig {
+            account_tag: Some("empty-tag".into()),
+            ..service
+        };
+        assert!(provider
+            .models_for_service(&empty, false)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

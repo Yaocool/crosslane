@@ -945,10 +945,14 @@ pub async fn models(State(service): State<ServiceHttpState>, request: Request) -
                 format,
             )?),
         };
-        let account_ids = service.account_ids().await;
+        let current_service = service.current_service();
+        let account_ids = state
+            .pool()
+            .matching_account_ids(|account| current_service.includes_account(account))
+            .await;
         let config = state.config.current();
         let effective_providers = config.effective_providers();
-        let service_allowed = config.allowed_providers_for_service(&service.service);
+        let service_allowed = config.allowed_providers_for_service(&current_service);
         let key_allowed = authenticated
             .as_ref()
             .map(|key| {
@@ -977,29 +981,41 @@ pub async fn models(State(service): State<ServiceHttpState>, request: Request) -
                     format,
                 ));
             }
-            if allowed.iter().any(|provider| provider.kind == "kiro")
-                && config.models.dynamic_discovery
-            {
-                let (_, fresh) = state.models.get(config.models.cache_ttl_ms);
-                if !fresh && state.models.begin_refresh() {
-                    let refresh_state = Arc::clone(&state);
-                    tokio::spawn(async move {
-                        if let Err(error) =
-                            crate::tasks::refresh_models_for(&refresh_state, Some("kiro")).await
-                        {
-                            tracing::warn!(%error, "on-demand Kiro model discovery failed");
-                        }
-                    });
-                }
-            }
-            let provider_ids = allowed
-                .iter()
-                .map(|provider| ProviderId::parse(provider.id.clone()))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| {
+            let mut models = Vec::new();
+            let mut errors = std::collections::BTreeMap::new();
+            for provider in &allowed {
+                let id = ProviderId::parse(provider.id.clone()).map_err(|error| {
                     ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string(), format)
                 })?;
-            let (mut models, errors) = state.providers.models(&provider_ids, false).await;
+                if provider.kind == "kiro" {
+                    let scoped = kiro_models_for_service(&state, &account_ids).await;
+                    models.extend(crate::providers::kiro_provider_models(&id, scoped));
+                } else if let Some(runtime) = state.providers.copilot(&id).await {
+                    match runtime.models_for_service(&current_service, false).await {
+                        Ok(discovered) => models.extend(discovered),
+                        Err(error) => {
+                            errors.insert(provider.id.clone(), error.to_string());
+                        }
+                    }
+                } else {
+                    // Unavailable or unsupported adapters retain their existing
+                    // discovery errors; active Copilot runtimes use the scoped path.
+                    let (_, failures) = state.providers.models(&[id], false).await;
+                    if failures.is_empty() {
+                        errors.insert(
+                            provider.id.clone(),
+                            "provider does not support service-scoped model discovery".into(),
+                        );
+                    } else {
+                        errors.extend(failures);
+                    }
+                }
+            }
+            models.sort_by(|left, right| {
+                left.provider_id
+                    .cmp(&right.provider_id)
+                    .then_with(|| left.id.cmp(&right.id))
+            });
             models.retain(|model| !state.config.current().is_model_disabled(&model.id));
             if let Some(key) = authenticated
                 .as_ref()
@@ -1032,33 +1048,7 @@ pub async fn models(State(service): State<ServiceHttpState>, request: Request) -
             }
             return provider_model_list(models, allowed.len() > 1, protocol, query.as_ref());
         }
-        if !config.models.dynamic_discovery {
-            let mut models =
-                filter_kiro_models_for_key(fallback_models(&config), authenticated.as_ref());
-            models.retain(|model| !config.is_model_disabled(&model.model_id));
-            return model_list(models, protocol, query.as_ref());
-        }
-        let (cached, fresh) = state.models.get(config.models.cache_ttl_ms);
-        let (has_enabled_accounts, scoped_catalog_ready) =
-            service_catalog_status(&state, &account_ids, &cached).await;
-        if has_enabled_accounts && (!fresh || !scoped_catalog_ready) && state.models.begin_refresh()
-        {
-            let refresh_state = Arc::clone(&state);
-            let refresh_account_ids = Arc::clone(&account_ids);
-            tokio::spawn(async move {
-                if let Err(error) =
-                    crate::tasks::refresh_models_scoped(&refresh_state, &refresh_account_ids).await
-                {
-                    tracing::warn!(%error, "on-demand model discovery failed");
-                }
-            });
-        }
-        let models = if cached.is_empty() {
-            fallback_models(&config)
-        } else {
-            cached
-        };
-        let models = service_models(&state, &account_ids, models).await;
+        let models = kiro_models_for_service(&state, &account_ids).await;
         let mut models = filter_kiro_models_for_key(models, authenticated.as_ref());
         models.retain(|model| !state.config.current().is_model_disabled(&model.model_id));
         model_list(models, protocol, query.as_ref())
@@ -1074,6 +1064,45 @@ pub async fn models(State(service): State<ServiceHttpState>, request: Request) -
         record_failed_request(&state, &trace_id, &path, &user_agent, "", started, &error);
         error.into_response()
     })
+}
+
+/// Both Kiro-only and mixed-provider lists use the same account-scoped catalog
+/// and refresh. Static fallback still requires an enabled in-scope account.
+async fn kiro_models_for_service(
+    state: &Arc<AppState>,
+    account_ids: &HashSet<String>,
+) -> Vec<crosslane_kiro::ModelInfo> {
+    let config = state.config.current();
+    if !config.models.dynamic_discovery {
+        let (has_enabled_accounts, _) = service_catalog_status(state, account_ids, &[]).await;
+        // Discovery-disabled installations intentionally ignore stale dynamic
+        // account catalogs, but the static list still requires a scoped account.
+        return if has_enabled_accounts {
+            fallback_models(&config)
+        } else {
+            Vec::new()
+        };
+    }
+    let (cached, fresh) = state.models.get(config.models.cache_ttl_ms);
+    let (has_enabled_accounts, scoped_catalog_ready) =
+        service_catalog_status(state, account_ids, &cached).await;
+    if has_enabled_accounts && (!fresh || !scoped_catalog_ready) && state.models.begin_refresh() {
+        let refresh_state = Arc::clone(state);
+        let refresh_account_ids = account_ids.clone();
+        tokio::spawn(async move {
+            if let Err(error) =
+                crate::tasks::refresh_models_scoped(&refresh_state, &refresh_account_ids).await
+            {
+                tracing::warn!(%error, "on-demand model discovery failed");
+            }
+        });
+    }
+    let models = if cached.is_empty() {
+        fallback_models(&config)
+    } else {
+        cached
+    };
+    service_models(state, account_ids, models).await
 }
 
 async fn service_catalog_status(
@@ -1119,21 +1148,14 @@ async fn service_models(
 ) -> Vec<crosslane_kiro::ModelInfo> {
     let pool = state.pool();
     let pool_accounts = pool.snapshot().await;
-    if account_ids.is_empty() {
-        // Preserve the established cold-start catalog when the installation
-        // has no accounts at all. If other services do have accounts, an empty
-        // scope is real and must not expose their model availability.
-        return if pool_accounts.is_empty() {
-            fallback_models(&state.config.current())
-        } else {
-            Vec::new()
-        };
-    }
     let enabled_ids = pool_accounts
         .into_iter()
         .filter(|account| account.enabled && account_ids.contains(&account.id))
         .map(|account| account.id)
         .collect::<Vec<_>>();
+    if enabled_ids.is_empty() {
+        return Vec::new();
+    }
     let mut supported = HashSet::new();
     let mut has_scoped_catalog = false;
     for account_id in enabled_ids {

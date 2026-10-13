@@ -288,6 +288,17 @@ crosslane account overage show
 ```
 
 Use an ID from the model list. Disabled models are unavailable to new requests.
+The business endpoints `GET /v1/models` and `GET /models` return the union of
+models supported by enabled accounts in the current service's effective pool,
+after applying service/API key provider permissions, API key model permissions,
+and global model disabling. Tags, manual inclusions, and explicit exclusions
+apply to Kiro, Copilot, and mixed-provider lists. A provider with no enabled
+account in that pool contributes no models; an empty pool returns an empty list.
+Kiro retains its static catalog fallback when an in-pool account has no discovered
+catalog or dynamic discovery is disabled. Copilot discovery and cached catalog
+aggregation only use in-pool accounts. The CLI model list is a provider-wide
+administrative query and does not use a service account pool.
+
 Copilot also accepts equivalent client aliases such as `claude-opus-4-8` for
 the discovered ID `claude-opus-4.8`. Explicit model mappings run first, and
 permissions are checked against the resolved ID. To route a missing Claude

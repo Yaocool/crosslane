@@ -226,34 +226,7 @@ impl ProviderAdapter for KiroProvider {
         } else {
             cached
         };
-        Ok(models
-            .into_iter()
-            .map(|model| {
-                let (max_input_tokens, max_output_tokens) = model
-                    .token_limits
-                    .map(|limits| {
-                        (
-                            limits.max_input_tokens.map(u64::from),
-                            limits.max_output_tokens.map(u64::from),
-                        )
-                    })
-                    .unwrap_or_default();
-                ProviderModel {
-                    provider_id: self.id.clone(),
-                    id: model.model_id,
-                    display_name: model.model_name,
-                    vendor: Some("kiro".into()),
-                    max_input_tokens,
-                    max_output_tokens,
-                    protocols: vec![
-                        ProviderProtocol::ClaudeMessages,
-                        ProviderProtocol::OpenAiChat,
-                        ProviderProtocol::OpenAiResponses,
-                    ],
-                    capabilities: serde_json::Value::Null,
-                }
-            })
-            .collect())
+        Ok(kiro_provider_models(&self.id, models))
     }
 
     async fn execute(&self, _request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
@@ -261,6 +234,40 @@ impl ProviderAdapter for KiroProvider {
             "Kiro execution uses the compatibility executor",
         ))
     }
+}
+
+pub(crate) fn kiro_provider_models(
+    provider_id: &ProviderId,
+    models: Vec<crosslane_kiro::ModelInfo>,
+) -> Vec<ProviderModel> {
+    models
+        .into_iter()
+        .map(|model| {
+            let (max_input_tokens, max_output_tokens) = model
+                .token_limits
+                .map(|limits| {
+                    (
+                        limits.max_input_tokens.map(u64::from),
+                        limits.max_output_tokens.map(u64::from),
+                    )
+                })
+                .unwrap_or_default();
+            ProviderModel {
+                provider_id: provider_id.clone(),
+                id: model.model_id,
+                display_name: model.model_name,
+                vendor: Some("kiro".into()),
+                max_input_tokens,
+                max_output_tokens,
+                protocols: vec![
+                    ProviderProtocol::ClaudeMessages,
+                    ProviderProtocol::OpenAiChat,
+                    ProviderProtocol::OpenAiResponses,
+                ],
+                capabilities: serde_json::Value::Null,
+            }
+        })
+        .collect()
 }
 
 struct UnsupportedProvider {

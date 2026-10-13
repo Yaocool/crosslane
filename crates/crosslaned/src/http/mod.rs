@@ -7,6 +7,8 @@ mod context_recovery;
 #[cfg(feature = "crs")]
 mod crs;
 mod handlers;
+#[cfg(test)]
+mod model_scope_tests;
 pub(crate) use handlers::fallback_models;
 pub(crate) mod compaction_replay;
 pub(crate) mod prompt_cache;
@@ -812,7 +814,7 @@ mod tests {
         serde_json::from_slice(&bytes).expect("json")
     }
 
-    fn discovered_model(
+    pub(super) fn discovered_model(
         id: &str,
         name: &str,
         max_input_tokens: Option<u32>,
@@ -848,7 +850,12 @@ mod tests {
         assert!(listener_config_changed(&current, &next));
     }
 
-    fn account_with_usage(id: &str, email: &str, enabled: bool, usage: Option<Usage>) -> Account {
+    pub(super) fn account_with_usage(
+        id: &str,
+        email: &str,
+        enabled: bool,
+        usage: Option<Usage>,
+    ) -> Account {
         Account {
             id: id.into(),
             email: email.into(),
@@ -1730,7 +1737,10 @@ mod tests {
 
     #[tokio::test]
     async fn aliases_methods_and_model_timestamps_match_protocol_contract() {
-        let (_directory, state) = test_state(Config::default()).await;
+        let mut config = Config::default();
+        config.models.dynamic_discovery = false;
+        let (_directory, state) = test_state(config).await;
+        seed_catalog_account(&state, &["claude-sonnet-4.6".into()]).await;
         for path in ["/v1/models", "/models"] {
             let response = router(Arc::clone(&state))
                 .oneshot(
@@ -1890,9 +1900,7 @@ mod tests {
             .as_array()
             .expect("model data")
             .clone();
-        assert!(disabled_data
-            .iter()
-            .all(|entry| entry["id"] != "inside-only" && entry["id"] != "outside-only"));
+        assert!(disabled_data.is_empty());
 
         inside_runtime.account.write().await.enabled = true;
         let response = router_for_service(state, service, false)
@@ -1985,6 +1993,7 @@ mod tests {
         });
         let (_directory, state) = test_state(config).await;
 
+        seed_catalog_account(&state, &["claude-sonnet-4.6".into()]).await;
         let response = router(state)
             .oneshot(
                 Request::get("/v1/models")
@@ -2417,7 +2426,10 @@ mod tests {
 
     #[tokio::test]
     async fn codex_products_are_recognized_without_accepting_substring_matches() {
-        let (_directory, state) = test_state(Config::default()).await;
+        let mut config = Config::default();
+        config.models.dynamic_discovery = false;
+        let (_directory, state) = test_state(config).await;
+        seed_catalog_account(&state, &["claude-sonnet-4.6".into()]).await;
         for agent in [
             "codex_cli_rs/0.147.0 (Mac OS 26.0; arm64) Terminal/1.0",
             "codex_exec/0.147.0",

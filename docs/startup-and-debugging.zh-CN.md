@@ -241,6 +241,13 @@ crosslane account overage show
 ```
 
 模型 ID 从列表中选取。禁用模型后，新请求将无法使用。
+业务接口 `GET /v1/models` 和 `GET /models` 返回当前 service 有效账号池内启用账号
+所支持模型的并集，并继续检查 service/API key 来源权限、API key 模型权限及全局禁用模型。
+Kiro、Copilot 和多来源列表都遵循账号标签、手工加入及显式排除规则。来源在该账号池内
+没有启用账号时不返回该来源的模型；账号池为空时返回空列表。Kiro 在池内账号尚未发现
+目录或动态发现关闭时保留静态目录兜底；Copilot 的目录发现及缓存聚合只使用池内账号。
+CLI 模型列表是来源级管理查询，不受某个 service 账号池限制。
+
 Copilot 也接受等价的客户端别名，例如将 `claude-opus-4-8` 解析为模型目录中的
 `claude-opus-4.8`。显式模型映射优先执行，权限按解析后的 ID 检查。要将缺失的
 Claude 版本路由到同一 Opus、Sonnet 或 Haiku 系列中最近的可用版本，可运行
