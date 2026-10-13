@@ -418,6 +418,23 @@ the 400 context error identifies `current_message` or `required_context` and
 recommends reducing/splitting input or paginating results; compacting older history
 cannot solve that condition.
 
+For a single oversized paste, attachment or tool result, the error message itself
+includes recovery steps so Claude Code can display them: stop resending the same
+large input, split it into smaller parts or paginate tool results. Keep the same
+session and try `/compact`, or send a short follow-up without the large input to
+allow automatic compaction. A short follow-up may be merged with the rejected
+input, and immediate `/compact` can fail while that input remains the current
+turn or there are too few conversation groups to compact. If either still fails,
+use Esc Esc or `/rewind` in interactive Claude Code to edit only the oversized
+turn and resend it in smaller parts; earlier conversation need not be cleared.
+For `required_context`, first reduce the required system instructions, enabled
+tool definitions or other mandatory input; compacting history cannot shrink
+them. These locally diagnosed Messages errors retain status 400, `context_length_exceeded`, numeric
+diagnostics and `retryable: false`. Compactable history overflow and upstream
+context errors keep their native wording so client automatic compaction continues
+to work. CRS non-streaming error sanitization can still hide recovery details;
+Claude Code's streaming path retains them when Crosslane is built with `crs`.
+
 Summary budgets use the selected model's window, with the configured window as a
 fallback only. The latest user turn is a partitionable source record rather than
 instruction overhead repeated in every part. Every part fits both estimated token

@@ -3,6 +3,7 @@
 pub(crate) mod client_context;
 #[cfg(test)]
 mod client_context_tests;
+mod context_recovery;
 #[cfg(feature = "crs")]
 mod crs;
 mod handlers;
@@ -1590,13 +1591,19 @@ mod tests {
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(body["request_id"], request_id);
         let message = body["error"]["message"].as_str().expect("message");
-        assert!(message.starts_with("prompt is too long for model '"));
-        assert!(message.contains("claude-sonnet-4.6"));
-        #[cfg(not(feature = "crs"))]
-        assert!(message.ends_with(" tokens > 128"));
+        assert!(message.starts_with("Current input exceeds this model's input budget:"));
+        assert!(message.contains("tokens (limit 128)"));
+        assert!(message.contains("try /compact"));
+        assert!(message.contains("Esc Esc or /rewind"));
+        assert_eq!(body["error"]["code"], "context_length_exceeded");
+        assert_eq!(body["error"]["retryable"], false);
+        assert_eq!(
+            body["error"]["context"]["overflow_scope"],
+            "current_message"
+        );
+        assert_eq!(body["error"]["context"]["maximum_input_tokens"], 128);
         #[cfg(feature = "crs")]
         {
-            assert!(message.contains(" tokens > 128"));
             assert!(message.contains(&format!("request ID: {request_id}")));
             assert_eq!(body["error"]["status"], 400);
             assert!(body["error"].get("upstream_status").is_none());

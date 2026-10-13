@@ -52,6 +52,169 @@ async fn start_copilot_error_with_status(status: Arc<AtomicU16>) -> (MockServer,
     (upstream, daemon, port)
 }
 
+async fn start_input_overflow_daemon() -> (MockServer, Daemon, u16) {
+    let upstream = MockServer::start().await;
+    mount_context_alignment_models(&upstream).await;
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(|request: &wiremock::Request| {
+            let payload: Value = serde_json::from_slice(&request.body).unwrap();
+            let current = payload["conversationState"]["currentMessage"]["userInputMessage"]
+                ["content"]
+                .as_str()
+                .unwrap();
+            let text = if current.contains("durable conversation checkpoint")
+                || current.contains("summary")
+            {
+                "<summary>Recovery source retained: project=cobalt-731; parameter=77 replaces 42.</summary>"
+            } else {
+                "Same session continued successfully."
+            };
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/vnd.amazon.eventstream")
+                .set_body_bytes(generation_body(text))
+        })
+        .mount(&upstream)
+        .await;
+    let port = unused_tcp_port();
+    let daemon = Daemon::start_http(
+        port,
+        &format!("{}/generateAssistantResponse", upstream.uri()),
+    )
+    .await;
+    import_context_alignment_account(&daemon, 0.0).await;
+    super::model_policy::configure(&daemon, |config| {
+        // A small fixture window exercises actual admission without allocating
+        // 1M tokens or making any real inference request.
+        config.model_mapping = vec![ModelMappingRule {
+            name: "recovery-guidance-fixture".into(),
+            source_models: vec![
+                "claude-sonnet-5.5".into(),
+                "claude-sonnet-5-5".into(),
+                "claude-opus-5.5".into(),
+                "claude-opus-5-5".into(),
+            ],
+            target_models: vec!["resolved-small".into()],
+            ..ModelMappingRule::default()
+        }];
+    })
+    .await;
+    (upstream, daemon, port)
+}
+
+#[tokio::test]
+async fn indivisible_input_guidance_preserves_protocol_errors_in_both_modes() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    let (upstream, daemon, port) = start_input_overflow_daemon().await;
+    let client = reqwest::Client::new();
+    let oversized = "synthetic recovery record ".repeat(5_000);
+    for endpoint in ["messages", "chat/completions", "responses"] {
+        for stream in [false, true] {
+            for scope in ["current_message", "required_context"] {
+                let current = if scope == "current_message" {
+                    &oversized
+                } else {
+                    "hello"
+                };
+                let system = if scope == "required_context" {
+                    &oversized
+                } else {
+                    "Be brief."
+                };
+                let body = match endpoint {
+                    "messages" => json!({"model":"resolved-tiny","max_tokens":32,"stream":stream,
+                        "system":system,"messages":[{"role":"user","content":current}]}),
+                    "responses" => {
+                        json!({"model":"resolved-tiny","max_output_tokens":32,"stream":stream,
+                        "instructions":system,"input":current})
+                    }
+                    _ => json!({"model":"resolved-tiny","max_tokens":32,"stream":stream,
+                        "messages":[{"role":"system","content":system},{"role":"user","content":current}]}),
+                };
+                let response = client
+                    .post(format!("http://127.0.0.1:{port}/v1/{endpoint}"))
+                    .bearer_auth(daemon.api_key.as_deref().unwrap())
+                    .header(
+                        "user-agent",
+                        if endpoint == "messages" {
+                            "claude-cli/2.1.296 (external, e2e)"
+                        } else {
+                            "codex_cli_rs/0.1.0"
+                        },
+                    )
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap();
+                let sse = cfg!(feature = "crs") && endpoint == "messages" && stream;
+                assert_eq!(response.status().as_u16(), if sse { 200 } else { 400 });
+                let text = response.text().await.unwrap();
+                let error: Value = if sse {
+                    sse_error_payload(&text)
+                } else {
+                    serde_json::from_str(&text).unwrap()
+                };
+                assert_eq!(error["error"]["type"], "invalid_request_error", "{error}");
+                if endpoint != "messages" {
+                    // OpenAI's existing hard context guard and error envelope
+                    // retain their native wording, including stream requests.
+                    assert!(error["error"]["code"].is_null(), "{error}");
+                    assert!(error["error"]["context"].is_null(), "{error}");
+                    assert!(
+                        error["error"]["message"]
+                            .as_str()
+                            .unwrap()
+                            .starts_with("prompt is too long"),
+                        "{error}"
+                    );
+                    assert!(!text.contains("synthetic recovery record"));
+                    continue;
+                }
+                assert_eq!(error["error"]["code"], "context_length_exceeded", "{error}");
+                assert_eq!(error["error"]["retryable"], false, "{error}");
+                assert_eq!(
+                    error["error"]["context"]["overflow_scope"], scope,
+                    "{error}"
+                );
+                let message = error["error"]["message"].as_str().unwrap();
+                let hint = error["error"]["hint"].as_str().unwrap();
+                assert!(
+                    message.contains(hint),
+                    "guidance must be visible in error.message: {error}"
+                );
+                assert!(!message.contains("prompt is too long"), "{error}");
+                if scope == "current_message" {
+                    assert!(
+                        message.contains("try /compact") && message.contains("Esc Esc or /rewind"),
+                        "{error}"
+                    );
+                } else {
+                    assert!(
+                        message.contains("reduce required system instructions"),
+                        "{error}"
+                    );
+                    assert!(message.contains("Run /compact only if"), "{error}");
+                }
+                assert!(!text.contains("synthetic recovery record"));
+                if sse {
+                    assert_eq!(error["error"]["status"], 400);
+                    assert!(!text.contains("event: message_stop"));
+                }
+            }
+        }
+    }
+    assert!(
+        !upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|request| { request.url.path() == "/generateAssistantResponse" }),
+        "indivisible input must be rejected before inference or compaction"
+    );
+    daemon.stop().await;
+}
+
 #[tokio::test]
 async fn copilot_error_statuses_are_preserved_for_both_protocols_and_modes() {
     let _guard = HTTP_TEST_LOCK.lock().await;
@@ -266,14 +429,7 @@ async fn copilot_errors_preserve_crs_diagnostics_and_report_build_features() {
     daemon.stop().await;
 }
 
-#[tokio::test]
-#[ignore = "requires CROSSLANE_CRS_SOURCE and CROSSLANE_CLAUDE_CODE_BIN; executes local clients only"]
-async fn claude_code_displays_copilot_error_through_unmodified_crs_console() {
-    let _guard = HTTP_TEST_LOCK.lock().await;
-    let claude = std::env::var("CROSSLANE_CLAUDE_CODE_BIN").expect("set CROSSLANE_CLAUDE_CODE_BIN");
-    let (_upstream, daemon, port) = start_copilot_error().await;
-    let (mut relay, address) = start_crs_console(&daemon, port).await;
-    let isolated = tempfile::tempdir().unwrap();
+fn claude_code_command(claude: &str, isolated: &Path, address: &str) -> Command {
     let mut client = Command::new(claude);
     client.env_clear();
     for name in ["PATH", "HOME", "TMPDIR"] {
@@ -282,10 +438,10 @@ async fn claude_code_displays_copilot_error_through_unmodified_crs_console() {
         }
     }
     client
-        .current_dir(isolated.path())
-        .env("ANTHROPIC_BASE_URL", &address)
+        .current_dir(isolated)
+        .env("ANTHROPIC_BASE_URL", address)
         .env("ANTHROPIC_API_KEY", "local-fake-key")
-        .env("CLAUDE_CONFIG_DIR", isolated.path().join("claude"))
+        .env("CLAUDE_CONFIG_DIR", isolated.join("claude"))
         .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
         .env("DISABLE_TELEMETRY", "1")
         .env("DISABLE_ERROR_REPORTING", "1")
@@ -298,14 +454,28 @@ async fn claude_code_displays_copilot_error_through_unmodified_crs_console() {
             "",
             "--setting-sources",
             "",
-            "--no-session-persistence",
-            "--max-turns",
-            "1",
-            "--model",
-            "claude-opus-5-5",
-            "hello",
         ])
         .kill_on_drop(true);
+    client
+}
+
+#[tokio::test]
+#[ignore = "requires CROSSLANE_CRS_SOURCE and CROSSLANE_CLAUDE_CODE_BIN; executes local clients only"]
+async fn claude_code_displays_copilot_error_through_unmodified_crs_console() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    let claude = std::env::var("CROSSLANE_CLAUDE_CODE_BIN").expect("set CROSSLANE_CLAUDE_CODE_BIN");
+    let (_upstream, daemon, port) = start_copilot_error().await;
+    let (mut relay, address) = start_crs_console(&daemon, port).await;
+    let isolated = tempfile::tempdir().unwrap();
+    let mut client = claude_code_command(&claude, isolated.path(), &address);
+    client.args([
+        "--no-session-persistence",
+        "--max-turns",
+        "1",
+        "--model",
+        "claude-opus-5-5",
+        "hello",
+    ]);
     let output = tokio::time::timeout(Duration::from_secs(30), client.output())
         .await
         .expect("Claude Code completed")
@@ -342,6 +512,175 @@ async fn claude_code_displays_copilot_error_through_unmodified_crs_console() {
     } else {
         assert_eq!(message, "API Error: 400 Internal server error");
     }
+    relay.kill().await.unwrap();
+    relay.wait().await.unwrap();
+    daemon.stop().await;
+}
+
+#[cfg(feature = "crs")]
+#[tokio::test]
+#[ignore = "requires CROSSLANE_CRS_SOURCE and CROSSLANE_CLAUDE_CODE_BIN; executes local clients only"]
+async fn claude_code_displays_input_recovery_and_can_continue_the_same_session() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    let claude = std::env::var("CROSSLANE_CLAUDE_CODE_BIN").expect("set CROSSLANE_CLAUDE_CODE_BIN");
+    let (upstream, daemon, port) = start_input_overflow_daemon().await;
+    let (mut relay, address) = start_crs_console(&daemon, port).await;
+    let oversized = format!(
+        "project=cobalt-731; parameter=42.\n{}\nCorrection: parameter=77 replaces 42.",
+        "synthetic source record ".repeat(25_000)
+    );
+    for model in ["claude-sonnet-5.5", "claude-opus-5.5"] {
+        let isolated = tempfile::tempdir().unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        let mut seed_boundary = String::new();
+        for (index, prompt) in [
+            "Remember project=cobalt-731; parameter=42, later corrected to 77. Reply briefly.",
+            oversized.as_str(),
+            "Continue briefly without adding new source input.",
+            "/compact",
+            "Continue after compact.",
+            "Reduced source part: parameter=77 replaces 42. Continue briefly.",
+            "/compact",
+            "Continue after compacting the reduced source.",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let before = upstream.received_requests().await.unwrap().len();
+            let mut client = claude_code_command(&claude, isolated.path(), &address);
+            client.args([
+                "--model",
+                model,
+                "--system-prompt",
+                "Keep replies short.",
+                if index == 0 {
+                    "--session-id"
+                } else {
+                    "--resume"
+                },
+                &session,
+            ]);
+            if index == 5 {
+                // Equivalent to conversation-only rewind to the last successful
+                // turn: preserve earlier facts and the session ID, then replace
+                // the rejected input with a smaller part. Never clear a session.
+                client.args(["--resume-session-at", &seed_boundary]);
+            }
+            client
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = client.spawn().unwrap();
+            let mut stdin = child.stdin.take().unwrap();
+            stdin.write_all(prompt.as_bytes()).await.unwrap();
+            stdin.shutdown().await.unwrap();
+            drop(stdin);
+            let output = tokio::time::timeout(Duration::from_secs(45), child.wait_with_output())
+                .await
+                .expect("Claude Code completed")
+                .unwrap();
+            let result: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+                panic!(
+                    "Claude Code result: {error}; stdout: {}; stderr: {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
+            println!(
+                "local recovery fixture: {}",
+                json!({
+                    "model":model,"step":index,"session_id":result["session_id"],
+                    "is_error":result["is_error"],"result":result["result"],
+                    "terminal_reason":result["terminal_reason"]
+                })
+            );
+            assert_eq!(result["session_id"], session, "{result}");
+            if index == 1 || index == 2 || index == 4 {
+                assert!(!output.status.success());
+                assert_eq!(result["is_error"], true, "{result}");
+                assert_eq!(result["terminal_reason"], "api_error", "{result}");
+                let message = result["result"].as_str().unwrap();
+                assert!(message.contains("Current input exceeds"), "{message}");
+                assert!(
+                    message.contains("Stop retrying the same oversized input"),
+                    "{message}"
+                );
+                assert!(message.contains("send a short follow-up"), "{message}");
+                assert!(
+                    message.contains("try /compact") && message.contains("Esc Esc or /rewind"),
+                    "{message}"
+                );
+                assert!(
+                    message.contains("code: context_length_exceeded"),
+                    "{message}"
+                );
+                assert_eq!(result["usage"]["input_tokens"], 0, "{result}");
+                assert_eq!(result["usage"]["output_tokens"], 0, "{result}");
+                assert_eq!(
+                    upstream.received_requests().await.unwrap().len(),
+                    before,
+                    "no inference or futile summary retry on oversized current input"
+                );
+            } else {
+                assert!(output.status.success(), "{result}");
+                assert_eq!(result["is_error"], false, "{result}");
+            }
+            if index == 5 {
+                let requests = upstream.received_requests().await.unwrap();
+                let resumed: Value =
+                    serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+                let source = resumed.to_string();
+                assert!(
+                    source.contains("Remember project=cobalt-731"),
+                    "earlier user context survives rewind"
+                );
+                assert!(
+                    source.contains("parameter=77 replaces 42"),
+                    "reduced input preserves the correction"
+                );
+                assert!(
+                    !source.contains("synthetic source record"),
+                    "only the oversized turn was replaced"
+                );
+            }
+            if index == 0 {
+                let mut projects = tokio::fs::read_dir(isolated.path().join("claude/projects"))
+                    .await
+                    .unwrap();
+                while let Some(project) = projects.next_entry().await.unwrap() {
+                    let transcript = project.path().join(format!("{session}.jsonl"));
+                    if let Ok(text) = tokio::fs::read_to_string(transcript).await {
+                        seed_boundary = text
+                            .lines()
+                            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                            .filter(|event| event["type"] == "assistant")
+                            .filter_map(|event| event["uuid"].as_str().map(str::to_owned))
+                            .next_back()
+                            .unwrap();
+                        break;
+                    }
+                }
+                assert!(
+                    !seed_boundary.is_empty(),
+                    "saved seed turn is available for conversation-only rewind"
+                );
+            }
+        }
+    }
+    let requests: Value = reqwest::get(format!("{address}/__requests"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        requests
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|request| request["stream"] == true),
+        "Claude Code must retain streaming through unmodified CRS: {requests}"
+    );
     relay.kill().await.unwrap();
     relay.wait().await.unwrap();
     daemon.stop().await;

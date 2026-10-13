@@ -2565,7 +2565,21 @@ impl IntoResponse for ApiError {
         if let Some(context) = &self.context_overflow {
             envelope["error"]["context"] = json!(context);
             if context.tokens.minimum_input_tokens > context.maximum_input_tokens {
-                envelope["error"]["hint"] = json!("Reduce or split the current input, paginate tool results, or shorten required system/tool content. Compacting older history cannot make this input fit.");
+                envelope["error"]["hint"] =
+                    json!(super::context_recovery::LEGACY_INPUT_OVERFLOW_HINT);
+            }
+            if self.format == ErrorFormat::Claude
+                && self.error_code == "context_length_exceeded"
+                && self.upstream_status.is_none()
+            {
+                if let Some(recovery) = super::context_recovery::input_overflow_recovery(context) {
+                    envelope["error"]["code"] = json!(self.error_code);
+                    envelope["error"]["message"] =
+                        json!(format!("{} {}", recovery.detail, recovery.hint));
+                    envelope["error"]["detail"] = json!(recovery.detail);
+                    envelope["error"]["hint"] = json!(recovery.hint);
+                    envelope["error"]["retryable"] = json!(false);
+                }
             }
         }
         #[cfg(feature = "crs")]

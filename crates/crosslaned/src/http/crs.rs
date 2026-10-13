@@ -32,7 +32,19 @@ pub(super) fn enrich_error_envelope(
     }
     // Keep the sanitized cause separate: normalizing a rendered context error
     // again must not interpret digits in its trace ID as token counts.
-    let detail = sanitize_error_message(error_message(envelope).unwrap_or_default());
+    let input_recovery = if code == "context_length_exceeded" && upstream_status.is_none() {
+        serde_json::from_value::<crate::stats::ContextOverflowDiagnostics>(
+            envelope["error"]["context"].clone(),
+        )
+        .ok()
+        .and_then(|context| super::context_recovery::input_overflow_recovery(&context))
+    } else {
+        None
+    };
+    let detail = input_recovery.as_ref().map_or_else(
+        || sanitize_error_message(error_message(envelope).unwrap_or_default()),
+        |recovery| recovery.detail.clone(),
+    );
     let cause = if is_opaque_message(&detail) {
         match code {
             "upstream_authentication_failed" => "Upstream credentials were rejected.",
@@ -50,13 +62,15 @@ pub(super) fn enrich_error_envelope(
     } else {
         detail.clone()
     };
-    let hint = if code == "context_length_exceeded"
+    let hint = if let Some(recovery) = &input_recovery {
+        recovery.hint
+    } else if code == "context_length_exceeded"
         && envelope["error"]["context"]["minimum_input_tokens"]
             .as_u64()
             .zip(envelope["error"]["context"]["maximum_input_tokens"].as_u64())
             .is_some_and(|(minimum, maximum)| minimum > maximum)
     {
-        "Reduce or split the current input, paginate tool results, or shorten required system/tool content. Compacting older history cannot make this input fit."
+        super::context_recovery::LEGACY_INPUT_OVERFLOW_HINT
     } else {
         error_hint(code)
     };
@@ -1690,24 +1704,87 @@ mod tests {
 #[cfg(test)]
 mod overflow_hint_regressions {
     use super::*;
+
+    fn context(current: u64, minimum: u64) -> Value {
+        serde_json::json!({
+            "total_input_tokens": minimum + 100,
+            "protected_prefix_tokens": minimum - current - 10,
+            "tool_definition_tokens": 0,
+            "current_message_tokens": current,
+            "history_tokens": 100,
+            "overhead_tokens": 10,
+            "minimum_input_tokens": minimum,
+            "maximum_input_tokens": 990000
+        })
+    }
+
     #[test]
-    fn current_input_overflow_does_not_recommend_compacting_older_history() {
-        let mut envelope = serde_json::json!({"error":{"message":"prompt is too long: 1200000 tokens > 990000",
-            "context":{"current_message_tokens":1200000,"minimum_input_tokens":1200010,"maximum_input_tokens":990000}}});
+    fn indivisible_input_recovery_survives_repeated_sse_normalization() {
+        let mut envelope = serde_json::json!({"error":{"type":"invalid_request_error","status":400,"message":"prompt is too long: 1200000 tokens > 990000",
+            "context":context(1200000, 1200010)}});
         enrich_error_envelope(
             &mut envelope,
             "context_length_exceeded",
             None,
             Some("trace_hint"),
         );
-        assert!(!envelope["error"]["hint"]
-            .as_str()
-            .unwrap()
-            .contains("Run /compact"));
-        assert!(envelope["error"]["hint"]
-            .as_str()
-            .unwrap()
-            .contains("cannot make this input fit"));
+        let hint = envelope["error"]["hint"].as_str().unwrap();
+        assert!(hint.contains("Stop retrying the same oversized input"));
+        assert!(hint.contains("send a short follow-up"));
+        assert!(hint.contains("try /compact"));
+        assert!(hint.contains("Esc Esc or /rewind"));
+        assert!(hint.contains("cannot make the current input fit"));
+        assert!(!envelope.to_string().contains("prompt is too long"));
         assert_eq!(envelope["error"]["retryable"], false);
+        let normalized = diagnostic_envelope(
+            StatusCode::BAD_REQUEST,
+            error_message(&envelope).unwrap(),
+            "context_length_exceeded",
+            None,
+            "trace_hint",
+            Some(&envelope),
+        );
+        assert_eq!(normalized["error"], envelope["error"]);
+    }
+
+    #[test]
+    fn required_input_recovery_explains_what_history_compaction_cannot_shrink() {
+        let mut envelope = serde_json::json!({"error":{
+            "message":"prompt is too long: 1200000 tokens > 990000",
+            "context":context(100, 1200010)
+        }});
+        enrich_error_envelope(&mut envelope, "context_length_exceeded", None, None);
+        assert!(envelope["error"]["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("Required input"));
+        let hint = envelope["error"]["hint"].as_str().unwrap();
+        assert!(hint.contains("required system instructions, enabled tool definitions"));
+        assert!(hint.contains("Run /compact only if older history"));
+        assert!(!hint.contains("send a short follow-up"));
+    }
+
+    #[test]
+    fn history_and_supplier_context_errors_keep_native_client_recovery() {
+        for (current, minimum, upstream) in [(100, 110, None), (1200000, 1200010, Some(400))] {
+            let mut envelope = serde_json::json!({"error":{
+                "message":"prompt is too long: 1200000 tokens > 990000",
+                "context":context(current, minimum)
+            }});
+            enrich_error_envelope(&mut envelope, "context_length_exceeded", upstream, None);
+            assert!(envelope["error"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("prompt is too long"));
+            let hint = envelope["error"]["hint"].as_str().unwrap();
+            if minimum > 990000 {
+                assert_eq!(
+                    hint,
+                    super::super::context_recovery::LEGACY_INPUT_OVERFLOW_HINT
+                );
+            } else {
+                assert!(hint.starts_with("Run /compact"));
+            }
+        }
     }
 }
