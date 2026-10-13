@@ -435,13 +435,17 @@ with automatic compaction disabled. Summary recovery partitions the complete
 source and preserves the client's summary instruction. The upstream error does
 not report an exact token limit and is not treated as an account failure.
 
-When a semantic summary needs multiple source parts, Crosslane consolidates their
-summaries into one checkpoint before retrying. Facts explicitly supplied by any
-part are retained; a later part's claim that it cannot see a value does not erase
-that value. Consolidation shares the existing summary deadline, input limits and
-usage accounting. Its logs use `proxy.compaction.summary_merge.started` and
-`proxy.compaction.summary_merge.completed`. Single-part summaries do not make an
-extra upstream request.
+Claude Code's native summary request reconciles complete, chronologically ordered
+source checkpoints during its final generation. This avoids a duplicate upstream
+consolidation request. Explicit values from any part take precedence over another
+part's local absence claims; only explicit later corrections or changed decisions
+supersede earlier facts. These checkpoints are never clipped. If they cannot fit
+the target or a smaller resolved window, Crosslane semantically consolidates the
+saved parts within the summary input, time and usage limits. Other server compaction
+requests keep their existing upstream consolidation. Logs use
+`proxy.compaction.summary_merge.completed` with `merge_mode` (`client_final_summary`
+or `upstream`) and `duration_ms`; upstream merges also log
+`proxy.compaction.summary_merge.started`. Single-part summaries remain unchanged.
 
 ### Anonymous client and conversation attribution
 

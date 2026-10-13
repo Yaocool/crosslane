@@ -3074,22 +3074,23 @@ priority = 10
 #[tokio::test]
 async fn mapped_compaction_is_reapplied_for_a_smaller_resolved_window_without_resummarizing() {
     let _http_guard = HTTP_TEST_LOCK.lock().await;
-    let mock = MockServer::start().await;
-    mount_context_alignment_models(&mock).await;
-    Mock::given(method("POST"))
-        .and(path("/generateAssistantResponse"))
-        .respond_with(LongCompactionResponder)
-        .mount(&mock)
-        .await;
+    for native_summary in [false, true] {
+        let mock = MockServer::start().await;
+        mount_context_alignment_models(&mock).await;
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(LongCompactionResponder)
+            .mount(&mock)
+            .await;
 
-    let port = unused_tcp_port();
-    let upstream_url = format!("{}/generateAssistantResponse", mock.uri());
-    let daemon = Daemon::start_http(port, &upstream_url).await;
-    import_context_alignment_account(&daemon, 50.0).await;
-    configure_context_alignment(
-        &daemon,
-        "summary-large",
-        r#"
+        let port = unused_tcp_port();
+        let upstream_url = format!("{}/generateAssistantResponse", mock.uri());
+        let daemon = Daemon::start_http(port, &upstream_url).await;
+        import_context_alignment_account(&daemon, 50.0).await;
+        configure_context_alignment(
+            &daemon,
+            "summary-large",
+            r#"
 [[model_mapping]]
 name = "low-credit-tiny-window"
 type = "replace"
@@ -3105,10 +3106,10 @@ source_models = ["source-large"]
 target_models = ["mapped-small"]
 priority = 10
 "#,
-    )
-    .await;
+        )
+        .await;
 
-    let response = reqwest::Client::new()
+        let response = reqwest::Client::new()
         .post(format!("http://127.0.0.1:{port}/v1/messages"))
         .header(
             "x-api-key",
@@ -3123,70 +3124,83 @@ priority = 10
             "messages":[
                 {"role":"user","content":"mapped history ".repeat(140000)},
                 {"role":"assistant","content":"keep the decision"},
-                {"role":"user","content":"finish after semantic reuse"}
+                {"role":"user","content":if native_summary { "Your task is to create a detailed summary of the conversation so far, finish after semantic reuse. Return <summary>...</summary>." } else { "finish after semantic reuse" }}
             ]
         }))
         .send()
         .await
         .expect("call two-window compact path");
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
-    let body: serde_json::Value = response.json().await.expect("Claude response JSON");
-    assert_eq!(body["content"][0]["type"], "compaction");
-    assert!(body["content"][0]["content"]
-        .as_str()
-        .is_some_and(|content| content.contains("checkpoint shortened to fit context")));
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = response.json().await.expect("Claude response JSON");
+        assert_eq!(body["content"][0]["type"], "compaction");
+        assert!(body["content"][0]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("checkpoint shortened to fit context")));
 
-    let requests = mock.received_requests().await.expect("received requests");
-    let payloads = requests
-        .iter()
-        .filter_map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).ok())
-        .filter(|payload| payload.get("conversationState").is_some())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        payloads.len(),
-        4,
-        "two summary parts, consolidation, and one main request"
-    );
-    assert_eq!(
-        payloads
+        let requests = mock.received_requests().await.expect("received requests");
+        let payloads = requests
             .iter()
-            .filter(
-                |payload| payload["conversationState"]["currentMessage"]["userInputMessage"]
-                    ["content"]
+            .filter_map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).ok())
+            .filter(|payload| payload.get("conversationState").is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            payloads.len(),
+            4,
+            "two summary parts, consolidation, and one main request"
+        );
+        assert_eq!(
+            payloads
+                .iter()
+                .filter(|payload| payload["conversationState"]["currentMessage"]
+                    ["userInputMessage"]["content"]
                     .as_str()
-                    .is_some_and(|content| content.contains("durable conversation checkpoint"))
-            )
-            .count(),
-        3,
-        "resolved-window replanning must reuse the consolidated summary without resummarizing"
-    );
-    assert_eq!(
-        payloads
-            .iter()
-            .filter(|payload| payload["conversationState"]["conversationId"]
-                .as_str()
-                .is_some_and(|id| id.ends_with("-merge")))
-            .count(),
-        1,
-        "consolidation must run only once"
-    );
-    let main = payloads
-        .iter()
-        .find(|payload| {
-            payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
-                .as_str()
-                .is_some_and(|content| {
-                    content.contains("finish after semantic reuse")
-                        && !content.contains("durable conversation checkpoint")
+                    .is_some_and(|content| content.contains("durable conversation checkpoint")))
+                .count(),
+            3,
+            "resolved-window replanning must reuse the consolidated summary without resummarizing"
+        );
+        assert_eq!(
+            payloads
+                .iter()
+                .filter(|payload| payload["conversationState"]["conversationId"]
+                    .as_str()
+                    .is_some_and(|id| id.ends_with("-merge")))
+                .count(),
+            1,
+            "consolidation must run only once"
+        );
+        if native_summary {
+            let merge = payloads
+                .iter()
+                .find(|payload| {
+                    payload["conversationState"]["conversationId"]
+                        .as_str()
+                        .is_some_and(|id| id.ends_with("-merge"))
                 })
-        })
-        .expect("main request");
-    assert_eq!(
-        main["conversationState"]["currentMessage"]["userInputMessage"]["modelId"],
-        "resolved-tiny"
-    );
+                .unwrap();
+            assert!(
+                merge["inferenceConfig"]["maxTokens"].as_u64().unwrap() < 4096,
+                "resolved-window consolidation must use the smaller output budget"
+            );
+        }
+        let main = payloads
+            .iter()
+            .find(|payload| {
+                payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+                    .as_str()
+                    .is_some_and(|content| {
+                        content.contains("finish after semantic reuse")
+                            && !content.contains("durable conversation checkpoint")
+                    })
+            })
+            .expect("main request");
+        assert_eq!(
+            main["conversationState"]["currentMessage"]["userInputMessage"]["modelId"],
+            "resolved-tiny"
+        );
 
-    daemon.stop().await;
+        daemon.stop().await;
+    }
 }
 
 #[tokio::test]

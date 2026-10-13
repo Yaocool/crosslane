@@ -1021,7 +1021,26 @@ async fn handle_claude_route_inner(
                 config.context.compaction_summary_model.trim()
             };
             let run = if let Some(artifact) = compaction_artifact.as_ref() {
-                reapply_compaction(&state, artifact, &decision).await?
+                reapply_compaction(
+                    &state,
+                    artifact,
+                    &decision,
+                    Some(&CompactionRequest {
+                        trace_id: &trace_id,
+                        client_context: Some(client_context),
+                        key_id: key_id.as_deref(),
+                        account_ids: Arc::clone(&account_ids),
+                        allowed_models: &allowed_models,
+                        service_id: Some(&service.service.id),
+                        source_payload: &payload,
+                        decision: &decision,
+                        summary_model,
+                        summary_timeout_ms: config.context.compaction_summary_timeout_ms,
+                        preserve_recent_turns: config.context.compaction_preserve_recent_turns,
+                        explicit_client_compaction: client_compaction,
+                    }),
+                )
+                .await?
             } else {
                 run_compaction(
                     &state,

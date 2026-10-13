@@ -247,6 +247,7 @@ async fn timed_out_summary_task_still_runs_its_accounting_tail() {
         task_completed.store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(GeneratedCompactionSummary {
             content: "late summary".into(),
+            deferred_parts: None,
             usage: CompactionIterationUsage {
                 input_tokens: 100,
                 output_tokens: 20,
@@ -1454,6 +1455,8 @@ async fn semantic_reapply_failure_keeps_the_context_limit_contract() {
         source_payload,
         plan,
         summary: "durable semantic checkpoint ".repeat(100),
+        deferred_parts: None,
+        summary_deadline: None,
         usage: CompactionIterationUsage {
             input_tokens: 4_000,
             output_tokens: 400,
@@ -1467,7 +1470,7 @@ async fn semantic_reapply_failure_keeps_the_context_limit_contract() {
         maximum_tokens: 60,
     };
 
-    let error = match reapply_compaction(&state, &artifact, &decision).await {
+    let error = match reapply_compaction(&state, &artifact, &decision, None).await {
         Ok(_) => panic!("semantic checkpoint must not fit the micro window"),
         Err(error) => error,
     };

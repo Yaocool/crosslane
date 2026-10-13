@@ -26,7 +26,12 @@ async fn partitioned_compaction_reconciles_missing_fact_claims_and_accounts_for_
     let _http_guard = HTTP_TEST_LOCK.lock().await;
     const FACTS: &str = "project=cobalt-731; recovery_tag=mango-482; checksum=spruce-956";
     const LOCAL_ABSENCE: &str = "UNKNOWN_VALUES_CLAIM: project, recovery_tag and checksum were not provided in this part. Request them again.";
-    for (stream, fail_merge) in [(false, false), (true, true)] {
+    for (stream, native_summary, fail_merge) in [
+        (false, true, false),
+        (true, true, false),
+        (false, false, false),
+        (true, false, true),
+    ] {
         let mock = MockServer::start().await;
         mount_context_alignment_models(&mock).await;
         let merges = Arc::new(AtomicUsize::new(0));
@@ -61,10 +66,14 @@ async fn partitioned_compaction_reconciles_missing_fact_claims_and_accounts_for_
                     assert!(history.contains("cobalt-731"));
                     assert!(history.contains("mango-482"));
                     assert!(history.contains("spruce-956"));
-                    assert!(
-                        !history.contains("UNKNOWN_VALUES_CLAIM"),
-                        "a local absence claim must not replace known facts in the final client summary"
-                    );
+                    if native_summary {
+                        assert!(history.contains(LOCAL_ABSENCE));
+                        assert!(history.contains("Source part summaries in chronological order"));
+                        assert!(history.contains("cannot negate an explicit value in another part"));
+                        assert!(history.contains("Only an explicit later correction"));
+                    } else {
+                        assert!(!history.contains("UNKNOWN_VALUES_CLAIM"));
+                    }
                     CLIENT_SUMMARY.to_owned()
                 };
                 ResponseTemplate::new(200)
@@ -90,12 +99,13 @@ async fn partitioned_compaction_reconciles_missing_fact_claims_and_accounts_for_
             .header("user-agent", "claude-cli/2.1.296 (external, sdk-cli)")
             .json(&json!({
                 "model":"mapped-small", "max_tokens":1024, "stream":stream,
+                "context_management":{"edits":[{"type":"compact_20260112","trigger":{"type":"input_tokens","value":50000}}]},
                 "messages":[
                     {"role":"user","content":format!("{FACTS}\n{records}")},
                     {"role":"assistant","content":"Acknowledged."},
                     {"role":"user","content":records},
                     {"role":"assistant","content":"Acknowledged."},
-                    {"role":"user","content":COMPACT_PROMPT}
+                    {"role":"user","content":if native_summary { COMPACT_PROMPT } else { "Continue with the established durable facts." }}
                 ]
             }))
             .send()
@@ -105,7 +115,7 @@ async fn partitioned_compaction_reconciles_missing_fact_claims_and_accounts_for_
         let body = response.text().await.unwrap();
         assert_eq!(status, reqwest::StatusCode::OK, "{body}");
         assert!(body.contains(CLIENT_SUMMARY), "{body}");
-        assert_eq!(merges.load(Ordering::SeqCst), 1);
+        assert_eq!(merges.load(Ordering::SeqCst), usize::from(!native_summary));
         let stats = expect_ok(
             daemon
                 .call("stats", json!({"detail":true,"recent":20}))

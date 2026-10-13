@@ -299,6 +299,8 @@ enum CompactionArtifact {
         source_payload: KiroPayload,
         plan: KiroCompactionPlan,
         summary: String,
+        deferred_parts: Option<Vec<String>>,
+        summary_deadline: Option<Instant>,
         usage: CompactionIterationUsage,
     },
     Extractive {
@@ -319,6 +321,7 @@ struct CompactionRun {
     iteration_usage: Option<CompactionIterationUsage>,
 }
 
+#[derive(Clone)]
 struct CompactionRequest<'a> {
     trace_id: &'a str,
     client_context: Option<&'a ClientContext>,
@@ -353,6 +356,7 @@ const COMPACTION_USAGE_PATH: &str = "/internal/compact";
 
 struct GeneratedCompactionSummary {
     content: String,
+    deferred_parts: Option<Vec<String>>,
     usage: CompactionIterationUsage,
 }
 

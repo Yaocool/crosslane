@@ -322,6 +322,44 @@ impl TokenCountCache {
         semantic_summary: &str,
         target_tokens: usize,
     ) -> Result<ContextCompactionStats, String> {
+        self.apply_semantic_compaction_with_policy(
+            payload,
+            plan,
+            semantic_summary,
+            target_tokens,
+            true,
+        )
+        .await
+    }
+
+    /// Fits a checkpoint by removing optional verbatim history only. Ordered
+    /// part summaries must reach the final summarizer whole: head/tail clipping
+    /// could remove a fact or the later correction that supersedes it.
+    pub async fn apply_complete_semantic_compaction(
+        &self,
+        payload: &mut KiroPayload,
+        plan: &KiroCompactionPlan,
+        semantic_summary: &str,
+        target_tokens: usize,
+    ) -> Result<ContextCompactionStats, String> {
+        self.apply_semantic_compaction_with_policy(
+            payload,
+            plan,
+            semantic_summary,
+            target_tokens,
+            false,
+        )
+        .await
+    }
+
+    async fn apply_semantic_compaction_with_policy(
+        &self,
+        payload: &mut KiroPayload,
+        plan: &KiroCompactionPlan,
+        semantic_summary: &str,
+        target_tokens: usize,
+        allow_truncation: bool,
+    ) -> Result<ContextCompactionStats, String> {
         let semantic_summary = semantic_summary.trim();
         if semantic_summary.is_empty() {
             return Err("Kiro returned an empty compaction summary".into());
@@ -360,7 +398,7 @@ impl TokenCountCache {
             );
             compacted_tokens = self.estimate_kiro_payload(payload).await?;
         }
-        if compacted_tokens > target_tokens {
+        if compacted_tokens > target_tokens && allow_truncation {
             let checkpoint_tokens = self.count(checkpoint.clone()).await?;
             let excess = compacted_tokens.saturating_sub(target_tokens);
             let checkpoint_budget = checkpoint_tokens.saturating_sub(excess + 16).max(64);
@@ -1756,6 +1794,44 @@ mod tests {
                 .model_id,
             "summary-model"
         );
+    }
+
+    #[tokio::test]
+    async fn complete_checkpoint_never_clips_facts_or_later_corrections() {
+        let cache = TokenCountCache::new(8).unwrap();
+        let source: KiroPayload = serde_json::from_value(serde_json::json!({
+            "conversationState":{
+                "chatTriggerType":"MANUAL","conversationId":"complete-checkpoint",
+                "history":[
+                    {"userInputMessage":{"content":"source ".repeat(4000),"modelId":"model","origin":"CLI","images":[]}},
+                    {"assistantResponseMessage":{"content":"acknowledged"}}
+                ],
+                "currentMessage":{"userInputMessage":{"content":"summarize","modelId":"model","origin":"CLI","images":[]}}
+            }
+        })).unwrap();
+        let plan = cache
+            .plan_kiro_compaction(&source, 500, 0)
+            .await
+            .unwrap()
+            .unwrap();
+        let summary = format!("project=snow-4729; parameter=42\n{}\nExplicit correction: parameter=77 replaces 42; privacy=NO_UPLOAD", "checkpoint detail ".repeat(1000));
+        let mut payload = source.clone();
+        assert!(cache
+            .apply_complete_semantic_compaction(&mut payload, &plan, &summary, 500)
+            .await
+            .is_err());
+        assert!(payload.conversation_state.history[0]
+            .user_input_message
+            .as_ref()
+            .unwrap()
+            .content
+            .contains(&summary));
+        let mut payload = source;
+        let stats = cache
+            .apply_complete_semantic_compaction(&mut payload, &plan, &summary, 5000)
+            .await
+            .unwrap();
+        assert!(stats.summary.unwrap().contains(&summary));
     }
 
     #[tokio::test]
