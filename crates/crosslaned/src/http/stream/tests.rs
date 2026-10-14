@@ -47,7 +47,17 @@ fn unnamed_tool_fragments_keep_upstream_identity_before_client_aliases() {
     };
     let mut client = tool_event("client", "client_search");
     restore_tool_event_name(&mut client, &mut names);
-    restore_web_tool_name(&mut client, &aliases);
+    super::super::tool_names::ClientToolNames::claude(&aliases)
+        .restore_event(
+            &mut client,
+            &super::super::tool_names::ToolNameTrace {
+                trace_id: "trace_alias",
+                request_id: "request_alias",
+                path: "/v1/messages",
+                streaming: true,
+            },
+        )
+        .unwrap();
     let mut server = tool_event("server", "web_search");
     restore_tool_event_name(&mut server, &mut names);
 
@@ -267,6 +277,23 @@ fn replay_encryption_failures_are_proxy_scoped() {
     );
     assert!(event.contains("\"code\":\"proxy_internal_error\""));
     assert!(event.contains("\"request_id\":\"req_replay\""));
+}
+
+#[test]
+fn tool_name_mismatches_have_a_distinct_non_account_error() {
+    let details = classify_stream_failure(TOOL_NAME_MISMATCH_MESSAGE, None);
+    assert_eq!(details.upstream_status, None);
+    assert_eq!(details.error_code, TOOL_NAME_MISMATCH_CODE);
+    assert_eq!(details.error_stage, "tool_name_validation");
+    assert_eq!(details.scope, StreamFailureScope::Upstream);
+    assert!(!details.account_error());
+    let output = stream_error(
+        &StreamProtocol::Claude,
+        "req_tool_name",
+        TOOL_NAME_MISMATCH_MESSAGE,
+    );
+    assert!(output.contains(TOOL_NAME_MISMATCH_CODE));
+    assert!(!output.contains("event: message_stop"));
 }
 
 #[test]

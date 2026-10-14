@@ -32,6 +32,7 @@ use super::response::{
     web_search_citations, CompactionIterationUsage, DecodedResponse, OpenAiToolIdentity,
     StopSequenceFilter, ThinkingContentFilter, ToolLeakFilter,
 };
+use super::tool_names::{TOOL_NAME_MISMATCH_CODE, TOOL_NAME_MISMATCH_MESSAGE};
 use super::usage::{fallback_credits, fill_missing_usage, produced_output};
 
 const WEB_SEARCH_REPLAY_FAILURE_MESSAGE: &str = "failed to protect web-search replay data";
@@ -490,14 +491,6 @@ fn event_is_tool_search(event: &KiroEvent, catalog: Option<&ClaudeToolSearchCata
 
 fn event_is_web_search(event: &KiroEvent, max_rounds: u32) -> bool {
     max_rounds > 0 && matches!(event, KiroEvent::ToolUse { name, .. } if name == "web_search")
-}
-
-fn restore_web_tool_name(event: &mut KiroEvent, names: &std::collections::HashMap<String, String>) {
-    if let KiroEvent::ToolUse { name, .. } = event {
-        if let Some(original) = names.get(name) {
-            name.clone_from(original);
-        }
-    }
 }
 
 fn restore_tool_event_name(
@@ -1576,6 +1569,14 @@ fn classify_stream_failure(
     message: &str,
     diagnostics: Option<&StreamFailureDiagnostics>,
 ) -> StreamFailureDetails {
+    if message == TOOL_NAME_MISMATCH_MESSAGE {
+        return StreamFailureDetails {
+            upstream_status: None,
+            error_code: TOOL_NAME_MISMATCH_CODE,
+            error_stage: "tool_name_validation",
+            scope: StreamFailureScope::Upstream,
+        };
+    }
     if crosslane_kiro::client::text_is_local_overload(message) {
         return StreamFailureDetails {
             upstream_status: None,

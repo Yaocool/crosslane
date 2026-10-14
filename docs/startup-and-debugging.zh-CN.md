@@ -207,6 +207,12 @@ Claude 上游不接受工具 schema 根部的 `oneOf`、`allOf`、`anyOf` 时，
 Responses 的 namespace 函数工具在上游使用唯一函数名，返回客户端时恢复原来的 namespace
 和名称。Claude Code 的 `thinking.display: "updates"` 会适配为上游支持的 `summarized`，
 保留 thinking 设置；`omitted` 仍隐藏思考内容。
+Kiro 工具调用在返回客户端前会校验是否匹配本次请求的工具声明，流式、非流式都适用。
+已知别名恢复原名；客户端明确声明的 hash 名仍合法。未知名称返回
+`upstream_tool_name_mismatch`：非流式为 HTTP 502，流式为错误事件，不切换账号重试，
+也不输出该工具调用。`proxy.tool_name.mapping_miss` 日志包含 trace/request ID、
+工具调用 ID 及有长度限制的工具名，不记录工具参数和 schema。
+代理执行的 Tool Search/Web Search 继续使用服务端工具处理逻辑。
 Copilot Messages 请求会移除上游不支持的 Anthropic `safeguards` 扩展，token counting
 请求也使用相同适配，避免新版 Claude Code 请求被拒绝。
 

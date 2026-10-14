@@ -1,13 +1,14 @@
 use super::super::handlers::{
     current_message_has_tool_results, empty_tool_result_disposition, EmptyToolResultDisposition,
 };
+use super::super::tool_names::{ClientToolNames, ToolNameTrace, TOOL_NAME_MISMATCH_CODE};
 use super::{
     accumulate_usage, apply_stream_stop, auto_continue_payload, build_claude_state,
     classified_stream_error, classify_stream_failure, claude_initial_events, client_visible_event,
     event_is_tool_search, event_is_web_search, event_kind, fill_missing_usage, finish_accounting,
     header, json, now_secs, prepend_pending_initial, record_account_scoped_stream_failure,
-    repair_json, restore_tool_event_name, restore_web_tool_name, should_buffer_tool_event, sse,
-    stream_error, stream_event, stream_finish, tool_search_continue_payload_batch,
+    repair_json, restore_tool_event_name, should_buffer_tool_event, sse, stream_error,
+    stream_event, stream_finish, tool_search_continue_payload_batch,
     web_search_continue_payload_batch, web_search_replay_failure, Body, Bytes, BytesMut,
     ClaudeToolSearchBudget, ClaudeWebSearchTrace, DecodedResponse, Decoder, EventStreamDecoder,
     HashSet, HeaderValue, Infallible, KiroEvent, KiroResponse, KiroToolUse, Response, StatusCode,
@@ -152,6 +153,12 @@ pub fn response(
         let mut accumulated_text = String::new();
         let mut accumulated_reasoning = String::new();
         let mut payload = context.payload.clone();
+        let tool_names = match protocol {
+            StreamProtocol::Claude => ClientToolNames::claude(&context.web_tool_names),
+            StreamProtocol::OpenAi => ClientToolNames::openai(&context.openai_tools),
+        };
+        let client_has_tools = payload.conversation_state.current_message.user_input_message
+            .user_input_message_context.as_ref().is_some_and(|context| !context.tools.is_empty());
         // Server calls must be emitted before client tool calls in mixed
         // turns, so buffering is mandatory whenever a server tool is active.
         // A pending Claude prelude also forces buffering: a tool event is not
@@ -159,9 +166,8 @@ pub fn response(
         let buffer_tool_calls = context.buffer_tool_calls
             || context.tool_search.is_some()
             || context.web_search_max_rounds > 0
-            || !pending_initial.is_empty();
-        let client_has_tools = payload.conversation_state.current_message.user_input_message
-            .user_input_message_context.as_ref().is_some_and(|context| !context.tools.is_empty());
+            || !pending_initial.is_empty()
+            || !client_has_tools;
         let mut auto_round = 0;
         let mut search_round = 0u32;
         let mut empty_tool_result_retries = 0u8;
@@ -238,8 +244,16 @@ pub fn response(
                                                 &event,
                                                 context.web_search_max_rounds,
                                             );
-                                            if !internal_search && !internal_web_search {
-                                                restore_web_tool_name(&mut event, &context.web_tool_names);
+                                            if !internal_search && !internal_web_search && client_has_tools {
+                                                if let Err(message) = tool_names.restore_event(&mut event, &ToolNameTrace {
+                                                    trace_id: &context.trace_id,
+                                                    request_id: &context.request_id,
+                                                    path: &context.path,
+                                                    streaming: true,
+                                                }) {
+                                                    failed = Some(message.to_owned());
+                                                    break;
+                                                }
                                             }
                                             if matches!(&event, KiroEvent::Reasoning { .. } | KiroEvent::Citations { .. } | KiroEvent::ToolUse { .. }) {
                                                 let pending = stop_filter.finish();
@@ -396,8 +410,16 @@ pub fn response(
                         event_is_tool_search(&event, context.tool_search.as_deref());
                     let internal_web_search =
                         event_is_web_search(&event, context.web_search_max_rounds);
-                    if !internal_search && !internal_web_search {
-                        restore_web_tool_name(&mut event, &context.web_tool_names);
+                    if !internal_search && !internal_web_search && client_has_tools {
+                        if let Err(message) = tool_names.restore_event(&mut event, &ToolNameTrace {
+                            trace_id: &context.trace_id,
+                            request_id: &context.request_id,
+                            path: &context.path,
+                            streaming: true,
+                        }) {
+                            failed = Some(message.to_owned());
+                            break;
+                        }
                     }
                     if matches!(
                         &event,
@@ -475,7 +497,15 @@ pub fn response(
             // path and cannot publish a failed compaction boundary.
             if failed.is_none() && stop_filter.matched().is_none() {
                 if let Err(error) = decoded.finalize_tool_inputs() {
-                    failed = Some(error);
+                    failed = Some(match tool_names.validate_decoded(&decoded, &ToolNameTrace {
+                        trace_id: &context.trace_id,
+                        request_id: &context.request_id,
+                        path: &context.path,
+                        streaming: true,
+                    }) {
+                        Ok(()) => error,
+                        Err(message) => message.to_owned(),
+                    });
                 }
             }
             if failed.is_some() {
@@ -553,7 +583,8 @@ pub fn response(
                 let retry_limit = config.upstream.max_retries;
                 let may_switch = (!is_quota || config.pool.auto_switch_on_quota_exhausted)
                     && !is_request_rejection
-                    && failure_details.scope != StreamFailureScope::Proxy;
+                    && failure_details.scope != StreamFailureScope::Proxy
+                    && failure_details.error_code != TOOL_NAME_MISMATCH_CODE;
                 let mut account_health_handled = false;
                 if !data_started && pre_data_retries < retry_limit && may_switch && is_auth {
                     let mut disable_account = true;
@@ -743,7 +774,8 @@ pub fn response(
                 let is_request_rejection = failure_details.is_request_rejection();
                 let may_switch = (!is_quota || config.pool.auto_switch_on_quota_exhausted)
                     && !is_request_rejection
-                    && failure_details.scope != StreamFailureScope::Proxy;
+                    && failure_details.scope != StreamFailureScope::Proxy
+                    && failure_details.error_code != TOOL_NAME_MISMATCH_CODE;
                 if !account_health_handled {
                     record_account_scoped_stream_failure(
                         &context.state,
@@ -2063,6 +2095,24 @@ pub fn response(
                         &message,
                     )));
                 }
+            }
+        }
+        // Calls used for the legacy no-tools continuation stay upstream-only.
+        // If that continuation ends with a tool call, never expose an undeclared
+        // name (including a hash alias) to the client.
+        if failed.is_none() && !client_has_tools {
+            if let Err(message) = tool_names.restore_decoded(&mut decoded, &ToolNameTrace {
+                trace_id: &context.trace_id,
+                request_id: &context.request_id,
+                path: &context.path,
+                streaming: true,
+            }) {
+                failed = Some(message.to_owned());
+                yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(
+                    &protocol,
+                    &context.request_id,
+                    message,
+                )));
             }
         }
         if failed.is_none() {

@@ -1044,14 +1044,6 @@ impl DecodedResponse {
         self.stop_sequence = Some(sequence);
     }
 
-    pub fn restore_tool_names(&mut self, names: &std::collections::HashMap<String, String>) {
-        for tool in self.tools.values_mut() {
-            if let Some(original) = names.get(&tool.name) {
-                tool.name.clone_from(original);
-            }
-        }
-    }
-
     pub fn push(&mut self, event: KiroEvent) -> Result<(), String> {
         match event {
             KiroEvent::AssistantResponse { content } => {

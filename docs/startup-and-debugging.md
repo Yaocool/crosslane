@@ -251,6 +251,15 @@ Responses namespace function tools use unique upstream names and restore their
 original namespace and name in client output. Claude Code's `thinking.display:
 "updates"` is adapted to upstream `summarized` while retaining thinking settings;
 `omitted` continues to hide thinking output.
+Kiro tool calls are checked against the originating request's tool declarations
+before reaching the client, in both streaming and non-streaming responses.
+Known aliases restore the original name; a hash-looking name explicitly declared
+by the client remains valid. Unknown names fail with `upstream_tool_name_mismatch`
+(HTTP 502 for non-streaming, an error event for streaming), without rotating
+accounts or emitting the unknown tool call. The `proxy.tool_name.mapping_miss`
+log records the trace/request IDs, call ID and a bounded tool name, without
+tool arguments or schemas. Proxy-managed Tool Search/Web Search retain their
+server-tool handling.
 Copilot Messages requests omit the unsupported Anthropic `safeguards` extension,
 including on token-counting requests, so newer Claude Code requests are accepted.
 

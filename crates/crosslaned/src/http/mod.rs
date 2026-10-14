@@ -16,6 +16,7 @@ mod response;
 pub(crate) mod responses;
 pub(crate) mod stream;
 mod timing;
+mod tool_names;
 mod usage;
 
 use std::collections::{HashMap, HashSet};

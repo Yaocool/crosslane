@@ -131,6 +131,9 @@ fn error_hint(code: &str) -> &'static str {
         "invalid_tool_protocol" | "unsupported_tool_protocol" => {
             "Check tool definitions and tool_use/tool_result pairing."
         }
+        super::tool_names::TOOL_NAME_MISMATCH_CODE => {
+            "Share the request ID with the service administrator to check the rejected upstream tool name and current tool declarations."
+        }
         "model_not_available" | "model_disabled" => {
             "Choose an available model or ask the service administrator to check model routing."
         }

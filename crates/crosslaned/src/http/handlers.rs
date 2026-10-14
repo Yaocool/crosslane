@@ -437,6 +437,7 @@ enum ExecuteError {
     Meter(MeterError),
     ContextLimit(ContextLimitError),
     UnsupportedWebSearch(String),
+    ToolNameMismatch,
     ModelNotAllowed {
         provider_id: String,
         model: String,
@@ -2272,6 +2273,7 @@ fn reserve_credits(
 
 fn upstream_error(error: ExecuteError, format: ErrorFormat) -> ApiError {
     match error {
+        ExecuteError::ToolNameMismatch => ApiError::tool_name_mismatch(format),
         ExecuteError::UnsupportedWebSearch(reason) => {
             let mut error = hosted_web::unsupported_search(reason);
             error.format = format;
@@ -2520,6 +2522,17 @@ impl ApiError {
         error
     }
 
+    fn tool_name_mismatch(format: ErrorFormat) -> Self {
+        let mut error = Self::new(
+            StatusCode::BAD_GATEWAY,
+            super::tool_names::TOOL_NAME_MISMATCH_MESSAGE,
+            format,
+        );
+        error.error_code = super::tool_names::TOOL_NAME_MISMATCH_CODE;
+        error.error_stage = "tool_name_validation";
+        error
+    }
+
     fn method_not_allowed(format: ErrorFormat, allow: &'static str) -> Self {
         let mut error = Self::new(StatusCode::METHOD_NOT_ALLOWED, "method not allowed", format);
         error.allow = Some(allow);
@@ -2584,6 +2597,11 @@ impl IntoResponse for ApiError {
             &self.message,
             self.request_id.as_deref(),
         );
+        if self.error_code == super::tool_names::TOOL_NAME_MISMATCH_CODE {
+            envelope["error"]["code"] = json!(self.error_code);
+            envelope["error"]["stage"] = json!(self.error_stage);
+            envelope["error"]["retryable"] = json!(false);
+        }
         if let Some(context) = &self.context_overflow {
             envelope["error"]["context"] = json!(context);
             if context.tokens.minimum_input_tokens > context.maximum_input_tokens {

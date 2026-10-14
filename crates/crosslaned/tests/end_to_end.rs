@@ -80,6 +80,9 @@ mod automatic_compaction;
 #[path = "end_to_end/empty_responses.rs"]
 mod empty_responses;
 
+#[path = "end_to_end/tool_names.rs"]
+mod tool_names;
+
 struct Daemon {
     child: Child,
     socket: PathBuf,

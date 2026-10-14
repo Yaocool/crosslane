@@ -211,6 +211,8 @@ pub(super) async fn collect_nonstream_rounds(
     resumed_tool_searches: Vec<crosslane_translate::ClaudeToolSearchTrace>,
     resumed_web_searches: Vec<ClaudeWebSearchTrace>,
     resumed_server_events: Vec<ClaudeServerEvent>,
+    tool_names: &super::super::tool_names::ClientToolNames,
+    tool_name_trace: &super::super::tool_names::ToolNameTrace<'_>,
 ) -> Result<(DecodedResponse, String, u64), ExecuteError> {
     let config = state.config.current();
     let max_tool_search_rounds = config.features.tool_search_max_rounds.clamp(1, 8);
@@ -302,14 +304,26 @@ pub(super) async fn collect_nonstream_rounds(
         if !stop_matched {
             let _trailing = stop_filter.finish();
         }
+        if client_has_tools || round >= config.features.auto_continue_rounds.min(30) {
+            // Validate names before tool-input errors can include an unknown
+            // alias, and before any proxy-managed server-tool continuation.
+            tool_names
+                .validate_decoded(&decoded, tool_name_trace)
+                .map_err(|_| ExecuteError::ToolNameMismatch)?;
+        }
         if decoded.stop_sequence.is_none() {
-            decoded.finalize_tool_inputs().map_err(|message| {
-                ExecuteError::Upstream(KiroError {
+            if let Err(message) = decoded.finalize_tool_inputs() {
+                // A malformed no-tools continuation is already failing; make
+                // sure its error cannot disclose an undeclared upstream alias.
+                tool_names
+                    .validate_decoded(&decoded, tool_name_trace)
+                    .map_err(|_| ExecuteError::ToolNameMismatch)?;
+                return Err(ExecuteError::Upstream(KiroError {
                     status: None,
                     endpoint: endpoint.clone(),
                     message,
-                })
-            })?;
+                }));
+            }
         }
         decoded.log_context_usage(
             trace_id,
@@ -1313,6 +1327,13 @@ pub(super) async fn nonstream_claude(
     diagnostics: RequestDiagnostics,
     web_tool_names: std::collections::HashMap<String, String>,
 ) -> Result<Response, ApiError> {
+    let tool_names = super::super::tool_names::ClientToolNames::claude(&web_tool_names);
+    let tool_name_trace = super::super::tool_names::ToolNameTrace {
+        trace_id: &trace_id,
+        request_id: &request_id,
+        path: &path,
+        streaming: false,
+    };
     let (mut decoded, endpoint, current_round_output_tokens) = collect_nonstream_rounds(
         &state,
         &trace_id,
@@ -1332,6 +1353,8 @@ pub(super) async fn nonstream_claude(
         resumed_tool_searches,
         resumed_web_searches,
         resumed_server_events,
+        &tool_names,
+        &tool_name_trace,
     )
     .await
     .map_err(|error| upstream_error(error, ErrorFormat::Claude))?;
@@ -1347,7 +1370,9 @@ pub(super) async fn nonstream_claude(
                 .remember(scope, source, summary.clone());
         }
     }
-    decoded.restore_tool_names(&web_tool_names);
+    tool_names
+        .restore_decoded(&mut decoded, &tool_name_trace)
+        .map_err(|_| ApiError::tool_name_mismatch(ErrorFormat::Claude))?;
     let current_round_output_tokens = if current_round_output_tokens == 0 {
         decoded.usage.output_tokens
     } else {
@@ -1464,6 +1489,13 @@ pub(super) async fn nonstream_openai(
     openai_tools: std::collections::HashMap<String, OpenAiToolIdentity>,
     responses_options: Option<super::super::responses::ResponsesOptions>,
 ) -> Result<Response, ApiError> {
+    let tool_names = super::super::tool_names::ClientToolNames::openai(&openai_tools);
+    let tool_name_trace = super::super::tool_names::ToolNameTrace {
+        trace_id: &trace_id,
+        request_id: &request_id,
+        path: &path,
+        streaming: false,
+    };
     let (mut decoded, endpoint, current_round_output_tokens) = collect_nonstream_rounds(
         &state,
         &trace_id,
@@ -1483,9 +1515,14 @@ pub(super) async fn nonstream_openai(
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        &tool_names,
+        &tool_name_trace,
     )
     .await
     .map_err(|error| upstream_error(error, ErrorFormat::OpenAi))?;
+    tool_names
+        .restore_decoded(&mut decoded, &tool_name_trace)
+        .map_err(|_| ApiError::tool_name_mismatch(ErrorFormat::OpenAi))?;
     let current_round_output_tokens = if current_round_output_tokens == 0 {
         decoded.usage.output_tokens
     } else {
