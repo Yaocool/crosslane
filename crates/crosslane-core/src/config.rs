@@ -216,7 +216,7 @@ pub struct UpstreamConfig {
     /// 双连接池参数。
     pub pool: UpstreamPoolConfig,
     /// Kiro MCP Web Search 端点。支持 `{region}` 占位符；空值使用
-    /// `https://runtime.{region}.kiro.dev/mcp`。
+    /// `https://runtime.{region}.kiro.dev/`，通过 InvokeMCP RPC 调用。
     pub web_search_endpoint: Option<String>,
     /// MCP Web Search 请求超时。
     pub web_search_timeout_ms: u64,
@@ -2143,7 +2143,8 @@ agent_mode = "vibe"
 max_retries = 3
 # 期望在 token 到期前多少秒刷新。运行时至少取扫描间隔的 2 倍和 10 分钟。
 token_refresh_before_expiry = 900
-# Kiro MCP Web Search 地址，支持 `{region}` 占位符；不配置时使用下面的默认形式。
+# 可选 Kiro MCP Web Search 地址，支持 `{region}` 占位符。显式 URL 使用兼容 JSON-RPC；
+# 不设置时使用 Runtime 根路径的原生 InvokeMCP RPC。
 # web_search_endpoint = "https://runtime.{region}.kiro.dev/mcp"
 # 单次 MCP Web Search 请求超时。
 web_search_timeout_ms = 60000

@@ -161,6 +161,23 @@ pub fn account_api_region(account: &Account) -> Result<String, crate::KiroError>
     Ok(region.into())
 }
 
+/// IDE 1.2.56 routes both extension REST and agent control-plane calls here.
+/// Keep the legacy host only for regions absent from its endpoint table.
+pub fn management_base(region: &str) -> String {
+    if supports_native_management(region) {
+        format!("https://management.{region}.kiro.dev/")
+    } else {
+        format!("https://q.{region}.amazonaws.com/")
+    }
+}
+
+pub(crate) fn supports_native_management(region: &str) -> bool {
+    matches!(
+        region,
+        "us-east-1" | "eu-central-1" | "us-gov-east-1" | "us-gov-west-1"
+    )
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct EndpointOverrides {
     pub codewhisperer_url: Option<String>,

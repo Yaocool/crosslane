@@ -160,6 +160,7 @@ async fn register_client(
 ) -> Result<Registration> {
     let response = client
         .post(format!("{oidc}/client/register"))
+        .header(reqwest::header::USER_AGENT, "KiroIDE")
         .json(&RegistrationRequest {
             client_name: "crosslane",
             client_type: "public",
@@ -205,6 +206,7 @@ async fn exchange_code(
 ) -> Result<TokenResponse> {
     let response = client
         .post(format!("{oidc}/token"))
+        .header(reqwest::header::USER_AGENT, "KiroIDE")
         .json(&TokenRequest {
             client_id: &registration.client_id,
             client_secret: &registration.client_secret,

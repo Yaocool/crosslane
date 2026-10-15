@@ -14,6 +14,9 @@ pub fn is_context_length_error(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     [
         "prompt is too long",
+        "prompt_too_long",
+        "prompt too long",
+        "model_context_window_exceeded",
         "context length exceeded",
         "context_length_exceeded",
         "input is too long",
@@ -385,6 +388,8 @@ mod tests {
         for message in [
             r#"{"reason":"CONTEXT_LENGTH_EXCEEDED","message":"ValidationException"}"#,
             r#"{"reason":"INPUT_TOO_LONG"}"#,
+            r#"{"reason":"PROMPT_TOO_LONG"}"#,
+            r#"{"reason":"MODEL_CONTEXT_WINDOW_EXCEEDED"}"#,
             r#"{"message":"Input content length exceeds threshold.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#,
             "Input content length exceeds threshold.",
             "The context window has been exceeded",

@@ -112,6 +112,15 @@ options. Check accounts with `crosslane account list` and
 `crosslane account refresh --help`. Export output is redacted by default;
 use secret-bearing exports only in protected backups.
 
+Native OAuth Runtime calls, the ControlPlane catalog, and extension management REST
+use separate protocols and identity headers. Management defaults to
+`management.{region}.kiro.dev`. Missing-profile discovery successes use an
+account-scoped cache of up to 500 entries for 15 minutes. Default Web Search uses
+`InvokeMCP` at the Runtime root; explicit `CROSSLANE_MCP_URL` or
+`upstream.web_search_endpoint` retains legacy JSON-RPC compatibility. See the
+[Kiro request audit (Chinese)](kiro-request-audit.zh-CN.md) for overrides,
+CLI/API key compatibility, and verification limits.
+
 ### GitHub Copilot
 
 Create a Copilot provider, then authorize an account through GitHub Device

@@ -191,12 +191,7 @@ fn to_event(headers: BTreeMap<String, String>, value: Value) -> KiroEvent {
     if message_type == Some("exception") || exception_type.is_some() {
         return KiroEvent::Error {
             kind: exception_type.unwrap_or_else(|| event_type.clone()),
-            message: value
-                .get("message")
-                .and_then(Value::as_str)
-                .or_else(|| value.get("Message").and_then(Value::as_str))
-                .unwrap_or("Unknown stream error")
-                .into(),
+            message: native_error_message(&value),
         };
     }
     if let Some(kind) = value
@@ -207,25 +202,26 @@ fn to_event(headers: BTreeMap<String, String>, value: Value) -> KiroEvent {
     {
         return KiroEvent::Error {
             kind: kind.into(),
-            message: value
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("Unknown stream error")
-                .into(),
+            message: native_error_message(&value),
         };
     }
     if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
         return KiroEvent::Error {
             kind: "upstream_error".into(),
-            message: error
-                .get("message")
-                .and_then(Value::as_str)
-                .or_else(|| error.as_str())
-                .unwrap_or("Unknown stream error")
-                .into(),
+            message: native_error_message(error),
         };
     }
     match event_type.as_str() {
+        "error" | "throttlingError" | "validationError" | "serviceUnavailableError" => {
+            let body = value
+                .get(&event_type)
+                .filter(|body| !body.is_null())
+                .unwrap_or(&value);
+            KiroEvent::Error {
+                kind: event_type,
+                message: native_error_message(body),
+            }
+        }
         "assistantResponseEvent" => KiroEvent::AssistantResponse {
             content: nested_str(&value, "assistantResponseEvent", "content")
                 .or_else(|| value.get("content").and_then(Value::as_str))
@@ -335,6 +331,10 @@ fn to_event(headers: BTreeMap<String, String>, value: Value) -> KiroEvent {
 
 fn detected_event_type(value: &Value) -> Option<&'static str> {
     [
+        "error",
+        "throttlingError",
+        "validationError",
+        "serviceUnavailableError",
         "assistantResponseEvent",
         "toolUseEvent",
         "reasoningContentEvent",
@@ -350,13 +350,38 @@ fn detected_event_type(value: &Value) -> Option<&'static str> {
         "invalidStateEvent",
     ]
     .into_iter()
-    .find(|key| value.get(key).is_some())
+    .find(|key| value.get(key).is_some_and(|body| !body.is_null()))
     .or_else(|| {
         value
             .get("citationLink")
             .is_some()
             .then_some("citationEvent")
     })
+}
+
+fn native_error_message(value: &Value) -> String {
+    let message = value
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("Message").and_then(Value::as_str))
+        .or_else(|| value.as_str())
+        .unwrap_or("Unknown stream error");
+    if value.get("reason").and_then(Value::as_str).is_none()
+        && value
+            .get("retryAfterMilliseconds")
+            .and_then(Value::as_u64)
+            .is_none()
+    {
+        return message.into();
+    }
+    let mut error = serde_json::json!({"message":message});
+    if let Some(reason) = value.get("reason").and_then(Value::as_str) {
+        error["reason"] = Value::String(reason.into());
+    }
+    if let Some(delay) = value.get("retryAfterMilliseconds").and_then(Value::as_u64) {
+        error["retryAfterMilliseconds"] = serde_json::json!(delay.min(300_000));
+    }
+    error.to_string()
 }
 
 fn nested_str<'a>(value: &'a Value, wrapper: &str, key: &str) -> Option<&'a str> {
@@ -591,11 +616,47 @@ mod tests {
             (":exception-type".into(), "ThrottlingException".into()),
         ]);
         assert_eq!(
-            to_event(headers, serde_json::json!({"message":"rate exceeded"})),
+            to_event(
+                headers.clone(),
+                serde_json::json!({"message":"rate exceeded"})
+            ),
             KiroEvent::Error {
                 kind: "ThrottlingException".into(),
                 message: "rate exceeded".into()
             }
         );
+        assert!(matches!(
+            to_event(headers, serde_json::json!({"message":null,"Message":"rate exceeded"})),
+            KiroEvent::Error { message, .. } if message == "rate exceeded"
+        ));
+    }
+
+    #[test]
+    fn native_error_events_preserve_reasons_and_bounded_retry_hints() {
+        for kind in [
+            "error",
+            "throttlingError",
+            "validationError",
+            "serviceUnavailableError",
+        ] {
+            let body = serde_json::json!({
+                "message": "request rejected",
+                "reason": "USAGE_LIMIT_REACHED",
+                "retryAfterMilliseconds": 400_000
+            });
+            let headers = BTreeMap::from([(":event-type".into(), kind.into())]);
+            let mut wrapper = serde_json::Map::new();
+            wrapper.insert(kind.into(), body.clone());
+            for event in [
+                to_event(headers, body),
+                to_event(BTreeMap::new(), Value::Object(wrapper)),
+            ] {
+                let KiroEvent::Error { message, .. } = event else {
+                    panic!("{kind} must be classified as an upstream error");
+                };
+                assert!(crate::client::text_is_quota_error(&message));
+                assert_eq!(crate::client::retry_after_millis(&message), Some(300_000));
+            }
+        }
     }
 }

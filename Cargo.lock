@@ -616,6 +616,7 @@ dependencies = [
  "futures",
  "http",
  "hyper-rustls",
+ "lru",
  "quinn",
  "quinn-proto",
  "quinn-udp",
