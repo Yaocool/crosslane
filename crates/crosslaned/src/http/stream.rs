@@ -1657,6 +1657,14 @@ fn classify_stream_failure(
             scope: StreamFailureScope::Model,
         };
     }
+    if crosslane_kiro::client::text_is_quota_error(message) {
+        return StreamFailureDetails {
+            upstream_status,
+            error_code: "upstream_quota_exhausted",
+            error_stage: "upstream_stream",
+            scope: StreamFailureScope::Account,
+        };
+    }
     if crosslane_kiro::client::text_is_throttle_error(message) {
         return StreamFailureDetails {
             upstream_status: upstream_status.or(Some(429)),
@@ -1669,14 +1677,6 @@ fn classify_stream_failure(
         return StreamFailureDetails {
             upstream_status,
             error_code: "upstream_authentication_failed",
-            error_stage: "upstream_stream",
-            scope: StreamFailureScope::Account,
-        };
-    }
-    if crosslane_kiro::client::text_is_quota_error(message) {
-        return StreamFailureDetails {
-            upstream_status,
-            error_code: "upstream_quota_exhausted",
             error_stage: "upstream_stream",
             scope: StreamFailureScope::Account,
         };

@@ -892,12 +892,18 @@ async fn dispatch_upstream(
             let exponent = attempt.min(5);
             let base_ms = 200u64.saturating_mul(1u64 << exponent).min(5_000);
             let jitter_ms = rand::thread_rng().gen_range(0..=base_ms / 4);
+            let server_delay = last_error
+                .as_ref()
+                .and_then(crosslane_kiro::KiroError::retry_after_ms)
+                .unwrap_or(0);
+            // A rejected account's retry hint must not stall fresh credentials.
             let backoff_ms = base_ms + jitter_ms;
             tracing::debug!(
                 event = "upstream.retry.waiting",
                 trace_id,
                 attempt = attempt + 1,
                 backoff_ms,
+                upstream_retry_after_ms = server_delay,
                 "waiting before upstream retry"
             );
             tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;

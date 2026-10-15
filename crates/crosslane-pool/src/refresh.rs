@@ -11,6 +11,8 @@ use thiserror::Error;
 
 use crate::{AccountHealth, AccountPool};
 
+const SOCIAL_REFRESH_URL: &str = "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken";
+
 #[derive(Debug, Error)]
 pub enum RefreshError {
     #[error("account not found")]
@@ -306,14 +308,14 @@ impl TokenRefresher {
         }
     }
 
-    async fn request_tokens(
+    fn token_request(
         &self,
         snapshot: &Account,
-    ) -> Result<RefreshResponse, RefreshRequestFailure> {
+    ) -> Result<reqwest::RequestBuilder, RefreshRequestFailure> {
         let Some(refresh_token) = snapshot.credentials.refresh_token.as_deref() else {
             return Err(RefreshRequestFailure::NotRefreshable);
         };
-        let response = match snapshot.credentials.auth_method {
+        Ok(match snapshot.credentials.auth_method {
             AuthMethod::ApiKey => return Err(RefreshRequestFailure::NotRefreshable),
             AuthMethod::Idc => {
                 let (Some(client_id), Some(client_secret)) = (
@@ -334,15 +336,18 @@ impl TokenRefresher {
                         snapshot.credentials.region
                     )
                 });
-                self.client.post(endpoint).json(&request).send().await
+                self.client
+                    .post(endpoint)
+                    .header(reqwest::header::USER_AGENT, "KiroIDE")
+                    .json(&request)
             }
             AuthMethod::Social => {
-                let endpoint = self.endpoint_override.clone().unwrap_or_else(|| {
-                    format!(
-                        "https://prod.{}.auth.desktop.kiro.dev/refreshToken",
-                        snapshot.credentials.region
-                    )
-                });
+                // Desktop social OAuth is global; a profile's Kiro region
+                // must not select a different token issuer.
+                let endpoint = self
+                    .endpoint_override
+                    .clone()
+                    .unwrap_or_else(|| SOCIAL_REFRESH_URL.into());
                 self.client
                     .post(endpoint)
                     .header(
@@ -350,10 +355,15 @@ impl TokenRefresher {
                         ide_auth_user_agent(&snapshot.machine_id),
                     )
                     .json(&SocialRefreshRequest { refresh_token })
-                    .send()
-                    .await
             }
-        };
+        })
+    }
+
+    async fn request_tokens(
+        &self,
+        snapshot: &Account,
+    ) -> Result<RefreshResponse, RefreshRequestFailure> {
+        let response = self.token_request(snapshot)?.send().await;
         match response {
             Ok(response) if response.status().is_success() => {
                 let status = response.status().as_u16();
@@ -490,6 +500,59 @@ mod tests {
         }
     }
 
+    #[test]
+    fn refresh_requests_use_the_token_issuer_instead_of_the_profile_region() {
+        let refresher = TokenRefresher::new(300).unwrap();
+        let mut account = account();
+        account.credentials.region = "eu-west-1".into();
+        account.profile_arn =
+            Some("arn:aws:codewhisperer:us-east-1:123456789012:profile/test".into());
+        let request = refresher
+            .token_request(&account)
+            .ok()
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            request.url().as_str(),
+            "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken"
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                request.body().unwrap().as_bytes().unwrap()
+            )
+            .unwrap(),
+            json!({"refreshToken":"refresh-token"})
+        );
+        assert!(!request.headers().contains_key("authorization"));
+        assert!(!request.headers().contains_key("tokentype"));
+
+        account.credentials.auth_method = AuthMethod::Idc;
+        account.credentials.client_id = Some("client-id".into());
+        account.credentials.client_secret = Some("client-secret".into());
+        let request = refresher
+            .token_request(&account)
+            .ok()
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            request.url().as_str(),
+            "https://oidc.eu-west-1.amazonaws.com/token"
+        );
+        assert_eq!(request.headers()["user-agent"], "KiroIDE");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                request.body().unwrap().as_bytes().unwrap()
+            )
+            .unwrap(),
+            json!({
+                "clientId":"client-id", "clientSecret":"client-secret",
+                "grantType":"refresh_token", "refreshToken":"refresh-token"
+            })
+        );
+    }
+
     #[tokio::test]
     async fn successful_refresh_preserves_cooling_and_exhausted_health() {
         let server = MockServer::start().await;
@@ -579,7 +642,7 @@ mod tests {
     #[tokio::test]
     async fn social_refresh_persists_rotated_credentials_and_uses_current_user_agent() {
         let server = MockServer::start().await;
-        let expected_user_agent = format!("KiroIDE-1.0.437-{}", "a".repeat(64));
+        let expected_user_agent = format!("KiroIDE-1.2.56-{}", "a".repeat(64));
         Mock::given(method("POST"))
             .and(path("/refresh"))
             .and(header("user-agent", expected_user_agent.as_str()))

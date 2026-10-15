@@ -99,6 +99,13 @@ crosslane account add-sso --email user@example.com --password-stdin < /secure/ki
 `crosslane account list` 检查账号，刷新选项见 `crosslane account refresh --help`。
 账号导出默认脱敏；包含凭证的导出只应存放在受保护的备份中。
 
+原生 Runtime 的 OAuth 请求、ControlPlane 模型目录和 extension 管理 REST 使用各自的
+协议与身份头。管理请求默认访问 `management.{region}.kiro.dev`；缺失 Profile 的发现
+结果有 15 分钟、最多 500 项的账号隔离缓存。默认 Web Search 使用 Runtime 根路径的
+`InvokeMCP`；显式 `CROSSLANE_MCP_URL` / `upstream.web_search_endpoint` 保留旧
+JSON-RPC 兼容格式。端点覆盖、CLI/API key 边界及验证范围见
+[Kiro 请求审计](kiro-request-audit.zh-CN.md)。
+
 ### GitHub Copilot
 
 先创建 Copilot 来源，再通过 GitHub Device Flow 授权，或从标准输入导入已有 token：

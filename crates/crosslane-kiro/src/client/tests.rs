@@ -5,6 +5,9 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::*;
 
+#[path = "request_contracts.rs"]
+mod request_contracts;
+
 #[tokio::test]
 async fn disabled_models_block_direct_calls_and_clones_already_waiting_for_a_slot() {
     let server = MockServer::start().await;
@@ -72,15 +75,16 @@ fn account(method: AuthMethod) -> Account {
 }
 
 fn assert_ide_identity(headers: &reqwest::header::HeaderMap, machine_id: &str) {
-    assert_eq!(
-        headers["user-agent"],
-        format!(
-            "aws-sdk-js/1.0.39 ua/2.1 os/win32#10.0.19044 lang/js md/nodejs#22.21.1 api/codewhispererstreaming#1.0.39 m/E KiroIDE-1.0.437-{machine_id}"
-        )
+    let user_agent = headers["user-agent"].to_str().unwrap();
+    assert!(user_agent.starts_with("aws-sdk-js/1.0.39 ua/2.1 "));
+    assert!(user_agent.ends_with(&format!(" KiroIDE 1.2.56 {machine_id}")));
+    assert!(
+        user_agent.contains("api/codewhispererstreaming#1.0.39")
+            || user_agent.contains("api/codewhisperer#1.0.39")
     );
     assert_eq!(
         headers["x-amz-user-agent"],
-        format!("aws-sdk-js/1.0.39 KiroIDE-1.0.437-{machine_id}")
+        format!("aws-sdk-js/1.0.39 KiroIDE 1.2.56 {machine_id}")
     );
 }
 
@@ -139,7 +143,7 @@ fn test_client(server: &MockServer) -> KiroClient {
             )),
             mcp_url: Some(format!("{}/mcp", server.uri())),
             runtime_url: Some(format!("{}/runtime", server.uri())),
-            management_url: Some(format!("{}/management", server.uri())),
+            management_url: None,
         },
     )
     .expect("client")
@@ -226,7 +230,7 @@ async fn api_key_generation_uses_runtime_without_oauth_profile_or_refresh() {
         "API keys must not trigger profile/catalog discovery"
     );
     assert!(!account.is_token_expiring(1_000_000, 300));
-    let headers = mcp_headers(&account).unwrap();
+    let headers = mcp_headers(&account, false).unwrap();
     assert_eq!(headers["tokentype"], "API_KEY");
     assert!(!headers.contains_key("x-amzn-kiro-profile-arn"));
 }
@@ -236,15 +240,16 @@ async fn runtime_catalog_uses_management_rpc_and_oauth_profile() {
     let server = MockServer::start().await;
     Mock::given(method("POST")).and(path("/management"))
         .respond_with(|request: &wiremock::Request| {
-            assert_cli_identity(&request.headers, "codewhispererruntime");
+            assert!(request.headers["user-agent"].to_str().unwrap().contains("api/kiro-controlplane-bearer#"));
+            assert!(request.headers["user-agent"].to_str().unwrap().ends_with("KAS/0.66.32"));
             assert_eq!(request.headers["authorization"], "Bearer access-token");
             assert_eq!(request.headers["content-type"], "application/x-amz-json-1.0");
             assert!(request.headers.contains_key("amz-sdk-invocation-id"));
             assert_eq!(request.headers["amz-sdk-request"], "attempt=1; max=1");
-            assert_eq!(request.headers["x-amz-target"], "AmazonCodeWhispererService.ListAvailableModels");
-            assert!(!request.headers.contains_key("tokentype"));
+            assert_eq!(request.headers["x-amz-target"], "KiroControlPlaneBearerService.ListAvailableModels");
+            assert_eq!(request.headers["tokentype"], "SSO_OIDC");
             let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
-            assert_eq!(body["origin"], "KIRO_CLI");
+            assert_eq!(body["origin"], "AI_EDITOR");
             assert_eq!(body["profileArn"], "arn:aws:codewhisperer:us-east-1:123456789012:profile/enterprise");
             ResponseTemplate::new(200).set_body_json(serde_json::json!({"models":[{
                 "modelId":"claude-opus-5", "modelName":"Opus 5",
@@ -253,6 +258,7 @@ async fn runtime_catalog_uses_management_rpc_and_oauth_profile() {
         }).expect(1).mount(&server).await;
     let mut client = test_client(&server);
     client.upstream.preferred_endpoint = Some(crosslane_core::config::Endpoint::Runtime);
+    client.overrides.management_url = Some(format!("{}/management", server.uri()));
     let models = client
         .list_models(&power_account(AuthMethod::Idc))
         .await
@@ -307,7 +313,7 @@ async fn govcloud_replaces_commercial_profile_before_runtime_and_management_requ
     let server = MockServer::start().await;
     let profile = "arn:aws-us-gov:codewhisperer:us-gov-west-1:123456789012:profile/enterprise";
     Mock::given(method("POST"))
-        .and(path("/amazon/ListAvailableProfiles"))
+        .and(path("/management/us-gov-west-1/ListAvailableProfiles"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "profiles":[{"arn":KIRO_BUILDER_ID_PROFILE_ARN},{"arn":profile}]
         })))
@@ -862,7 +868,7 @@ async fn web_search_calls_mcp_and_decodes_nested_json_text() {
             .headers
             .get("x-amzn-codewhisperer-optout")
             .and_then(|value| value.to_str().ok()),
-        Some("false")
+        Some("true")
     );
     assert_eq!(
         request

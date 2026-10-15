@@ -4,7 +4,8 @@
 //! this baseline, and validate the emitted upstream headers after rebuilding.
 //! These are the existing desktop/CLI platform profiles, not the proxy host OS.
 
-pub const IDE_VERSION: &str = "1.0.437";
+pub const IDE_VERSION: &str = "1.2.56";
+pub const KAS_VERSION: &str = "0.66.32";
 pub const CLI_VERSION: &str = "2.21.4";
 
 const IDE_SDK_VERSION: &str = "1.0.39";
@@ -34,14 +35,53 @@ pub fn ide_auth_user_agent(machine_id: &str) -> String {
 }
 
 pub fn ide_user_agent(machine_id: &str) -> String {
-    let app = ide_auth_user_agent(machine_id);
-    format!(
-        "aws-sdk-js/{IDE_SDK_VERSION} ua/2.1 os/win32#10.0.19044 lang/js md/nodejs#{IDE_NODE_VERSION} api/codewhispererstreaming#{IDE_SDK_VERSION} m/E {app}"
-    )
+    ide_service_user_agent(IdeService::LegacyStreaming, machine_id)
 }
 
 pub fn ide_amz_user_agent(machine_id: &str) -> String {
-    let app = ide_auth_user_agent(machine_id);
+    ide_service_amz_user_agent(IdeService::LegacyStreaming, machine_id)
+}
+
+/// Agent RPC clients and extension REST clients have distinct identities.
+/// The hyphenated desktop identity belongs only to social authentication.
+#[derive(Clone, Copy)]
+pub enum IdeService {
+    Runtime,
+    ControlPlane,
+    Management,
+    LegacyStreaming,
+}
+
+impl IdeService {
+    fn api_name(self) -> &'static str {
+        match self {
+            Self::Runtime => "kiro-runtime",
+            Self::ControlPlane => "kiro-controlplane-bearer",
+            Self::Management => "codewhisperer",
+            Self::LegacyStreaming => "codewhispererstreaming",
+        }
+    }
+
+    fn custom_user_agent(self, machine_id: &str) -> String {
+        let app = format!("KiroIDE {IDE_VERSION} {machine_id}");
+        if matches!(self, Self::Runtime | Self::ControlPlane) {
+            format!("{app} KAS/{KAS_VERSION}")
+        } else {
+            app
+        }
+    }
+}
+
+pub fn ide_service_user_agent(service: IdeService, machine_id: &str) -> String {
+    let app = service.custom_user_agent(machine_id);
+    let api = service.api_name();
+    format!(
+        "aws-sdk-js/{IDE_SDK_VERSION} ua/2.1 os/win32#10.0.19044 lang/js md/nodejs#{IDE_NODE_VERSION} api/{api}#{IDE_SDK_VERSION} m/E {app}"
+    )
+}
+
+pub fn ide_service_amz_user_agent(service: IdeService, machine_id: &str) -> String {
+    let app = service.custom_user_agent(machine_id);
     format!("aws-sdk-js/{IDE_SDK_VERSION} {app}")
 }
 

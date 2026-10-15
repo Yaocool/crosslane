@@ -1,6 +1,62 @@
 use super::*;
 
 #[test]
+fn native_error_reasons_preserve_quota_rate_capacity_and_validation_scopes() {
+    for reason in [
+        "USAGE_LIMIT_REACHED",
+        "DAILY_REQUEST_COUNT",
+        "OVERAGE_REQUEST_LIMIT_EXCEEDED",
+    ] {
+        let message = format!(
+            "throttlingError: {}",
+            serde_json::json!({"reason":reason,"message":"Request rejected"})
+        );
+        let details = classify_stream_failure(&message, None);
+        assert_eq!(details.error_code, "upstream_quota_exhausted");
+        assert_eq!(details.scope, StreamFailureScope::Account);
+        assert!(details.account_error());
+    }
+    for (kind, reason, code, scope) in [
+        (
+            "throttlingError",
+            "USER_REQUEST_RATE_EXCEEDED",
+            "upstream_rate_limited",
+            StreamFailureScope::Model,
+        ),
+        (
+            "throttlingError",
+            "CREDIT_CONSUMPTION_RATE_EXCEEDED",
+            "upstream_rate_limited",
+            StreamFailureScope::Model,
+        ),
+        (
+            "throttlingError",
+            "INSUFFICIENT_MODEL_CAPACITY",
+            "upstream_model_unavailable",
+            StreamFailureScope::Model,
+        ),
+        (
+            "validationError",
+            "INVALID_MODEL_ID",
+            "invalid_tool_protocol",
+            StreamFailureScope::Client,
+        ),
+        (
+            "validationError",
+            "PROMPT_TOO_LONG",
+            "context_length_exceeded",
+            StreamFailureScope::Client,
+        ),
+    ] {
+        let message = format!("{kind}: {}", serde_json::json!({"reason":reason}));
+        let details = classify_stream_failure(&message, None);
+        assert_eq!(details.error_code, code, "{reason}");
+        assert_eq!(details.scope, scope, "{reason}");
+        assert!(!details.account_error(), "{reason}");
+    }
+}
+
+#[test]
 fn local_stream_slot_failure_keeps_proxy_scope_and_no_upstream_status() {
     let error = crosslane_kiro::KiroError::stream_slot_timeout(30_000);
     assert!(!error.is_retriable());

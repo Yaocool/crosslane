@@ -1,6 +1,7 @@
 //! Upstream HTTP client with independent short-request and streaming pools.
 
-use std::sync::Arc;
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -18,12 +19,13 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::endpoint::{
-    account_api_region, endpoint_for_auth, EndpointCache, EndpointDefinition, EndpointKey,
-    EndpointOverrides, EndpointPurpose,
+    account_api_region, management_base, supports_native_management, EndpointCache,
+    EndpointDefinition, EndpointKey, EndpointOverrides, EndpointPurpose,
 };
 use crate::event_stream::{EventStreamDecoder, KiroEvent};
 use crate::identity::{
-    cli_amz_user_agent, cli_user_agent, ide_amz_user_agent, ide_user_agent, CliService,
+    cli_amz_user_agent, cli_user_agent, ide_amz_user_agent, ide_service_amz_user_agent,
+    ide_service_user_agent, ide_user_agent, CliService, IdeService,
 };
 
 const KIRO_BUILDER_ID_PROFILE_ARN: &str =
@@ -31,6 +33,9 @@ const KIRO_BUILDER_ID_PROFILE_ARN: &str =
 const KIRO_SOCIAL_PROFILE_ARN: &str =
     "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK";
 const LOCAL_STREAM_SLOT_ENDPOINT: &str = "crosslane.stream-slot";
+const PROFILE_CACHE_CAPACITY: usize = 500;
+const PROFILE_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
+const MAX_DISCOVERY_PAGES: usize = 100;
 
 #[derive(Clone)]
 pub struct KiroError {
@@ -85,7 +90,10 @@ impl KiroError {
     }
 
     pub fn is_auth(&self) -> bool {
-        matches!(self.status, Some(401 | 403)) || text_is_auth_error(&self.message)
+        self.status == Some(401)
+            || (!self.is_quota()
+                && !self.is_throttle()
+                && (self.status == Some(403) || text_is_auth_error(&self.message)))
     }
 
     pub fn is_quota(&self) -> bool {
@@ -93,7 +101,7 @@ impl KiroError {
     }
 
     pub fn is_throttle(&self) -> bool {
-        self.status == Some(429) || text_is_throttle_error(&self.message)
+        !self.is_quota() && (self.status == Some(429) || text_is_throttle_error(&self.message))
     }
 
     pub fn is_model_temporarily_unavailable(&self) -> bool {
@@ -119,6 +127,20 @@ impl KiroError {
     pub fn is_request_rejection(&self) -> bool {
         matches!(self.status, Some(400 | 413 | 422)) || text_is_request_rejection(&self.message)
     }
+
+    pub fn retry_after_ms(&self) -> Option<u64> {
+        retry_after_millis(&self.message)
+    }
+}
+
+/// Preserve Kiro's bounded retry hint without changing the public error shape.
+pub fn retry_after_millis(message: &str) -> Option<u64> {
+    let start = message.find('{')?;
+    let value: serde_json::Value = serde_json::from_str(&message[start..]).ok()?;
+    value
+        .get("retryAfterMilliseconds")?
+        .as_u64()
+        .map(|delay| delay.min(300_000))
 }
 
 /// Stream assembly retains the structured local endpoint in KiroError's
@@ -145,13 +167,15 @@ pub fn text_is_auth_error(message: &str) -> bool {
 }
 
 pub fn text_is_quota_error(message: &str) -> bool {
-    let text = message.to_ascii_lowercase();
+    let text = message.to_ascii_lowercase().replace('_', " ");
     [
         "quota",
         "credit exhausted",
         "credits exhausted",
         "insufficient credit",
         "usage limit",
+        "request count",
+        "overage request limit exceeded",
     ]
     .iter()
     .any(|marker| text.contains(marker))
@@ -159,7 +183,12 @@ pub fn text_is_quota_error(message: &str) -> bool {
 }
 
 pub fn text_is_throttle_error(message: &str) -> bool {
-    let text = message.to_ascii_lowercase();
+    // Kiro reports exhausted allowances through ThrottlingException/429 too.
+    // Its quota reason takes precedence over the generic exception name.
+    if text_is_quota_error(message) {
+        return false;
+    }
+    let text = message.to_ascii_lowercase().replace('_', " ");
     [
         "throttl",
         "too many requests",
@@ -177,6 +206,7 @@ pub fn text_is_model_temporarily_unavailable(message: &str) -> bool {
         "model_temporarily_unavailable",
         "model temporarily unavailable",
         "unexpectedly high load",
+        "insufficient_model_capacity",
     ]
     .iter()
     .any(|marker| text.contains(marker))
@@ -197,6 +227,7 @@ pub fn text_is_request_rejection(message: &str) -> bool {
             "request too large",
             "request entity too large",
             "validationexception",
+            "validationerror",
         ]
         .iter()
         .any(|marker| text.contains(marker))
@@ -514,7 +545,15 @@ pub struct KiroClient {
     short_slots: Arc<tokio::sync::Semaphore>,
     stream_slots: Arc<tokio::sync::Semaphore>,
     model_fetches: Arc<DashMap<(String, String), InFlightModelFetch>>,
-    profile_fetches: Arc<DashMap<(String, String), InFlightProfileFetch>>,
+    profile_fetches: Arc<DashMap<ProfileFetchKey, InFlightProfileFetch>>,
+    profile_cache: Arc<Mutex<lru::LruCache<ProfileFetchKey, CachedProfile>>>,
+}
+
+type ProfileFetchKey = (String, String, String);
+
+struct CachedProfile {
+    arn: String,
+    expires: Instant,
 }
 
 type SharedModelFetch = Shared<BoxFuture<'static, Result<Vec<ModelInfo>, KiroError>>>;
@@ -590,6 +629,9 @@ impl KiroClient {
             )),
             model_fetches: Arc::new(DashMap::new()),
             profile_fetches: Arc::new(DashMap::new()),
+            profile_cache: Arc::new(Mutex::new(lru::LruCache::new(
+                NonZeroUsize::new(PROFILE_CACHE_CAPACITY).expect("nonzero profile cache capacity"),
+            ))),
             upstream,
         })
     }
@@ -732,7 +774,23 @@ impl KiroClient {
             return Ok(KIRO_SOCIAL_PROFILE_ARN.into());
         }
 
-        let fetch_key = (account.id.clone(), account.credentials.access_token.clone());
+        let fetch_key = (
+            account.id.clone(),
+            account.credentials.access_token.clone(),
+            account_api_region(account)?,
+        );
+        {
+            let mut cache = self
+                .profile_cache
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(cached) = cache.get(&fetch_key) {
+                if cached.expires > Instant::now() {
+                    return Ok(cached.arn.clone());
+                }
+            }
+            cache.pop(&fetch_key);
+        }
         let fetch_id = Uuid::new_v4();
         let fetch = match self.profile_fetches.entry(fetch_key.clone()) {
             Entry::Occupied(entry) => entry.get().future.clone(),
@@ -759,6 +817,19 @@ impl KiroClient {
                 let fetches = Arc::clone(&self.profile_fetches);
                 tokio::spawn(async move {
                     let result = client.fetch_profile_arn_once(&account).await;
+                    if let Ok(arn) = &result {
+                        client
+                            .profile_cache
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .put(
+                                fetch_key.clone(),
+                                CachedProfile {
+                                    arn: arn.clone(),
+                                    expires: Instant::now() + PROFILE_CACHE_TTL,
+                                },
+                            );
+                    }
                     let _sent = result_sender.send(result);
                     fetches.remove_if(&fetch_key, |_, entry| entry.id == fetch_id);
                 });
@@ -769,11 +840,28 @@ impl KiroClient {
     }
 
     async fn fetch_profile_arn_once(&self, account: &Account) -> Result<String, KiroError> {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            self.fetch_profile_arn_pages(account),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(KiroError {
+                status: None,
+                endpoint: "ListAvailableProfiles".into(),
+                message: "profile discovery timed out after 10 seconds".into(),
+            })
+        })
+    }
+
+    async fn fetch_profile_arn_pages(&self, account: &Account) -> Result<String, KiroError> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Profiles {
             #[serde(default)]
             profiles: Vec<Profile>,
+            #[serde(default)]
+            next_token: Option<String>,
         }
 
         #[derive(Deserialize)]
@@ -792,64 +880,85 @@ impl KiroClient {
         let mut fallback_allowed = false;
         let mut last_error = None;
         for url in urls {
-            let response = self
-                .short
-                .post(url.clone())
-                .headers(profile_headers(account)?)
-                .json(&serde_json::json!({}))
-                .send()
-                .await
-                .map_err(|error| KiroError {
-                    status: None,
-                    endpoint: "ListAvailableProfiles".into(),
-                    message: error.to_string(),
-                })?;
-            let status = response.status();
-            let body =
-                bounded_response_text(response, 1024 * 1024, "ListAvailableProfiles").await?;
-            if status.is_success() {
-                let profiles =
-                    serde_json::from_str::<Profiles>(&body).map_err(|error| KiroError {
-                        status: Some(502),
-                        endpoint: "ListAvailableProfiles".into(),
-                        message: format!("invalid profile discovery response: {error}"),
-                    })?;
-                if let Some(profile_arn) = profiles
-                    .profiles
-                    .into_iter()
-                    .filter_map(|profile| profile.arn)
-                    .map(|profile_arn| profile_arn.trim().to_owned())
-                    .find(|profile_arn| {
-                        profile_arn.starts_with("arn:")
-                            && profile_arn.len() <= 2_048
-                            && (!govcloud
-                                || profile_arn.starts_with("arn:aws-us-gov:codewhisperer:us-gov-"))
-                    })
-                {
-                    debug!(
-                        account = %account.id,
-                        endpoint = %url,
-                        "Kiro profile ARN discovered"
-                    );
-                    return Ok(profile_arn);
+            let mut next_token: Option<String> = None;
+            let mut seen_tokens = std::collections::HashSet::new();
+            for page in 0..MAX_DISCOVERY_PAGES {
+                let mut request = serde_json::json!({});
+                if let Some(token) = &next_token {
+                    request["nextToken"] = serde_json::json!(token);
                 }
-                fallback_allowed = true;
-                continue;
-            }
+                let response = self
+                    .short
+                    .post(url.clone())
+                    .headers(profile_headers(account)?)
+                    .json(&request)
+                    .timeout(Duration::from_secs(10))
+                    .send()
+                    .await
+                    .map_err(|error| KiroError {
+                        status: None,
+                        endpoint: "ListAvailableProfiles".into(),
+                        message: error.to_string(),
+                    })?;
+                let status = response.status();
+                let body =
+                    bounded_response_text(response, 1024 * 1024, "ListAvailableProfiles").await?;
+                if status.is_success() {
+                    let profiles =
+                        serde_json::from_str::<Profiles>(&body).map_err(|error| KiroError {
+                            status: Some(502),
+                            endpoint: "ListAvailableProfiles".into(),
+                            message: format!("invalid profile discovery response: {error}"),
+                        })?;
+                    if let Some(profile_arn) = profiles
+                        .profiles
+                        .into_iter()
+                        .filter_map(|profile| profile.arn)
+                        .map(|profile_arn| profile_arn.trim().to_owned())
+                        .find(|profile_arn| {
+                            profile_arn.starts_with("arn:")
+                                && profile_arn.len() <= 2_048
+                                && (!govcloud
+                                    || profile_arn
+                                        .starts_with("arn:aws-us-gov:codewhisperer:us-gov-"))
+                        })
+                    {
+                        debug!(
+                            account = %account.id,
+                            endpoint = %url,
+                            "Kiro profile ARN discovered"
+                        );
+                        return Ok(profile_arn);
+                    }
+                    if let Some(token) = profiles.next_token.filter(|token| !token.is_empty()) {
+                        if page + 1 == MAX_DISCOVERY_PAGES || !seen_tokens.insert(token.clone()) {
+                            return Err(KiroError { status: Some(502), endpoint: "ListAvailableProfiles".into(), message: "profile discovery exceeded its pagination limit or repeated a page token".into() });
+                        }
+                        next_token = Some(token);
+                        continue;
+                    }
+                    fallback_allowed = true;
+                    break;
+                }
 
-            let error = KiroError {
-                status: Some(status.as_u16()),
-                endpoint: "ListAvailableProfiles".into(),
-                message: nonempty_error_body(status.as_u16(), &body),
-            };
-            if status.as_u16() == 403 && !text_is_auth_error(&error.message) {
-                // Builder ID accounts cannot list Enterprise profiles. Kiro's
-                // own clients use the fixed Builder ID profile in this case.
-                fallback_allowed = true;
-                last_error = Some(error);
-                continue;
+                let error = KiroError {
+                    status: Some(status.as_u16()),
+                    endpoint: "ListAvailableProfiles".into(),
+                    message: nonempty_error_body(status.as_u16(), &body),
+                };
+                if status.as_u16() == 403
+                    && !error.is_quota()
+                    && !error.is_throttle()
+                    && !text_is_auth_error(&error.message)
+                {
+                    // Builder ID accounts cannot list Enterprise profiles. Kiro's
+                    // own clients use the fixed Builder ID profile in this case.
+                    fallback_allowed = true;
+                    last_error = Some(error);
+                    break;
+                }
+                return Err(error);
             }
-            return Err(error);
         }
 
         if fallback_allowed && !govcloud {
@@ -864,32 +973,26 @@ impl KiroClient {
     }
 
     fn profile_discovery_urls(&self, account: &Account) -> Result<Vec<url::Url>, KiroError> {
-        if let Some(endpoint) = self.overrides.amazonq_url.as_deref() {
-            return Ok(vec![operation_url(endpoint, "ListAvailableProfiles")?]);
-        }
-
-        let region = account.credentials.region.trim();
-        if region.is_empty()
-            || !region
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric() || character == '-')
-        {
-            return Err(KiroError {
-                status: None,
-                endpoint: "ListAvailableProfiles".into(),
-                message: "account has an invalid API region".into(),
-            });
-        }
-        let regions = usage_api_regions(account);
-        regions
-            .into_iter()
-            .map(|region| {
-                operation_url(
-                    &format!("https://q.{region}.amazonaws.com"),
-                    "ListAvailableProfiles",
-                )
-            })
+        self.management_bases(account)?
+            .iter()
+            .map(|base| operation_url(base, "ListAvailableProfiles"))
             .collect()
+    }
+
+    fn management_bases(&self, account: &Account) -> Result<Vec<String>, KiroError> {
+        let region = account_api_region(account)?;
+        if let Some(endpoint) = self
+            .overrides
+            .management_url
+            .as_deref()
+            .or(self.overrides.amazonq_url.as_deref())
+        {
+            return Ok(vec![endpoint.replace("{region}", &region)]);
+        }
+        Ok(usage_api_regions(account)
+            .iter()
+            .map(|region| management_base(region))
+            .collect())
     }
 
     /// Executes Kiro's JSON-RPC MCP web search. The nested MCP text block is
@@ -924,16 +1027,30 @@ impl KiroClient {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
-        let request = serde_json::json!({
+        let mut request = serde_json::json!({
             "id":format!("web_search_tooluse_{}_{}", Uuid::new_v4().simple(), timestamp),
             "jsonrpc":"2.0",
             "method":"tools/call",
             "params":{"name":"web_search","arguments":{"query":query}}
         });
+        let native =
+            self.overrides.mcp_url.is_none() && self.upstream.web_search_endpoint.is_none();
+        if native && account.credentials.auth_method != AuthMethod::ApiKey {
+            let profile = account
+                .profile_arn
+                .as_deref()
+                .filter(|profile| !profile.trim().is_empty())
+                .ok_or_else(|| KiroError {
+                    status: Some(400),
+                    endpoint: "MCP web_search".into(),
+                    message: "account profile ARN was not resolved before web search".into(),
+                })?;
+            request["profileArn"] = serde_json::json!(profile);
+        }
         let response = self
             .mcp
             .post(url.clone())
-            .headers(mcp_headers(account)?)
+            .headers(mcp_headers(account, native)?)
             .json(&request)
             .send()
             .await
@@ -1038,7 +1155,8 @@ impl KiroClient {
             .mcp_url
             .as_deref()
             .or(self.upstream.web_search_endpoint.as_deref())
-            .unwrap_or("https://runtime.{region}.kiro.dev/mcp");
+            .or(self.overrides.runtime_url.as_deref())
+            .unwrap_or("https://runtime.{region}.kiro.dev/");
         let url = template.replace("{region}", region);
         let parsed = url::Url::parse(&url).map_err(build_error)?;
         if !matches!(parsed.scheme(), "http" | "https")
@@ -1064,10 +1182,11 @@ impl KiroClient {
         // this request, not temporary account health: do not probe by removing
         // fields or learn time-limited capabilities from error message text.
         let mut payload = payload.clone();
-        set_payload_origin(&mut payload, endpoint.origin);
         if endpoint.key == EndpointKey::Runtime {
-            payload.conversation_state.agent_continuation_id = None;
             if account.credentials.auth_method == AuthMethod::ApiKey {
+                // API-key traffic uses the existing CLI contract. The supplied
+                // IDE report does not establish a replacement for that client.
+                payload.conversation_state.agent_continuation_id = None;
                 payload.profile_arn = None;
             } else {
                 payload.profile_arn = Some(self.resolve_profile_arn(account).await?);
@@ -1076,7 +1195,12 @@ impl KiroClient {
             routed_account.profile_arn.clone_from(&payload.profile_arn);
             endpoint =
                 EndpointDefinition::for_account(endpoint.key, &self.overrides, &routed_account)?;
+            if account.credentials.auth_method != AuthMethod::ApiKey {
+                endpoint.origin = "AI_EDITOR";
+                endpoint.amz_target = "KiroRuntimeService.GenerateAssistantResponse";
+            }
         }
+        set_payload_origin(&mut payload, endpoint.origin);
         validate_kiro_tool_history(&payload).map_err(|message| KiroError {
             status: Some(400),
             endpoint: endpoint.name.into(),
@@ -1094,6 +1218,21 @@ impl KiroClient {
         .map_err(build_error)?;
         let stream_slot_wait_ms = slot_wait_started.elapsed().as_millis() as u64;
         let mut wire = serde_json::to_value(&payload).map_err(build_error)?;
+        if endpoint.key == EndpointKey::Runtime
+            && account.credentials.auth_method != AuthMethod::ApiKey
+        {
+            wire["agentMode"] = serde_json::json!(match self.upstream.agent_mode {
+                AgentMode::Auto | AgentMode::Vibe => "vibe",
+                AgentMode::Spec => "spec",
+            });
+            wire["conversationState"]["agentTaskType"] =
+                serde_json::json!(match self.upstream.agent_mode {
+                    AgentMode::Auto | AgentMode::Vibe => "vibe",
+                    AgentMode::Spec => "spectask",
+                });
+            wire["conversationState"]["rootConversationId"] =
+                serde_json::json!(payload.conversation_state.conversation_id);
+        }
         if endpoint.key == EndpointKey::Runtime {
             if let Some(history) = wire
                 .pointer_mut("/conversationState/history")
@@ -1194,14 +1333,12 @@ impl KiroClient {
             let response = self
                 .short
                 .get(url)
-                .headers(token_type_headers(account))
+                .headers(profile_headers(account)?)
                 .header("accept", "application/json")
                 .header(
                     "authorization",
                     format!("Bearer {}", account.credentials.access_token),
                 )
-                .header("user-agent", ide_user_agent(&account.machine_id))
-                .header("x-amz-user-agent", ide_amz_user_agent(&account.machine_id))
                 .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
                 .header("amz-sdk-request", "attempt=1; max=1")
                 .send()
@@ -1244,13 +1381,9 @@ impl KiroClient {
     }
 
     fn usage_limits_urls(&self, account: &Account) -> Result<Vec<url::Url>, KiroError> {
-        account_api_region(account)?;
-        if let Some(endpoint) = self.overrides.amazonq_url.as_deref() {
-            return Ok(vec![usage_limits_url(endpoint, account)?]);
-        }
-        usage_api_regions(account)
-            .into_iter()
-            .map(|region| usage_limits_url(&format!("https://q.{region}.amazonaws.com"), account))
+        self.management_bases(account)?
+            .iter()
+            .map(|base| usage_limits_url(base, account))
             .collect()
     }
 
@@ -1314,112 +1447,189 @@ impl KiroClient {
 
     async fn fetch_models_once(&self, account: &Account) -> Result<Vec<ModelInfo>, KiroError> {
         let endpoint_revision = self.cache.revision(&account.id);
+        let native_default = (self.overrides.management_url.is_some()
+            || (self.overrides.amazonq_url.is_none()
+                && self.overrides.codewhisperer_url.is_none()))
+        .then_some(EndpointKey::Runtime);
         let order = self.cache.order(
             account,
-            self.upstream.preferred_endpoint.map(EndpointKey::from),
+            self.upstream
+                .preferred_endpoint
+                .map(EndpointKey::from)
+                .or(native_default),
             EndpointPurpose::Models,
         );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         let mut last_error = None;
-        for key in order {
+        'endpoints: for key in order {
             let endpoint = EndpointDefinition::for_account(key, &self.overrides, account)?;
-            let request = if key == EndpointKey::Runtime {
-                let profile = self.resolve_profile_arn(account).await?;
-                let mut routed_account = account.clone();
-                routed_account.profile_arn = Some(profile.clone());
-                let region = account_api_region(&routed_account)?;
-                let url = self
-                    .overrides
-                    .management_url
-                    .clone()
-                    .unwrap_or_else(|| format!("https://management.{region}.kiro.dev/"))
-                    .replace("{region}", &region);
-                self.short
-                    .post(url)
-                    .bearer_auth(&account.credentials.access_token)
-                    .header("accept", "*/*")
-                    .header("content-type", "application/x-amz-json-1.0")
-                    .header("user-agent", cli_user_agent(CliService::Management))
-                    .header(
-                        "x-amz-user-agent",
-                        cli_amz_user_agent(CliService::Management),
-                    )
-                    .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
-                    .header("amz-sdk-request", "attempt=1; max=1")
-                    .header(
-                        "x-amz-target",
-                        "AmazonCodeWhispererService.ListAvailableModels",
-                    )
-                    .json(&serde_json::json!({"origin":"KIRO_CLI", "profileArn":profile}))
-            } else {
-                self.short
-                    .get(models_url(&endpoint.url, account)?)
-                    .headers(metadata_headers(
+            let mut collected = Vec::new();
+            let mut next_token: Option<String> = None;
+            let mut seen_tokens = std::collections::HashSet::new();
+            for page in 0..MAX_DISCOVERY_PAGES {
+                let request = if key == EndpointKey::Runtime {
+                    let profile =
+                        match tokio::time::timeout_at(deadline, self.resolve_profile_arn(account))
+                            .await
+                        {
+                            Ok(Ok(profile)) => profile,
+                            Ok(Err(error)) => {
+                                last_error = Some(error);
+                                continue 'endpoints;
+                            }
+                            Err(_) => {
+                                return Err(KiroError {
+                                    status: None,
+                                    endpoint: endpoint.name.into(),
+                                    message: "ListAvailableModels timed out resolving its profile"
+                                        .into(),
+                                })
+                            }
+                        };
+                    let mut routed_account = account.clone();
+                    routed_account.profile_arn = Some(profile.clone());
+                    let region = account_api_region(&routed_account)?;
+                    if self.overrides.management_url.is_none()
+                        && !supports_native_management(&region)
+                    {
+                        // The legacy regional host uses REST. Do not send a
+                        // KiroControlPlane RPC target to the Amazon Q root.
+                        last_error = Some(KiroError {
+                            status: None,
+                            endpoint: endpoint.name.into(),
+                            message: "native model catalog is not configured for this Kiro region"
+                                .into(),
+                        });
+                        continue 'endpoints;
+                    }
+                    let url = self
+                        .overrides
+                        .management_url
+                        .clone()
+                        .unwrap_or_else(|| management_base(&region))
+                        .replace("{region}", &region);
+                    let mut body = serde_json::json!({"origin":"AI_EDITOR", "profileArn":profile});
+                    if let Some(token) = &next_token {
+                        body["nextToken"] = serde_json::json!(token);
+                    }
+                    self.short
+                        .post(url)
+                        .headers(native_rpc_headers(
+                            account,
+                            IdeService::ControlPlane,
+                            "KiroControlPlaneBearerService.ListAvailableModels",
+                        )?)
+                        .json(&body)
+                } else {
+                    let mut url = models_url(&endpoint.url, account)?;
+                    if let Some(token) = &next_token {
+                        url.query_pairs_mut().append_pair("nextToken", token);
+                    }
+                    self.short.get(url).headers(metadata_headers(
                         account,
                         &endpoint,
                         self.upstream.agent_mode,
-                        false,
                     )?)
-            };
-            let _permit = Arc::clone(&self.short_slots)
-                .acquire_owned()
+                };
+                let _permit = tokio::time::timeout_at(
+                    deadline,
+                    Arc::clone(&self.short_slots).acquire_owned(),
+                )
                 .await
-                .map_err(build_error)?;
-            let response = match tokio::time::timeout(Duration::from_secs(15), request.send()).await
-            {
-                Ok(Ok(response)) => response,
-                Ok(Err(error)) => return Err(build_error(error)),
-                Err(_) => {
-                    return Err(KiroError {
-                        status: None,
-                        endpoint: endpoint.name.into(),
-                        message: "ListAvailableModels timed out after 15 seconds".into(),
-                    });
-                }
-            };
-            if response.status().is_success() {
-                #[derive(Deserialize)]
-                struct Models {
-                    #[serde(default)]
-                    models: Vec<ModelInfo>,
-                }
-                let models = response.json::<Models>().await.map_err(build_error)?.models;
-                if !models.is_empty() {
-                    self.cache.mark_success_if_revision(
-                        &account.id,
-                        EndpointPurpose::Models,
-                        key,
-                        endpoint_revision,
-                    );
-                    return Ok(models);
-                }
-                last_error = Some(KiroError {
+                .map_err(|_| KiroError {
                     status: None,
                     endpoint: endpoint.name.into(),
-                    message: "upstream returned an empty model list".into(),
-                });
-                continue;
-            } else {
-                let mut error = response_error(response, &endpoint).await;
-                match error.status {
-                    Some(401) => {
-                        last_error = Some(error);
+                    message: "ListAvailableModels timed out waiting for a short-request slot"
+                        .into(),
+                })?
+                .map_err(build_error)?;
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let response = match tokio::time::timeout_at(
+                    deadline,
+                    request.timeout(remaining).send(),
+                )
+                .await
+                {
+                    Ok(Ok(response)) => response,
+                    Ok(Err(error)) => return Err(build_error(error)),
+                    Err(_) => {
+                        return Err(KiroError {
+                            status: None,
+                            endpoint: endpoint.name.into(),
+                            message: "ListAvailableModels timed out after 15 seconds".into(),
+                        });
+                    }
+                };
+                if response.status().is_success() {
+                    #[derive(Deserialize)]
+                    #[serde(rename_all = "camelCase")]
+                    struct Models {
+                        #[serde(default)]
+                        models: Vec<ModelInfo>,
+                        #[serde(default)]
+                        next_token: Option<String>,
+                    }
+                    let text =
+                        bounded_response_text(response, 8 * 1024 * 1024, "ListAvailableModels")
+                            .await?;
+                    let response = serde_json::from_str::<Models>(&text).map_err(build_error)?;
+                    collected.extend(response.models);
+                    if let Some(token) = response.next_token.filter(|token| !token.is_empty()) {
+                        if page + 1 == MAX_DISCOVERY_PAGES || !seen_tokens.insert(token.clone()) {
+                            return Err(KiroError { status: Some(502), endpoint: endpoint.name.into(), message: "model discovery exceeded its pagination limit or repeated a page token".into() });
+                        }
+                        next_token = Some(token);
                         continue;
                     }
-                    Some(403) if error.is_quota() || error.is_throttle() => {
-                        error.status = Some(429);
-                        return Err(error);
-                    }
-                    Some(403) => {
-                        self.cache.mark_disabled_if_revision(
+                    let models = collected;
+                    if !models.is_empty() {
+                        self.cache.mark_success_if_revision(
                             &account.id,
                             EndpointPurpose::Models,
                             key,
                             endpoint_revision,
                         );
-                        last_error = Some(error);
-                        continue;
+                        return Ok(models);
                     }
-                    _ => return Err(error),
+                    last_error = Some(KiroError {
+                        status: None,
+                        endpoint: endpoint.name.into(),
+                        message: "upstream returned an empty model list".into(),
+                    });
+                    continue 'endpoints;
+                } else {
+                    let mut error = response_error(response, &endpoint).await;
+                    match error.status {
+                        Some(401) => {
+                            last_error = Some(error);
+                            continue 'endpoints;
+                        }
+                        Some(403) if error.is_quota() || error.is_throttle() => {
+                            error.status = Some(429);
+                            return Err(error);
+                        }
+                        Some(403) => {
+                            self.cache.mark_disabled_if_revision(
+                                &account.id,
+                                EndpointPurpose::Models,
+                                key,
+                                endpoint_revision,
+                            );
+                            last_error = Some(error);
+                            continue 'endpoints;
+                        }
+                        Some(404 | 405) if key == EndpointKey::Runtime => {
+                            self.cache.mark_disabled_if_revision(
+                                &account.id,
+                                EndpointPurpose::Models,
+                                key,
+                                endpoint_revision,
+                            );
+                            last_error = Some(error);
+                            continue 'endpoints;
+                        }
+                        _ => return Err(error),
+                    }
                 }
             }
         }
@@ -1438,29 +1648,26 @@ impl KiroClient {
             .acquire_owned()
             .await
             .map_err(build_error)?;
-        let endpoint = EndpointDefinition::for_account(
-            if account.credentials.auth_method == AuthMethod::ApiKey {
-                EndpointKey::Amazonq
-            } else {
-                endpoint_for_auth(account.credentials.auth_method)
-            },
-            &self.overrides,
-            account,
-        )?;
-        let base = endpoint
-            .url
-            .split("/generateAssistantResponse")
+        let base = self
+            .management_bases(account)?
+            .into_iter()
             .next()
-            .unwrap_or(&endpoint.url);
+            .ok_or_else(|| KiroError {
+                status: Some(400),
+                endpoint: "subscriptions".into(),
+                message: "no management endpoint".into(),
+            })?;
+        let endpoint = EndpointDefinition {
+            key: EndpointKey::Amazonq,
+            url: base.clone(),
+            origin: "AI_EDITOR",
+            amz_target: "",
+            name: "KiroManagement",
+        };
         let response = match self
             .short
-            .post(format!("{base}/listAvailableSubscriptions"))
-            .headers(metadata_headers(
-                account,
-                &endpoint,
-                self.upstream.agent_mode,
-                true,
-            )?)
+            .post(operation_url(&base, "listAvailableSubscriptions")?)
+            .headers(profile_headers(account)?)
             .json(&serde_json::json!({}))
             .send()
             .await
@@ -1518,6 +1725,14 @@ fn headers(
     endpoint: &EndpointDefinition,
     mode: AgentMode,
 ) -> Result<reqwest::header::HeaderMap, KiroError> {
+    if endpoint.key == EndpointKey::Runtime && account.credentials.auth_method != AuthMethod::ApiKey
+    {
+        return native_rpc_headers(
+            account,
+            IdeService::Runtime,
+            "KiroRuntimeService.GenerateAssistantResponse",
+        );
+    }
     use reqwest::header::{
         HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT,
     };
@@ -1580,7 +1795,46 @@ fn headers(
     Ok(headers)
 }
 
-fn mcp_headers(account: &Account) -> Result<reqwest::header::HeaderMap, KiroError> {
+fn native_rpc_headers(
+    account: &Account,
+    service: IdeService,
+    target: &'static str,
+) -> Result<reqwest::header::HeaderMap, KiroError> {
+    use reqwest::header::HeaderValue;
+    let mut headers = profile_headers(account)?;
+    headers.insert(
+        "content-type",
+        HeaderValue::from_static("application/x-amz-json-1.0"),
+    );
+    headers.insert("accept", HeaderValue::from_static("*/*"));
+    headers.insert("x-amz-target", HeaderValue::from_static(target));
+    headers.insert(
+        "user-agent",
+        HeaderValue::from_str(&ide_service_user_agent(service, &account.machine_id))
+            .map_err(build_error)?,
+    );
+    headers.insert(
+        "x-amz-user-agent",
+        HeaderValue::from_str(&ide_service_amz_user_agent(service, &account.machine_id))
+            .map_err(build_error)?,
+    );
+    if account.credentials.auth_method == AuthMethod::Idc {
+        headers.insert("tokentype", HeaderValue::from_static("SSO_OIDC"));
+    }
+    headers.insert(
+        "x-amzn-codewhisperer-optout",
+        HeaderValue::from_static("true"),
+    );
+    if matches!(service, IdeService::Runtime) {
+        headers.insert("x-kiro-attempt", HeaderValue::from_static("1;max=1"));
+    }
+    Ok(headers)
+}
+
+fn mcp_headers(account: &Account, native: bool) -> Result<reqwest::header::HeaderMap, KiroError> {
+    if native {
+        return native_rpc_headers(account, IdeService::Runtime, "KiroRuntimeService.InvokeMCP");
+    }
     use reqwest::header::{
         HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT,
     };
@@ -1598,7 +1852,7 @@ fn mcp_headers(account: &Account) -> Result<reqwest::header::HeaderMap, KiroErro
     }
     headers.insert(
         reqwest::header::HeaderName::from_static("x-amzn-codewhisperer-optout"),
-        HeaderValue::from_static("false"),
+        HeaderValue::from_static("true"),
     );
     headers.extend(token_type_headers(account));
     let profile_arn = account
@@ -1642,8 +1896,8 @@ fn profile_headers(account: &Account) -> Result<reqwest::header::HeaderMap, Kiro
 
     let mut headers = HeaderMap::new();
     let authorization = format!("Bearer {}", account.credentials.access_token);
-    let user_agent = ide_user_agent(&account.machine_id);
-    let amz_user_agent = ide_amz_user_agent(&account.machine_id);
+    let user_agent = ide_service_user_agent(IdeService::Management, &account.machine_id);
+    let amz_user_agent = ide_service_amz_user_agent(IdeService::Management, &account.machine_id);
     for (name, value) in [
         (CONTENT_TYPE, "application/json"),
         (ACCEPT, "application/json"),
@@ -1652,6 +1906,7 @@ fn profile_headers(account: &Account) -> Result<reqwest::header::HeaderMap, Kiro
     ] {
         headers.insert(name, HeaderValue::from_str(value).map_err(build_error)?);
     }
+    headers.extend(token_type_headers(account));
     for (name, value) in [
         ("x-amz-user-agent", amz_user_agent),
         ("amz-sdk-invocation-id", Uuid::new_v4().to_string()),
@@ -1669,27 +1924,75 @@ fn metadata_headers(
     account: &Account,
     endpoint: &EndpointDefinition,
     mode: AgentMode,
-    subscriptions: bool,
 ) -> Result<reqwest::header::HeaderMap, KiroError> {
     let mut output = headers(account, endpoint, mode)?;
     output.remove("x-amz-target");
-    if subscriptions {
-        output.insert(
-            reqwest::header::HeaderName::from_static("x-amzn-codewhisperer-optout-preference"),
-            reqwest::header::HeaderValue::from_static("OPTIN"),
-        );
-    }
     Ok(output)
 }
 
 async fn response_error(response: Response, endpoint: &EndpointDefinition) -> KiroError {
     let status = response.status();
-    let text = response.text().await.unwrap_or_else(|_| status.to_string());
+    let retry_after = response
+        .headers()
+        .get("x-amzn-kiro-ratelimit-retry-after")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .or_else(|| {
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .and_then(|seconds| seconds.checked_mul(1_000))
+        });
+    let text = bounded_response_text(response, 1024 * 1024, endpoint.name)
+        .await
+        .unwrap_or_else(|_| status.to_string());
     let text = if text.trim().is_empty() {
         format!(
             "upstream returned HTTP {} without an error message",
             status.as_u16()
         )
+    } else {
+        text
+    };
+    let mut structured = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .filter(|value| value.is_object());
+    if structured.is_none() && retry_after.is_some() {
+        structured = Some(serde_json::json!({"message":truncate_chars(&text, 500)}));
+    }
+    let text = if let Some(mut value) = structured {
+        let delay = retry_after.or_else(|| {
+            value
+                .get("retryAfterMilliseconds")
+                .and_then(serde_json::Value::as_u64)
+        });
+        if value.to_string().chars().count() > 1_500 {
+            // Truncating raw JSON can discard its reason or retry hint. Bound
+            // diagnostic fields first so classification still sees valid JSON.
+            let mut bounded = serde_json::json!({});
+            for field in ["message", "Message", "__type", "_type", "reason"] {
+                if let Some(text) = value.get(field).and_then(serde_json::Value::as_str) {
+                    let limit = if field.eq_ignore_ascii_case("message") {
+                        250
+                    } else {
+                        100
+                    };
+                    let text: String = text
+                        .chars()
+                        .take(limit)
+                        .map(|ch| if ch.is_control() { ' ' } else { ch })
+                        .collect();
+                    bounded[field] = serde_json::json!(text);
+                }
+            }
+            value = bounded;
+        }
+        if let Some(delay) = delay {
+            value["retryAfterMilliseconds"] = serde_json::json!(delay.min(300_000));
+        }
+        value.to_string()
     } else {
         text
     };
