@@ -296,8 +296,12 @@ streaming events and replayable tool history. `external_web_access:false` uses
 only the service/key's five-minute search cache and reports a cache miss. Codex
 clients needing live search can set `web_search = "live"`. Search replay is scoped
 to the same service/key, lasts at most thirty minutes, and expires on restart.
-Claude server-side search still rejects nonempty `allowed_domains`,
-`blocked_domains`, and `user_location` explicitly.
+Claude server-side search supports either `allowed_domains` or `blocked_domains`,
+but not both. Domains include their subdomains; search paths support prefixes and
+`*` wildcards. Use ASCII host names without schemes, ports, credentials, or host
+wildcards. The proxy adds `site:` / `-site:` query constraints and filters returned
+URLs before model continuation, citations, and encrypted replay. No matches yield
+an empty search result. `user_location` is still rejected explicitly.
 
 ## Models and quotas
 

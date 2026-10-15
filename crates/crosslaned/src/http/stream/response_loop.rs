@@ -1408,10 +1408,11 @@ pub fn response(
                         )
                     } else {
                         web_search_round += 1;
-                        match super::super::handlers::execute_kiro_web_search(
+                        match super::super::handlers::execute_filtered_kiro_web_search(
                             &context.state,
                             &context.lease,
                             &query,
+                            &context.web_search_domains,
                         ).await {
                             Ok(results) => ClaudeWebSearchTrace::success(server_id, &query, results),
                             Err(error) => {
@@ -1790,10 +1791,11 @@ pub fn response(
                         )
                     } else {
                         web_search_round += 1;
-                        match super::super::handlers::execute_kiro_web_search(
+                        match super::super::handlers::execute_filtered_kiro_web_search(
                             &context.state,
                             &context.lease,
                             &query,
+                            &context.web_search_domains,
                         ).await {
                             Ok(results) => ClaudeWebSearchTrace::success(server_id, &query, results),
                             Err(error) => {

@@ -16,6 +16,7 @@ use super::{
 };
 
 mod dispatch;
+use crosslane_translate::WebSearchDomainFilter;
 
 pub(super) use dispatch::{execute_upstream, prepare_upstream};
 
@@ -208,6 +209,7 @@ pub(super) async fn collect_nonstream_rounds(
     mut tool_search_operations: u32,
     web_search_max_rounds: u32,
     web_search_client_limit: bool,
+    web_search_domains: &WebSearchDomainFilter,
     resumed_tool_searches: Vec<crosslane_translate::ClaudeToolSearchTrace>,
     resumed_web_searches: Vec<ClaudeWebSearchTrace>,
     resumed_server_events: Vec<ClaudeServerEvent>,
@@ -600,7 +602,9 @@ pub(super) async fn collect_nonstream_rounds(
                     )
                 } else {
                     web_search_round += 1;
-                    match execute_kiro_web_search(state, lease, &query).await {
+                    match execute_filtered_kiro_web_search(state, lease, &query, web_search_domains)
+                        .await
+                    {
                         Ok(results) => ClaudeWebSearchTrace::success(server_id, &query, results),
                         Err(error) => {
                             return Err(ExecuteError::UnsupportedWebSearch(error.message))
@@ -873,7 +877,9 @@ pub(super) async fn collect_nonstream_rounds(
                     )
                 } else {
                     web_search_round += 1;
-                    match execute_kiro_web_search(state, lease, &query).await {
+                    match execute_filtered_kiro_web_search(state, lease, &query, web_search_domains)
+                        .await
+                    {
                         Ok(results) => ClaudeWebSearchTrace::success(server_id, &query, results),
                         Err(error) => {
                             return Err(ExecuteError::UnsupportedWebSearch(error.message))
@@ -1049,6 +1055,17 @@ pub(in crate::http) fn apply_remaining_output_budget(
         .get_or_insert_with(Default::default);
     inference.max_tokens = Some(remaining.min(u64::from(u32::MAX)) as u32);
     true
+}
+
+pub(in crate::http) async fn execute_filtered_kiro_web_search(
+    state: &Arc<AppState>,
+    lease: &AccountLease,
+    query: &str,
+    domains: &WebSearchDomainFilter,
+) -> Result<crosslane_translate::WebSearchResults, KiroError> {
+    let mut results = execute_kiro_web_search(state, lease, &domains.search_query(query)).await?;
+    domains.filter_results(query, &mut results);
+    Ok(results)
 }
 
 pub(in crate::http) async fn execute_kiro_web_search(
@@ -1321,6 +1338,7 @@ pub(super) async fn nonstream_claude(
     tool_search_operations: u32,
     web_search_max_rounds: u32,
     web_search_client_limit: bool,
+    web_search_domains: &WebSearchDomainFilter,
     resumed_tool_searches: Vec<crosslane_translate::ClaudeToolSearchTrace>,
     resumed_web_searches: Vec<ClaudeWebSearchTrace>,
     resumed_server_events: Vec<ClaudeServerEvent>,
@@ -1350,6 +1368,7 @@ pub(super) async fn nonstream_claude(
         tool_search_operations,
         web_search_max_rounds,
         web_search_client_limit,
+        web_search_domains,
         resumed_tool_searches,
         resumed_web_searches,
         resumed_server_events,
@@ -1512,6 +1531,7 @@ pub(super) async fn nonstream_openai(
         0,
         0,
         false,
+        &WebSearchDomainFilter::default(),
         Vec::new(),
         Vec::new(),
         Vec::new(),

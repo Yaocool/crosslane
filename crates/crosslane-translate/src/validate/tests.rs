@@ -621,10 +621,12 @@ fn rejects_unemulated_official_tool_execution_contracts_explicitly() {
     input.tools[0].response_inclusion = Some("full".into());
     validate_claude(&input).expect("opaque web search version");
     input.tools[0].allowed_domains = Some(vec!["example.com".into()]);
+    validate_claude(&input).expect("domain filter");
+    input.tools[0].blocked_domains = Some(vec!["blocked.example.com".into()]);
     assert!(validate_claude(&input)
-        .expect_err("domain filter")
+        .expect_err("mutually exclusive domain filters")
         .to_string()
-        .contains("domain filters"));
+        .contains("not both"));
 
     input = serde_json::from_value(serde_json::json!({
         "model":"claude-sonnet-4",

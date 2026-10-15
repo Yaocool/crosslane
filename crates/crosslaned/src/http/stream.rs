@@ -15,7 +15,7 @@ use crosslane_translate::{
     auto_continue_payload, tool_search_continue_payload_batch, web_search_continue_payload_batch,
     ClaudeContextEditStats, ClaudeServerToolEmission, ClaudeToolSearchBudget,
     ClaudeToolSearchCatalog, ClaudeToolSearchTrace, ClaudeWebSearchTrace, KiroPayload, KiroToolUse,
-    WebSearchReplayCodec, WebSearchReplayError,
+    WebSearchDomainFilter, WebSearchReplayCodec, WebSearchReplayError,
 };
 use futures::StreamExt;
 use serde_json::{json, Value};
@@ -140,6 +140,7 @@ pub struct StreamContext {
     pub web_search_max_rounds: u32,
     /// True when the request explicitly supplied web_search.max_uses.
     pub web_search_client_limit: bool,
+    pub web_search_domains: WebSearchDomainFilter,
     /// Result-only blocks that complete pending server calls from prior turns.
     pub resumed_tool_searches: Vec<ClaudeToolSearchTrace>,
     pub resumed_web_searches: Vec<ClaudeWebSearchTrace>,

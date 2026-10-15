@@ -4,24 +4,26 @@ use super::{
     claude_web_tool_names, compact_history_for_limits, compact_target_from_maximum,
     compact_trigger_tokens, context_maximum, enforce_claude_user_agent, enforce_codex_user_agent,
     enforce_context, enforce_payload_budget, estimate_context_management_input_tokens,
-    estimated_credits, execute_kiro_web_search, execute_upstream, initial_compaction_decision,
-    is_claude_user_agent, loaded_tool_bytes, loaded_tool_count, loaded_tool_names,
-    logged_user_agent, matches_type_family, nonstream_claude, nonstream_openai,
-    normalize_compaction_boundary, openai_to_kiro, openai_tool_identities, prepare_kiro_payload,
-    prepare_upstream, prepend_attempt_logs, prepend_execute_error_attempts, reapply_compaction,
-    reserve_credits, resolved_compaction_decision, resume_tool_search_payload,
-    resume_web_search_payload, run_compaction, serialized_payload_bytes, stream,
-    tool_search_budget_with_compaction, upstream_error, upstream_overflow_compaction_decision,
-    validate_claude, validate_claude_generation, validate_openai, ApiError, AppState, Arc, Bytes,
-    ClaudeRequest, ClaudeServerEvent, ClaudeToolSearchCatalog, ClaudeWebSearchTrace,
-    CompactionDecision, CompactionReason, CompactionRequest, Duration, Engine, ErrorFormat,
-    ExecuteError, HeaderMap, Instant, IpAddr, OpenAiRequest, RequestDiagnostics, Response,
-    ServiceHttpState, StatusCode, StreamContext, StreamExt, StreamProtocol, TranslationOptions,
-    UpstreamExecution, Url, Uuid, Value,
+    estimated_credits, execute_upstream, initial_compaction_decision, is_claude_user_agent,
+    loaded_tool_bytes, loaded_tool_count, loaded_tool_names, logged_user_agent,
+    matches_type_family, nonstream_claude, nonstream_openai, normalize_compaction_boundary,
+    openai_to_kiro, openai_tool_identities, prepare_kiro_payload, prepare_upstream,
+    prepend_attempt_logs, prepend_execute_error_attempts, reapply_compaction, reserve_credits,
+    resolved_compaction_decision, resume_tool_search_payload, resume_web_search_payload,
+    run_compaction, serialized_payload_bytes, stream, tool_search_budget_with_compaction,
+    upstream_error, upstream_overflow_compaction_decision, validate_claude,
+    validate_claude_generation, validate_openai, ApiError, AppState, Arc, Bytes, ClaudeRequest,
+    ClaudeServerEvent, ClaudeToolSearchCatalog, ClaudeWebSearchTrace, CompactionDecision,
+    CompactionReason, CompactionRequest, Duration, Engine, ErrorFormat, ExecuteError, HeaderMap,
+    Instant, IpAddr, OpenAiRequest, RequestDiagnostics, Response, ServiceHttpState, StatusCode,
+    StreamContext, StreamExt, StreamProtocol, TranslationOptions, UpstreamExecution, Url, Uuid,
+    Value,
 };
 use crosslane_core::provider::ProviderProtocol;
 use crosslane_translate::model::{map_model_for_provider, ModelMappingContext, ModelRoute};
-use crosslane_translate::{error::log_model, responses_to_openai, ResponsesRequest};
+use crosslane_translate::{
+    error::log_model, responses_to_openai, ResponsesRequest, WebSearchDomainFilter,
+};
 use futures::TryStreamExt;
 
 use super::super::compaction_replay::CompactionReplaySource;
@@ -417,6 +419,16 @@ async fn handle_claude_route_inner(
             .is_some_and(|kind| matches_type_family(kind, "web_search"))
     });
     let web_search_client_limit = web_search_tool.is_some_and(|tool| tool.max_uses.is_some());
+    let web_search_domains = web_search_tool
+        .map(|tool| {
+            WebSearchDomainFilter::new(
+                tool.allowed_domains.as_deref(),
+                tool.blocked_domains.as_deref(),
+            )
+        })
+        .transpose()
+        .map_err(|message| ApiError::new(StatusCode::BAD_REQUEST, message, ErrorFormat::Claude))?
+        .unwrap_or_default();
     let web_search_proxy_limit = config.features.web_search_max_rounds.max(1);
     if let Some(requested) = web_search_tool.and_then(|tool| tool.max_uses) {
         if requested > web_search_proxy_limit {
@@ -723,7 +735,14 @@ async fn handle_claude_route_inner(
             } else {
                 resumed_web_search_uses += 1;
                 match search_lease.as_ref() {
-                    Some(lease) => match execute_kiro_web_search(&state, lease, &query).await {
+                    Some(lease) => match super::execution::execute_filtered_kiro_web_search(
+                        &state,
+                        lease,
+                        &query,
+                        &web_search_domains,
+                    )
+                    .await
+                    {
                         Ok(results) => ClaudeWebSearchTrace::success(
                             tool_use.tool_use_id.clone(),
                             &query,
@@ -1297,6 +1316,7 @@ async fn handle_claude_route_inner(
                 tool_search_operations,
                 web_search_max_rounds,
                 web_search_client_limit,
+                web_search_domains,
                 resumed_tool_searches,
                 resumed_web_searches,
                 resumed_server_events,
@@ -1339,6 +1359,7 @@ async fn handle_claude_route_inner(
         tool_search_operations,
         web_search_max_rounds,
         web_search_client_limit,
+        &web_search_domains,
         resumed_tool_searches,
         resumed_web_searches,
         resumed_server_events,
@@ -2023,6 +2044,7 @@ pub(super) async fn handle_openai_route(
                 tool_search_operations: 0,
                 web_search_max_rounds: 0,
                 web_search_client_limit: false,
+                web_search_domains: WebSearchDomainFilter::default(),
                 resumed_tool_searches: Vec::new(),
                 resumed_web_searches: Vec::new(),
                 resumed_server_events: Vec::new(),

@@ -2,6 +2,131 @@ use super::*;
 use serde_json::{json, Value};
 
 #[tokio::test]
+async fn claude_search_domain_filters_cover_json_sse_parallel_and_pending_calls() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    for streaming in [false, true] {
+        for scenario in ["allowed", "blocked", "path", "parallel", "pending"] {
+            let mock = MockServer::start().await;
+            let final_url = "https://docs.example.test/guide/rust/articles/one";
+            let mut search = json!({"type":"web_search_20250305","name":"web_search"});
+            let expected_query = match scenario {
+                "blocked" => {
+                    search["blocked_domains"] = json!(["untrusted.test", "example.test.evil.test"]);
+                    "regression source -site:untrusted.test -site:example.test.evil.test"
+                }
+                "path" => {
+                    search["allowed_domains"] = json!(["example.test/guide/*/articles"]);
+                    "regression source (site:example.test/guide/*/articles)"
+                }
+                _ => {
+                    search["allowed_domains"] = json!(["EXAMPLE.test"]);
+                    "regression source (site:example.test)"
+                }
+            };
+            Mock::given(method("POST"))
+                .and(path("/mcp"))
+                .respond_with(move |request: &wiremock::Request| {
+                    let payload: Value = serde_json::from_slice(&request.body).unwrap();
+                    assert_eq!(payload["params"]["arguments"]["query"], expected_query);
+                    ResponseTemplate::new(200).set_body_json(json!({"result":{"content":[{
+                        "type":"text","text":json!({"query":expected_query,"totalResults":300,"results":[
+                            {"title":"Verified source","url":final_url,"snippet":"verified filtered snippet"},
+                            {"title":"Untrusted","url":"https://sub.untrusted.test/source","snippet":"EXCLUDED_UNTRUSTED"},
+                            {"title":"Lookalike","url":"https://example.test.evil.test/source","snippet":"EXCLUDED_LOOKALIKE"}
+                        ]}).to_string()
+                    }]}}))
+                })
+                .expect(1)
+                .mount(&mock)
+                .await;
+            let rounds = Arc::new(AtomicUsize::new(0));
+            let count = rounds.clone();
+            Mock::given(method("POST"))
+                .and(path("/generateAssistantResponse"))
+                .respond_with(move |request: &wiremock::Request| {
+                    let round = count.fetch_add(1, Ordering::SeqCst);
+                    let body =
+                        if round == 0 && scenario != "pending" {
+                            let mut body = event_stream_frame(
+                                "toolUseEvent",
+                                json!({
+                                    "toolUseId":"search_call","name":"web_search",
+                                    "input":"{\"query\":\"regression source\"}","stop":true
+                                }),
+                            );
+                            if scenario == "parallel" {
+                                body.extend(event_stream_frame("toolUseEvent", json!({
+                                "toolUseId":"discovery_call","name":"tool_search_tool_regex",
+                                "input":"{\"pattern\":\"deferred_example\"}","stop":true
+                            })));
+                            }
+                            body
+                        } else {
+                            let payload: Value = serde_json::from_slice(&request.body).unwrap();
+                            let rendered = payload.to_string();
+                            assert!(rendered.contains("verified filtered snippet"), "{payload}");
+                            assert!(!rendered.contains("EXCLUDED_"), "{payload}");
+                            assert!(!rendered.contains("untrusted.test"), "{payload}");
+                            assert!(!rendered.contains("example.test.evil.test"), "{payload}");
+                            generation_body(&format!("Verified result: {final_url}"))
+                        };
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/vnd.amazon.eventstream")
+                        .set_body_bytes(body)
+                })
+                .expect(if scenario == "pending" { 1 } else { 2 })
+                .mount(&mock)
+                .await;
+            let port = unused_tcp_port();
+            let daemon =
+                Daemon::start_http(port, &format!("{}/generateAssistantResponse", mock.uri()))
+                    .await;
+            expect_ok(daemon.call("account.import",json!({"accounts":[{
+                "id":"acc_77777777","email":"search@example.test","machine_id":"7".repeat(64),
+                "credentials":{"access_token":"ksk_synthetic-search","region":"us-east-1","expires_at":0,"auth_method":"api_key"},"created_at":1
+            }]})).await);
+            let mut tools = vec![search];
+            let mut messages = vec![json!({"role":"user","content":"search for the source"})];
+            if scenario == "parallel" {
+                tools.extend([
+                    json!({"type":"tool_search_tool_regex_20251119","name":"tool_search_tool_regex"}),
+                    json!({"name":"deferred_example","defer_loading":true,"input_schema":{"type":"object","properties":{}}}),
+                ]);
+            }
+            if scenario == "pending" {
+                tools.push(
+                    json!({"name":"fixture_task","input_schema":{"type":"object","properties":{}}}),
+                );
+                messages.extend([
+                    json!({"role":"assistant","content":[
+                        {"type":"server_tool_use","id":"srvtoolu_pending","name":"web_search","input":{"query":"regression source"}},
+                        {"type":"tool_use","id":"toolu_client","name":"fixture_task","input":{}}
+                    ]}),
+                    json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_client","content":"done"}]}),
+                ]);
+            }
+            let response = reqwest::Client::new()
+                .post(format!("http://127.0.0.1:{port}/v1/messages"))
+                .bearer_auth(daemon.api_key.as_deref().unwrap())
+                .header("user-agent", "claude-cli/2.1.300 (external, e2e)")
+                .json(&json!({"model":"claude-sonnet-4","max_tokens":4096,"messages":messages,"stream":streaming,"tools":tools}))
+                .send().await.unwrap();
+            let status = response.status();
+            let text = response.text().await.unwrap();
+            assert_eq!(status, 200, "{scenario}/{streaming}: {text}");
+            assert!(text.contains(final_url), "{scenario}/{streaming}: {text}");
+            assert!(text.contains("web_search_tool_result"), "{text}");
+            assert!(!text.contains("EXCLUDED_"), "{text}");
+            assert!(!text.contains("untrusted.test"), "{text}");
+            assert!(!text.contains("example.test.evil.test"), "{text}");
+            assert!(!text.contains("event: error"), "{text}");
+            mock.verify().await;
+            daemon.stop().await;
+        }
+    }
+}
+
+#[tokio::test]
 async fn failed_search_stops_generation_and_reports_unsupported_in_both_protocols() {
     let _guard = HTTP_TEST_LOCK.lock().await;
     for route in ["responses", "messages"] {
