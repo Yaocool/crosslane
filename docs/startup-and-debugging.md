@@ -504,11 +504,12 @@ use Esc Esc or `/rewind` in interactive Claude Code to edit only the oversized
 turn and resend it in smaller parts; earlier conversation need not be cleared.
 For `required_context`, first reduce the required system instructions, enabled
 tool definitions or other mandatory input; compacting history cannot shrink
-them. These locally diagnosed Messages errors retain status 400, `context_length_exceeded`, numeric
+them. These locally diagnosed Messages errors retain semantic status 400, `context_length_exceeded`, numeric
 diagnostics and `retryable: false`. Compactable history overflow and upstream
 context errors keep their native wording so client automatic compaction continues
-to work. CRS non-streaming error sanitization can still hide recovery details;
-Claude Code's streaming path retains them when Crosslane is built with `crs`.
+to work. With `crs`, local context errors use HTTP 200 error JSON for non-streaming
+transport, retaining 400 in `error.status` and `x-crosslane-error-status` so CRS
+Console preserves recovery details. Streaming requests retain SSE error events.
 
 Summary budgets use the selected model's window, with the configured window as a
 fallback only. The latest user turn is a partitionable source record rather than
@@ -636,9 +637,16 @@ With `crs` enabled, errors include Anthropic-shaped JSON with the sanitized caus
 action hint, failure stage, request ID, `error.status`, and the known supplier
 status in `error.upstream_status`. Context errors retain token diagnostics and
 compaction-retry results. No CRS code changes are required. CRS Console replaces
-non-2xx JSON bodies with fixed messages, so only streaming responses preserve
-the detailed diagnostics through its existing relay. CCR preserves non-streaming
-error bodies as well.
+non-2xx JSON bodies with fixed messages. Local `context_length_exceeded` errors
+at `context_validation` therefore use HTTP 200 with `type: "error"` JSON for
+non-streaming Claude Messages. Semantic status 400 remains in `error.status` and
+`x-crosslane-error-status`, and caching is disabled. The body contains no successful
+message, stop reason, or usage: clients must inspect `type` / `error` rather than
+treating HTTP 200 alone as generation success. Statistics retain failure status
+400 and separately record client transport status 200. This exception applies only
+to local context errors with `crs`; non-CRS builds, OpenAI endpoints, client
+authentication, and supplier errors retain their original HTTP statuses. Console
+may still sanitize other non-streaming errors; CCR preserves their original bodies.
 
 For Claude `stream: true` with `crs`, supplier errors use HTTP 200 and an SSE
 `event: error`, preserving the original status in `error.status`,

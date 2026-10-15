@@ -420,10 +420,11 @@ Anthropic 请求先经过 50 MiB 的 HTTP 请求体限制，翻译后的 Kiro �
 `/compact` 也可能失败。如果仍失败，在交互式 Claude Code 中用 Esc Esc 或 `/rewind`
 只编辑过大的那一轮，拆小后重发，保留之前的对话。`required_context` 超限要先缩小
 必需的系统指令、启用的工具定义或其他必需输入，压缩历史无法缩小这些内容。
-这些带本地数值诊断的 Messages 错误保留 400 状态、
+这些带本地数值诊断的 Messages 错误保留语义状态 400、
 `context_length_exceeded`、数值诊断及 `retryable: false`；可压缩的历史超限与上游
-上下文错误保留原有文案，继续触发客户端自动压缩。CRS 对非流式错误的脱敏仍可能隐藏
-恢复详情；Crosslane 启用 `crs` 构建后，Claude Code 的流式链路会保留这些指引。
+上下文错误保留原有文案，继续触发客户端自动压缩。启用 `crs` 后，本地上下文错误的
+非流式 JSON 使用 HTTP 200 传输，在 `error.status` 和 `x-crosslane-error-status` 中
+保留 400，避免 CRS Console 重写恢复详情；流式链路继续使用 SSE 错误事件。
 
 摘要预算采用所选模型的窗口，全局窗口只作缺少元数据时的回退。当前用户消息作为可分段
 的源记录，不再重复放进每段指令。每段同时满足 token 和序列化字节限制；初始最多 16 段、
@@ -520,7 +521,13 @@ Kiro 和 Copilot 返回的错误状态码保留原值，包括 401、402、403�
 启用 `crs` 后，错误正文保留 Anthropic 格式、脱敏原因、操作建议、失败阶段、请求 ID、
 `error.status` 和已知的真实 `error.upstream_status`。上下文错误还保留 token 诊断和
 压缩重试结果。无需修改 CRS 代码。现有 CRS Console 会把非 2xx JSON 错误正文替换成
-固定文案，因此只有流式响应能通过其现有转发保留详细诊断；CCR 路径也会保留非流式错误正文。
+固定文案。为保留本地 `context_length_exceeded` / `context_validation` 错误，非流式
+Claude Messages 使用 HTTP 200 传输 `type: "error"` JSON，在 `error.status` 和
+`x-crosslane-error-status` 中保留语义状态 400，并禁止缓存。正文不包含成功消息、结束原因或
+用量；客户端必须检查 `type` / `error`，不能仅凭 HTTP 200 判断生成成功。请求统计仍记为
+400 失败，同时记录客户端传输状态 200。这个例外只适用于启用 `crs` 的本地上下文错误；
+未启用 `crs`、OpenAI 接口、客户端认证及供应商错误保留原 HTTP 状态。
+其他非流式错误仍可能被 Console 脱敏；CCR 路径会保留其原始非流式错误正文。
 
 Claude 请求设置 `stream: true` 且启用 `crs` 时，供应商错误采用 HTTP 200 加 SSE
 `event: error`，在 `error.status`、`error.upstream_status` 和 `x-crosslane-error-status`

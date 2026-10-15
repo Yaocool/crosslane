@@ -2,6 +2,8 @@
 //!
 //! Preserve supplier error statuses in sanitized diagnostics and HTTP responses.
 //! Streaming errors use HTTP 200 SSE so CRS Console retains their details.
+//! Local non-streaming context rejections use HTTP 200 error JSON, with the
+//! semantic status in error.status and x-crosslane-error-status.
 //! Errors after an SSE response starts remain in the already committed stream.
 
 use std::time::{Duration, Instant};
@@ -172,6 +174,65 @@ pub(super) fn stream_requested(body: &[u8]) -> bool {
         stream: bool,
     }
     serde_json::from_slice::<RequestMode>(body).is_ok_and(|request| request.stream)
+}
+
+pub(super) fn uses_json_context_error(
+    status: StatusCode,
+    code: &str,
+    stage: &str,
+    upstream_status: Option<u16>,
+) -> bool {
+    status == StatusCode::BAD_REQUEST
+        && code == "context_length_exceeded"
+        && stage == "context_validation"
+        && upstream_status.is_none()
+}
+
+pub(super) async fn adapt_claude_nonstream_response(
+    response: Response,
+    request_id: &str,
+) -> Response {
+    let response = adapt_claude_response(response, request_id).await;
+    if response.status() != StatusCode::BAD_REQUEST
+        || response
+            .headers()
+            .contains_key("x-crosslane-upstream-status")
+    {
+        return response;
+    }
+    let (mut parts, body) = response.into_parts();
+    // Normalization already produced a bounded, sanitized error body. Inspect
+    // its stable classification rather than matching user-supplied error prose.
+    let bytes = to_bytes(body, MAX_ERROR_BODY_BYTES)
+        .await
+        .unwrap_or_default();
+    let envelope = serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
+    let local_context_error = envelope["type"] == "error"
+        && envelope["error"]["status"] == 400
+        && envelope["error"].get("upstream_status").is_none()
+        && uses_json_context_error(
+            parts.status,
+            envelope["error"]["code"].as_str().unwrap_or_default(),
+            envelope["error"]["stage"].as_str().unwrap_or_default(),
+            None,
+        );
+    if local_context_error {
+        // CRS Console rewrites every non-2xx JSON body. Keep this as an error
+        // object, never fabricate a successful assistant message or usage.
+        parts.status = StatusCode::OK;
+        parts.headers.remove(header::CONTENT_LENGTH);
+        parts.headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        parts
+            .headers
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        parts
+            .headers
+            .insert("x-crosslane-error-status", HeaderValue::from_static("400"));
+    }
+    Response::from_parts(parts, Body::from(bytes))
 }
 
 pub(super) async fn adapt_claude_stream_response(
@@ -988,6 +1049,137 @@ fn error_response(status: StatusCode, envelope: Value, request_id: &str) -> Resp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn nonstream_context_error_preserves_typed_failure_and_numeric_diagnostics() {
+        let response = Response::builder()
+            .status(400)
+            .header("content-type", "application/json")
+            .header("x-crosslane-error-code", "context_length_exceeded")
+            .header("x-crosslane-error-stage", "context_validation")
+            .header("x-crosslane-account-error", "false")
+            .body(Body::from(
+                serde_json::json!({
+                    "type":"error", "request_id":"trace_old_999999",
+                    "secret":"never_return_this",
+                    "error":{
+                        "type":"invalid_request_error", "status":400,
+                        "code":"context_length_exceeded", "stage":"context_validation",
+                        "message":"prompt is too long: 200301 tokens > 200000",
+                        "context":{
+                            "total_input_tokens":200301, "protected_prefix_tokens":100,
+                            "tool_definition_tokens":200, "current_message_tokens":200001,
+                            "history_tokens":0, "overhead_tokens":0,
+                            "minimum_input_tokens":200301, "maximum_input_tokens":200000,
+                            "overflow_scope":"current_message"
+                        }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = adapt_claude_nonstream_response(response, "trace_new_123456").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(response.headers()["x-crosslane-error-status"], "400");
+        assert_eq!(
+            response.headers()["x-crosslane-error-code"],
+            "context_length_exceeded"
+        );
+        assert_eq!(response.headers()["x-crosslane-account-error"], "false");
+        assert!(!response.headers().contains_key(header::CONTENT_LENGTH));
+        let body = body_json(response).await;
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["status"], 400);
+        assert_eq!(body["error"]["retryable"], false);
+        assert_eq!(body["error"]["stage"], "context_validation");
+        assert_eq!(body["error"]["context"]["current_message_tokens"], 200001);
+        assert_eq!(body["error"]["context"]["maximum_input_tokens"], 200000);
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains("200001 tokens (limit 200000)"), "{body}");
+        assert!(message.contains("/rewind"), "{body}");
+        assert!(message.contains("trace_new_123456"), "{body}");
+        assert!(!body.to_string().contains("trace_old_999999"));
+        assert!(!body.to_string().contains("never_return_this"));
+        assert!(body.get("content").is_none());
+        assert!(body.get("usage").is_none());
+        assert!(body.get("stop_reason").is_none());
+    }
+
+    #[tokio::test]
+    async fn nonstream_adapter_keeps_non_context_and_supplier_http_statuses() {
+        for (status, code, stage, upstream) in [
+            (
+                400,
+                "context_length_exceeded",
+                "provider_upstream",
+                Some(400),
+            ),
+            (
+                400,
+                "context_length_exceeded",
+                "context_validation",
+                Some(400),
+            ),
+            (400, "invalid_request", "context_validation", None),
+            (400, "context_length_exceeded", "request_validation", None),
+            (
+                401,
+                "upstream_authentication_failed",
+                "provider_upstream",
+                Some(401),
+            ),
+            (403, "invalid_api_key", "authentication", None),
+            (413, "request_body_too_large", "request_body", None),
+            (429, "upstream_rate_limited", "provider_upstream", Some(429)),
+            (503, "upstream_unavailable", "provider_upstream", Some(503)),
+        ] {
+            let mut envelope = serde_json::json!({
+                "type":"error","error":{"type":"invalid_request_error","status":status,
+                "code":code,"stage":stage,"message":"request rejected"}
+            });
+            if let Some(upstream) = upstream {
+                envelope["error"]["upstream_status"] = Value::from(upstream);
+            }
+            let response = Response::builder()
+                .status(status)
+                .header("x-crosslane-error-code", code)
+                .body(Body::from(envelope.to_string()))
+                .unwrap();
+            let response = adapt_claude_nonstream_response(response, "trace_no_remap").await;
+            assert_eq!(response.status().as_u16(), status, "{code}/{stage}");
+            assert_eq!(
+                response.headers()["x-crosslane-error-status"]
+                    .to_str()
+                    .unwrap(),
+                status.to_string()
+            );
+            let body = body_json(response).await;
+            assert_eq!(body["error"]["status"], status);
+            if let Some(upstream) = upstream {
+                assert_eq!(body["error"]["upstream_status"], upstream);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn nonstream_adapter_preserves_successful_messages() {
+        let message = serde_json::json!({
+            "type":"message", "id":"msg_success", "role":"assistant",
+            "content":[{"type":"text","text":"context_length_exceeded is an error code"}],
+            "stop_reason":"end_turn", "usage":{"input_tokens":5,"output_tokens":7}
+        });
+        let response = Response::builder()
+            .status(200)
+            .header("content-type", "application/json")
+            .body(Body::from(message.to_string()))
+            .unwrap();
+        let response = adapt_claude_nonstream_response(response, "trace_success").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key("x-crosslane-error-status"));
+        assert_eq!(body_json(response).await, message);
+    }
 
     async fn body_json(response: Response) -> Value {
         let bytes = to_bytes(response.into_body(), 1024 * 1024)

@@ -825,10 +825,19 @@ async fn manual_compact_partitions_oversized_system_and_tool_definitions() {
             .unwrap();
         assert_eq!(
             response.status(),
-            reqwest::StatusCode::BAD_REQUEST,
+            if cfg!(feature = "crs") {
+                reqwest::StatusCode::OK
+            } else {
+                reqwest::StatusCode::BAD_REQUEST
+            },
             "ordinary {label}"
         );
         let body: Value = response.json().await.unwrap();
+        assert_eq!(body["type"], "error");
+        if cfg!(feature = "crs") {
+            assert_eq!(body["error"]["status"], 400);
+            assert_eq!(body["error"]["code"], "context_length_exceeded");
+        }
         let component = if label == "tool_schemas" {
             "tool_definition_tokens"
         } else {
@@ -858,8 +867,20 @@ async fn manual_compact_partitions_oversized_system_and_tool_definitions() {
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.status(),
+            if cfg!(feature = "crs") {
+                reqwest::StatusCode::OK
+            } else {
+                reqwest::StatusCode::BAD_REQUEST
+            }
+        );
         let body: Value = response.json().await.unwrap();
+        assert_eq!(body["type"], "error");
+        if cfg!(feature = "crs") {
+            assert_eq!(body["error"]["status"], 400);
+            assert_eq!(body["error"]["code"], "context_length_exceeded");
+        }
         let context = &body["error"]["context"];
         assert!(context["protected_prefix_tokens"].as_u64().unwrap() > 64_000);
         assert!(
@@ -881,6 +902,11 @@ async fn manual_compact_partitions_oversized_system_and_tool_definitions() {
             .unwrap();
         assert_eq!(rejected["diagnostics"]["context_overflow"], *context);
         assert_eq!(rejected["diagnostics"]["account_error"], false);
+        assert_eq!(rejected["status"], 400);
+        assert_eq!(
+            rejected["diagnostics"]["client_status"],
+            if cfg!(feature = "crs") { 200 } else { 400 }
+        );
     }
     let dispatched = mock
         .received_requests()

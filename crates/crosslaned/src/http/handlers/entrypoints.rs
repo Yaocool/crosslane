@@ -257,7 +257,7 @@ pub async fn claude_messages(
                 if stream_requested {
                     crs::adapt_claude_stream_response(response, &trace_id, &model).await
                 } else {
-                    crs::adapt_claude_response(response, &trace_id).await
+                    crs::adapt_claude_nonstream_response(response, &trace_id).await
                 }
             }
             #[cfg(not(feature = "crs"))]
@@ -267,15 +267,25 @@ pub async fn claude_messages(
         }
         Err(error) => {
             #[cfg(feature = "crs")]
-            let error =
-                if stream_requested && crs::uses_sse_error(error.status, error.upstream_status) {
-                    ApiError {
-                        client_status: Some(200),
-                        ..error
-                    }
-                } else {
-                    error
-                };
+            let use_sse =
+                stream_requested && crs::uses_sse_error(error.status, error.upstream_status);
+            #[cfg(feature = "crs")]
+            let use_json_context = !stream_requested
+                && crs::uses_json_context_error(
+                    error.status,
+                    error.error_code,
+                    error.error_stage,
+                    error.upstream_status,
+                );
+            #[cfg(feature = "crs")]
+            let error = if use_sse || use_json_context {
+                ApiError {
+                    client_status: Some(200),
+                    ..error
+                }
+            } else {
+                error
+            };
             record_failed_request(
                 &state,
                 &trace_id,
@@ -285,13 +295,14 @@ pub async fn claude_messages(
                 started,
                 &error,
             );
-            #[cfg(feature = "crs")]
-            let use_sse =
-                stream_requested && crs::uses_sse_error(error.status, error.upstream_status);
             let response = error.with_request_id(&trace_id).into_response();
             #[cfg(feature = "crs")]
             if use_sse {
                 return crs::adapt_claude_stream_response(response, &trace_id, &model).await;
+            }
+            #[cfg(feature = "crs")]
+            if use_json_context {
+                return crs::adapt_claude_nonstream_response(response, &trace_id).await;
             }
             response
         }
