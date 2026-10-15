@@ -147,7 +147,18 @@ async fn indivisible_input_guidance_preserves_protocol_errors_in_both_modes() {
                     .await
                     .unwrap();
                 let sse = cfg!(feature = "crs") && endpoint == "messages" && stream;
-                assert_eq!(response.status().as_u16(), if sse { 200 } else { 400 });
+                let compat = cfg!(feature = "crs") && endpoint == "messages";
+                assert_eq!(response.status().as_u16(), if compat { 200 } else { 400 });
+                if compat {
+                    assert_eq!(response.headers()["x-crosslane-error-status"], "400");
+                    if !stream {
+                        assert!(response.headers()["content-type"]
+                            .to_str()
+                            .unwrap()
+                            .starts_with("application/json"));
+                        assert_eq!(response.headers()["cache-control"], "no-store");
+                    }
+                }
                 let text = response.text().await.unwrap();
                 let error: Value = if sse {
                     sse_error_payload(&text)
@@ -172,6 +183,12 @@ async fn indivisible_input_guidance_preserves_protocol_errors_in_both_modes() {
                 }
                 assert_eq!(error["error"]["code"], "context_length_exceeded", "{error}");
                 assert_eq!(error["error"]["retryable"], false, "{error}");
+                if compat {
+                    assert_eq!(error["type"], "error");
+                    assert_eq!(error["error"]["status"], 400);
+                    assert!(error.get("usage").is_none());
+                    assert!(error.get("content").is_none());
+                }
                 assert_eq!(
                     error["error"]["context"]["overflow_scope"], scope,
                     "{error}"
@@ -196,6 +213,23 @@ async fn indivisible_input_guidance_preserves_protocol_errors_in_both_modes() {
                     assert!(message.contains("Run /compact only if"), "{error}");
                 }
                 assert!(!text.contains("synthetic recovery record"));
+                let stats = expect_ok(
+                    daemon
+                        .call("stats", json!({"detail":true,"recent":20}))
+                        .await,
+                );
+                let recorded = stats["stats"]["recent_requests"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|record| record["trace_id"] == error["request_id"])
+                    .expect("context failure remains in error statistics");
+                assert_eq!(recorded["status"], 400);
+                assert_eq!(
+                    recorded["diagnostics"]["client_status"],
+                    if compat { 200 } else { 400 }
+                );
+                assert!(recorded["diagnostics"]["upstream_status"].is_null());
                 if sse {
                     assert_eq!(error["error"]["status"], 400);
                     assert!(!text.contains("event: message_stop"));
@@ -282,6 +316,73 @@ async fn start_crs_console(daemon: &Daemon, port: u16) -> (Child, String) {
         .unwrap()
         .unwrap();
     (relay, address)
+}
+
+#[cfg(feature = "crs")]
+#[tokio::test]
+#[ignore = "requires CROSSLANE_CRS_SOURCE; executes unmodified local CRS source and loopback services only"]
+async fn local_context_json_and_sse_errors_survive_unmodified_crs_console() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    let (upstream, daemon, port) = start_input_overflow_daemon().await;
+    let (mut relay, address) = start_crs_console(&daemon, port).await;
+    let client = reqwest::Client::new();
+    let oversized = "synthetic recovery record ".repeat(5_000);
+    for stream in [false, true] {
+        for scope in ["current_message", "required_context"] {
+            let response = client.post(format!("{address}/v1/messages"))
+                .header("user-agent", "claude-cli/2.1.300 (external, e2e)")
+                .json(&json!({"model":"resolved-tiny","max_tokens":32,"stream":stream,
+                    "system":if scope == "required_context" { &oversized } else { "Be brief." },
+                    "messages":[{"role":"user","content":if scope == "current_message" { &oversized } else { "hello" }}]}))
+                .send().await.unwrap();
+            assert_eq!(response.status(), 200);
+            if !stream {
+                assert!(response.headers()["content-type"]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("application/json"));
+                assert_eq!(response.headers()["x-crosslane-error-status"], "400");
+            }
+            let text = response.text().await.unwrap();
+            let error: Value = if stream {
+                sse_error_payload(&text)
+            } else {
+                serde_json::from_str(&text).unwrap()
+            };
+            assert_eq!(error["type"], "error", "{error}");
+            assert_eq!(error["error"]["code"], "context_length_exceeded");
+            assert_eq!(error["error"]["status"], 400);
+            assert_eq!(error["error"]["stage"], "context_validation");
+            assert_eq!(error["error"]["retryable"], false);
+            assert_eq!(error["error"]["context"]["overflow_scope"], scope);
+            assert!(
+                error["error"]["context"]["minimum_input_tokens"]
+                    .as_u64()
+                    .unwrap()
+                    > error["error"]["context"]["maximum_input_tokens"]
+                        .as_u64()
+                        .unwrap()
+            );
+            let message = error["error"]["message"].as_str().unwrap();
+            assert!(message.contains("Recovery:"), "{error}");
+            assert!(
+                message.contains(error["request_id"].as_str().unwrap()),
+                "{error}"
+            );
+            assert!(error.get("usage").is_none());
+            assert!(error.get("content").is_none());
+            assert!(!text.contains("E015"));
+            assert!(!text.contains("synthetic recovery record"));
+        }
+    }
+    assert!(!upstream
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .any(|request| request.url.path() == "/generateAssistantResponse"));
+    relay.kill().await.unwrap();
+    daemon.stop().await;
 }
 
 #[cfg(feature = "crs")]

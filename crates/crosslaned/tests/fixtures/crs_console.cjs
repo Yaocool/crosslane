@@ -68,7 +68,9 @@ const server = http.createServer(async (req, res) => {
     } else {
       const response = await relay.relayRequest(body, { id: 'local-test-key' }, null, res,
         req.headers, 'local-test-account')
-      res.writeHead(response.statusCode, { 'content-type': 'application/json' })
+      const headers = Object.fromEntries(Object.entries(response.headers).filter(([name]) =>
+        !['content-encoding', 'transfer-encoding', 'content-length'].includes(name.toLowerCase())))
+      res.writeHead(response.statusCode, headers)
       res.end(response.body)
     }
   } catch (error) {
