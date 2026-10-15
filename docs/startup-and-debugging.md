@@ -331,6 +331,44 @@ already in progress can still affect final usage.
 
 ## Request latency controls
 
+### Load Claude Code MCP tools on demand
+
+Claude Code can disable tool search when `ANTHROPIC_BASE_URL` points to
+Crosslane, loading every MCP tool into the model context on each turn. Enable
+it explicitly before starting Claude Code:
+
+```bash
+ENABLE_TOOL_SEARCH=true claude
+```
+
+Alternatively, merge this field into Claude Code's `~/.claude/settings.json`
+and restart the session:
+
+```json
+{
+  "env": {
+    "ENABLE_TOOL_SEARCH": "true"
+  }
+}
+```
+
+Crosslane enables `features.enable_tool_search` by default. Client `ToolSearch`
+calls remain client-executed. A `defer_loading` definition enters a Kiro
+request only after a history `tool_reference` discovers it or the tool has
+been used; unmatched definitions stay out of the upstream context. Previously
+used tools and a tool explicitly selected by `tool_choice` remain available.
+Long names use upstream aliases and are restored in client responses. If
+proxy tool search is explicitly disabled, deferred-tool requests still fail
+instead of silently loading the full catalog.
+
+Ordinary built-in tools, system instructions, and conversation history still
+consume context. Compare `loaded_tool_count`, `deferred_tool_count`,
+`loaded_tool_bytes`, and `input_tokens` in `proxy.request.prepared`, then
+measure both first-byte and complete response times. Counts cover definitions
+in this request, not the full MCP catalog retained by Claude Code. See the
+[Claude Code MCP documentation](https://code.claude.com/docs/en/mcp#configure-tool-search)
+for the client switch.
+
 Copilot model lookups reuse an enabled account's catalog up to
 `provider.models.max_stale_ms` while scheduled or explicit refreshes update it.
 A missing catalog on another account does not block requests with a usable

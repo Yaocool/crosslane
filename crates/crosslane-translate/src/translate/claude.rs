@@ -199,7 +199,7 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
                 );
                 let images = extract_images(&message.content);
                 let documents = extract_documents(&message.content);
-                let results = extract_tool_results(&message.content);
+                let results = extract_tool_results(&message.content, &tool_names);
                 let cache_point = message_cache_point(message, options.enable_prompt_cache);
                 if last {
                     current.content = nonempty(text, !results.is_empty());

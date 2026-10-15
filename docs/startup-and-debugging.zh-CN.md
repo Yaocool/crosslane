@@ -272,6 +272,37 @@ Kiro overage 默认关闭。
 
 ## 请求延迟控制
 
+### Claude Code 的 MCP 工具按需加载
+
+使用 Crosslane 的自定义 `ANTHROPIC_BASE_URL` 时，Claude Code 默认可能关闭工具搜索，
+导致每轮把所有 MCP 工具加载进模型上下文。在启动 Claude Code 前显式启用：
+
+```bash
+ENABLE_TOOL_SEARCH=true claude
+```
+
+也可以将以下字段合并进 Claude Code 的 `~/.claude/settings.json`，然后重新启动会话：
+
+```json
+{
+  "env": {
+    "ENABLE_TOOL_SEARCH": "true"
+  }
+}
+```
+
+Crosslane 的 `features.enable_tool_search` 默认为 `true`。客户端 `ToolSearch` 调用
+仍交给客户端执行；`defer_loading` 工具只在历史中被 `tool_reference` 引用或实际使用后
+加载到 Kiro 请求，未命中的定义不进入上游上下文。已经使用的工具和显式 `tool_choice`
+指定的工具保持可用；长工具名在上游使用别名，返回客户端时恢复原名。显式关闭代理工具
+搜索时，带延迟工具的请求仍会被拒绝，不会静默加载全部工具。
+
+普通内置工具、system 和对话历史仍会占用上下文；这项设置不会自动缩短这些内容。
+可对照 `proxy.request.prepared` 的 `loaded_tool_count`、`deferred_tool_count`、
+`loaded_tool_bytes` 和 `input_tokens` 判断实际减少量，再比较首包与完整响应耗时。
+计数只涵盖本次请求携带的定义，不包含 Claude Code 留在客户端的完整 MCP 目录。
+开关说明见 [Claude Code MCP 文档](https://code.claude.com/docs/en/mcp#configure-tool-search)。
+
 Copilot 业务模型查询优先复用启用账号在 `provider.models.max_stale_ms` 范围内的
 目录快照，由周期任务或显式刷新更新目录。其他账号缺少目录时，不会阻塞已有可用
 快照的请求；首次发现或全部快照过期时仍需查询上游，过期模型不会用于授权和选号。

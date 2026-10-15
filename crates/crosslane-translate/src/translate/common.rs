@@ -506,7 +506,7 @@ fn normalize_image_format(format: &str) -> &str {
     }
 }
 
-pub fn extract_tool_results(content: &Value) -> Vec<KiroToolResult> {
+pub fn extract_tool_results(content: &Value, tool_names: &ToolNameRegistry) -> Vec<KiroToolResult> {
     content
         .as_array()
         .into_iter()
@@ -514,7 +514,26 @@ pub fn extract_tool_results(content: &Value) -> Vec<KiroToolResult> {
         .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
         .filter_map(|block| {
             let tool_use_id = block.get("tool_use_id")?.as_str()?.to_string();
-            let result = block.get("content").map(content_text).unwrap_or_default();
+            let mut result = block.get("content").map(content_text).unwrap_or_default();
+            // Client-managed ToolSearch returns references instead of text.
+            // The definitions are loaded separately; retain the discovery
+            // result using the same names as those definitions and history.
+            let references = block
+                .get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|part| part.get("type").and_then(Value::as_str) == Some("tool_reference"))
+                .filter_map(|part| part.get("tool_name").and_then(Value::as_str))
+                .map(|name| tool_names.kiro_name(name))
+                .collect::<Vec<_>>();
+            if !references.is_empty() {
+                if !result.is_empty() {
+                    result.push('\n');
+                }
+                result.push_str("Available tool definitions: ");
+                result.push_str(&serde_json::to_string(&references).unwrap_or_default());
+            }
             let has_images = block
                 .get("content")
                 .is_some_and(content_contains_claude_image);
@@ -727,6 +746,37 @@ pub fn enhance_system(mut system: String, chunked_write_hint: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_tool_search_references_preserve_results_and_aliased_names() {
+        let long = "mcp__gateway__orch_mcp_server__orch_dingtalk_notification_send_with_details";
+        let names = ToolNameRegistry::new([long, "mcp.a/read", "mcp_a/read"]);
+        for with_text in [false, true] {
+            let mut parts = Vec::new();
+            if with_text {
+                parts.push(serde_json::json!({"type":"text","text":"Matching tools:"}));
+            }
+            for name in [long, "mcp.a/read", "mcp_a/read"] {
+                parts.push(serde_json::json!({"type":"tool_reference","tool_name":name}));
+            }
+            let results = extract_tool_results(
+                &serde_json::json!([{
+                    "type":"tool_result","tool_use_id":"toolu_search","content":parts
+                }]),
+                &names,
+            );
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].tool_use_id, "toolu_search");
+            assert_eq!(results[0].status, "success");
+            let text = &results[0].content[0].text;
+            assert_eq!(text.starts_with("Matching tools:\n"), with_text);
+            assert!(text.contains("Available tool definitions:"));
+            for name in [long, "mcp.a/read", "mcp_a/read"] {
+                assert!(text.contains(&format!("\"{}\"", names.kiro_name(name))));
+            }
+            assert!(!text.contains("(empty result)"));
+        }
+    }
 
     #[test]
     fn chunked_write_prompt_hint_does_not_classify_mcp_tools() {

@@ -468,6 +468,13 @@ async fn handle_claude_route_inner(
     if client_compaction {
         crosslane_translate::prepare_compaction_source_history(&mut payload);
     }
+    // Client-managed ToolSearch also uses deferred definitions, without a
+    // proxy-managed server-tool catalog. Count them before catalog extraction.
+    let deferred_tool_count = request
+        .tools
+        .iter()
+        .filter(|tool| tool.defer_loading)
+        .count();
     let catalog_bytes = request
         .tools
         .iter()
@@ -941,9 +948,7 @@ async fn handle_claude_route_inner(
         client_context: Some(client_context.clone()),
         original_tool_count,
         loaded_tool_count: loaded_tool_count(&payload),
-        deferred_tool_count: tool_search
-            .as_ref()
-            .map_or(0, |catalog| catalog.deferred_len()),
+        deferred_tool_count,
         loaded_tool_bytes: loaded_tool_bytes(&payload),
         catalog_bytes,
         tool_tokens,
@@ -981,7 +986,7 @@ async fn handle_claude_route_inner(
         payload_bytes,
         loaded_tool_count = loaded_tool_count(&payload),
         loaded_tool_bytes = diagnostics.loaded_tool_bytes,
-        deferred_tool_count = tool_search.as_ref().map_or(0, |catalog| catalog.deferred_len()),
+        deferred_tool_count = diagnostics.deferred_tool_count,
         catalog_bytes = diagnostics.catalog_bytes,
         estimated_credits = estimate,
         "upstream request prepared"

@@ -83,6 +83,9 @@ mod empty_responses;
 #[path = "end_to_end/tool_names.rs"]
 mod tool_names;
 
+#[path = "end_to_end/client_tool_search.rs"]
+mod client_tool_search;
+
 struct Daemon {
     child: Child,
     socket: PathBuf,
@@ -2742,7 +2745,11 @@ priority = 10
                 {"role":"user","content":"old context ".repeat(140000)},
                 {"role":"assistant","content":"an earlier conclusion"},
                 {"role":"user","content":"continue the streamed implementation"}
-            ]
+            ],
+            "tools":[{
+                "name":"write_file",
+                "input_schema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}
+            }]
         }))
         .send()
         .await
