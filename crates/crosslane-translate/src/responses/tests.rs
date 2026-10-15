@@ -83,6 +83,174 @@ fn codex_request_preserves_instructions_controls_and_namespace_tools() {
 }
 
 #[test]
+fn namespace_name_components_have_independent_length_budgets() {
+    for (namespace_length, name_length) in [(64, 64), (63, 64), (128, 128)] {
+        for kind in ["function", "custom"] {
+            for additional_tools in [false, true] {
+                let namespace = "n".repeat(namespace_length);
+                let name = "t".repeat(name_length);
+                let declaration = json!({"type":"namespace","name":namespace,"tools":[{
+                    "type":kind,"name":name,"parameters":{"type":"object"}
+                }]});
+                let (call_type, input_key, output_type) = if kind == "function" {
+                    ("function_call", "arguments", "function_call_output")
+                } else {
+                    ("custom_tool_call", "input", "custom_tool_call_output")
+                };
+                let mut input = json!({
+                    "model":"test",
+                    "input":[
+                        {"role":"user","content":"Use the tool."},
+                        {"type":call_type,"call_id":"call_history","namespace":namespace,
+                            "name":name,input_key:if kind == "function" { "{}" } else { "patch" }},
+                        {"type":output_type,"call_id":"call_history","output":"done"},
+                        {"role":"user","content":"Use it again."}
+                    ],
+                    "tool_choice":{"type":kind,"namespace":namespace,"name":name}
+                });
+                if additional_tools {
+                    input["input"].as_array_mut().unwrap().insert(
+                        0,
+                        json!({"type":"additional_tools","tools":[declaration.clone()]}),
+                    );
+                } else {
+                    input["tools"] = json!([declaration.clone()]);
+                }
+                let translated = normalize(input);
+                let alias = translated.request.tools[0].body[kind]["name"]
+                    .as_str()
+                    .unwrap();
+                assert!(alias.len() <= 128, "internal name is too long: {alias}");
+                assert_eq!(translated.tool_names[alias].name, name);
+                assert_eq!(
+                    translated.tool_names[alias].namespace.as_deref(),
+                    Some(namespace.as_str())
+                );
+                assert_eq!(translated.tools, vec![declaration]);
+                assert_eq!(
+                    translated.request.tool_choice.as_ref().unwrap()[kind]["name"],
+                    alias
+                );
+                let call = translated
+                    .request
+                    .messages
+                    .iter()
+                    .flat_map(|message| &message.tool_calls)
+                    .next()
+                    .unwrap();
+                assert_eq!(call[kind]["name"], alias);
+                crate::validate_openai(&translated.request).expect("normalized names stay valid");
+                let payload = openai_to_kiro(
+                    &translated.request,
+                    &TranslationOptions::new("test", "AI_EDITOR"),
+                );
+                let tools = &payload
+                    .conversation_state
+                    .current_message
+                    .user_input_message
+                    .user_input_message_context
+                    .as_ref()
+                    .unwrap()
+                    .tools;
+                assert_eq!(
+                    tools[0].specification().unwrap().name,
+                    crate::tool_name(alias)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn namespace_aliases_do_not_collide_with_declared_flat_names() {
+    let namespace = "A".repeat(128);
+    let name = "T".repeat(128);
+    let qualified = format!("{namespace}.{name}");
+    let flat_name = crate::tool_name(&qualified);
+    // Also declare the collision alias itself. It sorts after the namespace,
+    // so reserving only aliases already registered would lose this identity.
+    let collision_name = crate::ToolNameRegistry::new([qualified.as_str(), flat_name.as_str()])
+        .kiro_name(&qualified);
+    let translated = normalize(json!({
+        "model":"test","input":"Use the tools.",
+        "tools":[
+            {"type":"namespace","name":namespace,"tools":[{
+                "type":"function","name":name,"parameters":{"type":"object"}
+            }]},
+            {"type":"function","name":flat_name,"parameters":{"type":"object"}},
+            {"type":"function","name":collision_name,"parameters":{"type":"object"}}
+        ],
+        "tool_choice":{"type":"allowed_tools","mode":"required","tools":[
+            {"type":"function","namespace":namespace,"name":name},
+            {"type":"function","name":flat_name},
+            {"type":"function","name":collision_name}
+        ]}
+    }));
+    let names = translated
+        .request
+        .tools
+        .iter()
+        .map(|tool| tool.body["function"]["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_ne!(names[0], names[1]);
+    assert_ne!(names[0], names[2]);
+    assert_eq!(translated.tool_names.len(), 3);
+    assert_eq!(
+        translated.tool_names[names[0]].namespace.as_deref(),
+        Some(namespace.as_str())
+    );
+    assert_eq!(translated.tool_names[names[0]].name, name);
+    assert_eq!(translated.tool_names[names[1]].name, flat_name);
+    assert!(translated.tool_names[names[1]].namespace.is_none());
+    assert_eq!(translated.tool_names[names[2]].name, collision_name);
+    assert!(translated.tool_names[names[2]].namespace.is_none());
+    let choices = &translated.request.tool_choice.as_ref().unwrap()["allowed_tools"]["tools"];
+    assert_eq!(choices[0]["function"]["name"], names[0]);
+    assert_eq!(choices[1]["function"]["name"], names[1]);
+    assert_eq!(choices[2]["function"]["name"], names[2]);
+}
+
+#[test]
+fn response_name_components_are_validated_before_shortening() {
+    let valid = json!({
+        "model":"test","input":"Use the tool.",
+        "tools":[{"type":"namespace","name":"n".repeat(128),"tools":[{
+            "type":"function","name":"t".repeat(128),"parameters":{"type":"object"}
+        }]}]
+    });
+    normalize(valid.clone());
+    for (pointer, field) in [
+        ("/tools/0/name", "tools.0.name"),
+        ("/tools/0/tools/0/name", "tools.0.tools.0.name"),
+    ] {
+        let mut body = valid.clone();
+        *body.pointer_mut(pointer).unwrap() = json!("x".repeat(129));
+        let request: ResponsesRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(
+            responses_to_openai(&request).err().unwrap(),
+            ValidationError::InvalidField {
+                field: field.into(),
+                message: ValidationError::ToolNameTooLong.to_string(),
+            }
+        );
+    }
+    for kind in ["function", "custom"] {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"test","input":"Use the tool.",
+            "tools":[{"type":kind,"name":"x".repeat(129)}]
+        }))
+        .unwrap();
+        assert_eq!(
+            responses_to_openai(&request).err().unwrap(),
+            ValidationError::InvalidField {
+                field: "tools.0.name".into(),
+                message: ValidationError::ToolNameTooLong.to_string(),
+            }
+        );
+    }
+}
+
+#[test]
 fn responses_lite_additional_tools_are_callable_and_not_messages() {
     let translated = normalize(json!({
         "model":"gpt-5.6-sol",

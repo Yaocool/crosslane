@@ -204,8 +204,10 @@ Copilot Responses 流保留首次出现的响应 ID，并按输出序号统一�
 
 Claude 上游不接受工具 schema 根部的 `oneOf`、`allOf`、`anyOf` 时，Crosslane
 将组合约束移到等价的条件子 schema，保留分支必填字段、定义引用和闭合对象约束。
-Responses 的 namespace 函数工具在上游使用唯一函数名，返回客户端时恢复原来的 namespace
-和名称。Claude Code 的 `thinking.display: "updates"` 会适配为上游支持的 `summarized`，
+Responses 的 namespace 函数工具和 custom 工具在上游使用唯一名称，返回客户端时恢复原来的 namespace
+和名称。适配层分别对 namespace 和工具名保留 128 字符上限，拼接后的内部名称超过该长度时，
+会在工具声明、历史调用及 tool choice 中统一使用请求内的唯一别名；流式、非流式输出均恢复原字段。
+Claude Code 的 `thinking.display: "updates"` 会适配为上游支持的 `summarized`，
 保留 thinking 设置；`omitted` 仍隐藏思考内容。
 Kiro 工具调用在返回客户端前会校验是否匹配本次请求的工具声明，流式、非流式都适用。
 已知别名恢复原名；客户端明确声明的 hash 名仍合法。未知名称返回

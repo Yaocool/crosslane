@@ -4,7 +4,7 @@
 //! Web search is executed at the HTTP boundary after authentication; unsupported
 //! hosted tools are rejected. Ephemeral state is handled at that boundary too.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -94,7 +94,7 @@ pub struct ResponsesToolName {
 
 pub struct ResponsesTranslation {
     pub request: OpenAiRequest,
-    /// Flattened OpenAI name -> original Responses namespace and leaf name.
+    /// Internal OpenAI name -> original Responses namespace and leaf name.
     pub tool_names: HashMap<String, ResponsesToolName>,
     /// Effective Responses declarations from the top-level `tools` field and
     /// any `input[].additional_tools` control items. The HTTP adapter uses
@@ -332,7 +332,7 @@ pub fn responses_to_openai(
         let tool = declaration.value;
         let field = declaration.field.as_str();
         if tool.get("type").and_then(Value::as_str) == Some("namespace") {
-            let namespace = required_string(tool, "name", field)?;
+            let namespace = tool_name_component(tool, "name", field)?;
             let description = tool
                 .get("description")
                 .filter(|value| !value.is_null())
@@ -435,7 +435,7 @@ pub fn responses_to_openai(
         budget_tokens: None,
         display: None,
     });
-    let normalized = OpenAiRequest {
+    let mut normalized = OpenAiRequest {
         model: request.model.clone(),
         messages,
         temperature: request.temperature,
@@ -458,6 +458,7 @@ pub fn responses_to_openai(
         metadata: request.metadata.clone(),
         response_format: request.text.as_ref().and_then(|text| text.format.clone()),
     };
+    let tool_names = bound_qualified_tool_names(&mut normalized, tool_names);
     validate_openai(&normalized)?;
     Ok(ResponsesTranslation {
         request: normalized,
@@ -560,7 +561,7 @@ fn add_tool(
             "hosted tools are not supported; use function or custom tools executed by the client",
         );
     }
-    let name = required_string(tool, "name", field)?;
+    let name = tool_name_component(tool, "name", field)?;
     let qualified = namespace.map_or_else(
         || name.to_owned(),
         |namespace| format!("{namespace}.{name}"),
@@ -626,8 +627,93 @@ fn add_tool(
     Ok(())
 }
 
+fn tool_name_component<'a>(
+    value: &'a Value,
+    key: &str,
+    field: &str,
+) -> Result<&'a str, ValidationError> {
+    let name = required_string(value, key, field)?;
+    // Preserve the adapter's existing per-name resource boundary. A namespace
+    // and leaf name each have their own budget; their concatenation is internal.
+    if name.chars().count() > crate::validate::MAX_TOOL_NAME_CHARS {
+        return invalid(
+            format!("{field}.{key}"),
+            ValidationError::ToolNameTooLong.to_string(),
+        );
+    }
+    Ok(name)
+}
+
+fn bound_qualified_tool_names(
+    request: &mut OpenAiRequest,
+    names: HashMap<String, ResponsesToolName>,
+) -> HashMap<String, ResponsesToolName> {
+    let overlong = names
+        .keys()
+        .filter(|name| name.chars().count() > crate::validate::MAX_TOOL_NAME_CHARS)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if overlong.is_empty() {
+        return names;
+    }
+    let registry = crate::ToolNameRegistry::new(names.keys().map(String::as_str));
+    let mut occupied = names.keys().cloned().collect::<HashSet<_>>();
+    let mut aliases = HashMap::new();
+    for qualified in overlong {
+        let mut alias = registry.kiro_name(&qualified);
+        let mut nonce = 0usize;
+        // Reserve every existing flat name, including names which already look
+        // like a hash, so shortening a namespace cannot change another tool's
+        // identity. Sorted registration makes the mapping stable across turns.
+        while occupied.contains(&alias) {
+            nonce += 1;
+            alias = crate::tool_name(&format!("{qualified}.{nonce}"));
+        }
+        occupied.insert(alias.clone());
+        aliases.insert(qualified, alias);
+    }
+    let rewrite = |value: &mut Value, kind: &str| {
+        if let Some(name) = value.get_mut(kind).and_then(|body| body.get_mut("name")) {
+            if let Some(alias) = name.as_str().and_then(|name| aliases.get(name)) {
+                *name = json!(alias);
+            }
+        }
+    };
+    let rewrite_call = |call: &mut Value| match call.get("type").and_then(Value::as_str) {
+        Some("function") => rewrite(call, "function"),
+        Some("custom") => rewrite(call, "custom"),
+        _ => {}
+    };
+    for tool in &mut request.tools {
+        rewrite(&mut tool.body, &tool.r#type);
+    }
+    for call in request
+        .messages
+        .iter_mut()
+        .flat_map(|message| &mut message.tool_calls)
+    {
+        rewrite_call(call);
+    }
+    if let Some(choice) = &mut request.tool_choice {
+        rewrite_call(choice);
+        if let Some(tools) = choice
+            .get_mut("allowed_tools")
+            .and_then(|allowed| allowed.get_mut("tools"))
+            .and_then(Value::as_array_mut)
+        {
+            for tool in tools {
+                rewrite_call(tool);
+            }
+        }
+    }
+    names
+        .into_iter()
+        .map(|(name, identity)| (aliases.remove(&name).unwrap_or(name), identity))
+        .collect()
+}
+
 fn qualified_name(item: &Value, field: &str) -> Result<String, ValidationError> {
-    let name = required_string(item, "name", field)?;
+    let name = tool_name_component(item, "name", field)?;
     match item.get("namespace").filter(|v| !v.is_null()) {
         Some(value) => {
             let namespace = value
@@ -636,6 +722,7 @@ fn qualified_name(item: &Value, field: &str) -> Result<String, ValidationError> 
                 .ok_or_else(|| {
                     error(format!("{field}.namespace"), "expected a non-empty string")
                 })?;
+            tool_name_component(item, "namespace", field)?;
             Ok(format!("{namespace}.{name}"))
         }
         None => Ok(name.to_owned()),

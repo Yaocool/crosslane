@@ -168,6 +168,12 @@ async fn create_response_with_session(
                 })
                 .unwrap();
             assert_eq!(done["item"], *item);
+            for event in events.iter().filter(|event| event["output_index"] == index) {
+                if event["item"]["name"].is_string() {
+                    assert_eq!(event["item"]["name"], item["name"]);
+                    assert_eq!(event["item"]["namespace"], item["namespace"]);
+                }
+            }
         }
         completed["response"].clone()
     } else {
@@ -202,6 +208,132 @@ async fn responses_tool_roundtrip_works_through_both_aliases_and_buffer_modes() 
 #[tokio::test]
 async fn responses_tool_only_roundtrip_does_not_invent_assistant_text() {
     assert_tool_roundtrip("").await;
+}
+
+#[tokio::test]
+async fn responses_long_namespace_names_restore_and_resume_in_both_modes() {
+    let _http_guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    mount_context_alignment_models(&mock).await;
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(ToolRoundtrip {
+            assistant_content: "",
+        })
+        .mount(&mock)
+        .await;
+    let port = unused_tcp_port();
+    let daemon =
+        Daemon::start_http(port, &format!("{}/generateAssistantResponse", mock.uri())).await;
+    import_context_alignment_account(&daemon, 0.0).await;
+    let client = reqwest::Client::new();
+    for buffered in [false, true] {
+        model_policy::configure(&daemon, |config| {
+            config.features.buffer_tool_calls = buffered
+        })
+        .await;
+        for stream in [false, true] {
+            for length in [64, 128] {
+                for additional_tools in [false, true] {
+                    let namespace = "n".repeat(length);
+                    let function_name = "f".repeat(length);
+                    let custom_name = "c".repeat(length);
+                    let declaration = json!({"type":"namespace","name":namespace,"tools":[
+                        {"type":"function","name":function_name,
+                            "parameters":{"type":"object","properties":{"path":{"type":"string"}}}},
+                        {"type":"custom","name":custom_name,"format":{"type":"text"}}
+                    ]});
+                    let mut initial = json!({
+                        "model":"source-large","input":[{"role":"user","content":"Use both tools."}],
+                        "stream":stream,"max_output_tokens":512,
+                        "tool_choice":{"type":"allowed_tools","mode":"required","tools":[
+                            {"type":"function","namespace":namespace,"name":function_name},
+                            {"type":"custom","namespace":namespace,"name":custom_name}
+                        ]}
+                    });
+                    if additional_tools {
+                        initial["input"].as_array_mut().unwrap().insert(
+                            0,
+                            json!({"type":"additional_tools","tools":[declaration.clone()]}),
+                        );
+                    } else {
+                        initial["tools"] = json!([declaration.clone()]);
+                    }
+                    let first =
+                        create_response(&client, &daemon, port, "/v1/responses", &initial).await;
+                    let output = first["output"].as_array().unwrap();
+                    assert_eq!(output.len(), 2);
+                    let function = output
+                        .iter()
+                        .find(|item| item["type"] == "function_call")
+                        .unwrap();
+                    let custom = output
+                        .iter()
+                        .find(|item| item["type"] == "custom_tool_call")
+                        .unwrap();
+                    assert_eq!(function["name"], function_name);
+                    assert_eq!(function["namespace"], namespace);
+                    assert_eq!(custom["name"], custom_name);
+                    assert_eq!(custom["namespace"], namespace);
+                    assert_eq!(first["tools"], json!([declaration.clone()]));
+                    let continuation = json!({
+                        "model":"source-large","previous_response_id":first["id"],"stream":stream,
+                        "input":[
+                            {"type":"function_call_output","call_id":function["call_id"],"output":"README contents"},
+                            {"type":"custom_tool_call_output","call_id":custom["call_id"],"output":"Patch applied."}
+                        ]
+                    });
+                    let second =
+                        create_response(&client, &daemon, port, "/v1/responses", &continuation)
+                            .await;
+                    assert_eq!(second["previous_response_id"], first["id"]);
+                    assert_eq!(second["tools"], json!([declaration]));
+                    assert_eq!(
+                        second["output"][0]["content"][0]["text"],
+                        "Read the file and applied the patch."
+                    );
+                    let payloads = mock
+                        .received_requests()
+                        .await
+                        .unwrap()
+                        .iter()
+                        .filter(|request| request.url.path() == "/generateAssistantResponse")
+                        .rev()
+                        .take(2)
+                        .map(|request| serde_json::from_slice::<Value>(&request.body).unwrap())
+                        .collect::<Vec<_>>();
+                    let expected = [function_name, custom_name]
+                        .map(|name| crosslane_translate::tool_name(&format!("{namespace}.{name}")));
+                    for payload in &payloads {
+                        let names = payload["conversationState"]["currentMessage"]
+                            ["userInputMessage"]["userInputMessageContext"]["tools"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|tool| tool["toolSpecification"]["name"].as_str().unwrap())
+                            .collect::<Vec<_>>();
+                        assert_eq!(names, expected);
+                        assert!(names.iter().all(|name| name.len() <= 64));
+                    }
+                    let history_names = payloads[0]["conversationState"]["history"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter_map(|message| {
+                            message["assistantResponseMessage"]["toolUses"].as_array()
+                        })
+                        .flatten()
+                        .map(|tool| tool["name"].as_str().unwrap())
+                        .collect::<Vec<_>>();
+                    assert_eq!(history_names.len(), expected.len());
+                    assert!(expected
+                        .iter()
+                        .all(|name| history_names.contains(&name.as_str())));
+                }
+            }
+        }
+    }
+    daemon.stop().await;
 }
 
 async fn assert_tool_roundtrip(assistant_content: &'static str) {

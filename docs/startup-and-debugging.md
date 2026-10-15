@@ -247,9 +247,13 @@ Message phases, tool call IDs, citations, and `copilot_usage` remain unchanged.
 For Claude upstreams that reject root `oneOf`, `allOf`, or `anyOf` tool schemas,
 Crosslane moves those constraints into an equivalent conditional subschema,
 preserving required branches, local definitions, and closed object constraints.
-Responses namespace function tools use unique upstream names and restore their
-original namespace and name in client output. Claude Code's `thinking.display:
-"updates"` is adapted to upstream `summarized` while retaining thinking settings;
+Responses namespace function/custom tools use unique upstream names and restore their
+original namespace and name in client output. The adapter bounds namespace and
+leaf name independently to 128 characters. If their flattened internal name is
+longer, it uses a request-scoped alias consistently in declarations, history and
+tool choice; streamed and non-streamed output retain the original fields.
+Claude Code's `thinking.display: "updates"` is adapted to upstream `summarized`
+while retaining thinking settings;
 `omitted` continues to hide thinking output.
 Kiro tool calls are checked against the originating request's tool declarations
 before reaching the client, in both streaming and non-streaming responses.
