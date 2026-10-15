@@ -46,7 +46,9 @@ pub use translate::{
     WebSearchReplayCodec, WebSearchReplayError,
 };
 pub use validate::document_bytes_match_format;
+mod web_search_domains;
 pub use validate::{
     validate_claude, validate_claude_count, validate_claude_generation, validate_openai,
     ValidationError,
 };
+pub use web_search_domains::WebSearchDomainFilter;

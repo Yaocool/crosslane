@@ -242,8 +242,11 @@ Responses 返回 `web_search_call`、真实来源链接与 URL 引用，并保�
 `external_web_access:false` 仅复用该服务和 Key 的五分钟搜索缓存；未命中时明确报错。
 需要实时搜索的 Codex 客户端可在配置中设置 `web_search = "live"`。搜索历史续接仅在
 同一服务和 Key 下有效，最长保留三十分钟；服务重启后需要发送新请求。
-Claude 服务端搜索目前仍不支持非空的 `allowed_domains`、`blocked_domains` 和
-`user_location`；这些配置会明确报错。
+Claude 服务端搜索支持 `allowed_domains` 或 `blocked_domains`，两者不能同时提供。
+域名自动包含子域名，搜索路径支持前缀和 `*` 通配符；域名必须使用 ASCII 主机名，不能带
+协议、端口、凭据或主机名通配符。代理向 Kiro MCP 的查询加入 `site:` / `-site:` 约束，
+并在结果进入模型续写、引用和加密回放前按 URL 再次过滤。无匹配时返回空搜索结果。
+`user_location` 仍不支持，提供时会明确报错。
 
 ## 模型与额度
 

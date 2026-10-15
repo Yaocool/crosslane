@@ -323,20 +323,14 @@ fn validate_claude_request(request: &ClaudeRequest, counting: bool) -> Result<()
                     "input_examples is not supported on Claude server tools",
                 );
             }
-            if tool
-                .allowed_domains
-                .as_ref()
-                .is_some_and(|domains| !domains.is_empty())
-                || tool
-                    .blocked_domains
-                    .as_ref()
-                    .is_some_and(|domains| !domains.is_empty())
-            {
-                return invalid(
-                    format!("tools.{index}"),
-                    "web search domain filters are not supported by the Kiro MCP search endpoint",
-                );
-            }
+            crate::WebSearchDomainFilter::new(
+                tool.allowed_domains.as_deref(),
+                tool.blocked_domains.as_deref(),
+            )
+            .map_err(|message| ValidationError::InvalidField {
+                field: format!("tools.{index}"),
+                message,
+            })?;
             if tool.user_location.is_some() {
                 return invalid(
                     format!("tools.{index}.user_location"),

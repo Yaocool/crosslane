@@ -495,8 +495,9 @@ pub(super) struct ContextLimitError {
 mod execution;
 
 pub(super) use execution::{
-    apply_remaining_output_budget, execute_kiro_web_search, find_model_fallback,
-    prepare_kiro_payload, resolve_static_model, set_payload_model, validate_internal_continuation,
+    apply_remaining_output_budget, execute_filtered_kiro_web_search, execute_kiro_web_search,
+    find_model_fallback, prepare_kiro_payload, resolve_static_model, set_payload_model,
+    validate_internal_continuation,
 };
 #[cfg(test)]
 use execution::{
