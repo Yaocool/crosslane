@@ -282,6 +282,15 @@ async fn kiro_stream_failures_do_not_downgrade_the_model_and_cool_the_route() {
         .request("/v1/messages", "claude-sonnet-4-6", true, None)
         .await;
     assert_eq!(status, 200, "{body}");
+    #[cfg(feature = "crs")]
+    {
+        // CRS builds inspect uncommitted SSE errors before selecting the final
+        // provider. The fallback retains the model and must not expose errors
+        // from the discarded candidate to the client.
+        assert!(body.contains("from copilot"), "{body}");
+        assert!(!body.contains("\"type\":\"error\""), "{body}");
+    }
+    #[cfg(not(feature = "crs"))]
     assert!(body.contains("error"), "{body}");
     assert!(!body.contains("from kiro"), "{body}");
     let (status, body) = mixed

@@ -26,6 +26,11 @@ const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_PREFLIGHT_BYTES: usize = 64 * 1024;
 const PREFLIGHT_WAIT: Duration = Duration::from_secs(5);
 
+/// A candidate and the final response adapter share one inspection window.
+/// Extensions stay inside Crosslane and cannot be supplied as client headers.
+#[derive(Clone, Copy)]
+struct CandidatePreflightDeadline(tokio::time::Instant);
+
 pub(super) fn enrich_error_envelope(
     envelope: &mut Value,
     code: &str,
@@ -299,6 +304,115 @@ pub(super) async fn adapt_ccr_response(
     stream::protect_response(response, request_id, model)
 }
 
+/// Inspect an automatic candidate before any content reaches the caller.
+pub(super) async fn inspect_provider_candidate(response: Response, request_id: &str) -> Response {
+    if !response.status().is_success()
+        || !response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/event-stream"))
+    {
+        return response;
+    }
+    let (mut parts, body) = response.into_parts();
+    let mut source = body.into_data_stream();
+    let mut prefix = BytesMut::new();
+    let mut examined = 0;
+    let deadline = tokio::time::Instant::now() + PREFLIGHT_WAIT;
+    parts
+        .extensions
+        .insert(CandidatePreflightDeadline(deadline));
+    loop {
+        while let Some((end, event)) = next_event(&prefix, examined) {
+            let value = stream::event_value(&prefix[examined..end]);
+            examined = end;
+            if let PreludeEvent::Error {
+                message,
+                code,
+                status,
+                metadata,
+            } = event
+            {
+                drop(source);
+                let response = error_response(
+                    status,
+                    diagnostic_envelope(
+                        status,
+                        &message,
+                        &code,
+                        Some(status.as_u16()),
+                        request_id,
+                        Some(&metadata),
+                    ),
+                    request_id,
+                );
+                return rejected_candidate(response);
+            }
+            // A tool start already commits this candidate. Never wait for a
+            // complete tool block and then transparently replay its action.
+            let prelude = match value.as_ref() {
+                Some(value) => matches!(value["type"].as_str(), Some("message_start" | "ping")),
+                None => matches!(event, PreludeEvent::Prelude),
+            };
+            if !prelude {
+                return restore_candidate(parts, prefix, source);
+            }
+        }
+        if prefix.len() >= MAX_PREFLIGHT_BYTES {
+            return restore_candidate(parts, prefix, source);
+        }
+        match tokio::time::timeout_at(deadline, source.next()).await {
+            Ok(Some(Ok(bytes))) if bytes.len() <= MAX_PREFLIGHT_BYTES - prefix.len() => {
+                prefix.extend_from_slice(&bytes)
+            }
+            Ok(Some(Err(_))) => {
+                drop(source);
+                return rejected_candidate(json_error(
+                    StatusCode::BAD_GATEWAY,
+                    "Upstream stream transport failed before assistant content",
+                    "upstream_transport_interrupted",
+                    None,
+                    request_id,
+                ));
+            }
+            Ok(Some(chunk)) => {
+                return restore_candidate(
+                    parts,
+                    prefix,
+                    futures::stream::iter([chunk]).chain(source),
+                )
+            }
+            Ok(None) => {
+                return rejected_candidate(json_error(
+                    StatusCode::BAD_GATEWAY,
+                    "Upstream event stream ended before assistant content",
+                    "upstream_event_stream_empty",
+                    None,
+                    request_id,
+                ));
+            }
+            Err(_) => return restore_candidate(parts, prefix, source),
+        }
+    }
+}
+
+fn rejected_candidate(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert("x-crosslane-candidate-error", HeaderValue::from_static("1"));
+    response
+}
+
+fn restore_candidate(
+    parts: axum::http::response::Parts,
+    prefix: BytesMut,
+    source: impl futures::Stream<Item = Result<Bytes, axum::Error>> + Send + 'static,
+) -> Response {
+    let body = futures::stream::once(async { Ok::<_, axum::Error>(prefix.freeze()) }).chain(source);
+    Response::from_parts(parts, Body::from_stream(body))
+}
+
 fn initial_error_stream(envelope: &Value, request_id: &str, model: &str) -> String {
     // Claude Code retries an error-only stream without streaming. CRS then
     // sanitizes that HTTP error and erases the original diagnostics again.
@@ -521,7 +635,13 @@ async fn preflight_stream(response: Response, request_id: &str) -> Response {
     let mut stream = body.into_data_stream();
     let mut prefix = BytesMut::new();
     let mut examined = 0;
-    let deadline = tokio::time::Instant::now() + PREFLIGHT_WAIT;
+    let deadline = parts
+        .extensions
+        .get::<CandidatePreflightDeadline>()
+        .map_or_else(
+            || tokio::time::Instant::now() + PREFLIGHT_WAIT,
+            |value| value.0,
+        );
     loop {
         while let Some((end, event)) = next_event(&prefix, examined) {
             examined = end;
@@ -1080,6 +1200,31 @@ fn error_response(status: StatusCode, envelope: Value, request_id: &str) -> Resp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn automatic_and_response_preflight_share_one_wait_window() {
+        let source = async_stream::stream! {
+            yield Ok::<_, std::io::Error>(Bytes::from_static(b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n"));
+            tokio::time::sleep(Duration::from_secs(12)).await;
+            yield Ok(Bytes::from_static(b"event: ping\ndata: {\"type\":\"ping\"}\n\n"));
+        };
+        let response = Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from_stream(source))
+            .unwrap();
+        let started = Instant::now();
+        let response = inspect_provider_candidate(response, "trace_wait").await;
+        assert!(response
+            .extensions()
+            .get::<CandidatePreflightDeadline>()
+            .is_some());
+        let response = adapt_claude_stream_response(response, "trace_wait", "model").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            started.elapsed() < Duration::from_secs(7),
+            "the same prelude must not wait for a second five-second window"
+        );
+    }
 
     #[tokio::test]
     async fn oversized_event_resynchronizes_before_later_error_for_lf_and_crlf() {

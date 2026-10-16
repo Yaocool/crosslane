@@ -383,10 +383,50 @@ where
             available_providers = loads.len(), "automatic provider route selected");
         let provider = route.provider_id.to_string();
         let deadline = route.failover_timeout_ms;
+        let future = async {
+            let (response, context) = dispatch(route).await?;
+            #[cfg(feature = "crs")]
+            let response = if matches!(format, ErrorFormat::Claude) {
+                super::super::crs::inspect_provider_candidate(response, trace_id).await
+            } else {
+                response
+            };
+            #[cfg(feature = "crs")]
+            if matches!(format, ErrorFormat::Claude)
+                && response
+                    .headers()
+                    .contains_key("x-crosslane-candidate-error")
+            {
+                let status = response.status();
+                let (parts, body) = response.into_parts();
+                let bytes = axum::body::to_bytes(body, 64 * 1024)
+                    .await
+                    .unwrap_or_default();
+                let value = serde_json::from_slice::<Value>(&bytes).unwrap_or_default();
+                let mut error = ApiError::new(
+                    status,
+                    value
+                        .pointer("/error/detail")
+                        .or_else(|| value.pointer("/error/message"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("provider rejected the request before streaming content"),
+                    format,
+                )
+                .with_provider_id(&provider);
+                error.error_stage = "upstream_dispatch";
+                error.upstream_status = Some(status.as_u16());
+                error.account_error = true;
+                if retryable(&error) {
+                    return Err(error);
+                }
+                return Ok((Response::from_parts(parts, Body::from(bytes)), context));
+            }
+            Ok((response, context))
+        };
         let result = if deadline == 0 {
-            dispatch(route).await
+            future.await
         } else {
-            tokio::time::timeout(Duration::from_millis(deadline), dispatch(route))
+            tokio::time::timeout(Duration::from_millis(deadline), future)
                 .await
                 .unwrap_or_else(|_| {
                     let mut error = ApiError::new(
@@ -505,6 +545,222 @@ impl HttpBody for RoutedBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "crs")]
+    fn claude_plan(timeout: u64) -> RoutePlan {
+        let config = Config {
+            provider: vec![
+                crosslane_core::config::ProviderConfig::default(),
+                crosslane_core::config::ProviderConfig {
+                    id: "copilot".into(),
+                    kind: "copilot".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Config::default()
+        };
+        let mut pool = ProxyServiceConfig {
+            allowed_providers: vec!["kiro".into(), "copilot".into()],
+            ..Default::default()
+        };
+        let mut routes = Vec::new();
+        for id in ["kiro", "copilot"] {
+            pool.default_provider = id.into();
+            let mut route = select_provider_route(
+                &config,
+                &pool,
+                None,
+                &Bytes::from_static(br#"{"model":"claude-sonnet-4-6"}"#),
+                ErrorFormat::Claude,
+            )
+            .unwrap_or_else(|_| panic!("test route"));
+            route.automatic = true;
+            route.failover_timeout_ms = timeout;
+            routes.push((
+                route,
+                ProviderLoad {
+                    id: id.into(),
+                    capacity: 1,
+                    active: 0,
+                },
+            ));
+        }
+        RoutePlan {
+            routes,
+            automatic: true,
+            model: "claude-sonnet-4-6".into(),
+        }
+    }
+
+    #[cfg(feature = "crs")]
+    #[tokio::test]
+    async fn early_sse_error_can_fail_over_but_a_tool_start_commits_the_route() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for committed in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let scheduler = ProviderScheduler::default();
+            let (response, ()) = execute(&scheduler, "service", "trace_sse", claude_plan(1000), ErrorFormat::Claude, |_| {
+                let calls = Arc::clone(&calls);
+                async move {
+                    let index = calls.fetch_add(1, Ordering::SeqCst);
+                    let body = if index == 0 {
+                        format!("{}event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"rate_limit_error\",\"message\":\"busy supplier\"}}}}\n\n", if committed { "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"once\",\"name\":\"Bash\",\"input\":{}}}\n\n" } else { "" })
+                    } else { "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"fallback answer\"}}\n\n".into() };
+                    Ok((Response::builder().header("content-type", "text/event-stream").body(Body::from(body)).unwrap(), ()))
+                }
+            }).await.unwrap_or_else(|_| panic!("SSE candidate should complete"));
+            let bytes = axum::body::to_bytes(response.into_body(), 8192)
+                .await
+                .unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), if committed { 1 } else { 2 });
+            assert_eq!(
+                std::str::from_utf8(&bytes)
+                    .unwrap()
+                    .contains("fallback answer"),
+                !committed
+            );
+        }
+    }
+
+    #[cfg(feature = "crs")]
+    #[tokio::test]
+    async fn empty_or_broken_candidates_can_fail_over_before_content() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for broken in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (response, ()) = execute(
+                &ProviderScheduler::default(),
+                "service",
+                "trace_empty",
+                claude_plan(1000),
+                ErrorFormat::Claude,
+                |_| {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            let body = if broken {
+                                Body::from_stream(futures::stream::iter([Err::<Bytes, _>(
+                                    std::io::Error::other("broken upstream"),
+                                )]))
+                            } else {
+                                Body::empty()
+                            };
+                            Ok((
+                                Response::builder()
+                                    .header("content-type", "text/event-stream")
+                                    .body(body)
+                                    .unwrap(),
+                                (),
+                            ))
+                        } else {
+                            Ok((Response::new(Body::from("fallback answer")), ()))
+                        }
+                    }
+                },
+            )
+            .await
+            .unwrap_or_else(|_| panic!("empty and broken candidates are retryable"));
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                b"fallback answer"
+            );
+        }
+    }
+
+    #[cfg(feature = "crs")]
+    #[tokio::test]
+    async fn claude_provider_timeout_keeps_a_full_attempt_for_the_fallback() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (response, ()) = execute(
+            &ProviderScheduler::default(),
+            "service",
+            "trace_timeout",
+            claude_plan(20),
+            ErrorFormat::Claude,
+            |_| {
+                let calls = Arc::clone(&calls);
+                async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        std::future::pending::<()>().await;
+                    }
+                    Ok((Response::new(Body::from("fallback answer")), ()))
+                }
+            },
+        )
+        .await
+        .unwrap_or_else(|_| panic!("the fallback gets its own deadline"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"fallback answer"
+        );
+    }
+
+    #[cfg(feature = "crs")]
+    #[tokio::test]
+    async fn pinned_and_disabled_attempt_deadlines_keep_their_original_meaning() {
+        for pinned in [false, true] {
+            let mut plan = claude_plan(10);
+            if pinned {
+                plan.automatic = false;
+                plan.routes.truncate(1);
+            } else {
+                plan.routes[0].0.failover_timeout_ms = 0;
+            }
+            let result = execute(
+                &ProviderScheduler::default(),
+                "service",
+                "trace_pinned",
+                plan,
+                ErrorFormat::Claude,
+                |_| async {
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    Ok((Response::new(Body::from("answer")), ()))
+                },
+            )
+            .await;
+            assert!(
+                result.is_ok(),
+                "a failover deadline must not become a pinned or shared deadline"
+            );
+        }
+    }
+
+    #[cfg(feature = "crs")]
+    #[tokio::test]
+    async fn both_protocols_preserve_the_timed_out_provider_and_error_contract() {
+        for format in [ErrorFormat::Claude, ErrorFormat::OpenAi] {
+            let error = execute(
+                &ProviderScheduler::default(),
+                "service",
+                "trace_timeout",
+                claude_plan(10),
+                format,
+                |_| async {
+                    std::future::pending::<()>().await;
+                    Ok((Response::new(Body::empty()), ()))
+                },
+            )
+            .await
+            .expect_err("both providers time out");
+            assert_eq!(error.status, StatusCode::GATEWAY_TIMEOUT);
+            assert_eq!(error.error_code, "upstream_timeout");
+            assert_eq!(error.error_stage, "upstream_dispatch");
+            assert_eq!(error.log_context.provider_id, "copilot");
+            assert_eq!(
+                error.message.as_ref(),
+                "provider did not return a response before its failover deadline"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn a_stalled_attempt_expires_and_uses_the_other_provider() {
