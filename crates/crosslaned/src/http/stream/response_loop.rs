@@ -2175,7 +2175,9 @@ pub fn response(
     // A bounded bridge supplies backpressure and ensures a client that stops
     // reading cannot hold an account lease forever.
     let (sender, receiver) = tokio::sync::mpsc::channel(16);
-    tokio::spawn(async move {
+    #[cfg(feature = "crs")]
+    let stats_attempt = crate::stats::RequestStatsAttempt::current();
+    let bridge = async move {
         futures::pin_mut!(stream);
         while let Some(item) = stream.next().await {
             match tokio::time::timeout(std::time::Duration::from_secs(30), sender.send(item)).await
@@ -2201,7 +2203,10 @@ pub fn response(
                 }
             }
         }
-    });
+    };
+    #[cfg(feature = "crs")]
+    let bridge = crate::stats::RequestStatsAttempt::scope(stats_attempt, bridge);
+    tokio::spawn(bridge);
     let receiver = futures::stream::unfold(receiver, |mut receiver| async move {
         receiver.recv().await.map(|item| (item, receiver))
     });

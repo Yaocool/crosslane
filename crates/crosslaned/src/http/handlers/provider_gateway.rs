@@ -591,6 +591,27 @@ pub(super) async fn execute_provider(
                 )
             })?;
     }
+    let state = Arc::clone(&service.app);
+    let metadata = ProviderRequestMetadata {
+        provider_id: route.provider_id.to_string(),
+        original_model: route.original_model,
+        model: route.upstream_model,
+        mapping_rule: route.mapping_rule,
+        account_id: response.account_id.clone().unwrap_or_default(),
+        path,
+        trace_id: trace_id.clone(),
+        request_id: response
+            .upstream_request_id
+            .clone()
+            .unwrap_or_else(|| trace_id.clone()),
+        user_agent,
+        status: response.status.as_u16(),
+        started,
+        api_key_id,
+        client_context,
+        session_owner,
+        stores_response,
+    };
     // Failed attempts in an automatic route are recorded by the coordinator,
     // not as additional client requests. Keep pinned-provider responses intact.
     let protocol_error = if route.automatic && response.status.is_success() {
@@ -627,7 +648,28 @@ pub(super) async fn execute_provider(
             error_mapping_rule.as_deref(),
         );
         error.account_error = true;
-        error.log_context.account_id = response.account_id.clone().unwrap_or_default();
+        error.log_context.account_id = metadata.account_id.clone();
+        #[cfg(feature = "crs")]
+        if crate::stats::RequestStatsAttempt::current().is_some_and(|attempt| {
+            attempt.matches_request(&state.stats, &metadata.trace_id, &metadata.path)
+        }) {
+            // A JSON protocol error may still carry real usage or a native
+            // supplier bill. Settle the already buffered observation before
+            // failover rejects this candidate's client-request accounting.
+            if let ProviderResponseBody::Full(bytes) = &response.body {
+                let usage = ProviderUsage::from_bytes(bytes);
+                if usage.reported || usage.billing.is_some() {
+                    record_provider_request(
+                        &state,
+                        &metadata,
+                        usage,
+                        Some(error.message.to_string()),
+                        reservation,
+                    )
+                    .await;
+                }
+            }
+        }
         return Err(error);
     }
     let status = response.status;
@@ -639,35 +681,13 @@ pub(super) async fn execute_provider(
             .get("content-type")
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.starts_with("text/event-stream"));
-    let account_id = response.account_id.unwrap_or_default();
-    let request_id = response
-        .upstream_request_id
-        .unwrap_or_else(|| trace_id.clone());
     let mut builder = Response::builder().status(status);
     for (name, value) in &response.headers {
         builder = builder.header(name, value);
     }
-    if let Ok(value) = HeaderValue::from_str(&request_id) {
+    if let Ok(value) = HeaderValue::from_str(&metadata.request_id) {
         builder = builder.header("request-id", value);
     }
-    let state = Arc::clone(&service.app);
-    let metadata = ProviderRequestMetadata {
-        provider_id: route.provider_id.to_string(),
-        original_model: route.original_model,
-        model: route.upstream_model,
-        mapping_rule: route.mapping_rule,
-        account_id,
-        path,
-        trace_id,
-        request_id,
-        user_agent,
-        status: status.as_u16(),
-        started,
-        api_key_id,
-        client_context,
-        session_owner,
-        stores_response,
-    };
     let body = match response.body {
         ProviderResponseBody::Full(bytes) => {
             let usage = ProviderUsage::from_bytes(&bytes);
@@ -684,6 +704,7 @@ pub(super) async fn execute_provider(
                 claude: observe_claude.then(super::super::crs::ClaudeStreamState::default),
                 reservation: Some(reservation),
                 failure: None,
+                stats_attempt: crate::stats::RequestStatsAttempt::current(),
             };
             let stream = async_stream::stream! {
                 let _connection_guard = connection_guard;
@@ -801,6 +822,7 @@ struct ProviderStreamFinalizer {
     claude: Option<super::super::crs::ClaudeStreamState>,
     reservation: Option<CreditReservation>,
     failure: Option<String>,
+    stats_attempt: Option<Arc<crate::stats::RequestStatsAttempt>>,
 }
 
 #[cfg(feature = "crs")]
@@ -811,8 +833,12 @@ impl ProviderStreamFinalizer {
         let metadata = self.metadata.clone();
         let usage = std::mem::take(&mut self.usage).finish();
         let error = self.failure.take().or(error);
+        let stats_attempt = self.stats_attempt.clone();
         Some(tokio::spawn(async move {
-            record_provider_request(&state, &metadata, usage, error, reservation).await;
+            crate::stats::RequestStatsAttempt::scope(stats_attempt, async move {
+                record_provider_request(&state, &metadata, usage, error, reservation).await;
+            })
+            .await;
         }))
     }
 }
@@ -1311,36 +1337,89 @@ mod tests {
     use super::*;
 
     #[cfg(feature = "crs")]
+    fn provider_test_metadata(trace_id: &str) -> ProviderRequestMetadata {
+        ProviderRequestMetadata {
+            provider_id: "copilot".into(),
+            original_model: "model".into(),
+            model: "model".into(),
+            mapping_rule: None,
+            account_id: "fixture".into(),
+            path: "/v1/messages".into(),
+            trace_id: trace_id.into(),
+            request_id: trace_id.into(),
+            user_agent: "test".into(),
+            status: 200,
+            started: Instant::now(),
+            api_key_id: None,
+            client_context: Default::default(),
+            session_owner: super::super::super::responses::ResponsesSessionOwner::new(
+                "svc".into(),
+                None,
+            ),
+            stores_response: false,
+        }
+    }
+
+    #[cfg(feature = "crs")]
+    #[tokio::test]
+    async fn rejected_native_attempt_keeps_reported_billing_without_a_second_client_log() {
+        let (_directory, state) = super::super::super::tests::test_state(Config::default()).await;
+        let stats_attempt = crate::stats::RequestStatsAttempt::new(
+            Arc::clone(&state.stats),
+            "rejected",
+            "/v1/messages",
+        );
+        stats_attempt.reject();
+        let mut guard = ProviderStreamFinalizer {
+            state: Arc::clone(&state),
+            metadata: provider_test_metadata("rejected"),
+            usage: ProviderUsageScanner::default(),
+            claude: None,
+            reservation: Some(state.meter.reserve(None, 0.0).unwrap()),
+            stats_attempt: Some(stats_attempt),
+            failure: None,
+        };
+        guard.usage.push(b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":7}}}\n\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":3},\"copilot_usage\":{\"total_nano_aiu\":42}}\n\n");
+        guard
+            .finish(Some("candidate failed before content".into()))
+            .unwrap()
+            .await
+            .unwrap();
+        drop(guard);
+        let snapshot = state.stats.snapshot(None);
+        assert_eq!(snapshot.total.requests, 0);
+        assert_eq!(snapshot.total.input_tokens, 7);
+        assert_eq!(snapshot.total.output_tokens, 3);
+        assert!(snapshot.recent_requests.is_empty());
+        assert_eq!(
+            state
+                .meter
+                .account_aiu_usage("copilot", "fixture")
+                .unwrap()
+                .total_nano_aiu,
+            42
+        );
+    }
+
+    #[cfg(feature = "crs")]
     #[tokio::test]
     async fn cancelled_or_finished_provider_stream_is_recorded_exactly_once() {
         let (_directory, state) = super::super::super::tests::test_state(Config::default()).await;
         for outcome in ["cancelled", "failed", "completed"] {
-            let metadata = ProviderRequestMetadata {
-                provider_id: "copilot".into(),
-                original_model: "model".into(),
-                model: "model".into(),
-                mapping_rule: None,
-                account_id: "fixture".into(),
-                path: "/v1/messages".into(),
-                trace_id: outcome.into(),
-                request_id: outcome.into(),
-                user_agent: "test".into(),
-                status: 200,
-                started: Instant::now(),
-                api_key_id: None,
-                client_context: Default::default(),
-                session_owner: super::super::super::responses::ResponsesSessionOwner::new(
-                    "svc".into(),
-                    None,
-                ),
-                stores_response: false,
-            };
+            let metadata = provider_test_metadata(outcome);
+            let stats_attempt = crate::stats::RequestStatsAttempt::new(
+                Arc::clone(&state.stats),
+                outcome,
+                "/v1/messages",
+            );
+            stats_attempt.select();
             let mut guard = ProviderStreamFinalizer {
                 state: Arc::clone(&state),
                 metadata,
                 usage: ProviderUsageScanner::default(),
                 claude: None,
                 reservation: Some(state.meter.reserve(None, 0.0).unwrap()),
+                stats_attempt: Some(stats_attempt),
                 failure: (outcome == "failed")
                     .then(|| "original upstream transport failure".into()),
             };

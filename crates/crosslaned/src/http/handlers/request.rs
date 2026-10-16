@@ -101,8 +101,10 @@ async fn handle_claude_with_context(
     .await?;
     super::provider_balance::execute(
         &state.provider_scheduler,
+        &state.stats,
         &service.service.id,
         &trace_id,
+        &path,
         plan,
         ErrorFormat::Claude,
         |route| {
@@ -1468,8 +1470,10 @@ async fn handle_openai_with_context(
     let mut admission_guard = Some(admission_guard);
     let result = super::provider_balance::execute(
         &state.provider_scheduler,
+        &state.stats,
         &service.service.id,
         &trace_id,
+        &path,
         plan,
         ErrorFormat::OpenAi,
         |route| {

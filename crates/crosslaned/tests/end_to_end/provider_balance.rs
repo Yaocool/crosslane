@@ -9,6 +9,12 @@ struct Mixed {
     _copilot: MockServer,
     kiro_status: Arc<AtomicUsize>,
     kiro_stream_error: Arc<AtomicBool>,
+    #[cfg(feature = "crs")]
+    failed_stream_usage: Arc<AtomicBool>,
+    #[cfg(feature = "crs")]
+    copilot_early_error: Arc<AtomicBool>,
+    #[cfg(feature = "crs")]
+    copilot_json_error_usage: Arc<AtomicBool>,
     copilot_status: Arc<AtomicUsize>,
     protocol_error: Arc<AtomicBool>,
     kiro_calls: Arc<AtomicUsize>,
@@ -47,12 +53,16 @@ impl Mixed {
         }
         let kiro_status = Arc::new(AtomicUsize::new(200));
         let kiro_stream_error = Arc::new(AtomicBool::new(false));
+        let failed_stream_usage = Arc::new(AtomicBool::new(false));
+        let copilot_early_error = Arc::new(AtomicBool::new(false));
+        let copilot_json_error_usage = Arc::new(AtomicBool::new(false));
         let copilot_status = Arc::new(AtomicUsize::new(200));
         let protocol_error = Arc::new(AtomicBool::new(false));
         let kiro_calls = Arc::new(AtomicUsize::new(0));
         let copilot_calls = Arc::new(AtomicUsize::new(0));
         let status = Arc::clone(&kiro_status);
         let stream_error = Arc::clone(&kiro_stream_error);
+        let failed_usage = Arc::clone(&failed_stream_usage);
         let calls = Arc::clone(&kiro_calls);
         Mock::given(method("POST"))
             .and(path("/generateAssistantResponse"))
@@ -70,12 +80,18 @@ impl Mixed {
                         .set_body_json(json!({"message":"test Kiro unavailable"}));
                 }
                 if stream_error.load(Ordering::SeqCst) && model == "claude-sonnet-4.6" {
+                    let mut frames = if failed_usage.load(Ordering::SeqCst) {
+                        event_stream_frame("messageMetadataEvent", json!({"usage":{
+                            "inputTokens":31,"outputTokens":4,"creditsConsumed":0.125
+                        }}))
+                    } else { Vec::new() };
+                    frames.extend(event_stream_frame("error", json!({
+                        "__type":"MODEL_TEMPORARILY_UNAVAILABLE",
+                        "message":"Encountered unexpectedly high load when processing the request, please try again."
+                    })));
                     return ResponseTemplate::new(200)
                         .insert_header("content-type", "application/vnd.amazon.eventstream")
-                        .set_body_bytes(event_stream_frame("error", json!({
-                            "__type":"MODEL_TEMPORARILY_UNAVAILABLE",
-                            "message":"Encountered unexpectedly high load when processing the request, please try again."
-                        })));
+                        .set_body_bytes(frames);
                 }
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "application/vnd.amazon.eventstream")
@@ -92,6 +108,8 @@ impl Mixed {
             let status = Arc::clone(&copilot_status);
             let calls = Arc::clone(&copilot_calls);
             let protocol_error = Arc::clone(&protocol_error);
+            let early_error = Arc::clone(&copilot_early_error);
+            let json_error_usage = Arc::clone(&copilot_json_error_usage);
             Mock::given(method("POST")).and(path(endpoint))
                 .respond_with(move |request: &wiremock::Request| {
                     let sequence = calls.fetch_add(1, Ordering::SeqCst);
@@ -101,11 +119,23 @@ impl Mixed {
                     if status != 200 {
                         return ResponseTemplate::new(status).set_body_json(json!({"error":{"type":"invalid_request_error","message":if status == 400 {"max_tokens must be greater than 0"} else {"test Copilot unavailable"}}}));
                     }
+                    if json_error_usage.load(Ordering::SeqCst) {
+                        return ResponseTemplate::new(200).set_body_json(json!({
+                            "error":{"type":"overloaded_error","message":"reported native JSON failure"},
+                            "usage":{"input_tokens":21,"output_tokens":3},
+                            "copilot_usage":{"total_nano_aiu":12345,"cost_per_batch":9}
+                        }));
+                    }
                     if body["stream"] == true {
-                        let data = if protocol_error.load(Ordering::SeqCst) {
+                        let data = if early_error.load(Ordering::SeqCst) {
+                            format!("event: message_start\ndata: {}\n\nevent: message_delta\ndata: {}\n\nevent: error\ndata: {}\n\n",
+                                json!({"type":"message_start","message":{"id":"msg-failed","type":"message","role":"assistant","model":"claude-sonnet-4-6","content":[],"usage":{"input_tokens":11,"output_tokens":0}}}),
+                                json!({"type":"message_delta","delta":{},"usage":{"output_tokens":3}}),
+                                json!({"type":"error","error":{"type":"overloaded_error","message":"Copilot candidate unavailable before content"}}))
+                        } else if protocol_error.load(Ordering::SeqCst) {
                             "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial from copilot\"}}\n\nevent: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"unavailable\"}}\n\n".to_owned()
                         } else if endpoint == "/v1/messages" {
-                            format!("event: message_start\ndata: {}\n\nevent: content_block_delta\ndata: {}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n", json!({"type":"message_start","message":{"id":"msg-balanced","type":"message","role":"assistant","model":"claude-sonnet-4-6","content":[],"usage":{"input_tokens":8,"output_tokens":0}}}), json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"from copilot"}}))
+                            format!("event: message_start\ndata: {}\n\nevent: content_block_delta\ndata: {}\n\nevent: message_delta\ndata: {}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n", json!({"type":"message_start","message":{"id":"msg-balanced","type":"message","role":"assistant","model":"claude-sonnet-4-6","content":[],"usage":{"input_tokens":8,"output_tokens":0}}}), json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"from copilot"}}), json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}))
                         } else if endpoint == "/chat/completions" {
                             format!("data: {}\n\ndata: [DONE]\n\n", json!({"id":"chat-balanced","object":"chat.completion.chunk","model":"claude-sonnet-4-6","choices":[{"index":0,"delta":{"content":"from copilot"},"finish_reason":"stop"}]}))
                         } else {
@@ -176,6 +206,12 @@ impl Mixed {
             _copilot: copilot,
             kiro_status,
             kiro_stream_error,
+            #[cfg(feature = "crs")]
+            failed_stream_usage,
+            #[cfg(feature = "crs")]
+            copilot_early_error,
+            #[cfg(feature = "crs")]
+            copilot_json_error_usage,
             copilot_status,
             protocol_error,
             kiro_calls,
@@ -666,6 +702,166 @@ async fn a_started_stream_is_not_replayed_and_its_failure_cools_the_provider() {
     assert!(body.contains("from kiro"), "{body}");
     assert_eq!(mixed.counts(), (2, 1));
     mixed.daemon.stop().await;
+}
+
+#[cfg(feature = "crs")]
+#[tokio::test]
+async fn early_sse_failover_counts_one_client_request_and_keeps_each_attempts_usage() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    for all_fail in [false, true] {
+        let mixed = Mixed::start().await;
+        mixed.kiro_stream_error.store(true, Ordering::SeqCst);
+        mixed.failed_stream_usage.store(true, Ordering::SeqCst);
+        mixed.copilot_early_error.store(all_fail, Ordering::SeqCst);
+        let (status, body) = mixed
+            .request("/v1/messages", "claude-sonnet-4-6", true, None)
+            .await;
+        if all_fail {
+            assert!(body.contains("error"), "status={status}: {body}");
+            assert!(!body.contains("message_stop"), "{body}");
+        } else {
+            assert_eq!(status, 200, "{body}");
+            assert!(body.contains("from copilot"), "{body}");
+            assert!(!body.contains("\"type\":\"error\""), "{body}");
+        }
+        assert_eq!(mixed.counts(), (1, 1));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stats = loop {
+            let stats = expect_ok(
+                mixed
+                    .daemon
+                    .call("stats", json!({"detail":true,"recent":10}))
+                    .await,
+            );
+            if stats["stats"]["total"]["requests"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0
+            {
+                break stats;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "request was never accounted: {stats}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let total = &stats["stats"]["total"];
+        assert_eq!(total["requests"], 1, "{stats}");
+        assert_eq!(total["successes"], u64::from(!all_fail), "{stats}");
+        assert_eq!(total["failures"], u64::from(all_fail), "{stats}");
+        assert_eq!(
+            total["input_tokens"],
+            if all_fail { 42 } else { 39 },
+            "{stats}"
+        );
+        assert_eq!(
+            total["output_tokens"],
+            if all_fail { 7 } else { 6 },
+            "{stats}"
+        );
+        assert!(
+            total["credits"].as_f64().unwrap() >= 0.125,
+            "failed Kiro credits were lost: {stats}"
+        );
+        let kiro = &stats["stats"]["by_provider"]["kiro"];
+        assert_eq!(kiro["input_tokens"], 31, "{stats}");
+        assert_eq!(kiro["output_tokens"], 4, "{stats}");
+        assert_eq!(kiro["credits"], 0.125, "{stats}");
+        let rows = stats["stats"]["recent_requests"].as_array().unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "candidate attempts created extra client logs: {stats}"
+        );
+        assert_eq!(
+            rows[0]["status"],
+            if all_fail { 502 } else { 200 },
+            "{stats}"
+        );
+        mixed.daemon.stop().await;
+    }
+}
+
+#[cfg(feature = "crs")]
+#[tokio::test]
+async fn native_json_failover_preserves_reported_usage_and_supplier_billing_once() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    for stream in [false, true] {
+        let mixed = Mixed::start().await;
+        // The first successful route advances round robin to Copilot without
+        // imposing a provider pin that would intentionally disable failover.
+        let (status, body) = mixed
+            .request("/v1/messages", "claude-sonnet-4-6", false, None)
+            .await;
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("from kiro"), "{body}");
+        mixed.copilot_json_error_usage.store(true, Ordering::SeqCst);
+        let (status, body) = mixed
+            .request("/v1/messages", "claude-sonnet-4-6", stream, None)
+            .await;
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("from kiro"), "{body}");
+        assert!(!body.contains("reported native JSON failure"), "{body}");
+        assert_eq!(mixed.counts(), (2, 1));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stats = loop {
+            let stats = expect_ok(
+                mixed
+                    .daemon
+                    .call("stats", json!({"detail":true,"recent":10}))
+                    .await,
+            );
+            if stats["stats"]["total"]["requests"] == 2 {
+                break stats;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "client request accounting never completed: {stats}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let total = &stats["stats"]["total"];
+        assert_eq!(
+            total["requests"], 2,
+            "warmup plus one failed-over client request: {stats}"
+        );
+        assert_eq!(total["successes"], 2, "{stats}");
+        assert_eq!(total["failures"], 0, "{stats}");
+        assert_eq!(total["input_tokens"], 221, "{stats}");
+        assert_eq!(total["output_tokens"], 43, "{stats}");
+        let copilot = &stats["stats"]["by_provider"]["copilot"];
+        assert_eq!(
+            copilot["requests"], 0,
+            "a discarded attempt was counted as a client request: {stats}"
+        );
+        assert_eq!(copilot["input_tokens"], 21, "{stats}");
+        assert_eq!(copilot["output_tokens"], 3, "{stats}");
+        assert_eq!(
+            stats["stats"]["recent_requests"].as_array().unwrap().len(),
+            2,
+            "{stats}"
+        );
+        let billing = loop {
+            let accounts = expect_ok(
+                mixed
+                    .daemon
+                    .call("v2.account.list", json!({"provider":"copilot"}))
+                    .await,
+            );
+            let billing = &accounts["accounts"][0]["details"]["local_aiu_usage"];
+            if billing["billed_requests"] == 1 {
+                break billing.clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "failed native bill was not settled: {accounts}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(billing["total_nano_aiu"], 12345, "{billing}");
+        mixed.daemon.stop().await;
+    }
 }
 
 #[cfg(feature = "crs")]

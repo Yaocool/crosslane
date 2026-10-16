@@ -360,10 +360,13 @@ fn retryable(error: &ApiError) -> bool {
             && matches!(error.status.as_u16(), 429 | 502..=504))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn execute<F, Fut, T>(
     scheduler: &ProviderScheduler,
+    _stats: &Arc<crate::stats::StatsStore>,
     service: &str,
     trace_id: &str,
+    _path: &str,
     mut plan: RoutePlan,
     format: ErrorFormat,
     mut dispatch: F,
@@ -391,6 +394,14 @@ where
             available_providers = loads.len(), "automatic provider route selected");
         let provider = route.provider_id.to_string();
         let deadline = route.failover_timeout_ms;
+        #[cfg(feature = "crs")]
+        let accounting = matches!(format, ErrorFormat::Claude).then(|| {
+            crate::stats::CandidateStatsGuard(crate::stats::RequestStatsAttempt::new(
+                Arc::clone(_stats),
+                trace_id,
+                _path,
+            ))
+        });
         let future = async {
             let (response, context) = dispatch(route).await?;
             #[cfg(feature = "crs")]
@@ -431,6 +442,11 @@ where
             }
             Ok((response, context))
         };
+        #[cfg(feature = "crs")]
+        let future = crate::stats::RequestStatsAttempt::scope(
+            accounting.as_ref().map(|guard| Arc::clone(&guard.0)),
+            future,
+        );
         let result = if deadline == 0 {
             future.await
         } else {
@@ -450,6 +466,10 @@ where
         };
         match result {
             Ok((response, context)) => {
+                #[cfg(feature = "crs")]
+                if let Some(accounting) = &accounting {
+                    accounting.0.select();
+                }
                 let (parts, body) = response.into_parts();
                 let scanner = parts
                     .headers
@@ -472,6 +492,10 @@ where
                 ));
             }
             Err(error) if retryable(&error) => {
+                #[cfg(feature = "crs")]
+                if let Some(accounting) = &accounting {
+                    accounting.0.reject();
+                }
                 lease.failure();
                 tracing::warn!(
                     event = "upstream.provider.failover",
@@ -485,7 +509,13 @@ where
                 );
                 last_error = Some(error);
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                #[cfg(feature = "crs")]
+                if let Some(accounting) = &accounting {
+                    accounting.0.reject();
+                }
+                return Err(error);
+            }
         }
     }
     Err(last_error.unwrap_or_else(|| {
@@ -554,6 +584,12 @@ impl HttpBody for RoutedBody {
 mod tests {
     use super::*;
 
+    fn test_stats() -> Arc<crate::stats::StatsStore> {
+        Arc::new(crate::stats::StatsStore::empty(std::path::Path::new(
+            "/unused-routing-stats",
+        )))
+    }
+
     #[cfg(feature = "crs")]
     fn claude_plan(timeout: u64) -> RoutePlan {
         let config = Config {
@@ -607,7 +643,7 @@ mod tests {
         for committed in [false, true] {
             let calls = Arc::new(AtomicUsize::new(0));
             let scheduler = ProviderScheduler::default();
-            let (response, ()) = execute(&scheduler, "service", "trace_sse", claude_plan(1000), ErrorFormat::Claude, |_| {
+            let (response, ()) = execute(&scheduler, &test_stats(), "service", "trace_sse", "/v1/messages", claude_plan(1000), ErrorFormat::Claude, |_| {
                 let calls = Arc::clone(&calls);
                 async move {
                     let index = calls.fetch_add(1, Ordering::SeqCst);
@@ -638,8 +674,10 @@ mod tests {
             let calls = Arc::new(AtomicUsize::new(0));
             let (response, ()) = execute(
                 &ProviderScheduler::default(),
+                &test_stats(),
                 "service",
                 "trace_empty",
+                "/v1/messages",
                 claude_plan(1000),
                 ErrorFormat::Claude,
                 |_| {
@@ -686,8 +724,10 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let (response, ()) = execute(
             &ProviderScheduler::default(),
+            &test_stats(),
             "service",
             "trace_timeout",
+            "/v1/messages",
             claude_plan(20),
             ErrorFormat::Claude,
             |_| {
@@ -725,8 +765,10 @@ mod tests {
             }
             let result = execute(
                 &ProviderScheduler::default(),
+                &test_stats(),
                 "service",
                 "trace_pinned",
+                "/v1/messages",
                 plan,
                 ErrorFormat::Claude,
                 |_| async {
@@ -748,8 +790,10 @@ mod tests {
         for format in [ErrorFormat::Claude, ErrorFormat::OpenAi] {
             let error = execute(
                 &ProviderScheduler::default(),
+                &test_stats(),
                 "service",
                 "trace_timeout",
+                "/v1/messages",
                 claude_plan(10),
                 format,
                 |_| async {
@@ -817,8 +861,10 @@ mod tests {
         };
         let (response, ()) = execute(
             &scheduler,
+            &test_stats(),
             "service",
             "trace",
+            "/v1/messages",
             plan,
             ErrorFormat::OpenAi,
             |route| async move {

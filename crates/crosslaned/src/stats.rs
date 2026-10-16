@@ -8,6 +8,11 @@ use crosslane_kiro::ModelInfo;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+#[cfg(feature = "crs")]
+mod routing;
+#[cfg(feature = "crs")]
+pub(crate) use routing::{CandidateStatsGuard, RequestStatsAttempt};
+
 const MAX_DIMENSION_KEYS: usize = 1_024;
 const MAX_BUCKET_DIMENSION_KEYS: usize = MAX_DIMENSION_KEYS;
 const MAX_BUCKET_LATENCIES: usize = 256;
@@ -155,11 +160,23 @@ impl Counter {
         self.requests += 1;
         self.successes += u64::from(request.status < 400);
         self.failures += u64::from(request.status >= 400);
+        self.record_usage(request);
+        self.duration_ms = self.duration_ms.saturating_add(request.duration_ms);
+        self.duration_samples = self.duration_samples.saturating_add(1);
+    }
+
+    fn record_usage(&mut self, request: &RequestLog) {
         self.credits += request.credits;
         self.input_tokens += request.input_tokens;
         self.output_tokens += request.output_tokens;
-        self.duration_ms = self.duration_ms.saturating_add(request.duration_ms);
-        self.duration_samples = self.duration_samples.saturating_add(1);
+    }
+
+    fn record_with_request_count(&mut self, request: &RequestLog, count_request: bool) {
+        if count_request {
+            self.record(request);
+        } else {
+            self.record_usage(request);
+        }
     }
 
     fn merge(&mut self, other: &Self) {
@@ -210,41 +227,52 @@ impl WindowBucket {
         );
     }
 
+    #[cfg(test)]
     fn record(&mut self, request: &RequestLog) {
-        self.total.record(request);
+        self.record_with_request_count(request, true);
+    }
+
+    fn record_with_request_count(&mut self, request: &RequestLog, count_request: bool) {
+        self.total.record_with_request_count(request, count_request);
         provider_breakdown_entry(
             &mut self.provider_details,
             request_provider(request),
             MAX_BUCKET_DIMENSION_KEYS,
         )
-        .record(request, MAX_BUCKET_DIMENSION_KEYS);
-        record_dimension_with_limit(
+        .record_with_request_count(request, MAX_BUCKET_DIMENSION_KEYS, count_request);
+        record_dimension_with_request_count(
             &mut self.by_provider,
             request_provider(request),
             request,
             MAX_BUCKET_DIMENSION_KEYS,
+            count_request,
         );
-        record_dimension_with_limit(
+        record_dimension_with_request_count(
             &mut self.by_account,
             &request.account_id,
             request,
             MAX_BUCKET_DIMENSION_KEYS,
+            count_request,
         );
-        record_dimension_with_limit(
+        record_dimension_with_request_count(
             &mut self.by_endpoint,
             &request.endpoint,
             request,
             MAX_BUCKET_DIMENSION_KEYS,
+            count_request,
         );
-        record_dimension_with_limit(
+        record_dimension_with_request_count(
             &mut self.by_model,
             &request.model,
             request,
             MAX_BUCKET_DIMENSION_KEYS,
+            count_request,
         );
-        self.latencies_ms.push_back(request.duration_ms);
-        while self.latencies_ms.len() > MAX_BUCKET_LATENCIES {
-            self.latencies_ms.pop_front();
+        if count_request {
+            self.latencies_ms.push_back(request.duration_ms);
+            while self.latencies_ms.len() > MAX_BUCKET_LATENCIES {
+                self.latencies_ms.pop_front();
+            }
         }
     }
 }
@@ -263,14 +291,39 @@ pub struct ProviderStatsBreakdown {
 }
 
 impl ProviderStatsBreakdown {
-    fn record(&mut self, request: &RequestLog, maximum: usize) {
-        self.total.record(request);
-        record_dimension_with_limit(&mut self.by_account, &request.account_id, request, maximum);
-        record_dimension_with_limit(&mut self.by_endpoint, &request.endpoint, request, maximum);
-        record_dimension_with_limit(&mut self.by_model, &request.model, request, maximum);
-        self.latencies_ms.push_back(request.duration_ms);
-        while self.latencies_ms.len() > MAX_BUCKET_LATENCIES {
-            self.latencies_ms.pop_front();
+    fn record_with_request_count(
+        &mut self,
+        request: &RequestLog,
+        maximum: usize,
+        count_request: bool,
+    ) {
+        self.total.record_with_request_count(request, count_request);
+        record_dimension_with_request_count(
+            &mut self.by_account,
+            &request.account_id,
+            request,
+            maximum,
+            count_request,
+        );
+        record_dimension_with_request_count(
+            &mut self.by_endpoint,
+            &request.endpoint,
+            request,
+            maximum,
+            count_request,
+        );
+        record_dimension_with_request_count(
+            &mut self.by_model,
+            &request.model,
+            request,
+            maximum,
+            count_request,
+        );
+        if count_request {
+            self.latencies_ms.push_back(request.duration_ms);
+            while self.latencies_ms.len() > MAX_BUCKET_LATENCIES {
+                self.latencies_ms.pop_front();
+            }
         }
     }
 
@@ -486,15 +539,29 @@ struct SessionBucket {
 }
 
 impl SessionStats {
-    fn record(&mut self, request: &RequestLog) {
-        self.total.record(request);
-        record_dimension(&mut self.by_provider, request_provider(request), request);
+    fn record_with_request_count(&mut self, request: &RequestLog, count_request: bool) {
+        self.total.record_with_request_count(request, count_request);
+        record_dimension_with_request_count(
+            &mut self.by_provider,
+            request_provider(request),
+            request,
+            MAX_DIMENSION_KEYS,
+            count_request,
+        );
         let bucket = self
             .minute_buckets
             .entry(request.timestamp.div_euclid(60))
             .or_default();
-        bucket.total.record(request);
-        record_dimension(&mut bucket.by_provider, request_provider(request), request);
+        bucket
+            .total
+            .record_with_request_count(request, count_request);
+        record_dimension_with_request_count(
+            &mut bucket.by_provider,
+            request_provider(request),
+            request,
+            MAX_DIMENSION_KEYS,
+            count_request,
+        );
     }
 }
 
@@ -605,7 +672,18 @@ impl StatsStore {
         }
     }
 
-    pub fn record(&self, mut request: RequestLog) {
+    pub fn record(&self, request: RequestLog) {
+        #[cfg(feature = "crs")]
+        if let Some(attempt) =
+            RequestStatsAttempt::current().filter(|attempt| attempt.matches(self, &request))
+        {
+            attempt.record(request);
+            return;
+        }
+        self.record_direct(request, true);
+    }
+
+    fn record_direct(&self, mut request: RequestLog, count_request: bool) {
         use crosslane_translate::error::{log_model, sanitize_error_message};
         request.model = log_model(&request.model);
         request.original_model = log_model(&request.original_model);
@@ -624,7 +702,7 @@ impl StatsStore {
         let notification = request.clone();
         let request = Arc::new(request);
         let mut state = lock(&self.state);
-        record_persistent(&mut state.persistent, &request);
+        record_persistent_with_request_count(&mut state.persistent, &request, count_request);
         let minute = request.timestamp.div_euclid(60);
         Arc::make_mut(
             state
@@ -632,15 +710,21 @@ impl StatsStore {
                 .entry(minute)
                 .or_insert_with(|| Arc::new(WindowBucket::default())),
         )
-        .record(&request);
+        .record_with_request_count(&request, count_request);
         state.dirty_minutes.insert(minute);
-        state.session.record(&request);
-        state.recent_requests.push_back(Arc::clone(&request));
-        while state.recent_requests.len() > 1_000 {
-            state.recent_requests.pop_front();
+        state
+            .session
+            .record_with_request_count(&request, count_request);
+        if count_request {
+            state.recent_requests.push_back(Arc::clone(&request));
+            while state.recent_requests.len() > 1_000 {
+                state.recent_requests.pop_front();
+            }
         }
         drop(state);
-        let _result = self.sender.send(notification);
+        if count_request {
+            let _result = self.sender.send(notification);
+        }
     }
 
     pub fn session_started_at(&self) -> i64 {
@@ -963,19 +1047,51 @@ impl StatsStore {
     }
 }
 
-fn record_persistent(state: &mut ProxyStats, request: &RequestLog) {
-    state.total.record(request);
-    record_dimension(&mut state.by_provider, request_provider(request), request);
+fn record_persistent_with_request_count(
+    state: &mut ProxyStats,
+    request: &RequestLog,
+    count_request: bool,
+) {
+    state
+        .total
+        .record_with_request_count(request, count_request);
+    record_dimension_with_request_count(
+        &mut state.by_provider,
+        request_provider(request),
+        request,
+        MAX_DIMENSION_KEYS,
+        count_request,
+    );
     provider_breakdown_entry(
         &mut state.provider_details,
         request_provider(request),
         MAX_DIMENSION_KEYS,
     )
-    .record(request, MAX_DIMENSION_KEYS);
-    record_dimension(&mut state.by_account, &request.account_id, request);
-    record_dimension(&mut state.by_endpoint, &request.endpoint, request);
-    record_dimension(&mut state.by_model, &request.model, request);
-    state.latencies_ms.push_back(request.duration_ms);
+    .record_with_request_count(request, MAX_DIMENSION_KEYS, count_request);
+    record_dimension_with_request_count(
+        &mut state.by_account,
+        &request.account_id,
+        request,
+        MAX_DIMENSION_KEYS,
+        count_request,
+    );
+    record_dimension_with_request_count(
+        &mut state.by_endpoint,
+        &request.endpoint,
+        request,
+        MAX_DIMENSION_KEYS,
+        count_request,
+    );
+    record_dimension_with_request_count(
+        &mut state.by_model,
+        &request.model,
+        request,
+        MAX_DIMENSION_KEYS,
+        count_request,
+    );
+    if count_request {
+        state.latencies_ms.push_back(request.duration_ms);
+    }
     let minute = request.timestamp.div_euclid(60);
     state.history_started_at = Some(state.history_started_at.map_or_else(
         || minute.saturating_mul(60),
@@ -1533,17 +1649,15 @@ fn bound_provider_breakdowns(
     }
 }
 
-fn record_dimension(dimensions: &mut HashMap<String, Counter>, key: &str, request: &RequestLog) {
-    record_dimension_with_limit(dimensions, key, request, MAX_DIMENSION_KEYS);
-}
-
-fn record_dimension_with_limit(
+fn record_dimension_with_request_count(
     dimensions: &mut HashMap<String, Counter>,
     key: &str,
     request: &RequestLog,
     maximum: usize,
+    count_request: bool,
 ) {
-    dimension_entry_with_limit(dimensions, key, maximum).record(request);
+    dimension_entry_with_limit(dimensions, key, maximum)
+        .record_with_request_count(request, count_request);
 }
 
 fn merge_dimension(dimensions: &mut HashMap<String, Counter>, key: &str, counter: &Counter) {
@@ -1665,7 +1779,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
 
-    fn request(id: &str, timestamp: i64, status: u16) -> RequestLog {
+    pub(super) fn request(id: &str, timestamp: i64, status: u16) -> RequestLog {
         RequestLog {
             timestamp,
             trace_id: format!("trace-{id}"),
@@ -1718,7 +1832,7 @@ mod tests {
     fn legacy_aggregate_dimensions_are_backfilled_as_kiro() {
         let entry = request("legacy-provider", 42, 200);
         let mut aggregate = ProxyStats::default();
-        record_persistent(&mut aggregate, &entry);
+        record_persistent_with_request_count(&mut aggregate, &entry, true);
         aggregate.by_provider.clear();
         aggregate.provider_details.clear();
         let mut bucket = WindowBucket::default();

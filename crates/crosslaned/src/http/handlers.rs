@@ -570,8 +570,10 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
         .for_token_count();
         provider_balance::execute(
             &state.provider_scheduler,
+            &state.stats,
             &service.service.id,
             &trace_id,
+            &path,
             plan,
             ErrorFormat::Claude,
             |route| {
