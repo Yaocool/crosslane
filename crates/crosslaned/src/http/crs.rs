@@ -17,6 +17,9 @@ use crosslane_translate::{error_envelope, sanitize_error_message, ErrorFormat};
 use futures::StreamExt;
 use serde_json::Value;
 
+mod capability;
+pub(super) use capability::execute_with_effort_recovery;
+
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_PREFLIGHT_BYTES: usize = 64 * 1024;
 const PREFLIGHT_WAIT: Duration = Duration::from_secs(5);

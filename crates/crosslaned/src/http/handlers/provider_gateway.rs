@@ -548,12 +548,16 @@ pub(super) async fn execute_provider(
     let error_model = route.upstream_model.clone();
     let error_original_model = route.original_model.clone();
     let error_mapping_rule = route.mapping_rule.clone();
-    let mut response = if count_tokens {
+    #[cfg(feature = "crs")]
+    let result =
+        super::super::crs::execute_with_effort_recovery(&adapter, request, count_tokens).await;
+    #[cfg(not(feature = "crs"))]
+    let result = if count_tokens {
         adapter.count_tokens(request).await
     } else {
         adapter.execute(request).await
-    }
-    .map_err(|error| {
+    };
+    let mut response = result.map_err(|error| {
         provider_api_error(
             error,
             format,
