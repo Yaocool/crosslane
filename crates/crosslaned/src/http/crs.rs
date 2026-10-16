@@ -18,7 +18,9 @@ use futures::StreamExt;
 use serde_json::Value;
 
 mod capability;
+mod stream;
 pub(super) use capability::execute_with_effort_recovery;
+pub(super) use stream::ClaudeStreamState;
 
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_PREFLIGHT_BYTES: usize = 64 * 1024;
@@ -250,7 +252,7 @@ pub(super) async fn adapt_claude_stream_response(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse().ok());
     if !uses_sse_error(response.status(), upstream_status) {
-        return response;
+        return stream::protect_response(response, request_id, model);
     }
     let status = response.status();
     let (mut parts, body) = response.into_parts();
@@ -281,18 +283,20 @@ pub(super) async fn adapt_claude_stream_response(
         "x-crosslane-error-status",
         HeaderValue::from(status.as_u16()),
     );
-    Response::from_parts(
+    let response = Response::from_parts(
         parts,
         Body::from(initial_error_stream(&envelope, request_id, model)),
-    )
+    );
+    stream::protect_response(response, request_id, model)
 }
 
 pub(super) async fn adapt_ccr_response(
     response: Response,
     request_id: &str,
-    _model: &str,
+    model: &str,
 ) -> Response {
-    adapt_claude_response(response, request_id).await
+    let response = adapt_claude_response(response, request_id).await;
+    stream::protect_response(response, request_id, model)
 }
 
 fn initial_error_stream(envelope: &Value, request_id: &str, model: &str) -> String {
@@ -604,7 +608,8 @@ fn restore_stream(
                     finish_discarded_stream(tail);
                     // An unfinished frame would concatenate with the error
                     // event and make the latter invisible to CRS's line parser.
-                    let _ = rewriter.finish();
+                    let partial = rewriter.finish().is_some() || rewriter.passthrough;
+                    if partial { yield Ok(Bytes::from_static(b"\n\n")); }
                     if !rewriter.saw_error {
                         yield Ok(sse_error_bytes(
                             "Upstream stream transport failed",
@@ -629,6 +634,7 @@ struct SseErrorRewriter {
     pending: BytesMut,
     passthrough: bool,
     saw_error: bool,
+    boundary: stream::EventBoundary,
 }
 
 impl SseErrorRewriter {
@@ -638,6 +644,7 @@ impl SseErrorRewriter {
             pending: BytesMut::new(),
             passthrough: false,
             saw_error: false,
+            boundary: stream::EventBoundary::default(),
         }
     }
 
@@ -645,12 +652,22 @@ impl SseErrorRewriter {
         if chunk.is_empty() {
             return Vec::new();
         }
-        if self.passthrough {
-            return vec![chunk];
-        }
         let mut output = Vec::new();
         let mut offset = 0;
         while offset < chunk.len() {
+            if self.passthrough {
+                let start = offset;
+                while offset < chunk.len() {
+                    let end = self.boundary.push(chunk[offset]);
+                    offset += 1;
+                    if end {
+                        self.passthrough = false;
+                        break;
+                    }
+                }
+                output.push(chunk.slice(start..offset));
+                continue;
+            }
             let take = (MAX_PREFLIGHT_BYTES - self.pending.len()).min(chunk.len() - offset);
             self.pending
                 .extend_from_slice(&chunk[offset..offset + take]);
@@ -685,11 +702,11 @@ impl SseErrorRewriter {
             }
             if self.pending.len() == MAX_PREFLIGHT_BYTES {
                 self.passthrough = true;
-                output.push(self.pending.split().freeze());
-                if offset < chunk.len() {
-                    output.push(chunk.slice(offset..));
+                self.boundary = stream::EventBoundary::default();
+                for byte in &self.pending {
+                    self.boundary.push(*byte);
                 }
-                break;
+                output.push(self.pending.split().freeze());
             }
         }
         output
@@ -781,6 +798,9 @@ fn next_event(buffer: &[u8], offset: usize) -> Option<(usize, PreludeEvent)> {
         if let Some(name) = line.strip_prefix("event:") {
             event_name = name.trim();
         } else if let Some(value) = line.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
             data.push_str(value.trim_start());
         }
     }
@@ -1060,6 +1080,42 @@ fn error_response(status: StatusCode, envelope: Value, request_id: &str) -> Resp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn oversized_event_resynchronizes_before_later_error_for_lf_and_crlf() {
+        for newline in ["\n", "\r\n"] {
+            for chunk_size in [257, 4093, 131072] {
+                let content = format!("event: content_block_delta{newline}data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{}\"}}}}{newline}{newline}", "x".repeat(70_000));
+                let error = format!("event: error{newline}data: {{\"type\":\"error\",\"error\":{{\"type\":\"invalid_request_error\",\"message\":\"large event followed by rejected field\"}}}}{newline}{newline}");
+                let input = content.clone() + &error;
+                let chunks = input
+                    .as_bytes()
+                    .chunks(chunk_size)
+                    .map(|chunk| Ok::<_, std::io::Error>(Bytes::copy_from_slice(chunk)))
+                    .collect::<Vec<_>>();
+                let response = Response::builder()
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from_stream(futures::stream::iter(chunks)))
+                    .unwrap();
+                let bytes = to_bytes(
+                    adapt_claude_stream_response(response, "trace_big_event", "model")
+                        .await
+                        .into_body(),
+                    1024 * 1024,
+                )
+                .await
+                .unwrap();
+                assert!(bytes.starts_with(content.as_bytes()));
+                let error = error_from_sse(&bytes).expect("later error must remain visible");
+                assert_eq!(error["error"]["code"], "invalid_request");
+                assert_eq!(error["request_id"], "trace_big_event");
+                assert!(error["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("rejected field"));
+            }
+        }
+    }
 
     #[tokio::test]
     async fn ccr_preserves_http_400_and_console_preserves_sse_diagnostics() {

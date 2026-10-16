@@ -631,6 +631,14 @@ pub(super) async fn execute_provider(
         return Err(error);
     }
     let status = response.status;
+    #[cfg(feature = "crs")]
+    let observe_claude = protocol == ProviderProtocol::ClaudeMessages
+        && status.is_success()
+        && response
+            .headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/event-stream"));
     let account_id = response.account_id.unwrap_or_default();
     let request_id = response
         .upstream_request_id
@@ -673,10 +681,14 @@ pub(super) async fn execute_provider(
                 let _admission_guard = admission_guard;
                 let mut stream_error = None;
                 let mut usage = ProviderUsageScanner::default();
+                #[cfg(feature = "crs")]
+                let mut claude = observe_claude.then(super::super::crs::ClaudeStreamState::default);
                 while let Some(chunk) = upstream.next().await {
                     match chunk {
                         Ok(bytes) => {
                             usage.push(&bytes);
+                            #[cfg(feature = "crs")]
+                            if let Some(claude) = claude.as_mut() { claude.push(&bytes); }
                             // Persist attribution before the completed event
                             // reaches the client: it can immediately issue a
                             // continuation without waiting for transport EOF.
@@ -689,6 +701,10 @@ pub(super) async fn execute_provider(
                             break;
                         }
                     }
+                }
+                #[cfg(feature = "crs")]
+                if stream_error.is_none() && claude.as_ref().is_some_and(super::super::crs::ClaudeStreamState::incomplete) {
+                    stream_error = Some("upstream event stream ended before message completion".into());
                 }
                 record_provider_request(
                     &state,
