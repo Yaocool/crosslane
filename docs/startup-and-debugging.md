@@ -667,7 +667,9 @@ Console compatibility retries an explicit HTTP 400 rejection of
 `output_config.effort` once, before output, using the same account and removing
 only that field. Thinking history, signatures, and tool arguments stay intact.
 CCR preserves HTTP 400 for client recovery. Other HTTP 400 errors do not trigger
-this compatibility retry.
+this compatibility retry. Recovery freezes the retry to the original provider
+instance and account, retaining service exclusions and provider permissions;
+it cannot expand a tagged or explicitly bound pool into the global pool.
 
 SSE JSON strings use ASCII Unicode escapes on the CRS hop to protect Chinese
 text and tool arguments from per-chunk UTF-8 decoding. Decoded values are
@@ -688,6 +690,9 @@ deadline. Pinned routes do not gain this deadline, and no implicit request-wide
 deadline is added. Candidate and response preflight share one five-second window
 instead of waiting twice. Adding
 `Retry-After` in Crosslane cannot restore a header that CRS discards.
+Discarded automatic candidates retain their observed usage in their actual
+provider, account and model totals, while the final outcome counts as one client
+request. Internal summary requests keep their separate accounting.
 
 With `crs`, late `tool_addition` / `tool_removal` declarations update the current
 `tools[]` catalog in message order, supporting references and new custom tool
@@ -700,6 +705,16 @@ fail validation. Generation and count_tokens share this projection. Unknown
 references, conflicting definitions and unsupported definition kinds fail
 explicitly; normal history, capacity and schema checks still apply. Builds
 without `crs` keep their existing behavior.
+
+The latest non-empty assistant `compaction` block resets the tool-change history.
+Its `tool_changes` restores the checkpoint's tool state before later changes
+apply; discarded earlier changes and references cannot alter or reject the active
+catalog. Null or missing compaction content remains a no-op. The checkpoint block
+and its signature are preserved by this one-pass legacy catalog projection.
+Explicit `tool_choice=none` retains completed tool pairs and the schemas needed
+to interpret them as source data, even when tool features are disabled. These
+declarations cannot activate Tool Search or Web Search, resume pending calls, or
+publish callable tools. Generation and token counting use the same tool policy.
 
 | Symptom | First checks |
 | --- | --- |

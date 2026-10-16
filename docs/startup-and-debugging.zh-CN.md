@@ -543,6 +543,8 @@ Claude 请求设置 `stream: true` 且采用 Console 策略时，供应商错误
 Console 路径遇到明确的 `output_config.effort` 不受支持的 HTTP 400 时，只在输出前向
 同一账号重试一次，且只删除该字段；不会删除 thinking 历史、签名或工具参数。CCR 策略保留
 HTTP 400，由客户端自行恢复。其他字段拒绝和其他 HTTP 400 不会触发这次兼容重试。
+重试只锁定原 provider 实例的原账号，保留服务排除项及 provider 权限，不会将标签池或
+显式绑定的账号池扩大为全局账号池。
 
 流内 JSON 字符串以 ASCII Unicode 转义传给 CRS，避免 CRS 逐块 UTF-8 解码损坏中文或
 工具参数，客户端解析后的值保持一致。纯 ASCII 流块复用原缓冲区，Unicode 转义以固定
@@ -558,6 +560,8 @@ Console 未向 Crosslane 传播取消时，Crosslane 无法判断客户端已离
 `0` 只关闭该来源的尝试期限；固定来源不新增此期限，也不隐式设置整次请求的总期限。
 候选检查和最终响应检查共享同一个五秒窗口，避免对首段 SSE 重复等待。
 CRS 丢弃的 `Retry-After` 等响应头不能靠 Crosslane 增加同名头恢复。
+被舍弃的自动路由候选仍按实际 provider、账号和模型累计已收到的用量；最终结果只计为
+一次客户端请求，内部摘要请求仍独立记账。
 
 Claude Code 的延迟 `tool_addition` / `tool_removal` 声明在 `crs` 构建中按消息顺序投影为
 当前 `tools[]`，既支持已有工具的引用，也支持新增 custom 工具定义。声明原位置改为文字
@@ -566,6 +570,13 @@ Claude Code 的延迟 `tool_addition` / `tool_removal` 声明在 `crs` 构建中
 仍可用的引用。已移除工具不会重新进入当前目录，移除后的新引用及未知引用仍明确拒绝。
 生成与 count_tokens 使用相同处理。未知引用、冲突重定义和不支持的定义类型会明确拒绝，
 有效目录仍须通过原有工具配对、容量与结构校验；未启用 `crs` 的行为不变。
+
+最新的非空 assistant `compaction` 块重置工具变更历史，先以其中的 `tool_changes` 恢复
+检查点工具状态，再应用后续变更；已经丢弃的旧声明和引用不会修改当前目录或拒绝续聊。
+`content` 为 null 或缺失的压缩块仍视为无操作。这是一次式的旧协议目录投影，检查点原块
+及其签名保持不变。显式 `tool_choice=none` 在禁用工具功能时仍保留已完成的工具配对，
+以及解释历史所需的 schema 来源数据；这些声明不会激活 Tool Search、Web Search、
+恢复待执行调用或发布可调用工具。生成与 token 计数使用相同的工具策略。
 
 ## 备份与恢复
 
