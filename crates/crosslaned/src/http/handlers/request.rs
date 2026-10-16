@@ -134,6 +134,44 @@ async fn handle_claude_with_context(
     .map(|(response, ())| response)
 }
 
+fn requests_claude_web_search(body: &Value) -> bool {
+    #[cfg(feature = "crs")]
+    if body.pointer("/tool_choice/type").and_then(Value::as_str) == Some("none") {
+        return false;
+    }
+    body["tools"].as_array().is_some_and(|tools| {
+        tools.iter().any(|tool| {
+            tool["type"]
+                .as_str()
+                .is_some_and(|kind| matches_type_family(kind, "web_search"))
+        })
+    })
+}
+
+/// CRS keeps explicit `none` declarations as historical source metadata. The
+/// translator suppresses callable tools and continuations independently; feature
+/// switches must not erase the intent that preserves completed tool pairs.
+pub(super) fn apply_claude_tool_policy(
+    request: &mut ClaudeRequest,
+    features: &crosslane_core::config::FeaturesConfig,
+) -> bool {
+    #[cfg(feature = "crs")]
+    if request.crs_tools_disabled() {
+        return true;
+    }
+    if features.disable_tools {
+        request.tools.clear();
+        request.tool_choice = None;
+    } else if !features.enable_web_tools {
+        request.tools.retain(|tool| {
+            !tool.r#type.as_deref().is_some_and(|kind| {
+                matches_type_family(kind, "web_search") || matches_type_family(kind, "web_fetch")
+            })
+        });
+    }
+    false
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_claude_route(
     service: ServiceHttpState,
@@ -147,13 +185,7 @@ async fn handle_claude_route(
     client_context: &crosslane_core::client_context::ClientContext,
 ) -> Result<Response, ApiError> {
     let body: Value = serde_json::from_slice(&provider_route.body).unwrap_or_default();
-    let search_request = body["tools"].as_array().is_some_and(|tools| {
-        tools.iter().any(|tool| {
-            tool["type"]
-                .as_str()
-                .is_some_and(|kind| matches_type_family(kind, "web_search"))
-        })
-    });
+    let search_request = requests_claude_web_search(&body);
     if search_request {
         let config = service.app.config.current();
         if config.features.disable_tools || !config.features.enable_web_tools {
@@ -205,13 +237,7 @@ async fn handle_claude_route_inner(
     let started = Instant::now();
     if provider_route.provider_kind == "copilot" {
         let body: Value = serde_json::from_slice(&provider_route.body).unwrap_or_default();
-        if body["tools"].as_array().is_some_and(|tools| {
-            tools.iter().any(|tool| {
-                tool["type"]
-                    .as_str()
-                    .is_some_and(|kind| matches_type_family(kind, "web_search"))
-            })
-        }) {
+        if requests_claude_web_search(&body) {
             // Claude Code declares the server-side web tool only in its actual
             // WebSearch subrequest, unlike the Responses tool catalog.
             let (route, key) = super::hosted_web::kiro_search_route(
@@ -381,17 +407,9 @@ async fn handle_claude_route_inner(
             "prepared a tool-free client summary with system and tool definitions as complete source history"
         );
     }
-    if config.features.disable_tools {
-        request.tools.clear();
-        request.tool_choice = None;
-    } else if !config.features.enable_web_tools {
-        request.tools.retain(|tool| {
-            !tool.r#type.as_deref().is_some_and(|kind| {
-                matches_type_family(kind, "web_search") || matches_type_family(kind, "web_fetch")
-            })
-        });
-    }
-    if !config.features.enable_tool_search
+    let tools_disabled = apply_claude_tool_policy(&mut request, &config.features);
+    if !tools_disabled
+        && !config.features.enable_tool_search
         && request.tools.iter().any(|tool| {
             tool.defer_loading
                 || tool
@@ -414,9 +432,11 @@ async fn handle_claude_route_inner(
         claude_pending_server_tool_uses(&request)
     };
     let web_search_tool = request.tools.iter().find(|tool| {
-        tool.r#type
-            .as_deref()
-            .is_some_and(|kind| matches_type_family(kind, "web_search"))
+        !tools_disabled
+            && tool
+                .r#type
+                .as_deref()
+                .is_some_and(|kind| matches_type_family(kind, "web_search"))
     });
     let web_search_client_limit = web_search_tool.is_some_and(|tool| tool.max_uses.is_some());
     let web_search_domains = web_search_tool

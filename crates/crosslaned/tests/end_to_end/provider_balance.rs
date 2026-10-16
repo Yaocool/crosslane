@@ -667,3 +667,81 @@ async fn a_started_stream_is_not_replayed_and_its_failure_cools_the_provider() {
     assert_eq!(mixed.counts(), (2, 1));
     mixed.daemon.stop().await;
 }
+
+#[cfg(feature = "crs")]
+#[tokio::test]
+async fn native_none_with_inert_web_tools_stays_on_the_authorized_provider() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    let mixed = Mixed::start().await;
+    for disable_tools in [false, true] {
+        model_policy::configure(&mixed.daemon, |config| {
+            config.proxy_service[0].allowed_providers = vec!["copilot".into()];
+            config.proxy_service[0].default_provider = "copilot".into();
+            config.api_key[0].allowed_providers = vec!["copilot".into()];
+            config.features.disable_tools = disable_tools;
+            config.features.enable_web_tools = false;
+            config.features.enable_tool_search = false;
+        })
+        .await;
+        for (endpoint, stream) in [
+            ("messages/count_tokens", false),
+            ("messages", false),
+            ("messages", true),
+        ] {
+            let response = reqwest::Client::new()
+                .post(format!("http://127.0.0.1:{}/v1/{endpoint}", mixed.port))
+                .bearer_auth(mixed.daemon.api_key.as_deref().unwrap())
+                .header("user-agent", "claude-cli/2.1.300 (external, e2e)")
+                .json(
+                    &json!({"model":"copilot/claude-sonnet-4-6","max_tokens":32,"stream":stream,
+                    "tool_choice":{"type":"none"},
+                    "tools":[{"type":"web_search_20250305","name":"web_search"}],
+                    "messages":[{"role":"user","content":"Answer without any tool calls."}]}),
+                )
+                .send()
+                .await
+                .unwrap();
+            let status = response.status().as_u16();
+            let text = response.text().await.unwrap();
+            assert_eq!(
+                status, 200,
+                "disable_tools={disable_tools} {endpoint}: {text}"
+            );
+            assert!(!text.contains("\"type\":\"error\""), "{text}");
+            if endpoint == "messages" {
+                assert!(text.contains("from copilot"), "{text}");
+                if stream {
+                    assert!(text.contains("message_stop"), "{text}");
+                }
+            }
+        }
+    }
+    assert_eq!(
+        mixed.counts(),
+        (0, 6),
+        "an inert web catalog must not select the hosted Kiro path"
+    );
+    let requests = mixed
+        ._copilot
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| {
+            matches!(
+                request.url.path(),
+                "/v1/messages" | "/v1/messages/count_tokens"
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(requests.len(), 6);
+    for request in requests {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["model"], "claude-sonnet-4-6");
+        assert_eq!(
+            body["tool_choice"]["type"], "none",
+            "native relay lost the original no-call intent: {body}"
+        );
+    }
+    mixed.daemon.stop().await;
+}

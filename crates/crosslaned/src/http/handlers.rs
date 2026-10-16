@@ -743,24 +743,10 @@ async fn count_tokens_route(
         claude_code && crosslane_translate::prepare_claude_code_compaction(&mut request);
     let original_client_compaction =
         claude_code && crosslane_translate::prepare_claude_code_compaction(&mut original_request);
-    if config.features.disable_tools {
-        request.tools.clear();
-        request.tool_choice = None;
-        original_request.tools.clear();
-        original_request.tool_choice = None;
-    } else if !config.features.enable_web_tools {
-        request.tools.retain(|tool| {
-            !tool.r#type.as_deref().is_some_and(|kind| {
-                matches_type_family(kind, "web_search") || matches_type_family(kind, "web_fetch")
-            })
-        });
-        original_request.tools.retain(|tool| {
-            !tool.r#type.as_deref().is_some_and(|kind| {
-                matches_type_family(kind, "web_search") || matches_type_family(kind, "web_fetch")
-            })
-        });
-    }
-    if !config.features.enable_tool_search
+    let tools_disabled = request::apply_claude_tool_policy(&mut request, &config.features);
+    request::apply_claude_tool_policy(&mut original_request, &config.features);
+    if !tools_disabled
+        && !config.features.enable_tool_search
         && request.tools.iter().any(|tool| {
             tool.defer_loading
                 || tool

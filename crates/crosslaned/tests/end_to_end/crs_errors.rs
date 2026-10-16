@@ -24,6 +24,118 @@ async fn send_tool_lifecycle_request(
 
 #[cfg(feature = "crs")]
 #[tokio::test]
+async fn none_history_survives_global_tool_switches_without_activating_inert_catalogs() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    let upstream = MockServer::start().await;
+    mount_context_alignment_models(&upstream).await;
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(|request: &wiremock::Request| {
+            let value: Value = serde_json::from_slice(&request.body).unwrap();
+            let state = &value["conversationState"];
+            let history = state["history"].as_array().unwrap();
+            let calls = history
+                .iter()
+                .filter_map(|item| item["assistantResponseMessage"]["toolUses"].as_array())
+                .flatten()
+                .collect::<Vec<_>>();
+            let current = &state["currentMessage"]["userInputMessage"];
+            let context = &current["userInputMessageContext"];
+            assert!(
+                context.get("tools").is_none(),
+                "none exposed callable tools: {value}"
+            );
+            assert!(
+                value.to_string().contains("HISTORICAL_SCHEMA_SENTINEL"),
+                "a used historical schema was lost: {value}"
+            );
+            let paired = calls.len() == 1
+                && calls[0]["toolUseId"] == "past-lookup"
+                && context["toolResults"][0]["toolUseId"] == "past-lookup";
+            let body = if paired {
+                generation_body("HISTORY_PRESERVED")
+            } else {
+                // Simulate legacy Kiro's accounting-only response after history
+                // calls have been flattened and their result pairing is lost.
+                event_stream_frame("contextUsageEvent", json!({"contextUsagePercentage":0.7}))
+            };
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/vnd.amazon.eventstream")
+                .set_body_bytes(body)
+        })
+        .mount(&upstream)
+        .await;
+    let port = unused_tcp_port();
+    let daemon = Daemon::start_http(
+        port,
+        &format!("{}/generateAssistantResponse", upstream.uri()),
+    )
+    .await;
+    import_context_alignment_account(&daemon, 0.0).await;
+    let body = json!({"model":"resolved-small","max_tokens":128,
+    "tool_choice":{"type":"none"},"tools":[
+        {"name":"lookup","description":"HISTORICAL_SCHEMA_SENTINEL","input_schema":{"type":"object"}},
+        {"name":"future_lookup","input_schema":{"type":"object"},"defer_loading":true},
+        {"type":"tool_search_tool_regex_20251119","name":"tool_search_tool_regex"},
+        {"type":"web_search_20250305","name":"web_search"}
+    ],"messages":[
+        {"role":"user","content":"Look up the stored value."},
+        {"role":"assistant","content":[{"type":"tool_use","id":"past-lookup","name":"lookup","input":{}}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"past-lookup","content":"42"}]}
+    ]});
+    for disable_tools in [false, true] {
+        for enable_tool_search in [false, true] {
+            for enable_web_tools in [false, true] {
+                model_policy::configure(&daemon, |config| {
+                    config.features.disable_tools = disable_tools;
+                    config.features.enable_tool_search = enable_tool_search;
+                    config.features.enable_web_tools = enable_web_tools;
+                })
+                .await;
+                for (endpoint, stream) in [
+                    ("messages/count_tokens", false),
+                    ("messages", false),
+                    ("messages", true),
+                ] {
+                    let mut request = body.clone();
+                    request["stream"] = stream.into();
+                    let (status, text) =
+                        send_tool_lifecycle_request(&daemon, port, endpoint, &request).await;
+                    assert_eq!(status, 200, "disable_tools={disable_tools} enable_tool_search={enable_tool_search} enable_web_tools={enable_web_tools} {endpoint}: {text}");
+                    assert!(!text.contains("\"type\":\"error\""), "{text}");
+                    if endpoint == "messages" {
+                        assert!(text.contains("HISTORY_PRESERVED"), "{text}");
+                        if stream {
+                            assert!(text.contains("message_stop"), "{text}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Inert catalogs still receive basic request validation.
+    let mut invalid = body.clone();
+    invalid["tools"][0]["name"] = json!("");
+    for endpoint in ["messages/count_tokens", "messages"] {
+        let (status, text) = send_tool_lifecycle_request(&daemon, port, endpoint, &invalid).await;
+        assert_eq!(status, 400, "{endpoint}: {text}");
+    }
+    let generations = upstream
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.url.path() == "/generateAssistantResponse")
+        .count();
+    assert_eq!(
+        generations, 16,
+        "counting, validation and inert server tools must not issue extra generation calls"
+    );
+    daemon.stop().await;
+}
+
+#[cfg(feature = "crs")]
+#[tokio::test]
 async fn checkpoint_tool_changes_restore_the_same_catalog_for_count_and_generation() {
     let _guard = HTTP_TEST_LOCK.lock().await;
     let (upstream, daemon, port) = start_input_overflow_daemon().await;
