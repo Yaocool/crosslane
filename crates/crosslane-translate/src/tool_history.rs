@@ -2,9 +2,11 @@
 //!
 //! Client histories can become incomplete after context editing, compaction,
 //! or retries. Kiro rejects the entire request when a structured tool call is
-//! undefined, malformed, duplicated, or not followed by exactly one matching
+//! malformed, duplicated, or not followed by exactly one matching
 //! result. This module repairs valid calls locally and archives only the calls
 //! that cannot be represented safely as structured Kiro history.
+//! CRS's explicit `tool_choice=none` keeps historical pairs without publishing
+//! definitions for new calls; other requests retain the existing catalog check.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -77,12 +79,17 @@ struct SourcedResult {
 /// Repairs a Kiro payload so ordinary and proxy-executed tool calls form
 /// strict, adjacent, one-to-one call/result pairs.
 ///
-/// Calls whose definitions are still active remain structured. Undefined,
+/// Calls whose definitions are still active remain structured. CRS also retains
+/// valid historical pairs when the client explicitly disables new tools. Undefined,
 /// malformed, or ambiguous calls are archived as neutral JSON records while
 /// the rest of the history remains structured, so one bad call cannot flatten
 /// unrelated tool calls or make model-visible text resemble an instruction.
 pub fn sanitize_kiro_tool_history(payload: &mut KiroPayload) -> KiroToolHistoryStats {
     let mut stats = KiroToolHistoryStats::default();
+    let preserve_without_definitions = payload
+        .model_request_intent
+        .as_ref()
+        .is_some_and(|intent| intent.preserves_tool_history_without_definitions());
     let state = &mut payload.conversation_state;
 
     let active_tool_names = sanitize_current_tool_definitions(
@@ -115,7 +122,12 @@ pub fn sanitize_kiro_tool_history(payload: &mut KiroPayload) -> KiroToolHistoryS
     }
     messages.push(ConversationMessage::User(current));
 
-    let scheduled = repair_tool_pairs(&mut messages, &active_tool_names, &mut stats);
+    let scheduled = repair_tool_pairs(
+        &mut messages,
+        &active_tool_names,
+        preserve_without_definitions,
+        &mut stats,
+    );
     messages = normalize_roles(messages, scheduled, &mut stats);
 
     let current = match messages.pop() {
@@ -151,6 +163,10 @@ pub fn sanitize_kiro_tool_history(payload: &mut KiroPayload) -> KiroToolHistoryS
 
 /// Verifies the exact Kiro tool history contract after all payload mutations.
 pub fn validate_kiro_tool_history(payload: &KiroPayload) -> Result<(), String> {
+    let preserve_without_definitions = payload
+        .model_request_intent
+        .as_ref()
+        .is_some_and(|intent| intent.preserves_tool_history_without_definitions());
     let current = &payload
         .conversation_state
         .current_message
@@ -168,6 +184,9 @@ pub fn validate_kiro_tool_history(payload: &KiroPayload) -> Result<(), String> {
         .unwrap_or_default();
     if active_names.iter().any(|name| name.trim().is_empty()) {
         return Err("current tool definitions contain an empty name".into());
+    }
+    if preserve_without_definitions && !active_names.is_empty() {
+        return Err("tool_choice=none cannot have current tool definitions".into());
     }
     if current
         .user_input_message_context
@@ -225,6 +244,7 @@ pub fn validate_kiro_tool_history(payload: &KiroPayload) -> Result<(), String> {
                 previous_uses = validate_assistant_uses(
                     assistant,
                     &active_names,
+                    preserve_without_definitions,
                     &mut all_use_ids,
                     &format!("history message {index}"),
                 )?;
@@ -283,6 +303,7 @@ fn sanitize_current_tool_definitions(
 fn repair_tool_pairs(
     messages: &mut [ConversationMessage],
     active_tool_names: &HashSet<String>,
+    preserve_without_definitions: bool,
     stats: &mut KiroToolHistoryStats,
 ) -> HashMap<usize, Vec<KiroToolResult>> {
     let mut results = Vec::<SourcedResult>::new();
@@ -340,7 +361,9 @@ fn repair_tool_pairs(
                 || trimmed_id.is_empty()
                 || duplicate_id
                 || !tool_use.input.is_object();
-            let undefined = !trimmed_name.is_empty() && !active_tool_names.contains(trimmed_name);
+            let undefined = !preserve_without_definitions
+                && !trimmed_name.is_empty()
+                && !active_tool_names.contains(trimmed_name);
             if malformed || undefined {
                 append_text(&mut assistant.content, &render_tool_use(&tool_use));
                 stats.flattened_tool_uses = stats.flattened_tool_uses.saturating_add(1);
@@ -492,6 +515,7 @@ fn normalize_roles(
 fn validate_assistant_uses(
     assistant: &KiroAssistantMessage,
     active_names: &HashSet<&str>,
+    preserve_without_definitions: bool,
     all_ids: &mut HashSet<String>,
     location: &str,
 ) -> Result<Vec<String>, String> {
@@ -506,7 +530,7 @@ fn validate_assistant_uses(
                 tool_use.tool_use_id
             ));
         }
-        if !active_names.contains(tool_use.name.as_str()) {
+        if !preserve_without_definitions && !active_names.contains(tool_use.name.as_str()) {
             return Err(format!(
                 "{location} tool call '{}' references undefined tool '{}'",
                 tool_use.tool_use_id, tool_use.name

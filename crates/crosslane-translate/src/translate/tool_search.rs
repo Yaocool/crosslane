@@ -128,6 +128,10 @@ pub struct ClaudeToolSearchCatalog {
 
 impl ClaudeToolSearchCatalog {
     pub fn from_request(request: &ClaudeRequest) -> Option<Self> {
+        #[cfg(feature = "crs")]
+        if request.crs_tools_disabled() {
+            return None;
+        }
         let names = ToolNameRegistry::new(request.tools.iter().map(|tool| tool.name.as_str()));
         let deferred = request
             .tools
@@ -155,6 +159,10 @@ impl ClaudeToolSearchCatalog {
     /// Moves deferred definitions out of a parsed request after translation so
     /// large catalogs are not duplicated for the lifetime of an upstream call.
     pub fn take_from_request(request: &mut ClaudeRequest) -> Option<Self> {
+        #[cfg(feature = "crs")]
+        if request.crs_tools_disabled() {
+            return None;
+        }
         let names = ToolNameRegistry::new(request.tools.iter().map(|tool| tool.name.as_str()));
         let search_tools = request
             .tools

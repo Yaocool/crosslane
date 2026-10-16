@@ -27,6 +27,8 @@ pub(super) use tools::normalize_tool_changes;
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_PREFLIGHT_BYTES: usize = 64 * 1024;
 const PREFLIGHT_WAIT: Duration = Duration::from_secs(5);
+pub(super) const CONTENT_FILTERED_ERROR: &str =
+    "Upstream content policy declined this request (CONTENT_FILTERED).";
 
 /// A candidate and the final response adapter share one inspection window.
 /// Extensions stay inside Crosslane and cannot be supplied as client headers.
@@ -130,6 +132,7 @@ pub(super) fn enrich_error_envelope(
 
 fn error_hint(code: &str) -> &'static str {
     match code {
+        "upstream_content_filtered" => "Review the conversation content; the provider declined this request. Retrying the same request is not recommended.",
         "context_length_exceeded" => {
             "Run /compact, reduce large tool results or attachments, or start a new session."
         }
@@ -1047,6 +1050,7 @@ fn status_for_error(code: &str, kind: Option<&str>) -> StatusCode {
         | "unsupported_tool_protocol"
         | "tool_budget_exceeded"
         | "invalid_tool_protocol"
+        | "upstream_content_filtered"
         | "invalid_request" => StatusCode::BAD_REQUEST,
         "upstream_rate_limited" | "upstream_quota_exhausted" | "rate_limit_error" => {
             StatusCode::TOO_MANY_REQUESTS

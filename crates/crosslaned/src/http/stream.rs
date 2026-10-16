@@ -1561,7 +1561,10 @@ impl StreamFailureDetails {
     fn is_request_rejection(self) -> bool {
         matches!(
             self.error_code,
-            "context_length_exceeded" | "tool_budget_exceeded" | "invalid_tool_protocol"
+            "context_length_exceeded"
+                | "tool_budget_exceeded"
+                | "invalid_tool_protocol"
+                | "upstream_content_filtered"
         )
     }
 }
@@ -1570,6 +1573,15 @@ fn classify_stream_failure(
     message: &str,
     diagnostics: Option<&StreamFailureDiagnostics>,
 ) -> StreamFailureDetails {
+    #[cfg(feature = "crs")]
+    if message == super::crs::CONTENT_FILTERED_ERROR {
+        return StreamFailureDetails {
+            upstream_status: None,
+            error_code: "upstream_content_filtered",
+            error_stage: "upstream_stream",
+            scope: StreamFailureScope::Client,
+        };
+    }
     if message == TOOL_NAME_MISMATCH_MESSAGE {
         return StreamFailureDetails {
             upstream_status: None,

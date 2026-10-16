@@ -5,6 +5,146 @@ use std::sync::atomic::AtomicU16;
 const FIELD_ERROR: &str = "messages.1.output_config: Extra inputs are not permitted";
 
 #[tokio::test]
+async fn none_preserves_historical_pairs_without_publishing_callable_tools() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    let upstream = MockServer::start().await;
+    mount_context_alignment_models(&upstream).await;
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(|request: &wiremock::Request| {
+            let wire: Value = serde_json::from_slice(&request.body).unwrap();
+            let state = &wire["conversationState"];
+            if state["currentMessage"]["userInputMessage"]["content"].as_str().is_some_and(|text| text.contains("OWNED_CONTENT_FILTERED")) {
+                return ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/vnd.amazon.eventstream")
+                    .set_body_bytes(event_stream_frame("metadataEvent",json!({
+                        "stopReason":"CONTENT_FILTERED", "usage":{"inputTokens":17,"outputTokens":0},
+                        "stopDetails":{"refusal":{"category":"CYBER","explanation":"Provider declined the request."}}
+                    })));
+            }
+            let calls = state["history"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|item| item["assistantResponseMessage"]["toolUses"].as_array())
+                .flatten()
+                .collect::<Vec<_>>();
+            let context = &state["currentMessage"]["userInputMessage"]["userInputMessageContext"];
+            assert!(
+                context.get("tools").is_none(),
+                "none must not publish callable tools"
+            );
+            let paired = calls.len() == 1
+                && calls[0]["toolUseId"] == "past-search"
+                && context["toolResults"][0]["toolUseId"] == "past-search";
+            let body = if paired {
+                generation_body("已移除工具续答正常 中文😀")
+            } else {
+                // Recorded legacy-Kiro failure: transport success containing
+                // context accounting only, with no assistant output frame.
+                event_stream_frame("contextUsageEvent", json!({"contextUsagePercentage":0.7}))
+            };
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/vnd.amazon.eventstream")
+                .set_body_bytes(body)
+        })
+        .mount(&upstream)
+        .await;
+    let port = unused_tcp_port();
+    let daemon = Daemon::start_http(
+        port,
+        &format!("{}/generateAssistantResponse", upstream.uri()),
+    )
+    .await;
+    import_context_alignment_account(&daemon, 0.0).await;
+    for removed in [false, true] {
+        let mut body = json!({"model":"resolved-small","max_tokens":128,
+        "tool_choice":{"type":"none"},"tools":[
+            {"name":"catalog_lookup","input_schema":{"type":"object"}},
+            {"name":"retired_lookup","input_schema":{"type":"object"},"defer_loading":true}
+        ],"messages":[
+            {"role":"user","content":"历史工具发现记录"},
+            {"role":"assistant","content":[{"type":"tool_use","id":"past-search","name":"catalog_lookup","input":{"query":"retired_lookup"}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"past-search","content":[
+                {"type":"tool_reference","tool_name":"retired_lookup"},{"type":"text","text":"发现工具 retired_lookup 中文😀"}
+            ]}]}
+        ]});
+        let mut current = vec![json!({"type":"text","text":"保持历史结果，禁止新工具调用。"})];
+        if removed {
+            current.insert(0, json!({"type":"tool_removal","tool":{"type":"tool_reference","name":"retired_lookup"}}));
+        }
+        body["messages"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"user","content":current}));
+        for (endpoint, streaming) in [
+            ("messages/count_tokens", false),
+            ("messages", false),
+            ("messages", true),
+        ] {
+            body["stream"] = streaming.into();
+            let response = reqwest::Client::new()
+                .post(format!("http://127.0.0.1:{port}/v1/{endpoint}"))
+                .bearer_auth(daemon.api_key.as_deref().unwrap())
+                .header("user-agent", "claude-cli/2.1.300 (external, e2e)")
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let text = response.text().await.unwrap();
+            assert_eq!(status.as_u16(), 200, "{endpoint}: {text}");
+            assert!(!text.contains("\"type\":\"error\""), "{text}");
+            if !endpoint.ends_with("count_tokens") {
+                assert!(
+                    text.contains("\\u5df2") || text.contains("已移除工具续答正常"),
+                    "{text}"
+                );
+                if streaming {
+                    assert!(text.contains("message_stop"));
+                }
+            }
+        }
+    }
+    for streaming in [false, true] {
+        let response = reqwest::Client::new().post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .bearer_auth(daemon.api_key.as_deref().unwrap())
+            .header("user-agent","claude-cli/2.1.300 (external, e2e)")
+            .json(&json!({"model":"resolved-small","max_tokens":128,"stream":streaming,
+                "tool_choice":{"type":"none"},"messages":[{"role":"user","content":"OWNED_CONTENT_FILTERED"}]}))
+            .send().await.unwrap();
+        assert_eq!(
+            response.status().as_u16(),
+            if streaming { 200 } else { 400 }
+        );
+        let text = response.text().await.unwrap();
+        assert!(text.contains("upstream_content_filtered"), "{text}");
+        assert!(text.contains("\"retryable\":false"), "{text}");
+        assert!(!text.contains("message_stop"), "{text}");
+    }
+    let generated = upstream
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.url.path() == "/generateAssistantResponse")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        generated.len(),
+        6,
+        "successful replies and explicit refusals must not use an empty-output retry"
+    );
+    for request in generated.iter().take(4) {
+        let wire: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(wire["inferenceConfig"]["maxTokens"], 128);
+        assert!(!wire.to_string().contains("archived_tool_call"));
+        assert!(!wire.to_string().contains("crs_tool_choice_none"));
+        assert!(wire.to_string().contains("发现工具 retired_lookup 中文😀"));
+    }
+    daemon.stop().await;
+}
+
+#[tokio::test]
 async fn removed_tool_discoveries_allow_counting_and_kiro_continuation() {
     let _guard = HTTP_TEST_LOCK.lock().await;
     let (upstream, daemon, port) = start_input_overflow_daemon().await;

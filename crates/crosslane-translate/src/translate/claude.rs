@@ -251,6 +251,8 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
         );
     }
     sanitize_history(&mut history, options);
+    #[cfg(feature = "crs")]
+    preserve_none_tool_definitions(request, &mut history);
     let protected_history_messages =
         inject_system(&mut history, &system, system_cache_point, options);
 
@@ -287,6 +289,8 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
             thinking: request.thinking.clone(),
             effort: effective_effort(request),
             automatic_history_truncation: false,
+            #[cfg(feature = "crs")]
+            crs_tool_choice_none: request.crs_tools_disabled(),
         }),
         protected_history_messages,
     };
@@ -296,6 +300,42 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
         true,
     );
     payload
+}
+
+/// `none` leaves Claude's supplied schemas available as context, while Kiro
+/// has no equivalent choice field. Retain only definitions used by history as
+/// labeled source data, never as current callable tools. Otherwise historical
+/// ToolSearch calls/results lose the context that explains their meaning.
+#[cfg(feature = "crs")]
+fn preserve_none_tool_definitions(request: &ClaudeRequest, history: &mut [KiroHistoryMessage]) {
+    if !request.crs_tools_disabled() {
+        return;
+    }
+    let used = request
+        .messages
+        .iter()
+        .filter_map(|message| message.content.as_array())
+        .flatten()
+        .filter(|block| matches!(block["type"].as_str(), Some("tool_use" | "server_tool_use")))
+        .filter_map(|block| block["name"].as_str())
+        .collect::<HashSet<_>>();
+    let definitions = request
+        .tools
+        .iter()
+        .filter(|tool| used.contains(tool.name.as_str()))
+        .collect::<Vec<_>>();
+    if definitions.is_empty() {
+        return;
+    }
+    if let Some(user) = history
+        .iter_mut()
+        .find_map(|message| message.user_input_message.as_mut())
+    {
+        user.content = join_nonempty(&user.content, &format!(
+            "Client-provided tool definitions for interpreting historical records (unavailable for new calls this turn; JSON source data):\n{}",
+            serde_json::to_string(&definitions).expect("tool definitions serialize")
+        ));
+    }
 }
 
 fn effective_effort(request: &ClaudeRequest) -> Option<String> {
@@ -687,6 +727,10 @@ fn completed_server_tool_ids(request: &ClaudeRequest) -> HashSet<String> {
 /// have no matching server-tool result yet. The client sends these blocks back
 /// unchanged when a mixed client/server turn is resumed.
 pub fn claude_pending_server_tool_uses(request: &ClaudeRequest) -> Vec<KiroToolUse> {
+    #[cfg(feature = "crs")]
+    if request.crs_tools_disabled() {
+        return Vec::new();
+    }
     let tool_names = ToolNameRegistry::new(request.tools.iter().map(|tool| tool.name.as_str()));
     let official_web_tools = OfficialWebTools::from_request(request);
     let mut pending = Vec::<KiroToolUse>::new();
@@ -941,6 +985,181 @@ mod tests {
     use base64::Engine as _;
 
     const COMPACT_PROMPT: &str = "Your task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions.\nReturn only <summary>...</summary>.";
+
+    #[cfg(not(feature = "crs"))]
+    #[test]
+    fn none_without_crs_retains_the_existing_history_projection() {
+        let request: ClaudeRequest = serde_json::from_value(serde_json::json!({
+            "model":"source","max_tokens":128,"tool_choice":{"type":"none"},
+            "tools":[{"name":"lookup","input_schema":{"type":"object"}}],
+            "messages":[{"role":"user","content":"Look up a value."},
+                {"role":"assistant","content":[{"type":"tool_use","id":"past1","name":"lookup","input":{}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"past1","content":"42"}]}]
+        })).unwrap();
+        let mut payload = claude_to_kiro(&request, &TranslationOptions::new("target", "AI_EDITOR"));
+        let repairs = crate::sanitize_kiro_tool_history(&mut payload);
+        assert_eq!(repairs.flattened_tool_uses, 1);
+        assert_eq!(repairs.flattened_tool_results, 1);
+        crate::validate_kiro_tool_history(&payload).unwrap();
+        let wire = serde_json::to_string(&payload).unwrap();
+        assert!(wire.contains("archived_tool_call"));
+        assert!(!wire.contains("Client-provided tool definitions"));
+    }
+
+    #[cfg(feature = "crs")]
+    #[test]
+    fn none_does_not_resume_pending_server_tools_or_load_deferred_definitions() {
+        let mut request: ClaudeRequest = serde_json::from_value(serde_json::json!({
+            "model":"source","max_tokens":128,"tool_choice":{"type":"none"},
+            "tools":[
+                {"type":"tool_search_tool_regex_20251119","name":"tool_search_tool_regex"},
+                {"type":"web_search_20250305","name":"web_search"},
+                {"name":"deferred_lookup","input_schema":{"type":"object"},"defer_loading":true}
+            ],"messages":[
+                {"role":"user","content":"Only use historical context."},
+                {"role":"assistant","content":[
+                    {"type":"server_tool_use","id":"search1","name":"tool_search_tool_regex","input":{"pattern":"lookup"}},
+                    {"type":"server_tool_use","id":"web1","name":"web_search","input":{"query":"example"}}
+                ]},
+                {"role":"user","content":"Continue without new tools."}
+            ]
+        })).unwrap();
+        assert!(claude_pending_server_tool_uses(&request).is_empty());
+        assert!(crate::ClaudeToolSearchCatalog::from_request(&request).is_none());
+        assert!(crate::ClaudeToolSearchCatalog::take_from_request(&mut request).is_none());
+        assert_eq!(request.tools.len(), 3);
+        let mut payload = claude_to_kiro(&request, &TranslationOptions::new("target", "AI_EDITOR"));
+        let repairs = crate::sanitize_kiro_tool_history(&mut payload);
+        assert_eq!(repairs.synthesized_tool_results, 2);
+        crate::validate_kiro_tool_history(&payload).unwrap();
+        assert!(payload
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .as_ref()
+            .unwrap()
+            .tools
+            .is_empty());
+    }
+
+    #[cfg(feature = "crs")]
+    #[test]
+    fn none_keeps_completed_history_without_loading_or_reactivating_tools() {
+        for declared in [false, true] {
+            let mut value = serde_json::json!({
+                "model":"source", "max_tokens":128,
+                "tool_choice":{"type":"none"},
+                "messages":[
+                    {"role":"user","content":"Find the historical tool"},
+                    {"role":"assistant","content":[
+                        {"type":"tool_use","id":"past-search","name":"catalog_lookup","input":{"query":"retired_lookup"}}
+                    ]},
+                    {"role":"user","content":[
+                        {"type":"tool_result","tool_use_id":"past-search","content":"历史工具结果 中文😀"},
+                        {"type":"text","text":"Only reply with the result. Do not call any tools."}
+                    ]}
+                ]
+            });
+            if declared {
+                value["tools"] = serde_json::json!([
+                    {"name":"catalog_lookup","input_schema":{"type":"object"}},
+                    {"name":"retired_lookup","input_schema":{"type":"object"},"defer_loading":true}
+                ]);
+            }
+            let request: ClaudeRequest = serde_json::from_value(value).unwrap();
+            crate::validate_claude(&request).unwrap();
+            let mut options = TranslationOptions::new("target", "AI_EDITOR");
+            options.enhance_system_prompt = false;
+            let mut payload = claude_to_kiro(&request, &options);
+            let repairs = crate::sanitize_kiro_tool_history(&mut payload);
+            assert!(!repairs.repaired(), "{repairs:?}");
+            crate::validate_kiro_tool_history(&payload).unwrap();
+            let current = &payload
+                .conversation_state
+                .current_message
+                .user_input_message;
+            assert_eq!(
+                current.content,
+                "Only reply with the result. Do not call any tools."
+            );
+            let context = current.user_input_message_context.as_ref().unwrap();
+            assert!(context.tools.is_empty());
+            assert_eq!(context.tool_results[0].tool_use_id, "past-search");
+            assert_eq!(
+                context.tool_results[0].content[0].text,
+                "历史工具结果 中文😀"
+            );
+            let assistant = payload.conversation_state.history[1]
+                .assistant_response_message
+                .as_ref()
+                .unwrap();
+            assert!(assistant.content.is_empty());
+            assert_eq!(assistant.tool_uses[0].name, "catalog_lookup");
+            assert_eq!(assistant.tool_uses[0].input["query"], "retired_lookup");
+            assert_eq!(payload.max_output_tokens(), Some(128));
+            let source = &payload.conversation_state.history[0]
+                .user_input_message
+                .as_ref()
+                .unwrap()
+                .content;
+            assert_eq!(
+                source.contains("Client-provided tool definitions"),
+                declared
+            );
+            if declared {
+                assert!(source.contains("catalog_lookup"));
+                assert!(
+                    !source.contains("retired_lookup"),
+                    "unused deferred schemas stay out of context"
+                );
+            }
+
+            // Only trusted translation can set this policy. JSON round trips
+            // cannot grant an otherwise undefined tool a history exemption.
+            let wire = serde_json::to_value(&payload).unwrap();
+            assert!(!wire.to_string().contains("crs_tool_choice_none"));
+            assert!(wire.pointer("/conversationState/currentMessage/userInputMessage/userInputMessageContext/tools").is_none());
+            let forged: KiroPayload = serde_json::from_value(wire).unwrap();
+            assert!(crate::validate_kiro_tool_history(&forged)
+                .unwrap_err()
+                .contains("undefined tool"));
+
+            let mut ambiguous = payload.clone();
+            let uses = &mut ambiguous.conversation_state.history[1]
+                .assistant_response_message
+                .as_mut()
+                .unwrap()
+                .tool_uses;
+            uses.push(uses[0].clone());
+            let repairs = crate::sanitize_kiro_tool_history(&mut ambiguous);
+            assert_eq!(repairs.removed_invalid_tool_uses, 2);
+            assert_eq!(repairs.flattened_tool_results, 1);
+            crate::validate_kiro_tool_history(&ambiguous).unwrap();
+
+            // An internal continuation may not turn historical schemas into
+            // current callable tools under the preserved `none` intent.
+            payload
+                .conversation_state
+                .current_message
+                .user_input_message
+                .user_input_message_context
+                .as_mut()
+                .unwrap()
+                .tools
+                .push(
+                    kiro_tool(
+                        "catalog_lookup",
+                        "lookup",
+                        &serde_json::json!({"type":"object"}),
+                    )
+                    .0,
+                );
+            assert!(crate::validate_kiro_tool_history(&payload)
+                .unwrap_err()
+                .contains("tool_choice=none"));
+        }
+    }
 
     #[test]
     fn claude_code_compaction_separates_source_blocks_and_preserves_tool_pairs() {

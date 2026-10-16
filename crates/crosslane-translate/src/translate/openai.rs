@@ -312,6 +312,8 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
                 .clone()
                 .filter(|effort| effort != "none"),
             automatic_history_truncation: false,
+            #[cfg(feature = "crs")]
+            crs_tool_choice_none: false,
         }),
         protected_history_messages,
     };

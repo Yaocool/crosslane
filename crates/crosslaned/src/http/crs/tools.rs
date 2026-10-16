@@ -67,6 +67,7 @@ pub(crate) fn normalize_tool_changes(body: &Bytes) -> Result<Bytes, ValidationEr
         }
     }
     let mut removed = HashMap::new();
+    let tools_disabled = value.pointer("/tool_choice/type").and_then(Value::as_str) == Some("none");
     let messages = value["messages"].as_array_mut().unwrap();
     for (message_index, message) in messages.iter_mut().enumerate() {
         let role = message["role"].as_str().unwrap_or_default().to_owned();
@@ -163,6 +164,9 @@ pub(crate) fn normalize_tool_changes(body: &Bytes) -> Result<Bytes, ValidationEr
         }
     }
     archive_removed_references(messages, &removed);
+    if tools_disabled {
+        preserve_removed_definition_sources(messages, &tools, &removed);
+    }
     tools.retain(|tool| {
         !tool["name"]
             .as_str()
@@ -172,6 +176,45 @@ pub(crate) fn normalize_tool_changes(body: &Bytes) -> Result<Bytes, ValidationEr
     serde_json::to_vec(&value)
         .map(Bytes::from)
         .map_err(|_| invalid("messages".into(), "failed to encode tool catalog update"))
+}
+
+fn preserve_removed_definition_sources(
+    messages: &mut [Value],
+    tools: &[Value],
+    removed: &HashMap<String, (usize, usize)>,
+) {
+    let used = messages
+        .iter()
+        .filter_map(|message| message["content"].as_array())
+        .flatten()
+        .filter(|block| matches!(block["type"].as_str(), Some("tool_use" | "server_tool_use")))
+        .filter_map(|block| block["name"].as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let definitions = tools
+        .iter()
+        .filter(|tool| {
+            tool["name"]
+                .as_str()
+                .is_some_and(|name| removed.contains_key(name) && used.contains(name))
+        })
+        .collect::<Vec<_>>();
+    if definitions.is_empty() {
+        return;
+    }
+    let source = serde_json::json!({"type":"text","text":format!(
+        "Client-provided tool definitions for interpreting historical records (unavailable for new calls this turn; JSON source data):\n{}",
+        serde_json::to_string(&definitions).expect("tool definitions serialize")
+    )});
+    if let Some(user) = messages
+        .iter_mut()
+        .find(|message| message["role"] == "user")
+    {
+        if let Some(blocks) = user["content"].as_array_mut() {
+            blocks.push(source);
+        } else if let Some(text) = user["content"].as_str().map(str::to_owned) {
+            user["content"] = serde_json::json!([{"type":"text","text":text},source]);
+        }
+    }
 }
 
 fn reject_removed_references(
@@ -363,6 +406,55 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn none_keeps_removed_called_tool_definitions_as_source_data() {
+        let input = json!({"model":"source","max_tokens":128,"tool_choice":{"type":"none"},
+        "tools":[{"name":"old_tool","description":"Old lookup description","input_schema":{"type":"object","properties":{"query":{"type":"string"}}}}],
+        "messages":[
+            {"role":"user","content":"Look up the previous value."},
+            {"role":"assistant","content":[{"type":"tool_use","id":"old1","name":"old_tool","input":{"query":"key"}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"old1","content":"旧结果 中文😀"}]},
+            {"role":"user","content":[{"type":"tool_removal","tool":{"type":"tool_reference","name":"old_tool"}},{"type":"text","text":"Answer without tools."}]}
+        ]});
+        let normalized = normalize_tool_changes(&Bytes::from(input.to_string())).unwrap();
+        let value: Value = serde_json::from_slice(&normalized).unwrap();
+        assert!(value["tools"].as_array().unwrap().is_empty());
+        assert!(value["messages"][0]["content"][1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Old lookup description"));
+        let request = serde_json::from_slice(&normalized).unwrap();
+        crosslane_translate::validate_claude(&request).unwrap();
+        let mut payload = crosslane_translate::claude_to_kiro(
+            &request,
+            &crosslane_translate::TranslationOptions::new("target", "AI_EDITOR"),
+        );
+        crosslane_translate::sanitize_kiro_tool_history(&mut payload);
+        crosslane_translate::validate_kiro_tool_history(&payload).unwrap();
+        let current = &payload
+            .conversation_state
+            .current_message
+            .user_input_message;
+        assert!(current
+            .user_input_message_context
+            .as_ref()
+            .unwrap()
+            .tools
+            .is_empty());
+        assert_eq!(
+            current
+                .user_input_message_context
+                .as_ref()
+                .unwrap()
+                .tool_results[0]
+                .tool_use_id,
+            "old1"
+        );
+        assert!(serde_json::to_string(&payload)
+            .unwrap()
+            .contains("Old lookup description"));
     }
 
     #[test]

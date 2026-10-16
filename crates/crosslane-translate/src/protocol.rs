@@ -59,6 +59,15 @@ pub struct ClaudeRequest {
     pub extra: Map<String, Value>,
 }
 
+#[cfg(feature = "crs")]
+impl ClaudeRequest {
+    pub fn crs_tools_disabled(&self) -> bool {
+        self.tool_choice
+            .as_ref()
+            .is_some_and(|choice| choice.r#type == "none")
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaudeMessage {
     pub role: String,
@@ -249,6 +258,23 @@ pub struct ModelRequestIntent {
     /// Responses opt-in, retained across model retries and continuations.
     /// This intent is proxy-local and never serialized onto the Kiro wire.
     pub automatic_history_truncation: bool,
+    /// CRS compatibility: `none` disables new tool calls, not completed history.
+    /// This intent cannot be supplied through client JSON or sent to Kiro.
+    #[cfg(feature = "crs")]
+    pub crs_tool_choice_none: bool,
+}
+
+impl ModelRequestIntent {
+    pub(crate) fn preserves_tool_history_without_definitions(&self) -> bool {
+        #[cfg(feature = "crs")]
+        {
+            self.crs_tool_choice_none
+        }
+        #[cfg(not(feature = "crs"))]
+        {
+            false
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

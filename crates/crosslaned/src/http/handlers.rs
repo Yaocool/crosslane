@@ -2343,6 +2343,14 @@ fn upstream_api_error(
     context: RequestLogContext,
     format: ErrorFormat,
 ) -> ApiError {
+    #[cfg(feature = "crs")]
+    if error.message == super::crs::CONTENT_FILTERED_ERROR {
+        let mut output = ApiError::new(StatusCode::BAD_REQUEST, error.message, format);
+        output.log_context = Box::new(context);
+        output.error_code = "upstream_content_filtered";
+        output.error_stage = "upstream_stream";
+        return output;
+    }
     if error.is_local_overload() {
         let mut output = ApiError::new(StatusCode::SERVICE_UNAVAILABLE, error.message, format);
         output.retry_after = true;

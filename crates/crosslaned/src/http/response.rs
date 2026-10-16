@@ -409,6 +409,8 @@ const MAX_CUMULATIVE_TOOL_INPUT_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Debug)]
 pub struct ToolLeakFilter {
     enabled: bool,
+    #[cfg(feature = "crs")]
+    tools_disabled: bool,
     known_tools: HashSet<String>,
     tool_schemas: BTreeMap<String, Value>,
     position: MarkdownPosition,
@@ -422,6 +424,8 @@ impl ToolLeakFilter {
     pub fn new(enabled: bool, known_tools: impl IntoIterator<Item = String>) -> Self {
         Self {
             enabled,
+            #[cfg(feature = "crs")]
+            tools_disabled: false,
             known_tools: known_tools.into_iter().collect(),
             tool_schemas: BTreeMap::new(),
             position: MarkdownPosition::default(),
@@ -434,6 +438,13 @@ impl ToolLeakFilter {
 
     pub fn for_payload(enabled: bool, payload: &crosslane_translate::KiroPayload) -> Self {
         let mut filter = Self::new(enabled, std::iter::empty());
+        #[cfg(feature = "crs")]
+        {
+            filter.tools_disabled = payload
+                .model_request_intent
+                .as_ref()
+                .is_some_and(|intent| intent.crs_tool_choice_none);
+        }
         for tool in payload
             .conversation_state
             .current_message
@@ -452,6 +463,29 @@ impl ToolLeakFilter {
     }
 
     pub fn push(&mut self, event: KiroEvent) -> Vec<KiroEvent> {
+        #[cfg(feature = "crs")]
+        if let KiroEvent::MessageMetadata { usage } = &event {
+            let metadata = usage
+                .get("metadataEvent")
+                .or_else(|| usage.get("messageMetadataEvent"))
+                .unwrap_or(usage);
+            if metadata["stopReason"] == "CONTENT_FILTERED" {
+                return vec![
+                    event,
+                    KiroEvent::Error {
+                        kind: "upstream_content_filtered".into(),
+                        message: super::crs::CONTENT_FILTERED_ERROR.into(),
+                    },
+                ];
+            }
+        }
+        #[cfg(feature = "crs")]
+        if self.tools_disabled && matches!(&event, KiroEvent::ToolUse { .. }) {
+            return vec![KiroEvent::Error {
+                kind: "tool_choice_violation".into(),
+                message: "upstream returned a new tool call while tool_choice=none".into(),
+            }];
+        }
         if !self.enabled {
             return vec![event];
         }
@@ -1784,6 +1818,50 @@ fn normalize_partial_json(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "crs")]
+    #[test]
+    fn none_rejects_new_upstream_tool_calls_even_when_leak_filter_is_disabled() {
+        let request: crosslane_translate::ClaudeRequest = serde_json::from_value(json!({
+            "model":"target","max_tokens":128,"tool_choice":{"type":"none"},
+            "messages":[{"role":"user","content":"Reply directly."}]
+        }))
+        .unwrap();
+        let payload = crosslane_translate::claude_to_kiro(
+            &request,
+            &crosslane_translate::TranslationOptions::new("target", "AI_EDITOR"),
+        );
+        for enabled in [false, true] {
+            let mut filter = ToolLeakFilter::for_payload(enabled, &payload);
+            let events = filter.push(KiroEvent::ToolUse {
+                id: "unexpected".into(),
+                name: "web_search".into(),
+                input_delta: "{}".into(),
+                stop: true,
+            });
+            assert!(
+                matches!(&events[..], [KiroEvent::Error { kind, .. }] if kind == "tool_choice_violation")
+            );
+            assert!(filter.finish().is_empty());
+        }
+    }
+
+    #[cfg(feature = "crs")]
+    #[test]
+    fn content_filtered_metadata_is_an_explicit_terminal_error() {
+        for enabled in [false, true] {
+            for usage in [
+                json!({"stopReason":"CONTENT_FILTERED"}),
+                json!({"metadataEvent":{"stopReason":"CONTENT_FILTERED"}}),
+            ] {
+                let mut filter = ToolLeakFilter::new(enabled, []);
+                assert!(
+                    matches!(&filter.push(KiroEvent::MessageMetadata { usage })[..],
+                    [KiroEvent::MessageMetadata { .. }, KiroEvent::Error { kind, message }] if kind == "upstream_content_filtered" && message == super::super::crs::CONTENT_FILTERED_ERROR)
+                );
+            }
+        }
+    }
 
     fn replay_codec() -> WebSearchReplayCodec {
         WebSearchReplayCodec::from_key([0x5A; 32])
