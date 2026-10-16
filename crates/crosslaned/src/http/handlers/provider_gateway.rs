@@ -676,36 +676,52 @@ pub(super) async fn execute_provider(
             Body::from(bytes)
         }
         ProviderResponseBody::Stream(mut upstream) => {
+            #[cfg(feature = "crs")]
+            let mut finalizer = ProviderStreamFinalizer {
+                state: Arc::clone(&state),
+                metadata: metadata.clone(),
+                usage: ProviderUsageScanner::default(),
+                claude: observe_claude.then(super::super::crs::ClaudeStreamState::default),
+                reservation: Some(reservation),
+                failure: None,
+            };
             let stream = async_stream::stream! {
                 let _connection_guard = connection_guard;
                 let _admission_guard = admission_guard;
                 let mut stream_error = None;
+                #[cfg(not(feature = "crs"))]
                 let mut usage = ProviderUsageScanner::default();
-                #[cfg(feature = "crs")]
-                let mut claude = observe_claude.then(super::super::crs::ClaudeStreamState::default);
                 while let Some(chunk) = upstream.next().await {
                     match chunk {
                         Ok(bytes) => {
-                            usage.push(&bytes);
                             #[cfg(feature = "crs")]
-                            if let Some(claude) = claude.as_mut() { claude.push(&bytes); }
+                            let usage = &mut finalizer.usage;
+                            usage.push(&bytes);
                             // Persist attribution before the completed event
                             // reaches the client: it can immediately issue a
                             // continuation without waiting for transport EOF.
                             remember_provider_client_context(&state, &metadata, &mut usage.usage, metadata.status);
+                            #[cfg(feature = "crs")]
+                            if let Some(claude) = finalizer.claude.as_mut() { claude.push(&bytes); }
                             yield Ok::<_, ProviderError>(bytes)
                         },
                         Err(error) => {
                             stream_error = Some(error.to_string());
+                            #[cfg(feature = "crs")]
+                            { finalizer.failure = stream_error.clone(); }
                             yield Err(error);
                             break;
                         }
                     }
                 }
                 #[cfg(feature = "crs")]
-                if stream_error.is_none() && claude.as_ref().is_some_and(super::super::crs::ClaudeStreamState::incomplete) {
-                    stream_error = Some("upstream event stream ended before message completion".into());
+                {
+                    if stream_error.is_none() && finalizer.claude.as_ref().is_some_and(super::super::crs::ClaudeStreamState::incomplete) {
+                        stream_error = Some("upstream event stream ended before message completion".into());
+                    }
+                    if let Some(task) = finalizer.finish(stream_error) { let _ = task.await; }
                 }
+                #[cfg(not(feature = "crs"))]
                 record_provider_request(
                     &state,
                     &metadata,
@@ -755,6 +771,7 @@ async fn inspect_json_response(
     Ok(ProviderResponseBody::Full(Bytes::from(buffered)))
 }
 
+#[derive(Clone)]
 struct ProviderRequestMetadata {
     provider_id: String,
     original_model: String,
@@ -771,6 +788,48 @@ struct ProviderRequestMetadata {
     client_context: crosslane_core::client_context::ClientContext,
     session_owner: super::super::responses::ResponsesSessionOwner,
     stores_response: bool,
+}
+
+/// Body cancellation can drop an async generator at any yield. Keep ownership
+/// of its reservation outside that generator and transfer final persistence to
+/// a task exactly once, with the usage observed before the last yield.
+#[cfg(feature = "crs")]
+struct ProviderStreamFinalizer {
+    state: Arc<AppState>,
+    metadata: ProviderRequestMetadata,
+    usage: ProviderUsageScanner,
+    claude: Option<super::super::crs::ClaudeStreamState>,
+    reservation: Option<CreditReservation>,
+    failure: Option<String>,
+}
+
+#[cfg(feature = "crs")]
+impl ProviderStreamFinalizer {
+    fn finish(&mut self, error: Option<String>) -> Option<tokio::task::JoinHandle<()>> {
+        let reservation = self.reservation.take()?;
+        let state = Arc::clone(&self.state);
+        let metadata = self.metadata.clone();
+        let usage = std::mem::take(&mut self.usage).finish();
+        let error = self.failure.take().or(error);
+        Some(tokio::spawn(async move {
+            record_provider_request(&state, &metadata, usage, error, reservation).await;
+        }))
+    }
+}
+
+#[cfg(feature = "crs")]
+impl Drop for ProviderStreamFinalizer {
+    fn drop(&mut self) {
+        if self.reservation.is_some() && tokio::runtime::Handle::try_current().is_ok() {
+            let error = self
+                .usage
+                .usage
+                .error
+                .is_none()
+                .then(|| "downstream cancelled before transport completion".into());
+            self.finish(error);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1095,11 +1154,14 @@ async fn record_provider_request(
     reservation: CreditReservation,
 ) {
     let stream_error = stream_error.or_else(|| usage.error.take());
-    let status = if stream_error.is_some() && metadata.status < 400 {
-        502
-    } else {
-        metadata.status
-    };
+    let status =
+        if stream_error.as_deref() == Some("downstream cancelled before transport completion") {
+            499
+        } else if stream_error.is_some() && metadata.status < 400 {
+            502
+        } else {
+            metadata.status
+        };
     remember_provider_client_context(state, metadata, &mut usage, status);
     if let Err(error) = reservation
         .settle(UsageRecord {
@@ -1247,6 +1309,84 @@ fn provider_api_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "crs")]
+    #[tokio::test]
+    async fn cancelled_or_finished_provider_stream_is_recorded_exactly_once() {
+        let (_directory, state) = super::super::super::tests::test_state(Config::default()).await;
+        for outcome in ["cancelled", "failed", "completed"] {
+            let metadata = ProviderRequestMetadata {
+                provider_id: "copilot".into(),
+                original_model: "model".into(),
+                model: "model".into(),
+                mapping_rule: None,
+                account_id: "fixture".into(),
+                path: "/v1/messages".into(),
+                trace_id: outcome.into(),
+                request_id: outcome.into(),
+                user_agent: "test".into(),
+                status: 200,
+                started: Instant::now(),
+                api_key_id: None,
+                client_context: Default::default(),
+                session_owner: super::super::super::responses::ResponsesSessionOwner::new(
+                    "svc".into(),
+                    None,
+                ),
+                stores_response: false,
+            };
+            let mut guard = ProviderStreamFinalizer {
+                state: Arc::clone(&state),
+                metadata,
+                usage: ProviderUsageScanner::default(),
+                claude: None,
+                reservation: Some(state.meter.reserve(None, 0.0).unwrap()),
+                failure: (outcome == "failed")
+                    .then(|| "original upstream transport failure".into()),
+            };
+            guard.usage.push(b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":7}}}\n\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":3}}\n\n");
+            if outcome == "completed" {
+                guard.finish(None).unwrap().await.unwrap();
+            }
+            drop(guard);
+            for _ in 0..100 {
+                if state
+                    .stats
+                    .snapshot(None)
+                    .recent_requests
+                    .iter()
+                    .any(|row| row.trace_id == outcome)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            let rows: Vec<_> = state
+                .stats
+                .snapshot(None)
+                .recent_requests
+                .into_iter()
+                .filter(|row| row.trace_id == outcome)
+                .collect();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].input_tokens, 7);
+            assert_eq!(rows[0].output_tokens, 3);
+            assert_eq!(
+                rows[0].status,
+                match outcome {
+                    "cancelled" => 499,
+                    "failed" => 502,
+                    _ => 200,
+                }
+            );
+            if outcome == "failed" {
+                assert_eq!(
+                    rows[0].error.as_deref(),
+                    Some("original upstream transport failure")
+                );
+            }
+        }
+    }
     use crosslane_core::config::ProviderConfig;
 
     #[tokio::test]
