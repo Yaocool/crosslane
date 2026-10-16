@@ -115,9 +115,23 @@ pub(crate) async fn execute_with_effort_recovery(
     let Some(pool) = retry.account_pool.as_mut() else {
         return Ok(response);
     };
-    pool.account_tag = None;
-    pool.account_ids = vec![account_id.clone()];
-    pool.excluded_account_ids.clear();
+    let provider_id = adapter.descriptor().id;
+    // The adapter selected this account using the original pool. Recheck
+    // membership when it is independent of account tags, so an unexpected
+    // response cannot introduce an account outside a frozen explicit scope.
+    if pool.selected_account_tags().is_empty()
+        && !pool.includes_provider_account(provider_id.as_str(), account_id, &[])
+    {
+        return Ok(response);
+    }
+    // `None` inherits the global pool, and bare IDs only identify Kiro
+    // accounts. Disable the base pool and use the provider instance ID, while
+    // retaining exclusions and all other service/provider permissions.
+    pool.account_tag = Some(crosslane_core::config::ServiceAccountTags::Many(Vec::new()));
+    pool.account_ids = vec![format!("{provider_id}/{account_id}")];
+    if !pool.includes_provider_account(provider_id.as_str(), account_id, &[]) {
+        return Ok(response);
+    }
     tracing::info!(event = "crs.capability.recovery", trace_id = %retry.trace_id, service_id = %retry.service_id, model = %retry.model, account_id, field = "output_config.effort", "retrying explicit unsupported effort once before output");
     drop(response);
     adapter.execute(retry).await
@@ -126,6 +140,262 @@ pub(crate) async fn execute_with_effort_recovery(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crosslane_core::config::{CrsRelayMode, ProxyServiceConfig, ServiceAccountTags};
+    use crosslane_core::provider::{
+        ProviderCapabilities, ProviderDescriptor, ProviderId, ProviderModel, ProviderProtocol,
+    };
+    use std::sync::Mutex;
+
+    const EFFORT_REJECTION: &[u8] = br#"{"error":{"type":"invalid_request_error","message":"output_config.effort: Extra inputs are not permitted"}}"#;
+
+    struct EffortProbe {
+        provider_id: &'static str,
+        account_id: Option<&'static str>,
+        requests: Mutex<Vec<ProviderRequest>>,
+        count_requests: Mutex<Vec<ProviderRequest>>,
+    }
+
+    impl EffortProbe {
+        fn new(provider_id: &'static str, account_id: Option<&'static str>) -> Arc<Self> {
+            Arc::new(Self {
+                provider_id,
+                account_id,
+                requests: Mutex::new(Vec::new()),
+                count_requests: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn rejection(&self) -> ProviderResponse {
+            ProviderResponse {
+                status: StatusCode::BAD_REQUEST,
+                headers: Default::default(),
+                body: ProviderResponseBody::Full(Bytes::from_static(EFFORT_REJECTION)),
+                account_id: self.account_id.map(str::to_owned),
+                upstream_request_id: None,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderAdapter for EffortProbe {
+        fn descriptor(&self) -> ProviderDescriptor {
+            ProviderDescriptor {
+                id: ProviderId::parse(self.provider_id).unwrap(),
+                kind: "copilot".into(),
+                enabled: true,
+                status: "ready".into(),
+                error: None,
+                capabilities: ProviderCapabilities::default(),
+            }
+        }
+
+        async fn models(&self, _: bool) -> Result<Vec<ProviderModel>, ProviderError> {
+            Ok(Vec::new())
+        }
+
+        async fn execute(
+            &self,
+            request: ProviderRequest,
+        ) -> Result<ProviderResponse, ProviderError> {
+            self.requests.lock().unwrap().push(request);
+            // Reject the retry as well to assert that recovery is bounded.
+            Ok(self.rejection())
+        }
+
+        async fn count_tokens(
+            &self,
+            request: ProviderRequest,
+        ) -> Result<ProviderResponse, ProviderError> {
+            self.count_requests.lock().unwrap().push(request);
+            Ok(self.rejection())
+        }
+    }
+
+    fn effort_request(pool: Option<ProxyServiceConfig>) -> ProviderRequest {
+        ProviderRequest {
+            protocol: ProviderProtocol::ClaudeMessages,
+            model: "claude-sonnet-4-6".into(),
+            original_model: Some("client-model".into()),
+            path: "/v1/messages".into(),
+            headers: Default::default(),
+            body: Bytes::from_static(br#"{"model":"claude-sonnet-4-6","max_tokens":32,"output_config":{"effort":"high"},"messages":[{"role":"user","content":"hello"}]}"#),
+            trace_id: "effort-scope-test".into(),
+            service_id: "restricted-service".into(),
+            account_pool: pool,
+            api_key_id: Some("restricted-key".into()),
+            client_context: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn effort_recovery_pins_the_selected_provider_account_without_expanding_scope() {
+        for tags in [
+            Some(ServiceAccountTags::Many(Vec::new())),
+            Some(ServiceAccountTags::One("team-a".into())),
+            None,
+        ] {
+            let pool = ProxyServiceConfig {
+                id: "restricted-service".into(),
+                allowed_providers: vec!["copilot-team-a".into(), "kiro".into()],
+                account_tag: tags,
+                account_ids: vec![
+                    "copilot-team-a/selected".into(),
+                    "copilot-team-a/other-allowed".into(),
+                ],
+                excluded_account_ids: vec!["copilot-team-a/forbidden".into()],
+                ..Default::default()
+            };
+            let probe = EffortProbe::new("copilot-team-a", Some("selected"));
+            let adapter: Arc<dyn ProviderAdapter> = probe.clone();
+            let original = effort_request(Some(pool.clone()));
+            let response = execute_with_effort_recovery(&adapter, original.clone(), false)
+                .await
+                .unwrap();
+            assert_eq!(response.status, StatusCode::BAD_REQUEST);
+            let requests = probe.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2, "only one effort retry is permitted");
+            let retry = &requests[1];
+            let narrowed = retry.account_pool.as_ref().unwrap();
+            assert_eq!(narrowed.account_ids, ["copilot-team-a/selected"]);
+            assert!(narrowed.includes_provider_account("copilot-team-a", "selected", &[]));
+            for id in ["other-allowed", "outside", "forbidden"] {
+                assert!(!narrowed.includes_provider_account(
+                    "copilot-team-a",
+                    id,
+                    &["team-a".into()]
+                ));
+            }
+            assert!(!narrowed.includes_provider_account("copilot-team-b", "selected", &[]));
+            assert!(!narrowed.includes_provider_account("kiro", "selected", &[]));
+            let mut expected = pool;
+            expected.account_tag = Some(ServiceAccountTags::Many(Vec::new()));
+            expected.account_ids = vec!["copilot-team-a/selected".into()];
+            assert_eq!(narrowed, &expected, "retain every other service constraint");
+            assert_eq!(retry.trace_id, original.trace_id);
+            assert_eq!(retry.service_id, original.service_id);
+            assert_eq!(retry.api_key_id, original.api_key_id);
+            assert_eq!(retry.model, original.model);
+            assert_eq!(retry.original_model, original.original_model);
+            let body: Value = serde_json::from_slice(&retry.body).unwrap();
+            assert!(body.get("output_config").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn effort_recovery_can_pin_an_account_selected_by_its_service_tag() {
+        let probe = EffortProbe::new("copilot", Some("tagged-account"));
+        let adapter: Arc<dyn ProviderAdapter> = probe.clone();
+        let pool = ProxyServiceConfig {
+            allowed_providers: vec!["copilot".into()],
+            account_tag: Some(ServiceAccountTags::One("team-a".into())),
+            excluded_account_ids: vec!["copilot/forbidden".into()],
+            ..Default::default()
+        };
+        execute_with_effort_recovery(&adapter, effort_request(Some(pool)), false)
+            .await
+            .unwrap();
+        let requests = probe.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let retry = requests[1].account_pool.as_ref().unwrap();
+        assert!(retry.includes_provider_account("copilot", "tagged-account", &[]));
+        assert!(!retry.includes_provider_account("copilot", "other-tagged", &["team-a".into()]));
+        assert!(!retry.includes_provider_account("copilot", "forbidden", &["team-a".into()]));
+    }
+
+    #[tokio::test]
+    async fn effort_recovery_does_not_override_exclusions_or_frozen_provider_scope() {
+        for pool in [
+            ProxyServiceConfig {
+                allowed_providers: vec!["copilot".into()],
+                excluded_account_ids: vec!["copilot/selected".into()],
+                ..Default::default()
+            },
+            ProxyServiceConfig {
+                allowed_providers: vec!["copilot".into()],
+                account_tag: Some(ServiceAccountTags::One("team-a".into())),
+                excluded_account_ids: vec!["copilot/selected".into()],
+                ..Default::default()
+            },
+            ProxyServiceConfig {
+                allowed_providers: vec!["another-provider".into()],
+                ..Default::default()
+            },
+            ProxyServiceConfig {
+                allowed_providers: vec!["copilot".into()],
+                account_tag: Some(ServiceAccountTags::Many(Vec::new())),
+                account_ids: vec!["copilot/other-account".into()],
+                ..Default::default()
+            },
+        ] {
+            let probe = EffortProbe::new("copilot", Some("selected"));
+            let adapter: Arc<dyn ProviderAdapter> = probe.clone();
+            let response =
+                execute_with_effort_recovery(&adapter, effort_request(Some(pool)), false)
+                    .await
+                    .unwrap();
+            assert_eq!(probe.requests.lock().unwrap().len(), 1);
+            let ProviderResponseBody::Full(body) = response.body else {
+                panic!("original rejection must remain available");
+            };
+            assert_eq!(body, Bytes::from_static(EFFORT_REJECTION));
+        }
+    }
+
+    #[tokio::test]
+    async fn effort_recovery_preserves_ccr_counting_and_missing_account_behavior() {
+        for (pool, account_id, count_tokens, protocol) in [
+            (
+                Some(ProxyServiceConfig {
+                    crs_relay: Some(CrsRelayMode::Ccr),
+                    ..Default::default()
+                }),
+                Some("selected"),
+                false,
+                ProviderProtocol::ClaudeMessages,
+            ),
+            (
+                Some(ProxyServiceConfig::default()),
+                Some("selected"),
+                true,
+                ProviderProtocol::ClaudeMessages,
+            ),
+            (
+                Some(ProxyServiceConfig::default()),
+                None,
+                false,
+                ProviderProtocol::ClaudeMessages,
+            ),
+            (
+                None,
+                Some("selected"),
+                false,
+                ProviderProtocol::ClaudeMessages,
+            ),
+            (
+                Some(ProxyServiceConfig::default()),
+                Some("selected"),
+                false,
+                ProviderProtocol::OpenAiChat,
+            ),
+        ] {
+            let probe = EffortProbe::new("kiro", account_id);
+            let adapter: Arc<dyn ProviderAdapter> = probe.clone();
+            let mut request = effort_request(pool);
+            request.protocol = protocol;
+            execute_with_effort_recovery(&adapter, request, count_tokens)
+                .await
+                .unwrap();
+            assert_eq!(
+                probe.requests.lock().unwrap().len(),
+                usize::from(!count_tokens)
+            );
+            assert_eq!(
+                probe.count_requests.lock().unwrap().len(),
+                usize::from(count_tokens)
+            );
+        }
+    }
 
     #[test]
     fn only_explicit_effort_rejection_is_repaired() {
