@@ -109,6 +109,14 @@ pub(super) async fn plan(
     protocol: ProviderProtocol,
     format: ErrorFormat,
 ) -> Result<RoutePlan, ApiError> {
+    #[cfg(feature = "crs")]
+    let normalized_body = if protocol == ProviderProtocol::ClaudeMessages {
+        super::super::crs::normalize_tool_changes(body).map_err(super::claude_validation_error)?
+    } else {
+        body.clone()
+    };
+    #[cfg(feature = "crs")]
+    let body = &normalized_body;
     let config = service.app.config.current();
     let pool = service.current_service();
     let pinned = |pool: &ProxyServiceConfig| {

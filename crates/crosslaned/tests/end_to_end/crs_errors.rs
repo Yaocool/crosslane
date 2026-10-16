@@ -4,6 +4,154 @@ use std::sync::atomic::AtomicU16;
 
 const FIELD_ERROR: &str = "messages.1.output_config: Extra inputs are not permitted";
 
+#[tokio::test]
+async fn removed_tool_discoveries_allow_counting_and_kiro_continuation() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    let (upstream, daemon, port) = start_input_overflow_daemon().await;
+    for official in [false, true] {
+        let search = if official {
+            json!({"type":"tool_search_tool_regex_20251119","name":"tool_search_tool_regex"})
+        } else {
+            json!({"name":"custom_search","input_schema":{"type":"object"}})
+        };
+        let history = if official {
+            json!([
+                {"role":"user","content":"find old_tool"},
+                {"role":"assistant","content":[
+                    {"type":"server_tool_use","id":"search1","name":"tool_search_tool_regex","input":{"pattern":"old_tool"}},
+                    {"type":"tool_search_tool_result","tool_use_id":"search1","content":{"type":"tool_search_tool_search_result","tool_references":[{"type":"tool_reference","tool_name":"old_tool"}]}}
+                ]}
+            ])
+        } else {
+            json!([
+                {"role":"user","content":"find old_tool"},
+                {"role":"assistant","content":[{"type":"tool_use","id":"search1","name":"custom_search","input":{}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"search1","content":[{"type":"tool_reference","tool_name":"old_tool"}]}]}
+            ])
+        };
+        let mut body = json!({"model":"resolved-small","max_tokens":32,"tools":[
+            search,{"name":"old_tool","input_schema":{"type":"object"},"defer_loading":true}
+        ],"messages":history});
+        body["messages"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"user","content":[
+                {"type":"tool_removal","tool":{"type":"tool_reference","name":"old_tool"}},
+                {"type":"text","text":"Continue in Chinese 中文😀"}
+            ]}));
+        for (endpoint, stream) in [
+            ("messages/count_tokens", false),
+            ("messages", false),
+            ("messages", true),
+        ] {
+            body["stream"] = stream.into();
+            let response = reqwest::Client::new()
+                .post(format!("http://127.0.0.1:{port}/v1/{endpoint}"))
+                .bearer_auth(daemon.api_key.as_deref().unwrap())
+                .header("user-agent", "claude-cli/2.1.300 (external, e2e)")
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+            let text = response.text().await.unwrap();
+            assert!(!text.contains("\"type\":\"error\""), "{text}");
+        }
+    }
+    let generated = upstream
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.url.path() == "/generateAssistantResponse")
+        .collect::<Vec<_>>();
+    assert_eq!(generated.len(), 4);
+    for request in generated {
+        let value: Value = serde_json::from_slice(&request.body).unwrap();
+        let text = value.to_string();
+        assert!(text.contains("Historical tool reference"));
+        assert!(text.contains("old_tool"));
+        if let Some(tools) = value
+            .pointer(
+                "/conversationState/currentMessage/userInputMessage/userInputMessageContext/tools",
+            )
+            .and_then(Value::as_array)
+        {
+            assert!(tools
+                .iter()
+                .all(|tool| tool["toolSpecification"]["name"] != "old_tool"));
+        }
+    }
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn late_tool_catalog_updates_preserve_kiro_generation_and_token_counting() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    let (upstream, daemon, port) = start_input_overflow_daemon().await;
+    let body = json!({"model":"resolved-small","max_tokens":32,"tools":[
+        {"name":"Read","input_schema":{"type":"object"}},
+        {"name":"late_reader","input_schema":{"type":"object"},"defer_loading":true}
+    ],"messages":[
+        {"role":"user","content":"read the source"},
+        {"role":"assistant","content":[{"type":"tool_use","id":"once","name":"Read","input":{"file_path":"/tmp/中文.txt"}}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"once","content":"中文工具结果😀"}]},
+        {"role":"system","content":[{"type":"text","text":"keep this policy"},
+            {"type":"tool_addition","tool":{"type":"tool_reference","name":"late_reader"}},
+            {"type":"tool_addition","tool":{"type":"tool_definition","definition":{"name":"extra_new","description":"late definition","input_schema":{"type":"object"}}}}
+        ]}
+    ]});
+    for (endpoint, stream) in [
+        ("messages/count_tokens", false),
+        ("messages", false),
+        ("messages", true),
+    ] {
+        let mut body = body.clone();
+        body["stream"] = stream.into();
+        let response = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/{endpoint}"))
+            .bearer_auth(daemon.api_key.as_deref().unwrap())
+            .header("user-agent", "claude-cli/2.1.300 (external, e2e)")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        let text = response.text().await.unwrap();
+        assert!(!text.contains("\"type\":\"error\""), "{text}");
+        if endpoint.ends_with("count_tokens") {
+            assert!(
+                serde_json::from_str::<Value>(&text).unwrap()["input_tokens"]
+                    .as_u64()
+                    .unwrap()
+                    > 0
+            );
+        }
+    }
+    let generated = upstream
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.url.path() == "/generateAssistantResponse")
+        .collect::<Vec<_>>();
+    assert_eq!(generated.len(), 2);
+    for request in generated {
+        let text = std::str::from_utf8(&request.body).unwrap();
+        assert!(
+            text.contains("late_reader")
+                && text.contains("extra_new")
+                && text.contains("keep this policy")
+        );
+        assert!(!text.contains("tool_addition"));
+        assert!(
+            text.contains("once"),
+            "tool result identity must be retained"
+        );
+    }
+    daemon.stop().await;
+}
+
 async fn start_copilot_error() -> (MockServer, Daemon, u16) {
     start_copilot_error_with_status(Arc::new(AtomicU16::new(400))).await
 }

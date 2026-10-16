@@ -19,8 +19,10 @@ use serde_json::Value;
 
 mod capability;
 mod stream;
+mod tools;
 pub(super) use capability::execute_with_effort_recovery;
 pub(super) use stream::ClaudeStreamState;
+pub(super) use tools::normalize_tool_changes;
 
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_PREFLIGHT_BYTES: usize = 64 * 1024;
