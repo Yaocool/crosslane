@@ -603,6 +603,12 @@ when its Claude Messages endpoint is used as a Claude Relay Service Console/CCR 
 feature applies to every Claude Messages listener in that binary. It is disabled in the default
 Cargo build.
 
+Console compatibility is the default. For a listener used only by CCR, set
+`crs_relay = "ccr"` inside its existing `[[proxy_service]]` entry. This preserves
+HTTP error statuses so Claude Code can perform native parameter recovery.
+Omit the setting or use `"console"` for the Console transport described below.
+The setting does not change HTTP behavior in builds without `crs`.
+
 Full Docker images enable all Cargo features, including `sso` and `crs`, by default.
 Use `./deploy/docker-setup.sh --build` to build and deploy locally, or
 `docker build --target runtime-full -t crosslane:full .` to build an image only.
@@ -621,8 +627,8 @@ curl -i "$CROSSLANE_URL/v1/messages" \
 ```
 
 This authenticated probe fails local validation without calling an upstream.
-With `crs` enabled it returns HTTP 200, `text/event-stream` and `event: error`;
-without the feature it returns HTTP 400 JSON.
+With Console compatibility it returns HTTP 200, `text/event-stream` and `event: error`;
+CCR compatibility and builds without the feature return HTTP 400 JSON.
 
 Supplier error statuses are preserved for Kiro and Copilot, including 401, 402,
 403, 413, 503, 504, and 529. Non-streaming and non-CRS responses use the original
@@ -646,7 +652,7 @@ to local context errors with `crs`; non-CRS builds, OpenAI endpoints, client
 authentication, and supplier errors retain their original HTTP statuses. Console
 may still sanitize other non-streaming errors; CCR preserves their original bodies.
 
-For Claude `stream: true` with `crs`, supplier errors use HTTP 200 and an SSE
+For Claude `stream: true` with Console compatibility, supplier errors use HTTP 200 and an SSE
 `event: error`, preserving the original status in `error.status`,
 `error.upstream_status` and `x-crosslane-error-status`. Early errors initialize a
 zero-usage empty text block before the error, preventing Claude Code from falling
@@ -656,6 +662,44 @@ Once a successful SSE response has started, subsequent errors remain in the
 committed stream. Request statistics record failure status separately from the
 HTTP 200 client transport. Crosslane checks up to 64 KiB or five seconds of initial
 SSE events and enriches errors after assistant content starts.
+
+Console compatibility retries an explicit HTTP 400 rejection of
+`output_config.effort` once, before output, using the same account and removing
+only that field. Thinking history, signatures, and tool arguments stay intact.
+CCR preserves HTTP 400 for client recovery. Other HTTP 400 errors do not trigger
+this compatibility retry.
+
+SSE JSON strings use ASCII Unicode escapes on the CRS hop to protect Chinese
+text and tool arguments from per-chunk UTF-8 decoding. Decoded values are
+unchanged. ASCII slices reuse their original buffers; Unicode escapes use fixed
+hexadecimal output without per-character formatting allocations. Unicode wire
+expansion remains necessary for CRS compatibility. An event exceeding 64 KiB skips only that event's diagnostic parsing;
+inspection resumes at the next event. A native Messages EOF without a completion signal
+or with open content blocks records a 502 and emits an error, without fabricating
+successful completion or closing an unfinished tool. Closed blocks plus a stop
+reason but no `message_stop` are treated separately.
+
+Observable downstream cancellations record 499 and settle only received usage;
+unknown tokens and supplier charges stay unreported. Crosslane cannot infer a
+cancellation that Console does not propagate. Automatic routing can switch only
+before content or a tool starts. `failover_timeout_ms` remains a separate deadline
+for each automatic provider attempt; zero disables only that provider's attempt
+deadline. Pinned routes do not gain this deadline, and no implicit request-wide
+deadline is added. Candidate and response preflight share one five-second window
+instead of waiting twice. Adding
+`Retry-After` in Crosslane cannot restore a header that CRS discards.
+
+With `crs`, late `tool_addition` / `tool_removal` declarations update the current
+`tools[]` catalog in message order, supporting references and new custom tool
+definitions. Their original positions become text notices with cache markers
+retained. Tool call IDs, arguments, thinking and signatures stay intact. Historical
+references preceding an explicit removal become text records retaining the original
+reference data; official search results retain call pairing and active references.
+Removed tools stay outside the current catalog. New references after removal still
+fail validation. Generation and count_tokens share this projection. Unknown
+references, conflicting definitions and unsupported definition kinds fail
+explicitly; normal history, capacity and schema checks still apply. Builds
+without `crs` keep their existing behavior.
 
 | Symptom | First checks |
 | --- | --- |

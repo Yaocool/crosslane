@@ -492,6 +492,10 @@ CRS Console 和 OpenAI Responses 转发保留这些字段时即可使用，无�
 Claude Messages 作为 CRS Console/CCR 上游时，使用
 `cargo build -p crosslaned --bin crosslaned --release --features crs` 构建。
 该 feature 对二进制中的所有 Claude Messages 监听服务生效，普通 Cargo 构建默认关闭。
+默认使用 Console 兼容策略。只接入 CCR 的监听服务可在现有 `[[proxy_service]]` 项内配置
+`crs_relay = "ccr"`；该策略保留 HTTP 错误状态，供 Claude Code 执行原生参数恢复。
+省略此项或设置为 `"console"` 时，继续使用下文的 Console 错误传输策略。
+此配置在未启用 `crs` 的构建中不改变 HTTP 行为。
 完整 Docker 镜像默认启用全部 Cargo feature，包括 `sso` 和 `crs`。
 使用 `./deploy/docker-setup.sh --build` 本地构建并部署，或
 `docker build --target runtime-full -t crosslane:full .` 仅构建镜像。
@@ -510,7 +514,7 @@ curl -i "$CROSSLANE_URL/v1/messages" \
 ```
 
 此请求通过认证后仅触发本地必填字段校验，不调用上游。启用 `crs` 时返回
-HTTP 200、`text/event-stream` 和 `event: error`；未启用时返回 HTTP 400 JSON。
+HTTP 200、`text/event-stream` 和 `event: error`；CCR 策略或未启用时返回 HTTP 400 JSON。
 
 Kiro 和 Copilot 返回的错误状态码保留原值，包括 401、402、403、413、503、504 和 529。
 非流式响应及未启用 `crs` 的响应使用原 HTTP 状态码；CRS 兼容的 Claude 流式响应将原值
@@ -528,13 +532,40 @@ Claude Messages 使用 HTTP 200 传输 `type: "error"` JSON，在 `error.status`
 未启用 `crs`、OpenAI 接口、客户端认证及供应商错误保留原 HTTP 状态。
 其他非流式错误仍可能被 Console 脱敏；CCR 路径会保留其原始非流式错误正文。
 
-Claude 请求设置 `stream: true` 且启用 `crs` 时，供应商错误采用 HTTP 200 加 SSE
+Claude 请求设置 `stream: true` 且采用 Console 策略时，供应商错误采用 HTTP 200 加 SSE
 `event: error`，在 `error.status`、`error.upstream_status` 和 `x-crosslane-error-status`
 中保留原始状态码。流开始前的错误先初始化零用量的空文本块，避免 Claude Code 退回非流式
 重试后被 Console 清理掉错误详情。客户端认证、方法和 HTTP 请求体限制错误保留原 HTTP 状态。
 成功的 SSE 响应已经开始输出后，后续错误继续通过流内事件表达。请求统计分别记录失败状态和
 客户端 HTTP 200 传输状态。服务端检查最初最多 64 KiB 或五秒的 SSE 事件，也会补充已经开始
 输出助手内容后的错误诊断。
+
+Console 路径遇到明确的 `output_config.effort` 不受支持的 HTTP 400 时，只在输出前向
+同一账号重试一次，且只删除该字段；不会删除 thinking 历史、签名或工具参数。CCR 策略保留
+HTTP 400，由客户端自行恢复。其他字段拒绝和其他 HTTP 400 不会触发这次兼容重试。
+
+流内 JSON 字符串以 ASCII Unicode 转义传给 CRS，避免 CRS 逐块 UTF-8 解码损坏中文或
+工具参数，客户端解析后的值保持一致。纯 ASCII 流块复用原缓冲区，Unicode 转义以固定
+十六进制写入，避免逐字符格式化和重复复制；为兼容 CRS，Unicode 转义的线路字节开销仍存在。
+单个事件超过 64 KiB 时只跳过该事件的诊断解析，
+后续事件仍会检查。原生 Messages 流缺少结束信号或仍有未闭合内容块时，EOF 会被记录为
+502 并返回流内错误，不会补造成功事件或关闭未完成工具。已闭合内容块且已有结束原因、
+仅缺少 `message_stop` 的情况单独处理。
+
+能观测到的下游取消记为 499，并且仅结算已经收到的 usage；未知 token 或供应商费用不估造。
+Console 未向 Crosslane 传播取消时，Crosslane 无法判断客户端已离开。自动路由只允许在
+首段内容或工具开始之前切换。`failover_timeout_ms` 仍是自动路由每个来源各自的尝试期限，
+`0` 只关闭该来源的尝试期限；固定来源不新增此期限，也不隐式设置整次请求的总期限。
+候选检查和最终响应检查共享同一个五秒窗口，避免对首段 SSE 重复等待。
+CRS 丢弃的 `Retry-After` 等响应头不能靠 Crosslane 增加同名头恢复。
+
+Claude Code 的延迟 `tool_addition` / `tool_removal` 声明在 `crs` 构建中按消息顺序投影为
+当前 `tools[]`，既支持已有工具的引用，也支持新增 custom 工具定义。声明原位置改为文字
+通知并保留缓存标记，原有工具调用 ID、工具参数、thinking 和签名不变。
+明确移除之前的历史工具引用转为保留原始引用内容的文字记录；官方搜索结果保留调用配对及
+仍可用的引用。已移除工具不会重新进入当前目录，移除后的新引用及未知引用仍明确拒绝。
+生成与 count_tokens 使用相同处理。未知引用、冲突重定义和不支持的定义类型会明确拒绝，
+有效目录仍须通过原有工具配对、容量与结构校验；未启用 `crs` 的行为不变。
 
 ## 备份与恢复
 
