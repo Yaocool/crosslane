@@ -4,6 +4,99 @@ use std::sync::atomic::AtomicU16;
 
 const FIELD_ERROR: &str = "messages.1.output_config: Extra inputs are not permitted";
 
+#[cfg(feature = "crs")]
+async fn send_tool_lifecycle_request(
+    daemon: &Daemon,
+    port: u16,
+    endpoint: &str,
+    body: &Value,
+) -> (u16, String) {
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/{endpoint}"))
+        .bearer_auth(daemon.api_key.as_deref().unwrap())
+        .header("user-agent", "claude-cli/2.1.300 (external, e2e)")
+        .json(body)
+        .send()
+        .await
+        .unwrap();
+    (response.status().as_u16(), response.text().await.unwrap())
+}
+
+#[cfg(feature = "crs")]
+#[tokio::test]
+async fn checkpoint_tool_changes_restore_the_same_catalog_for_count_and_generation() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    let (upstream, daemon, port) = start_input_overflow_daemon().await;
+    let checkpoint = json!({"type":"compaction","content":"Retained checkpoint 中文😀", "tool_changes":[
+        {"type":"tool_removal","tool":{"type":"tool_reference","name":"retired_lookup"}},
+        {"type":"tool_addition","tool":{"type":"tool_definition","definition":{
+            "name":"checkpoint_reader","description":"Checkpoint-created lookup",
+            "input_schema":{"type":"object","properties":{"path":{"type":"string"}}}
+        }}}
+    ]});
+    let mut changed = json!({"model":"resolved-small","max_tokens":32,"tools":[
+        {"name":"retired_lookup","input_schema":{"type":"object"}},
+        {"name":"stable_lookup","input_schema":{"type":"object"}}
+    ],"messages":[
+        {"role":"user","content":"Context replaced by the checkpoint."},
+        {"role":"assistant","content":[checkpoint]},
+        {"role":"user","content":"Continue from the retained checkpoint."}
+    ]});
+    let mut net = changed.clone();
+    net["tools"] = json!([
+        {"name":"stable_lookup","input_schema":{"type":"object"}},
+        {"name":"checkpoint_reader","description":"Checkpoint-created lookup",
+         "input_schema":{"type":"object","properties":{"path":{"type":"string"}}}}
+    ]);
+    net["messages"][1]["content"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("tool_changes");
+    let (status, count) =
+        send_tool_lifecycle_request(&daemon, port, "messages/count_tokens", &changed).await;
+    assert_eq!(status, 200, "{count}");
+    let (net_status, net_count) =
+        send_tool_lifecycle_request(&daemon, port, "messages/count_tokens", &net).await;
+    assert_eq!(net_status, 200, "{net_count}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&count).unwrap()["input_tokens"],
+        serde_json::from_str::<Value>(&net_count).unwrap()["input_tokens"],
+        "counting did not use the checkpoint's effective tool catalog"
+    );
+    for stream in [false, true] {
+        changed["stream"] = stream.into();
+        let (status, text) = send_tool_lifecycle_request(&daemon, port, "messages", &changed).await;
+        assert_eq!(status, 200, "{text}");
+        assert!(!text.contains("\"type\":\"error\""), "{text}");
+        if stream {
+            assert!(text.contains("message_stop"), "{text}");
+        }
+    }
+    let generations = upstream
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.url.path() == "/generateAssistantResponse")
+        .collect::<Vec<_>>();
+    assert_eq!(generations.len(), 2);
+    for request in generations {
+        let payload: Value = serde_json::from_slice(&request.body).unwrap();
+        let mut names = payload
+            .pointer(
+                "/conversationState/currentMessage/userInputMessage/userInputMessageContext/tools",
+            )
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .map(|tool| tool["toolSpecification"]["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(names, ["checkpoint_reader", "stable_lookup"], "{payload}");
+    }
+    daemon.stop().await;
+}
+
 #[tokio::test]
 async fn none_preserves_historical_pairs_without_publishing_callable_tools() {
     let _guard = HTTP_TEST_LOCK.lock().await;
