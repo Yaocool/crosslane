@@ -284,6 +284,14 @@ pub(super) async fn adapt_claude_stream_response(
     )
 }
 
+pub(super) async fn adapt_ccr_response(
+    response: Response,
+    request_id: &str,
+    _model: &str,
+) -> Response {
+    adapt_claude_response(response, request_id).await
+}
+
 fn initial_error_stream(envelope: &Value, request_id: &str, model: &str) -> String {
     // Claude Code retries an error-only stream without streaming. CRS then
     // sanitizes that HTTP error and erases the original diagnostics again.
@@ -1049,6 +1057,30 @@ fn error_response(status: StatusCode, envelope: Value, request_id: &str) -> Resp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ccr_preserves_http_400_and_console_preserves_sse_diagnostics() {
+        for ccr in [false, true] {
+            let response = Response::builder().status(400).body(Body::from(r#"{"type":"error","error":{"type":"invalid_request_error","message":"output_config.effort: Extra inputs are not permitted"}}"#)).unwrap();
+            let response = if ccr {
+                adapt_ccr_response(response, "trace_contract", "model").await
+            } else {
+                adapt_claude_stream_response(response, "trace_contract", "model").await
+            };
+            assert_eq!(
+                response.status(),
+                if ccr {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::OK
+                }
+            );
+            let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
+            assert!(std::str::from_utf8(&bytes)
+                .unwrap()
+                .contains("output_config.effort"));
+        }
+    }
 
     #[tokio::test]
     async fn nonstream_context_error_preserves_typed_failure_and_numeric_diagnostics() {

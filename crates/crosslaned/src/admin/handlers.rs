@@ -1919,6 +1919,7 @@ async fn handle_service_create(state: &Arc<AppState>, params: serde_json::Value)
     };
     let service = ProxyServiceConfig {
         web_search_provider: None,
+        crs_relay: None,
         id: format!("svc_{}", uuid::Uuid::new_v4().simple()),
         name: name.to_string(),
         host: params.host.unwrap_or_else(|| previous.server.host.clone()),

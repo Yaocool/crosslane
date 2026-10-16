@@ -233,6 +233,9 @@ pub async fn claude_messages(
     let model = request_model_hint(&body);
     #[cfg(feature = "crs")]
     let stream_requested = crs::stream_requested(&body);
+    #[cfg(feature = "crs")]
+    let ccr_relay =
+        service.current_service().crs_relay == Some(crosslane_core::config::CrsRelayMode::Ccr);
     tracing::debug!(
         trace_id = %trace_id,
         protocol = "claude",
@@ -254,7 +257,9 @@ pub async fn claude_messages(
         Ok(response) => {
             #[cfg(feature = "crs")]
             {
-                if stream_requested {
+                if ccr_relay {
+                    crs::adapt_ccr_response(response, &trace_id, &model).await
+                } else if stream_requested {
                     crs::adapt_claude_stream_response(response, &trace_id, &model).await
                 } else {
                     crs::adapt_claude_nonstream_response(response, &trace_id).await
@@ -267,10 +272,12 @@ pub async fn claude_messages(
         }
         Err(error) => {
             #[cfg(feature = "crs")]
-            let use_sse =
-                stream_requested && crs::uses_sse_error(error.status, error.upstream_status);
+            let use_sse = !ccr_relay
+                && stream_requested
+                && crs::uses_sse_error(error.status, error.upstream_status);
             #[cfg(feature = "crs")]
-            let use_json_context = !stream_requested
+            let use_json_context = !ccr_relay
+                && !stream_requested
                 && crs::uses_json_context_error(
                     error.status,
                     error.error_code,

@@ -1301,6 +1301,7 @@ mod tests {
     fn service() -> ProxyServiceConfig {
         ProxyServiceConfig {
             web_search_provider: None,
+            crs_relay: None,
             id: "svc".into(),
             name: "svc".into(),
             host: "127.0.0.1".into(),
@@ -1557,6 +1558,7 @@ mod tests {
             });
         let service = ProxyServiceConfig {
             web_search_provider: None,
+            crs_relay: None,
             id: "legacy".into(),
             name: "legacy".into(),
             host: "127.0.0.1".into(),

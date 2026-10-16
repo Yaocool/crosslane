@@ -419,6 +419,7 @@ fn fully_populated_config() -> Config {
     });
     config.proxy_service.push(ProxyServiceConfig {
         web_search_provider: None,
+        crs_relay: None,
         id: "svc_example".into(),
         name: "example".into(),
         host: "127.0.0.1".into(),
@@ -656,6 +657,7 @@ fn rejects_non_local_host_without_api_key() {
     let mut config = Config::default();
     config.proxy_service.push(ProxyServiceConfig {
         web_search_provider: None,
+        crs_relay: None,
         id: "svc_test".into(),
         name: "test".into(),
         host: "0.0.0.0".into(),
@@ -690,6 +692,7 @@ fn accepts_non_local_host_with_enabled_api_key() {
     });
     config.proxy_service.push(ProxyServiceConfig {
         web_search_provider: None,
+        crs_relay: None,
         id: "svc_test".into(),
         name: "test".into(),
         host: "0.0.0.0".into(),
@@ -724,6 +727,7 @@ fn treats_loopback_hosts_as_local() {
         });
         config.proxy_service.push(ProxyServiceConfig {
             web_search_provider: None,
+            crs_relay: None,
             id: "svc_test".into(),
             name: "test".into(),
             host: host.into(),
@@ -760,6 +764,7 @@ fn rejects_disabled_api_key_as_public_credential() {
     });
     config.proxy_service.push(ProxyServiceConfig {
         web_search_provider: None,
+        crs_relay: None,
         id: "svc_test".into(),
         name: "test".into(),
         host: "0.0.0.0".into(),
@@ -860,6 +865,7 @@ fn tagged_account(id: &str, tag: &str) -> Account {
 fn proxy_service_pool_combines_tag_manual_binding_and_exclusion() {
     let service = ProxyServiceConfig {
         web_search_provider: None,
+        crs_relay: None,
         id: "svc_team".into(),
         name: "team".into(),
         host: "127.0.0.1".into(),
@@ -886,6 +892,7 @@ fn proxy_service_pool_combines_tag_manual_binding_and_exclusion() {
 fn proxy_service_without_tag_uses_global_pool_except_exclusions() {
     let service = ProxyServiceConfig {
         web_search_provider: None,
+        crs_relay: None,
         id: "svc_global".into(),
         name: "global".into(),
         host: "127.0.0.1".into(),
@@ -910,6 +917,7 @@ fn proxy_service_without_tag_uses_global_pool_except_exclusions() {
 fn proxy_service_multiple_tags_match_the_union_and_roundtrip_as_an_array() {
     let mut service = ProxyServiceConfig {
         web_search_provider: None,
+        crs_relay: None,
         id: "svc_multi".into(),
         name: "multi".into(),
         host: "127.0.0.1".into(),
@@ -951,6 +959,7 @@ fn proxy_service_rejects_empty_duplicate_and_malformed_account_tags() {
     let mut config = Config::default();
     config.proxy_service.push(ProxyServiceConfig {
         web_search_provider: None,
+        crs_relay: None,
         id: "svc_multi".into(),
         name: "multi".into(),
         host: "127.0.0.1".into(),
@@ -991,6 +1000,7 @@ fn proxy_service_account_references_reject_surrounding_whitespace() {
     });
     config.proxy_service.push(ProxyServiceConfig {
         web_search_provider: None,
+        crs_relay: None,
         id: "svc_team".into(),
         name: "team".into(),
         host: "127.0.0.1".into(),

@@ -944,6 +944,10 @@ pub struct ProxyServiceConfig {
     /// Ordinary generation permissions are unchanged. Account scope still applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_search_provider: Option<String>,
+    /// CRS response contract used only by crosslaned's `crs` feature. Console
+    /// is the default; CCR preserves HTTP errors for the client's SDK recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crs_relay: Option<CrsRelayMode>,
     /// 创建时间（Unix 秒）。
     #[serde(default)]
     pub created_at: i64,
@@ -965,9 +969,17 @@ impl Default for ProxyServiceConfig {
             default_provider: String::new(),
             allowed_providers: Vec::new(),
             web_search_provider: None,
+            crs_relay: None,
             created_at: 0,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CrsRelayMode {
+    Console,
+    Ccr,
 }
 
 /// A proxy service's tag-derived account pool, stored as a legacy scalar or a

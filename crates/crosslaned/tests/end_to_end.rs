@@ -199,6 +199,7 @@ impl Daemon {
         }];
         config.proxy_service = vec![ProxyServiceConfig {
             web_search_provider: None,
+            crs_relay: None,
             id: "svc_copilot_e2e".into(),
             name: "copilot-e2e".into(),
             host: "127.0.0.1".into(),
