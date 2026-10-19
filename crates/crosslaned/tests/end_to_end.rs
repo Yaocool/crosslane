@@ -74,6 +74,10 @@ mod warning_regressions;
 #[path = "end_to_end/manual_compaction.rs"]
 mod manual_compaction;
 
+#[cfg(feature = "crs")]
+#[path = "end_to_end/client_summary_retry.rs"]
+mod client_summary_retry;
+
 #[path = "end_to_end/automatic_compaction.rs"]
 mod automatic_compaction;
 

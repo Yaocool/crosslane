@@ -4,6 +4,10 @@ use super::{
     sanitize_error_message, set_payload_model, upstream_attempt_log, AppState, Arc, ExecuteError,
     HashSet, KiroError, PoolError, PreparedUpstream, Rng, UpstreamAttemptLog, UpstreamExecution,
 };
+#[cfg(feature = "crs")]
+use crate::http::crs::{
+    reacquire_summary_account, summary_recovery_permitted, ClientSummaryRecovery,
+};
 use crosslane_translate::error::log_model;
 use crosslane_translate::model::{map_model_for_provider, ModelMappingContext};
 
@@ -24,6 +28,53 @@ fn configured_cross_provider_target<'a>(
 enum DispatchOutcome {
     Prepared(Box<PreparedUpstream>),
     Generated(Box<UpstreamExecution>),
+}
+
+#[cfg(feature = "crs")]
+struct FrozenSummaryAttempt {
+    account: crosslane_core::account::Account,
+    payload: crosslane_translate::KiroPayload,
+    client: crosslane_kiro::KiroClient,
+    upstream_config: Option<serde_json::Value>,
+    mapped_model: String,
+    model_path: Vec<String>,
+    model_mapping_rule: Option<String>,
+}
+
+#[cfg(feature = "crs")]
+async fn generate_with_summary_budget(
+    state: &AppState,
+    account: &crosslane_core::account::Account,
+    payload: &crosslane_translate::KiroPayload,
+    route: (&str, &[String], Option<&str>),
+    recovery: &mut Option<&mut ClientSummaryRecovery>,
+    frozen: &mut Option<FrozenSummaryAttempt>,
+) -> Result<crosslane_kiro::KiroResponse, KiroError> {
+    if let Some(budget) = recovery.as_deref_mut() {
+        let upstream_before = serde_json::to_value(state.runtime_config_snapshot().upstream).ok();
+        let client = state.kiro();
+        let upstream_after = serde_json::to_value(state.runtime_config_snapshot().upstream).ok();
+        *frozen = Some(FrozenSummaryAttempt {
+            account: account.clone(),
+            payload: state.prepare_generation_payload(payload),
+            client,
+            upstream_config: if upstream_before == upstream_after {
+                upstream_after
+            } else {
+                None
+            },
+            mapped_model: route.0.to_owned(),
+            model_path: route.1.to_vec(),
+            model_mapping_rule: route.2.map(str::to_owned),
+        });
+        budget.record_generation();
+        let prepared = frozen.as_ref().expect("prepared summary");
+        state
+            .generate_prepared_with_client(&prepared.client, account, &prepared.payload)
+            .await
+    } else {
+        state.generate(account, payload).await
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -58,6 +109,8 @@ pub(in crate::http::handlers) async fn prepare_upstream(
         None,
         true,
         true,
+        #[cfg(feature = "crs")]
+        None,
     )
     .await?
     {
@@ -84,6 +137,7 @@ pub(in crate::http::handlers) async fn execute_upstream(
     payload: &crosslane_translate::KiroPayload,
     prepared: Option<PreparedUpstream>,
     allow_model_fallback: bool,
+    #[cfg(feature = "crs")] summary_recovery: Option<&mut ClientSummaryRecovery>,
 ) -> Result<UpstreamExecution, ExecuteError> {
     match dispatch_upstream(
         state,
@@ -103,6 +157,8 @@ pub(in crate::http::handlers) async fn execute_upstream(
         prepared,
         false,
         allow_model_fallback,
+        #[cfg(feature = "crs")]
+        summary_recovery,
     )
     .await?
     {
@@ -130,6 +186,7 @@ async fn dispatch_upstream(
     prepared: Option<PreparedUpstream>,
     preflight_only: bool,
     allow_model_fallback: bool,
+    #[cfg(feature = "crs")] mut summary_recovery: Option<&mut ClientSummaryRecovery>,
 ) -> Result<DispatchOutcome, ExecuteError> {
     let mut input_tokens = input_tokens;
     let config = state.config.current();
@@ -144,6 +201,8 @@ async fn dispatch_upstream(
     let account_count = account_ids.len() as u32;
     let attempts = retry_attempt_count(config.upstream.max_retries, account_count);
     let mut last_error = None;
+    #[cfg(feature = "crs")]
+    let mut frozen_summary_request = None;
     // Reuse the prepared state without cloning the full conversation again or
     // drawing another weighted mapping choice. Preserve preflight exclusions
     // and attempt numbers when generation subsequently needs a retry.
@@ -463,7 +522,19 @@ async fn dispatch_upstream(
             attempt + 1,
             "initial",
         );
-        match state.generate(&account, &request_payload).await {
+        #[cfg(feature = "crs")]
+        let generated = generate_with_summary_budget(
+            state,
+            &account,
+            &request_payload,
+            (&mapped_model, &model_path, model_mapping_rule.as_deref()),
+            &mut summary_recovery,
+            &mut frozen_summary_request,
+        )
+        .await;
+        #[cfg(not(feature = "crs"))]
+        let generated = state.generate(&account, &request_payload).await;
+        match generated {
             Ok(response) => {
                 tracing::info!(
                     event = "upstream.response.accepted",
@@ -544,7 +615,19 @@ async fn dispatch_upstream(
                         attempt + 1,
                         "refreshed_account",
                     );
-                    match state.generate(&refreshed, &request_payload).await {
+                    #[cfg(feature = "crs")]
+                    let generated = generate_with_summary_budget(
+                        state,
+                        &refreshed,
+                        &request_payload,
+                        (&mapped_model, &model_path, model_mapping_rule.as_deref()),
+                        &mut summary_recovery,
+                        &mut frozen_summary_request,
+                    )
+                    .await;
+                    #[cfg(not(feature = "crs"))]
+                    let generated = state.generate(&refreshed, &request_payload).await;
+                    match generated {
                         Ok(response) => {
                             let refreshed_name = refreshed.display_name().to_owned();
                             tracing::info!(
@@ -765,7 +848,19 @@ async fn dispatch_upstream(
                                     attempt + 1,
                                     "model_fallback",
                                 );
-                                match state.generate(&account, &request_payload).await {
+                                #[cfg(feature = "crs")]
+                                let generated = generate_with_summary_budget(
+                                    state,
+                                    &account,
+                                    &request_payload,
+                                    (&mapped_model, &model_path, model_mapping_rule.as_deref()),
+                                    &mut summary_recovery,
+                                    &mut frozen_summary_request,
+                                )
+                                .await;
+                                #[cfg(not(feature = "crs"))]
+                                let generated = state.generate(&account, &request_payload).await;
+                                match generated {
                                     Ok(response) => {
                                         tracing::info!(
                                             event = "upstream.model_fallback.succeeded",
@@ -928,6 +1023,241 @@ async fn dispatch_upstream(
                 "waiting before upstream retry"
             );
             tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+        }
+    }
+    #[cfg(feature = "crs")]
+    if let (Some(budget), Some(error), Some(frozen)) = (
+        summary_recovery,
+        last_error.as_ref(),
+        frozen_summary_request,
+    ) {
+        let retry_endpoint = match error.endpoint.as_str() {
+            "AmazonQ" => Some(crosslane_kiro::endpoint::EndpointKey::Amazonq),
+            "CodeWhisperer" => Some(crosslane_kiro::endpoint::EndpointKey::Codewhisperer),
+            "KiroRuntime" => Some(crosslane_kiro::endpoint::EndpointKey::Runtime),
+            _ => None,
+        };
+        if let Some((deadline, retry_endpoint)) = budget
+            .claim(error, state.config.current().upstream.max_retries)
+            .zip(retry_endpoint)
+        {
+            let frozen_model = frozen
+                .payload
+                .conversation_state
+                .current_message
+                .user_input_message
+                .model_id
+                .clone();
+            let frozen_profile_available = retry_endpoint
+                != crosslane_kiro::endpoint::EndpointKey::Runtime
+                || frozen.account.credentials.auth_method
+                    == crosslane_core::account::AuthMethod::ApiKey
+                || frozen
+                    .payload
+                    .profile_arn
+                    .as_deref()
+                    .is_some_and(|profile| !profile.trim().is_empty());
+            if frozen_profile_available
+                && summary_recovery_permitted(
+                    state,
+                    account_ids,
+                    &frozen.account,
+                    requested_model,
+                    &frozen_model,
+                    &frozen.model_path,
+                    allowed_models,
+                    key_id,
+                    service_id,
+                )
+            {
+                let recovery_pool = state.pool();
+                let recovery_config = state.config.current();
+                let mut recovery_generation_started = false;
+                let recovered = tokio::time::timeout_at(deadline, async {
+                    let original_runtime = recovery_pool.get(&frozen.account.id).await?;
+                    let lease = reacquire_summary_account(
+                        &recovery_pool,
+                        &recovery_config.pool,
+                        &frozen.account.id,
+                        &frozen_model,
+                        estimate,
+                    )
+                    .await?;
+                    let account = lease.account().await;
+                    let current_runtime = state.pool().get(&account.id).await?;
+                    // A token may rotate, but account/profile/transport identity
+                    // changes must not silently rewrite the frozen request.
+                    if !Arc::ptr_eq(&original_runtime, &current_runtime)
+                        || current_runtime.health() != crosslane_pool::AccountHealth::Available
+                        || frozen.upstream_config.is_none()
+                        || frozen.upstream_config
+                            != serde_json::to_value(state.runtime_config_snapshot().upstream).ok()
+                        || account.profile_arn != frozen.account.profile_arn
+                        || account.machine_id != frozen.account.machine_id
+                        || account.credentials.region != frozen.account.credentials.region
+                        || account.credentials.auth_method != frozen.account.credentials.auth_method
+                        || (account.credentials.auth_method
+                            != crosslane_core::account::AuthMethod::ApiKey
+                            && account.credentials.expires_at <= now_secs())
+                        || !summary_recovery_permitted(
+                            state,
+                            account_ids,
+                            &account,
+                            requested_model,
+                            &frozen_model,
+                            &frozen.model_path,
+                            allowed_models,
+                            key_id,
+                            service_id,
+                        )
+                    {
+                        return None;
+                    }
+                    recovery_generation_started = true;
+                    budget.record_generation();
+                    super::super::super::crs::log_generation_request(
+                        &frozen.payload,
+                        trace_id,
+                        attempt_logs.len() as u32 + 1,
+                        "client_summary_recovery",
+                    );
+                    let response = state
+                        .generate_at_endpoint_isolated_with_client(
+                            &frozen.client,
+                            &account,
+                            &frozen.payload,
+                            retry_endpoint,
+                        )
+                        .await;
+                    Some((lease, account, response))
+                })
+                .await;
+                match recovered {
+                    Ok(Some((lease, account, Ok(response)))) => {
+                        recovery_pool.record_success(&account.id).await;
+                        tracing::info!(
+                            event = "proxy.compaction.client_summary_recovered",
+                            trace_id,
+                            model = %frozen_model,
+                            endpoint = %response.endpoint.name,
+                            "client summary accepted after one bounded same-request recovery"
+                        );
+                        return Ok(DispatchOutcome::Generated(Box::new(UpstreamExecution {
+                            lease,
+                            response,
+                            upstream_access_token: account.credentials.access_token,
+                            mapped_model: frozen.mapped_model,
+                            kiro_model: frozen_model,
+                            model_path: frozen.model_path,
+                            model_mapping_rule: frozen.model_mapping_rule,
+                            attempts: attempt_logs,
+                            payload: frozen.payload,
+                        })));
+                    }
+                    Ok(Some((lease, _, Err(error))))
+                        if error.endpoint == "isolated-endpoint-policy" =>
+                    {
+                        // A local endpoint/profile guard sent no POST. Keep
+                        // the original supplier error and account health.
+                        drop(lease);
+                        tracing::info!(
+                            event = "proxy.compaction.client_summary_recovery_stopped",
+                            trace_id,
+                            local_endpoint_policy = true,
+                            "client summary recovery was inapplicable to the frozen endpoint"
+                        );
+                    }
+                    Ok(Some((lease, account, Err(error)))) => {
+                        attempt_logs.push(upstream_attempt_log(
+                            attempt_logs.len() as u32 + 1,
+                            &account,
+                            &frozen_model,
+                            &error,
+                        ));
+                        if error.is_auth() {
+                            let latest = lease.account().await;
+                            let present = |value: &Option<String>| {
+                                value
+                                    .as_deref()
+                                    .is_some_and(|value| !value.trim().is_empty())
+                            };
+                            let refreshable = match latest.credentials.auth_method {
+                                crosslane_core::account::AuthMethod::Idc => {
+                                    present(&latest.credentials.refresh_token)
+                                        && present(&latest.credentials.client_id)
+                                        && present(&latest.credentials.client_secret)
+                                }
+                                crosslane_core::account::AuthMethod::Social => {
+                                    present(&latest.credentials.refresh_token)
+                                }
+                                crosslane_core::account::AuthMethod::ApiKey => false,
+                            };
+                            if refreshable
+                                || latest.credentials.access_token
+                                    != account.credentials.access_token
+                            {
+                                // Leave refresh/verification to the existing
+                                // next-request path. A cancellable refresh here
+                                // could strand the account in Refreshing, and
+                                // this recovery cannot send a third generation.
+                                recovery_pool.record_error(&account.id).await;
+                            } else {
+                                recovery_pool.mark_banned(&account.id).await;
+                                crate::alerts::emit_token_refresh_failure(
+                                    state,
+                                    &account.id,
+                                    account.display_name(),
+                                    "上游认证失败且没有可用刷新凭据",
+                                );
+                            }
+                        } else if error.is_quota() && !error.is_throttle() {
+                            recovery_pool.record_quota_error(&account.id).await;
+                            if recovery_pool.get(&account.id).await.is_some_and(|runtime| {
+                                runtime.health() == crosslane_pool::AccountHealth::Exhausted
+                            }) {
+                                if let Err(error) = crate::tasks::persist_pool_accounts(state).await
+                                {
+                                    tracing::error!(trace_id, %error,
+                                        "failed to persist exhausted account state");
+                                }
+                                crate::alerts::sync_account_quota(state, &account.id).await;
+                                crate::alerts::sync_service_quota(state).await;
+                            }
+                        } else if !error.is_request_rejection()
+                            && !error.is_local_overload()
+                            && !error.is_model_temporarily_unavailable()
+                        {
+                            recovery_pool.record_error(&account.id).await;
+                        }
+                        drop(lease);
+                        mapped_model = frozen.mapped_model;
+                        actual_model = frozen_model;
+                        model_path = frozen.model_path;
+                        model_mapping_rule = frozen.model_mapping_rule;
+                        last_error = Some(error);
+                    }
+                    Ok(None) | Err(_) => {
+                        if recovery_generation_started {
+                            attempt_logs.push(upstream_attempt_log(
+                                attempt_logs.len() as u32 + 1,
+                                &frozen.account,
+                                &frozen_model,
+                                &KiroError {
+                                    status: None,
+                                    endpoint: "client-summary-recovery".into(),
+                                    message: "client summary recovery deadline elapsed before an upstream response was accepted".into(),
+                                },
+                            ));
+                        }
+                        tracing::info!(
+                            event = "proxy.compaction.client_summary_recovery_stopped",
+                            trace_id,
+                            deadline_elapsed = tokio::time::Instant::now() >= deadline,
+                            "client summary recovery unavailable within the original recovery budget"
+                        );
+                    }
+                }
+            }
         }
     }
     let model_resolution_failed = last_error.is_none()

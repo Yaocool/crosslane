@@ -1034,6 +1034,13 @@ async fn handle_claude_route_inner(
     );
     drop(body);
     let request_id = format!("msg_{}", Uuid::new_v4().simple());
+    #[cfg(feature = "crs")]
+    let mut summary_recovery = (client_compaction && config.upstream.max_retries > 0).then(|| {
+        super::super::crs::ClientSummaryRecovery::new(
+            config.upstream.max_retries,
+            config.upstream.stream_read_timeout_ms,
+        )
+    });
     let first_execution = execute_upstream(
         &state,
         &account_ids,
@@ -1055,6 +1062,8 @@ async fn handle_claude_route_inner(
         &payload,
         prepared,
         allow_model_fallback,
+        #[cfg(feature = "crs")]
+        summary_recovery.as_mut(),
     )
     .await;
     let (execution, reservation) = match first_execution {
@@ -1213,6 +1222,8 @@ async fn handle_claude_route_inner(
                 &payload,
                 None,
                 allow_model_fallback,
+                #[cfg(feature = "crs")]
+                summary_recovery.as_mut(),
             )
             .await;
             let execution = match retry_execution {
@@ -1999,6 +2010,8 @@ pub(super) async fn handle_openai_route(
         &payload,
         prepared,
         allow_model_fallback,
+        #[cfg(feature = "crs")]
+        None,
     )
     .await
     .map_err(|error| upstream_error(error, ErrorFormat::OpenAi))?;

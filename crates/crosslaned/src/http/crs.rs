@@ -18,12 +18,16 @@ use futures::StreamExt;
 use serde_json::Value;
 
 mod capability;
+mod client_summary_retry;
 mod empty_tool_retry;
 mod event_diagnostics;
 mod request_diagnostics;
 mod stream;
 mod tools;
 pub(super) use capability::execute_with_effort_recovery;
+pub(super) use client_summary_retry::{
+    reacquire_summary_account, summary_recovery_permitted, ClientSummaryRecovery,
+};
 pub(super) use empty_tool_retry::clarify_tool_execution_boundary;
 pub(super) use event_diagnostics::{collect_events as collect_kiro_events, KiroEventDiagnostics};
 pub(super) use request_diagnostics::log_generation_request;

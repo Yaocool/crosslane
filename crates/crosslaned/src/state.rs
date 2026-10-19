@@ -645,6 +645,12 @@ impl AppState {
         account: &Account,
         payload: &KiroPayload,
     ) -> Result<KiroResponse, KiroError> {
+        let prepared = self.prepare_generation_payload(payload);
+        self.generate_prepared(account, &prepared).await
+    }
+
+    /// Freezes attempt-local model controls without changing the caller's payload.
+    pub(crate) fn prepare_generation_payload(&self, payload: &KiroPayload) -> KiroPayload {
         // Work on an attempt-local copy so routing to another model cannot
         // permanently erase the original request's effort or thinking controls.
         let mut prepared = payload.clone();
@@ -653,8 +659,48 @@ impl AppState {
             intent.requested_model = config.unqualified_model(&intent.requested_model).to_owned();
         }
         self.prepare_model_request(&mut prepared);
-        let result = self.kiro().generate(account, &prepared, None).await;
-        match &result {
+        prepared
+    }
+
+    /// Sends an already prepared payload without rebuilding its model controls.
+    pub(crate) async fn generate_prepared(
+        &self,
+        account: &Account,
+        payload: &KiroPayload,
+    ) -> Result<KiroResponse, KiroError> {
+        self.generate_prepared_with_client(&self.kiro(), account, payload)
+            .await
+    }
+
+    /// Sends a prepared payload through the selected client without rebuilding either.
+    pub(crate) async fn generate_prepared_with_client(
+        &self,
+        client: &KiroClient,
+        account: &Account,
+        payload: &KiroPayload,
+    ) -> Result<KiroResponse, KiroError> {
+        let result = client.generate(account, payload, None).await;
+        self.record_generation_feedback(&result);
+        result
+    }
+
+    #[cfg(feature = "crs")]
+    pub(crate) async fn generate_at_endpoint_isolated_with_client(
+        &self,
+        client: &KiroClient,
+        account: &Account,
+        payload: &KiroPayload,
+        endpoint: crosslane_kiro::endpoint::EndpointKey,
+    ) -> Result<KiroResponse, KiroError> {
+        let result = client
+            .generate_at_endpoint_isolated(account, payload, endpoint)
+            .await;
+        self.record_generation_feedback(&result);
+        result
+    }
+
+    fn record_generation_feedback(&self, result: &Result<KiroResponse, KiroError>) {
+        match result {
             Ok(response) => self
                 .adaptive_feedback
                 .record_success(response.stream_slot_wait_ms()),
@@ -662,7 +708,6 @@ impl AppState {
                 error.is_model_capacity_error() || matches!(error.status, Some(429 | 503)),
             ),
         }
-        result
     }
 
     /// Records an overload delivered inside an already accepted event stream.

@@ -824,6 +824,8 @@ async fn generate_compaction_summary_inner(
             &payload,
             None,
             true,
+            #[cfg(feature = "crs")]
+            None,
         ) => result.map_err(execute_error_message)?,
         _ = cancel.cancelled() => {
             return Err(CompactionSummaryFailure {
