@@ -27,6 +27,9 @@ pub struct DecodedResponse {
     pub redacted_thinking: String,
     pub citations: Vec<KiroCitation>,
     pub tools: BTreeMap<String, ToolBuffer>,
+    /// Cancelled calls remain private accounting evidence, never executable output.
+    #[cfg(feature = "crs")]
+    pub refused_tools: BTreeMap<String, ToolBuffer>,
     pub tool_searches: Vec<ClaudeToolSearchTrace>,
     pub web_searches: Vec<ClaudeWebSearchTrace>,
     /// Non-streaming order for proxy-executed server tools. Text produced
@@ -1195,7 +1198,7 @@ impl DecodedResponse {
                     // A refused round may end after emitting a syntactically
                     // valid but incomplete tool input. Buffered calls have not
                     // run and must never be published or executed as results.
-                    self.tools.clear();
+                    self.refused_tools.append(&mut self.tools);
                 }
                 merge_usage(&mut self.usage, &usage);
                 if self.usage.input_tokens > 0 {

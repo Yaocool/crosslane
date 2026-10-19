@@ -18,10 +18,10 @@ pub async fn fill_missing_usage(
     payload: &KiroPayload,
 ) {
     #[cfg(feature = "crs")]
-    if decoded.refusal_details.is_some() {
-        // A refusal is a native terminal response, not a completed generation
-        // whose missing counters should be inferred from an unfinished call.
-        // Keep reported and previously accumulated usage exactly as received.
+    if decoded.refusal_details.is_some() && !produced_output(decoded) {
+        // Pure refusal metadata does not prove a generation occurred. Partial
+        // generation and reported charges still use the existing fallback;
+        // cancelling a tool must not cancel its accounting evidence.
         return;
     }
     if decoded.usage.input_tokens == 0 {
@@ -45,14 +45,19 @@ pub async fn fill_missing_usage(
     }
     if decoded.usage.output_tokens == 0 && produced_output(decoded) {
         #[cfg(feature = "crs")]
-        if decoded.text.is_empty() && decoded.reasoning.is_empty() && decoded.tools.is_empty() {
+        if decoded.text.is_empty()
+            && decoded.reasoning.is_empty()
+            && decoded.tools.is_empty()
+            && decoded.refused_tools.is_empty()
+        {
             // A reported charge proves billable work, not generated tokens.
             // Preserve that charge without tokenizing an empty projection.
             return;
         }
-        let tools = decoded
-            .tools
-            .values()
+        let tools = decoded.tools.values();
+        #[cfg(feature = "crs")]
+        let tools = tools.chain(decoded.refused_tools.values());
+        let tools = tools
             .map(|tool| {
                 json!({
                     "id":tool.id,
@@ -79,6 +84,10 @@ pub async fn fill_missing_usage(
 }
 
 pub fn produced_output(decoded: &DecodedResponse) -> bool {
+    #[cfg(feature = "crs")]
+    if !decoded.refused_tools.is_empty() {
+        return true;
+    }
     !decoded.text.is_empty()
         || !decoded.reasoning.is_empty()
         || !decoded.tools.is_empty()

@@ -864,3 +864,55 @@ async fn native_refusal_preserves_prior_round_charges_without_estimated_refusal_
         daemon.stop().await;
     }
 }
+
+#[tokio::test]
+async fn native_refusal_retains_unmetered_partial_usage_without_publishing_calls() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    for (stream, reasoning_only) in [(false, false), (true, false), (false, true), (true, true)] {
+        let mock = MockServer::start().await;
+        let mut body = if reasoning_only {
+            event_stream_frame(
+                "reasoningContentEvent",
+                json!({
+                    "reasoningContentEvent":{"text":"Observed generation ".repeat(500)}
+                }),
+            )
+        } else {
+            event_stream_frame(
+                "toolUseEvent",
+                json!({
+                    "name":READER,"toolUseId":"cancelled-unmetered",
+                    "input":format!("{{\"path\":\"/partial{}", " long argument".repeat(500))
+                }),
+            )
+        };
+        body.extend(refusal());
+        Mock::given(method("POST"))
+            .respond_with(event_response(body))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        let mut models = catalog();
+        models["models"][0]["modelId"] = json!("claude-opus-5");
+        let (daemon, port) = start_daemon_with_catalog(&mock, None, models).await;
+        let mut input = request(stream);
+        input["model"] = json!("claude-opus-5");
+        input["thinking"] = json!({"type":"adaptive","display":"summarized"});
+        let (status, response) = send(&daemon, port, &input).await;
+        assert_native_refusal(status, &response, stream, "reasoning_extraction");
+        assert!(!response.contains("cancelled-unmetered"), "{response}");
+        assert!(!response.contains("/partial"), "{response}");
+        let stats = expect_ok(
+            daemon
+                .call("stats", json!({"detail":true,"recent":10}))
+                .await,
+        );
+        let row = &stats["stats"]["recent_requests"][0];
+        assert!(row["input_tokens"].as_u64().unwrap() > 0, "{row}");
+        assert!(row["output_tokens"].as_u64().unwrap() > 100, "{row}");
+        assert!(row["credits"].as_f64().unwrap() > 0.0, "{row}");
+        assert_eq!(row["diagnostics"]["credits_source"], "estimated", "{row}");
+        assert_eq!(stats["stats"]["total"]["requests"], 1, "{stats}");
+        daemon.stop().await;
+    }
+}
