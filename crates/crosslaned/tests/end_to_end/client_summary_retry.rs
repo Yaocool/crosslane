@@ -180,13 +180,11 @@ async fn client_summary_generic_500_recovery_preserves_exact_payload_and_single_
                 .and(path("/generateAssistantResponse"))
                 .respond_with(move |_: &wiremock::Request| {
                     if observed.fetch_add(1, Ordering::SeqCst) == 0 {
-                        if tools_disabled {
-                            ResponseTemplate::new(500).set_body_string(GENERIC_ERROR)
-                        } else {
-                            ResponseTemplate::new(500).set_body_json(json!({
-                                "type":"InternalServerException", "message":GENERIC_ERROR
-                            }))
-                        }
+                        // Exact envelope observed on the real auto-summary
+                        // failure; null carries no specialized failure reason.
+                        ResponseTemplate::new(500).set_body_json(json!({
+                            "message":GENERIC_ERROR, "reason":null
+                        }))
                     } else {
                         successful_summary()
                     }

@@ -81,11 +81,12 @@ fn is_generic_summary_failure(error: &KiroError) -> bool {
     };
     // Unknown/specialized reasons, including policy declines, must keep their
     // existing handling even if their message happens to use generic wording.
-    body.keys().all(|key| {
+    // AmazonQ also emits reason:null when there is no specialized reason.
+    body.iter().all(|(key, value)| {
         matches!(
             key.as_str(),
             "message" | "Message" | "__type" | "_type" | "type"
-        )
+        ) || (key == "reason" && value.is_null())
     }) && ["message", "Message"]
         .iter()
         .filter_map(|field| body.get(*field))
@@ -205,12 +206,40 @@ pub(in crate::http) fn summary_recovery_permitted(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     fn generic() -> KiroError {
         KiroError {
             status: Some(500),
             endpoint: "AmazonQ".into(),
             message: serde_json::json!({"message": GENERIC_FAILURE}).to_string(),
+        }
+    }
+
+    #[test]
+    fn live_generic_failure_with_null_reason_is_eligible() {
+        let mut error = generic();
+        error.message = serde_json::json!({"message":GENERIC_FAILURE,"reason":null}).to_string();
+        assert_eq!(error.message.len(), 106);
+        assert_eq!(
+            format!("{:x}", Sha256::digest(error.message.as_bytes())),
+            "621e325b3c909be32bfa66e3f00235ed0c8985702348b98b1a016dc1ed6e6f30"
+        );
+        assert!(is_generic_summary_failure(&error));
+        for reason in [
+            serde_json::json!(""),
+            serde_json::json!(false),
+            serde_json::json!(0),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ] {
+            error.message =
+                serde_json::json!({"message":GENERIC_FAILURE,"reason":reason}).to_string();
+            assert!(!is_generic_summary_failure(&error));
+        }
+        for field in ["code", "stopReason", "stopDetails", "unknown"] {
+            error.message = serde_json::json!({"message":GENERIC_FAILURE,field:null}).to_string();
+            assert!(!is_generic_summary_failure(&error));
         }
     }
 
