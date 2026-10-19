@@ -244,6 +244,10 @@ pub(super) async fn collect_nonstream_rounds(
         .count() as u32;
     loop {
         let effective_thinking = thinking_enabled && upstream.thinking_enabled();
+        #[cfg(feature = "crs")]
+        let (endpoint_definition, response, upstream_permit, frozen_payload) =
+            upstream.into_parts_with_payload();
+        #[cfg(not(feature = "crs"))]
         let (endpoint_definition, response, upstream_permit) = upstream.into_parts();
         let endpoint = endpoint_definition.name.to_string();
         #[cfg(feature = "crs")]
@@ -398,6 +402,72 @@ pub(super) async fn collect_nonstream_rounds(
         match empty_disposition {
             EmptyToolResultDisposition::Accept => {}
             EmptyToolResultDisposition::Retry => {
+                #[cfg(feature = "crs")]
+                {
+                    let account = lease.account().await;
+                    if let Some(client) = super::super::crs::isolated_empty_retry_client(
+                        state.kiro(),
+                        &account,
+                        &frozen_payload,
+                        endpoint_definition.key,
+                        super::super::crs::EmptyRetryConditions {
+                            claude_protocol: tool_names.is_claude(),
+                            semantic_started: false,
+                            output_tokens: decoded.usage.output_tokens,
+                            already_retried: empty_tool_result_retries > 0,
+                        },
+                    ) {
+                        empty_tool_result_retries += 1;
+                        merge_round_usage(&mut accumulated_usage, &decoded.usage);
+                        let input_tokens = state
+                            .tokenizer
+                            .estimate_kiro_payload(&frozen_payload)
+                            .await
+                            .map(|tokens| tokens as u64)
+                            .unwrap_or(decoded.usage.input_tokens);
+                        decoded = DecodedResponse::default();
+                        reservation
+                            .extend(estimated_credits(
+                                input_tokens,
+                                frozen_payload
+                                    .max_output_tokens()
+                                    .unwrap_or(super::DEFAULT_OUTPUT_TOKEN_ESTIMATE),
+                                &config.pool,
+                            ))
+                            .map_err(ExecuteError::Meter)?;
+                        tracing::warn!(
+                            trace_id,
+                            account_id = %account.id,
+                            previous_endpoint = endpoint,
+                            endpoint = "KiroRuntime",
+                            retry = empty_tool_result_retries,
+                            "retrying empty assistant once through isolated Runtime"
+                        );
+                        super::super::crs::log_generation_request(
+                            &frozen_payload,
+                            trace_id,
+                            u32::from(empty_tool_result_retries),
+                            "empty_assistant_runtime_retry",
+                        );
+                        upstream = state
+                            .generate_runtime_isolated_with_client(
+                                &client,
+                                &account,
+                                &frozen_payload,
+                                endpoint_definition.key,
+                            )
+                            .await
+                            .unwrap_or_else(|| {
+                                Err(KiroError {
+                                    status: None,
+                                    endpoint: "KiroRuntime".into(),
+                                    message: "isolated Runtime retry became unavailable".into(),
+                                })
+                            })
+                            .map_err(ExecuteError::Upstream)?;
+                        continue;
+                    }
+                }
                 empty_tool_result_retries += 1;
                 tracing::warn!(
                     trace_id,

@@ -84,6 +84,10 @@ mod automatic_compaction;
 #[path = "end_to_end/empty_responses.rs"]
 mod empty_responses;
 
+#[cfg(feature = "crs")]
+#[path = "end_to_end/crs_isolated_runtime.rs"]
+mod crs_isolated_runtime;
+
 #[path = "end_to_end/tool_names.rs"]
 mod tool_names;
 

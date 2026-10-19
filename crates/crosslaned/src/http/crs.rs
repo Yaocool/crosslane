@@ -21,6 +21,7 @@ mod capability;
 mod client_summary_retry;
 mod empty_tool_retry;
 mod event_diagnostics;
+mod isolated_empty_retry;
 mod request_diagnostics;
 mod stream;
 mod tools;
@@ -30,6 +31,7 @@ pub(super) use client_summary_retry::{
 };
 pub(super) use empty_tool_retry::clarify_tool_execution_boundary;
 pub(super) use event_diagnostics::{collect_events as collect_kiro_events, KiroEventDiagnostics};
+pub(super) use isolated_empty_retry::{isolated_empty_retry_client, EmptyRetryConditions};
 pub(super) use request_diagnostics::log_generation_request;
 pub(super) use stream::ClaudeStreamState;
 pub(super) use tools::normalize_tool_changes;

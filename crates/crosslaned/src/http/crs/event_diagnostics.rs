@@ -91,7 +91,7 @@ fn stop_reason(value: &str) -> String {
 }
 
 fn refusal_category(value: &str) -> String {
-    classified(value, &["CYBER", "OTHER", "NONE"])
+    classified(value, &["CYBER", "REASONING_EXTRACTION", "OTHER", "NONE"])
 }
 
 fn exception_kind(value: &str) -> String {
@@ -393,6 +393,28 @@ mod tests {
 
     fn diagnostics() -> KiroEventDiagnostics<'static> {
         KiroEventDiagnostics::new("trace_owned", "request_owned", "AmazonQ", true, 1)
+    }
+
+    #[test]
+    fn reasoning_extraction_refusal_keeps_category_but_not_explanation() {
+        let mut diagnostics = diagnostics();
+        diagnostics.observe(&KiroEvent::MessageMetadata {
+            usage: json!({
+                "stopReason": "CONTENT_FILTERED",
+                "stopDetails": {"refusal": {
+                    "category": "REASONING_EXTRACTION",
+                    "explanation": "private provider explanation"
+                }}
+            }),
+        });
+        let snapshot = diagnostics.snapshot(None, "metadata_stop");
+        assert_eq!(
+            snapshot["refusal_categories"]["counts"]["REASONING_EXTRACTION"],
+            1
+        );
+        assert!(!snapshot
+            .to_string()
+            .contains("private provider explanation"));
     }
 
     #[test]

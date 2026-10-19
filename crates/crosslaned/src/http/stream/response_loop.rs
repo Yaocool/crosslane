@@ -73,7 +73,13 @@ pub fn response(
     mut context: StreamContext,
 ) -> Response {
     let mut effective_thinking = upstream.thinking_enabled();
+    #[cfg(feature = "crs")]
+    let (initial_endpoint, initial_response, initial_permit, mut frozen_payload) =
+        upstream.into_parts_with_payload();
+    #[cfg(not(feature = "crs"))]
     let (initial_endpoint, initial_response, initial_permit) = upstream.into_parts();
+    #[cfg(feature = "crs")]
+    let mut endpoint_key = initial_endpoint.key;
     let mut upstream_permit = Some(initial_permit);
     let mut source = Some(initial_response.bytes_stream());
     let mut endpoint = initial_endpoint.name.to_string();
@@ -171,6 +177,10 @@ pub fn response(
         let mut auto_round = 0;
         let mut search_round = 0u32;
         let mut empty_tool_result_retries = 0u8;
+        #[cfg(feature = "crs")]
+        let mut isolated_empty_attempt = false;
+        #[cfg(not(feature = "crs"))]
+        let isolated_empty_attempt = false;
         #[cfg(feature = "crs")]
         let mut diagnostic_round = 0u64;
         let mut tool_search_operations = context.tool_search_operations;
@@ -598,7 +608,8 @@ pub fn response(
                 // This budget includes same-account auth/model retries. Pool
                 // size only bounds candidate switches; it cannot add retries.
                 let retry_limit = config.upstream.max_retries;
-                let may_switch = (!is_quota || config.pool.auto_switch_on_quota_exhausted)
+                let may_switch = !isolated_empty_attempt
+                    && (!is_quota || config.pool.auto_switch_on_quota_exhausted)
                     && !is_request_rejection
                     && failure_details.scope != StreamFailureScope::Proxy
                     && failure_details.error_code != TOOL_NAME_MISMATCH_CODE;
@@ -628,7 +639,17 @@ pub fn response(
                             Ok(retry) => {
                                 upstream_access_token = account.credentials.access_token.clone();
                                 effective_thinking = retry.thinking_enabled();
+                                #[cfg(feature = "crs")]
+                                let (next_endpoint, next_response, next_permit, next_frozen_payload) =
+                                    retry.into_parts_with_payload();
+                                #[cfg(not(feature = "crs"))]
                                 let (next_endpoint, next_response, next_permit) = retry.into_parts();
+                                #[cfg(feature = "crs")]
+                                {
+                                    endpoint_key = next_endpoint.key;
+                                    frozen_payload = next_frozen_payload;
+                                    isolated_empty_attempt = false;
+                                }
                                 endpoint = next_endpoint.name.to_string();
                                 source = Some(next_response.bytes_stream());
                                 upstream_metrics.reset();
@@ -748,8 +769,17 @@ pub fn response(
                                         upstream_access_token =
                                             account.credentials.access_token.clone();
                                         effective_thinking = retry.thinking_enabled();
-                                        let (next_endpoint, next_response, next_permit) =
-                                            retry.into_parts();
+                                        #[cfg(feature = "crs")]
+                                        let (next_endpoint, next_response, next_permit, next_frozen_payload) =
+                                            retry.into_parts_with_payload();
+                                        #[cfg(not(feature = "crs"))]
+                                        let (next_endpoint, next_response, next_permit) = retry.into_parts();
+                                        #[cfg(feature = "crs")]
+                                        {
+                                            endpoint_key = next_endpoint.key;
+                                            frozen_payload = next_frozen_payload;
+                                            isolated_empty_attempt = false;
+                                        }
                                         endpoint = next_endpoint.name.to_string();
                                         source = Some(next_response.bytes_stream());
                                         upstream_metrics.reset();
@@ -789,7 +819,8 @@ pub fn response(
                     classify_stream_failure(active_failure_text, stream_failure.as_ref());
                 let is_quota = failure_details.is_quota_error();
                 let is_request_rejection = failure_details.is_request_rejection();
-                let may_switch = (!is_quota || config.pool.auto_switch_on_quota_exhausted)
+                let may_switch = !isolated_empty_attempt
+                    && (!is_quota || config.pool.auto_switch_on_quota_exhausted)
                     && !is_request_rejection
                     && failure_details.scope != StreamFailureScope::Proxy
                     && failure_details.error_code != TOOL_NAME_MISMATCH_CODE;
@@ -1015,7 +1046,17 @@ pub fn response(
                         Ok(retry) => {
                             upstream_access_token = account.credentials.access_token.clone();
                             effective_thinking = retry.thinking_enabled();
+                            #[cfg(feature = "crs")]
+                            let (next_endpoint, next_response, next_permit, next_frozen_payload) =
+                                retry.into_parts_with_payload();
+                            #[cfg(not(feature = "crs"))]
                             let (next_endpoint, next_response, next_permit) = retry.into_parts();
+                            #[cfg(feature = "crs")]
+                            {
+                                endpoint_key = next_endpoint.key;
+                                frozen_payload = next_frozen_payload;
+                                isolated_empty_attempt = false;
+                            }
                             endpoint = next_endpoint.name.to_string();
                             source = Some(next_response.bytes_stream());
                             upstream_metrics.reset();
@@ -1103,6 +1144,108 @@ pub fn response(
                     }
                 }
                 EmptyToolResultDisposition::Retry => {
+                    #[cfg(feature = "crs")]
+                    {
+                        let account = context.lease.account().await;
+                        if let Some(client) = super::super::crs::isolated_empty_retry_client(
+                            context.state.kiro(),
+                            &account,
+                            &frozen_payload,
+                            endpoint_key,
+                            super::super::crs::EmptyRetryConditions {
+                                claude_protocol: matches!(protocol, StreamProtocol::Claude),
+                                semantic_started: data_started,
+                                output_tokens: decoded.usage.output_tokens,
+                                already_retried: empty_tool_result_retries > 0,
+                            },
+                        ) {
+                            if let Some(checkpoint) = claude_checkpoint.take() {
+                                claude = checkpoint;
+                            }
+                            if let Some(checkpoint) = pending_initial_checkpoint.take() {
+                                pending_initial = checkpoint;
+                            }
+                            empty_tool_result_retries += 1;
+                            accumulate_usage(&mut accumulated_usage, &decoded.usage);
+                            decoded = DecodedResponse::default();
+                            context.input_tokens = context.state.tokenizer
+                                .estimate_kiro_payload(&frozen_payload)
+                                .await
+                                .map(|tokens| tokens as u64)
+                                .unwrap_or(context.input_tokens);
+                            let config = context.state.config.current();
+                            let estimate = super::super::handlers::estimated_credits(
+                                context.input_tokens,
+                                frozen_payload.max_output_tokens().unwrap_or(
+                                    super::super::handlers::DEFAULT_OUTPUT_TOKEN_ESTIMATE,
+                                ),
+                                &config.pool,
+                            );
+                            if let Err(error) = context.reservation.extend(estimate) {
+                                let message = error.to_string();
+                                failed = Some(message.clone());
+                                yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(
+                                    &protocol, &context.request_id, &message,
+                                )));
+                                break 'rounds;
+                            }
+                            tracing::warn!(
+                                trace_id = %context.trace_id,
+                                request_id = %context.request_id,
+                                account_id = %account.id,
+                                previous_endpoint = endpoint,
+                                endpoint = "KiroRuntime",
+                                retry = empty_tool_result_retries,
+                                "retrying empty assistant once through isolated Runtime"
+                            );
+                            super::super::crs::log_generation_request(
+                                &frozen_payload,
+                                &context.trace_id,
+                                u32::from(empty_tool_result_retries),
+                                "empty_assistant_runtime_retry",
+                            );
+                            match context.state.generate_runtime_isolated_with_client(
+                                &client, &account, &frozen_payload, endpoint_key,
+                            ).await.unwrap_or_else(|| Err(crosslane_kiro::KiroError {
+                                status: None,
+                                endpoint: "KiroRuntime".into(),
+                                message: "isolated Runtime retry became unavailable".into(),
+                            })) {
+                                Ok(next) => {
+                                    upstream_access_token = account.credentials.access_token.clone();
+                                    effective_thinking = next.thinking_enabled();
+                                    let (next_endpoint, next_response, next_permit, next_frozen_payload) =
+                                        next.into_parts_with_payload();
+                                    endpoint_key = next_endpoint.key;
+                                    endpoint = next_endpoint.name.to_string();
+                                    frozen_payload = next_frozen_payload;
+                                    source = Some(next_response.bytes_stream());
+                                    upstream_metrics.reset();
+                                    stream_failure = None;
+                                    upstream_permit = Some(next_permit);
+                                    buffer.clear();
+                                    decoder = EventStreamDecoder;
+                                    stop_filter = StopSequenceFilter::new(&context.stop_sequences);
+                                    isolated_empty_attempt = true;
+                                    continue 'rounds;
+                                }
+                                Err(error) => {
+                                    let message = error.to_string();
+                                    stream_failure = None;
+                                    record_account_scoped_stream_failure(
+                                        &context.state, &context.trace_id, &context.request_id,
+                                        &context.user_agent, &account.id,
+                                        classify_stream_failure(&message, None),
+                                    ).await;
+                                    failed = Some(message.clone());
+                                    yield Ok::<Bytes, Infallible>(Bytes::from(classified_stream_error(
+                                        &protocol, &message, &context.request_id, None,
+                                    )));
+                                    break 'rounds;
+                                }
+                            }
+                        }
+                    }
                     if let Some(checkpoint) = claude_checkpoint.take() {
                         claude = checkpoint;
                     }
@@ -1185,7 +1328,17 @@ pub fn response(
                         Ok(next) => {
                             upstream_access_token = account.credentials.access_token.clone();
                             effective_thinking = next.thinking_enabled();
+                            #[cfg(feature = "crs")]
+                            let (next_endpoint, next_response, next_permit, next_frozen_payload) =
+                                next.into_parts_with_payload();
+                            #[cfg(not(feature = "crs"))]
                             let (next_endpoint, next_response, next_permit) = next.into_parts();
+                            #[cfg(feature = "crs")]
+                            {
+                                endpoint_key = next_endpoint.key;
+                                frozen_payload = next_frozen_payload;
+                                isolated_empty_attempt = false;
+                            }
                             endpoint = next_endpoint.name.to_string();
                             source = Some(next_response.bytes_stream());
                             upstream_metrics.reset();
@@ -1728,7 +1881,17 @@ pub fn response(
                     Ok(next) => {
                         upstream_access_token = account.credentials.access_token.clone();
                         effective_thinking = next.thinking_enabled();
+                        #[cfg(feature = "crs")]
+                        let (next_endpoint, next_response, next_permit, next_frozen_payload) =
+                            next.into_parts_with_payload();
+                        #[cfg(not(feature = "crs"))]
                         let (next_endpoint, next_response, next_permit) = next.into_parts();
+                        #[cfg(feature = "crs")]
+                        {
+                            endpoint_key = next_endpoint.key;
+                            frozen_payload = next_frozen_payload;
+                            isolated_empty_attempt = false;
+                        }
                         endpoint = next_endpoint.name.to_string();
                         source = Some(next_response.bytes_stream());
                         upstream_metrics.reset();
@@ -1938,7 +2101,17 @@ pub fn response(
                     Ok(next) => {
                         upstream_access_token = account.credentials.access_token.clone();
                         effective_thinking = next.thinking_enabled();
+                        #[cfg(feature = "crs")]
+                        let (next_endpoint, next_response, next_permit, next_frozen_payload) =
+                            next.into_parts_with_payload();
+                        #[cfg(not(feature = "crs"))]
                         let (next_endpoint, next_response, next_permit) = next.into_parts();
+                        #[cfg(feature = "crs")]
+                        {
+                            endpoint_key = next_endpoint.key;
+                            frozen_payload = next_frozen_payload;
+                            isolated_empty_attempt = false;
+                        }
                         endpoint = next_endpoint.name.to_string();
                         source = Some(next_response.bytes_stream());
                         upstream_metrics.reset();
@@ -2049,7 +2222,17 @@ pub fn response(
                 Ok(next) => {
                     upstream_access_token = account.credentials.access_token.clone();
                     effective_thinking = next.thinking_enabled();
+                    #[cfg(feature = "crs")]
+                    let (next_endpoint, next_response, next_permit, next_frozen_payload) =
+                        next.into_parts_with_payload();
+                    #[cfg(not(feature = "crs"))]
                     let (next_endpoint, next_response, next_permit) = next.into_parts();
+                    #[cfg(feature = "crs")]
+                    {
+                        endpoint_key = next_endpoint.key;
+                        frozen_payload = next_frozen_payload;
+                        isolated_empty_attempt = false;
+                    }
                     endpoint = next_endpoint.name.to_string();
                     source = Some(next_response.bytes_stream());
                     upstream_metrics.reset();

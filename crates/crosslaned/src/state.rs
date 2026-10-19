@@ -699,6 +699,23 @@ impl AppState {
         result
     }
 
+    #[cfg(feature = "crs")]
+    pub(crate) async fn generate_runtime_isolated_with_client(
+        &self,
+        client: &KiroClient,
+        account: &Account,
+        payload: &KiroPayload,
+        previous_endpoint: crosslane_kiro::endpoint::EndpointKey,
+    ) -> Option<Result<KiroResponse, KiroError>> {
+        let result = client
+            .generate_runtime_isolated(account, payload, previous_endpoint)
+            .await;
+        if let Some(result) = &result {
+            self.record_generation_feedback(result);
+        }
+        result
+    }
+
     fn record_generation_feedback(&self, result: &Result<KiroResponse, KiroError>) {
         match result {
             Ok(response) => self
