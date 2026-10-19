@@ -18,9 +18,11 @@ use futures::StreamExt;
 use serde_json::Value;
 
 mod capability;
+mod empty_tool_retry;
 mod stream;
 mod tools;
 pub(super) use capability::execute_with_effort_recovery;
+pub(super) use empty_tool_retry::clarify_tool_execution_boundary;
 pub(super) use stream::ClaudeStreamState;
 pub(super) use tools::normalize_tool_changes;
 

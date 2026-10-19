@@ -380,6 +380,10 @@ pub(super) async fn collect_nonstream_rounds(
                     accumulated_usage.output_tokens,
                 );
                 debug_assert!(budget_available);
+                #[cfg(feature = "crs")]
+                if tool_names.is_claude() {
+                    super::super::crs::clarify_tool_execution_boundary(&mut payload);
+                }
                 let next_input_tokens = validate_internal_continuation(
                     state,
                     &mut payload,

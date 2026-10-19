@@ -23,6 +23,225 @@ async fn send_tool_lifecycle_request(
 }
 
 #[cfg(feature = "crs")]
+#[derive(Clone, Copy)]
+enum EmptyReaderReply {
+    Recover,
+    Immediate,
+    AlwaysEmpty,
+}
+
+#[cfg(feature = "crs")]
+async fn exercise_empty_reader_retry(stream: bool, checkpoint: bool, reply: EmptyReaderReply) {
+    const READER: &str = "mcp__fixture_gateway__workspace_files__read_source_file_with_long_name";
+    const DESCRIPTION: &str = "Read the original file, retaining 中文😀 and line boundaries.";
+    const HINT: &str = " This is a client-executed custom function. Return a structured tool call with the requested arguments; the client will perform the operation.";
+    const CURRENT_TEXT: &str =
+        "Read /tmp/报告😀.txt with offset 7 and limit 12; keep the original path.";
+    let schema = json!({"type":"object","additionalProperties":false,"properties":{
+        "file_path":{"type":"string","description":"Original path 中文😀"},
+        "offset":{"type":"integer"},"limit":{"type":"integer"}
+    },"required":["file_path","offset","limit"]});
+    let arguments = json!({"file_path":"/tmp/报告😀.txt","offset":7,"limit":12});
+    let definition = json!({"name":READER,"description":DESCRIPTION,"input_schema":schema});
+    let mut body = json!({"model":"source-large","max_tokens":128,"stream":stream,
+    "tools":[definition.clone()],"messages":[
+        {"role":"user","content":"Retain this prior source history 中文😀."},
+        {"role":"assistant","content":[{"type":"tool_use","id":"past-reader-call","name":READER,"input":{"file_path":"/tmp/历史😀.txt","offset":1,"limit":2}}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"past-reader-call","content":"Original historical result 中文😀"},{"type":"text","text":CURRENT_TEXT}]}
+    ]});
+    if checkpoint {
+        body["tools"] = json!([{"name":"retired_reader","input_schema":{"type":"object"}}]);
+        body["messages"].as_array_mut().unwrap().insert(0, json!({"role":"assistant","content":[
+            {"type":"compaction","content":"Retained reader checkpoint 中文😀","signature":"opaque-checkpoint","tool_changes":[
+                {"type":"tool_removal","tool":{"type":"tool_reference","name":"retired_reader"}},
+                {"type":"tool_addition","tool":{"type":"tool_definition","definition":{"name":"checkpoint_reader","description":"Intermediate checkpoint reader","input_schema":{"type":"object"}}}}
+            ]}
+        ]}));
+        body["messages"][1]["content"] = json!([
+            {"type":"tool_removal","tool":{"type":"tool_reference","name":"checkpoint_reader"}},
+            {"type":"tool_addition","tool":{"type":"tool_definition","definition":definition}},
+            {"type":"text","text":"Retain this prior source history 中文😀."}
+        ]);
+    }
+    let upstream = MockServer::start().await;
+    mount_context_alignment_models(&upstream).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&calls);
+    let first_payload = Arc::new(std::sync::Mutex::new(None::<Value>));
+    let recorded = Arc::clone(&first_payload);
+    let expected_schema = schema.clone();
+    let expected_arguments = arguments.clone();
+    let alias = crosslane_translate::tool_name(READER);
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(move |request: &wiremock::Request| {
+            let attempt = observed.fetch_add(1, Ordering::SeqCst);
+            assert!(attempt < 2, "empty recovery must not make a third attempt");
+            let payload: Value = serde_json::from_slice(&request.body).unwrap();
+            let tools = payload.pointer("/conversationState/currentMessage/userInputMessage/userInputMessageContext/tools")
+                .and_then(Value::as_array).unwrap();
+            let specifications = tools.iter().filter_map(|tool| tool.get("toolSpecification")).collect::<Vec<_>>();
+            assert_eq!(specifications.len(), 1, "only the current reader may remain: {payload}");
+            let specification = specifications[0];
+            assert_eq!(specification["name"], alias);
+            assert_eq!(specification["inputSchema"]["json"], expected_schema);
+            assert_eq!(specification["description"], if attempt == 0 { DESCRIPTION.to_owned() } else { format!("{DESCRIPTION}{HINT}") });
+            assert_eq!(payload["inferenceConfig"]["maxTokens"], 128);
+            assert!(payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+                .as_str().unwrap().contains(CURRENT_TEXT));
+            let serialized = payload.to_string();
+            assert!(serialized.contains("past-reader-call"), "history ID changed: {payload}");
+            assert!(serialized.contains("/tmp/历史😀.txt"), "history arguments changed: {payload}");
+            assert!(serialized.contains("Original historical result 中文😀"), "history result changed: {payload}");
+            if checkpoint {
+                assert!(serialized.contains("Retained reader checkpoint 中文😀"));
+                assert!(!serialized.contains("Intermediate checkpoint reader"));
+                assert!(!serialized.contains("retired_reader"));
+            }
+            let mut first = recorded.lock().unwrap();
+            if attempt == 0 {
+                *first = Some(payload.clone());
+            } else {
+                let mut expected = first.as_ref().unwrap().clone();
+                let tools = expected.pointer_mut("/conversationState/currentMessage/userInputMessage/userInputMessageContext/tools")
+                    .and_then(Value::as_array_mut).unwrap();
+                for tool in tools {
+                    if let Some(specification) = tool.get_mut("toolSpecification") {
+                        specification["description"] = json!(format!("{DESCRIPTION}{HINT}"));
+                    }
+                }
+                assert_eq!(payload, expected, "retry changed more than current tool descriptions");
+            }
+            let output = if matches!(reply, EmptyReaderReply::Immediate)
+                || (matches!(reply, EmptyReaderReply::Recover) && attempt == 1)
+            {
+                let input = expected_arguments.to_string();
+                let mut output = event_stream_frame("toolUseEvent", json!({
+                    "toolUseId":"toolu_reader_unicode","name":alias,"input":"{","stop":false
+                }));
+                output.extend(event_stream_frame("toolUseEvent", json!({
+                    "toolUseId":"toolu_reader_unicode","input":&input[1..],"stop":true
+                })));
+                output.extend(event_stream_frame("messageMetadataEvent", json!({
+                    "usage":{"inputTokens":100,"outputTokens":11,"creditsConsumed":0.02}
+                })));
+                output
+            } else {
+                // Observed Kiro transport success without an assistant frame.
+                event_stream_frame("contextUsageEvent", json!({"contextUsagePercentage":0.7}))
+            };
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/vnd.amazon.eventstream")
+                .set_body_bytes(output)
+        })
+        .mount(&upstream)
+        .await;
+    let port = unused_tcp_port();
+    let daemon = Daemon::start_http(
+        port,
+        &format!("{}/generateAssistantResponse", upstream.uri()),
+    )
+    .await;
+    import_context_alignment_account(&daemon, 0.0).await;
+    model_policy::configure(&daemon, |config| {
+        config.upstream.max_retries = 0;
+        config.features.auto_continue_rounds = 0;
+        config.features.enable_model_fallback = false;
+    })
+    .await;
+    let (status, text) = send_tool_lifecycle_request(&daemon, port, "messages", &body).await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        if matches!(reply, EmptyReaderReply::Immediate) {
+            1
+        } else {
+            2
+        },
+        "stream={stream} checkpoint={checkpoint}: {text}"
+    );
+    if matches!(reply, EmptyReaderReply::AlwaysEmpty) {
+        assert_eq!(status, if stream { 200 } else { 502 }, "{text}");
+        assert!(
+            text.contains("no assistant output") || text.contains("upstream_unavailable"),
+            "{text}"
+        );
+        assert!(!text.contains("\"type\":\"message_stop\""), "{text}");
+        assert!(!text.contains("\"type\":\"tool_use\""), "{text}");
+    } else {
+        assert_eq!(status, 200, "{text}");
+        let returned_arguments = if stream {
+            let events = text
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+                .collect::<Vec<_>>();
+            let calls = events
+                .iter()
+                .filter_map(|event| event.get("content_block"))
+                .filter(|block| block["type"] == "tool_use")
+                .collect::<Vec<_>>();
+            assert_eq!(calls.len(), 1, "{text}");
+            assert_eq!(calls[0]["name"], READER, "{text}");
+            assert_eq!(calls[0]["id"], "toolu_reader_unicode", "{text}");
+            assert!(
+                events.iter().any(|event| event["type"] == "message_stop"),
+                "{text}"
+            );
+            let input = events
+                .iter()
+                .filter_map(|event| event.pointer("/delta/partial_json").and_then(Value::as_str))
+                .collect::<String>();
+            serde_json::from_str::<Value>(&input).unwrap()
+        } else {
+            let message: Value = serde_json::from_str(&text).unwrap();
+            let calls = message["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|block| block["type"] == "tool_use")
+                .collect::<Vec<_>>();
+            assert_eq!(calls.len(), 1, "{text}");
+            assert_eq!(calls[0]["name"], READER, "{text}");
+            assert_eq!(calls[0]["id"], "toolu_reader_unicode", "{text}");
+            assert_eq!(message["stop_reason"], "tool_use", "{text}");
+            calls[0]["input"].clone()
+        };
+        assert_eq!(returned_arguments, arguments, "{text}");
+        assert!(!text.contains("\"type\":\"error\""), "{text}");
+    }
+    daemon.stop().await;
+}
+
+#[cfg(feature = "crs")]
+#[tokio::test]
+async fn empty_tool_reply_recovery_preserves_reader_and_checkpoint_contracts() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    for stream in [false, true] {
+        for checkpoint in [false, true] {
+            exercise_empty_reader_retry(stream, checkpoint, EmptyReaderReply::Recover).await;
+        }
+    }
+}
+
+#[cfg(feature = "crs")]
+#[tokio::test]
+async fn successful_tool_reply_keeps_original_description_without_retry() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    for stream in [false, true] {
+        exercise_empty_reader_retry(stream, false, EmptyReaderReply::Immediate).await;
+    }
+}
+
+#[cfg(feature = "crs")]
+#[tokio::test]
+async fn repeated_empty_tool_replies_stop_after_one_clarified_retry() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    for stream in [false, true] {
+        exercise_empty_reader_retry(stream, false, EmptyReaderReply::AlwaysEmpty).await;
+    }
+}
+
+#[cfg(feature = "crs")]
 #[tokio::test]
 async fn none_history_survives_global_tool_switches_without_activating_inert_catalogs() {
     let _guard = HTTP_TEST_LOCK.lock().await;

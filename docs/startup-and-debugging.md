@@ -537,7 +537,13 @@ clients that discard compaction blocks.
 An ordinary Kiro response with no assistant output is retried once, then returned
 as an explicit error if still empty. Valid text, tool calls, reasoning and terminal
 semantics remain supported. Streaming retries do not replay visible output or
-publish duplicate compaction boundaries. With `features.buffer_tool_calls=false`,
+publish duplicate compaction boundaries. With `crs`, this empty-response retry on
+the Claude interface appends a tool-description clarification: return a structured
+call for the client or proxy to execute. The first attempt, names, schemas,
+arguments and conversation text stay unchanged. Descriptions that would exceed
+1,024 UTF-8 bytes retain their original text without truncation. The updated
+continuation still passes context and output-budget validation; the retry count
+does not increase. With `features.buffer_tool_calls=false`,
 ordinary tool argument fragments still stream immediately; an error after visible
 output ends that stream without replaying the upstream call.
 Nonstreaming rounds release the completed upstream connection slot before

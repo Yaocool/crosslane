@@ -24,6 +24,11 @@ pub(super) struct ClientToolNames {
 }
 
 impl ClientToolNames {
+    #[cfg(feature = "crs")]
+    pub fn is_claude(&self) -> bool {
+        self.restore_original
+    }
+
     pub fn claude(names: &HashMap<String, String>) -> Self {
         Self::new(names.clone(), true)
     }

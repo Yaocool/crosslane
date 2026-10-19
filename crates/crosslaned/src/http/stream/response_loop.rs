@@ -1101,6 +1101,10 @@ pub fn response(
                             accumulated_usage.output_tokens,
                         );
                     debug_assert!(budget_available);
+                    #[cfg(feature = "crs")]
+                    if matches!(protocol, StreamProtocol::Claude) {
+                        super::super::crs::clarify_tool_execution_boundary(&mut payload);
+                    }
                     match super::super::handlers::validate_internal_continuation(
                         &context.state,
                         &mut payload,
