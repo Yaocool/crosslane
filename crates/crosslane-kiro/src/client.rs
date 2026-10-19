@@ -697,6 +697,20 @@ impl KiroClient {
         payload: &KiroPayload,
         explicit: Option<EndpointKey>,
     ) -> Result<KiroResponse, KiroError> {
+        #[cfg(feature = "crs")]
+        if explicit.is_none()
+            && payload.requires_native_tool_termination()
+            && self.runtime_isolated_retry_eligible(account, payload, EndpointKey::Amazonq)
+        {
+            // Legacy generation omits refusal metadata and can terminate in
+            // the middle of a tool argument while still returning HTTP 200.
+            // Claude 5 clients need the native terminal reason to cancel that
+            // call and run their own recovery. Select that protocol before
+            // generation; do not learn a preference for unrelated requests.
+            return self
+                .generate_at_endpoint_isolated(account, payload, EndpointKey::Runtime)
+                .await;
+        }
         drop(self.admit_model(payload).await?);
         let explicit = explicit.or(self.upstream.preferred_endpoint.map(EndpointKey::from));
         let order = self

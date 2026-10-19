@@ -262,6 +262,10 @@ pub struct ModelRequestIntent {
     /// This intent cannot be supplied through client JSON or sent to Kiro.
     #[cfg(feature = "crs")]
     pub crs_tool_choice_none: bool,
+    /// Native Messages termination metadata is required for Claude tool turns.
+    /// This is proxy-local protocol intent, not a client-supplied wire field.
+    #[cfg(feature = "crs")]
+    pub crs_native_messages: bool,
 }
 
 impl ModelRequestIntent {
@@ -299,6 +303,36 @@ pub struct KiroPayload {
 }
 
 impl KiroPayload {
+    /// Claude 5 tool turns need a native terminal reason before any buffered
+    /// call is committed. Legacy EOF alone cannot distinguish tool completion
+    /// from a refusal that cut its arguments short.
+    #[cfg(feature = "crs")]
+    pub fn requires_native_tool_termination(&self) -> bool {
+        if !self
+            .model_request_intent
+            .as_ref()
+            .is_some_and(|intent| intent.crs_native_messages)
+        {
+            return false;
+        }
+        let current = &self.conversation_state.current_message.user_input_message;
+        let model = crosslane_core::model_policy::model_key(&current.model_id);
+        let claude_five = ["claude-opus-5", "claude-sonnet-5", "claude-haiku-5"]
+            .iter()
+            .any(|prefix| model == *prefix || model.starts_with(&format!("{prefix}-")));
+        claude_five
+            && current
+                .user_input_message_context
+                .as_ref()
+                .is_some_and(|context| {
+                    !context.tool_results.is_empty()
+                        || context
+                            .tools
+                            .iter()
+                            .any(|tool| tool.specification().is_some())
+                })
+    }
+
     pub fn max_output_tokens(&self) -> Option<u32> {
         self.inference_config
             .as_ref()

@@ -17,6 +17,13 @@ pub async fn fill_missing_usage(
     decoded: &mut DecodedResponse,
     payload: &KiroPayload,
 ) {
+    #[cfg(feature = "crs")]
+    if decoded.refusal_details.is_some() {
+        // A refusal is a native terminal response, not a completed generation
+        // whose missing counters should be inferred from an unfinished call.
+        // Keep reported and previously accumulated usage exactly as received.
+        return;
+    }
     if decoded.usage.input_tokens == 0 {
         match state.tokenizer.estimate_kiro_payload(payload).await {
             Ok(tokens) => decoded.usage.input_tokens = tokens as u64,
@@ -37,6 +44,12 @@ pub async fn fill_missing_usage(
             };
     }
     if decoded.usage.output_tokens == 0 && produced_output(decoded) {
+        #[cfg(feature = "crs")]
+        if decoded.text.is_empty() && decoded.reasoning.is_empty() && decoded.tools.is_empty() {
+            // A reported charge proves billable work, not generated tokens.
+            // Preserve that charge without tokenizing an empty projection.
+            return;
+        }
         let tools = decoded
             .tools
             .values()

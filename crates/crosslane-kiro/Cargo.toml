@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-crs = []
+crs = ["crosslane-translate/crs"]
 
 [dependencies]
 crosslane-core.workspace = true

@@ -537,14 +537,9 @@ async fn none_preserves_historical_pairs_without_publishing_callable_tools() {
             .json(&json!({"model":"resolved-small","max_tokens":128,"stream":streaming,
                 "tool_choice":{"type":"none"},"messages":[{"role":"user","content":"OWNED_CONTENT_FILTERED"}]}))
             .send().await.unwrap();
-        assert_eq!(
-            response.status().as_u16(),
-            if streaming { 200 } else { 400 }
-        );
+        let status = response.status().as_u16();
         let text = response.text().await.unwrap();
-        assert!(text.contains("upstream_content_filtered"), "{text}");
-        assert!(text.contains("\"retryable\":false"), "{text}");
-        assert!(!text.contains("message_stop"), "{text}");
+        super::crs_isolated_runtime::assert_native_refusal(status, &text, streaming, "cyber");
     }
     let generated = upstream
         .received_requests()

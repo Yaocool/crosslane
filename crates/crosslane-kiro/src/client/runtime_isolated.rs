@@ -43,6 +43,73 @@ fn prepared_tool_payload() -> KiroPayload {
 }
 
 #[tokio::test]
+async fn claude_five_tools_use_native_termination_without_changing_other_protocols() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let client = test_client(&server);
+    let account = power_account(AuthMethod::Idc);
+    let mut payload = prepared_tool_payload();
+    payload.model_request_intent = Some(crosslane_translate::ModelRequestIntent {
+        crs_native_messages: true,
+        ..Default::default()
+    });
+    let before = format!("{:?}", client.cache);
+    drop(client.generate(&account, &payload, None).await.unwrap());
+    assert_eq!(format!("{:?}", client.cache), before);
+    payload
+        .model_request_intent
+        .as_mut()
+        .unwrap()
+        .crs_native_messages = false;
+    drop(client.generate(&account, &payload, None).await.unwrap());
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests[0].url.path(), "/runtime");
+    assert_eq!(requests[1].url.path(), "/amazon/generateAssistantResponse");
+    for request in requests {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["inferenceConfig"]["maxTokens"], 128000);
+        assert!(!String::from_utf8_lossy(&request.body).contains("crs_native_messages"));
+    }
+}
+
+#[test]
+fn native_termination_is_scoped_to_claude_five_tool_requests() {
+    let mut payload = prepared_tool_payload();
+    payload.model_request_intent = Some(crosslane_translate::ModelRequestIntent {
+        crs_native_messages: true,
+        ..Default::default()
+    });
+    assert!(payload.requires_native_tool_termination());
+    payload
+        .conversation_state
+        .current_message
+        .user_input_message
+        .model_id = "claude-opus-5.5".into();
+    assert!(payload.requires_native_tool_termination());
+    payload
+        .conversation_state
+        .current_message
+        .user_input_message
+        .model_id = "claude-sonnet-4.6".into();
+    assert!(!payload.requires_native_tool_termination());
+    payload
+        .conversation_state
+        .current_message
+        .user_input_message
+        .model_id = "claude-opus-5".into();
+    payload
+        .conversation_state
+        .current_message
+        .user_input_message
+        .user_input_message_context = None;
+    assert!(!payload.requires_native_tool_termination());
+}
+
+#[tokio::test]
 async fn runtime_isolated_preserves_frozen_controls_history_and_native_wire_contract() {
     for (auth, previous) in [
         (AuthMethod::Idc, EndpointKey::Amazonq),

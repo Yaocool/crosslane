@@ -286,6 +286,8 @@ pub(super) async fn collect_nonstream_rounds(
         let event_count = events.len();
         let mut leak_filter =
             ToolLeakFilter::for_payload(config.features.enable_tool_leak_filter, &payload);
+        #[cfg(feature = "crs")]
+        leak_filter.set_native_claude_refusals(tool_names.is_claude());
         let mut thinking_filter = ThinkingContentFilter::new(effective_thinking)
             .with_omitted_summary(payload.thinking_summary_omitted());
         let mut stop_filter = StopSequenceFilter::new(stop_sequences);
@@ -371,7 +373,7 @@ pub(super) async fn collect_nonstream_rounds(
                 .unwrap_or(0) as u64,
         );
         fill_missing_usage(state, &mut decoded, &payload).await;
-        if decoded.stop_sequence.is_some() {
+        if decoded.stop_sequence.is_some() || decoded.stop_reason.as_deref() == Some("refusal") {
             #[cfg(feature = "crs")]
             event_diagnostics.log_summary(Some(&decoded), "complete");
             accumulated_text.push_str(&decoded.text);

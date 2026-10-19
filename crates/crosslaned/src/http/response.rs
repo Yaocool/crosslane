@@ -41,6 +41,8 @@ pub struct DecodedResponse {
     /// Explicit Claude stop reason for proxy-managed server loops (for example
     /// `pause_turn`). When absent the ordinary tool/max/end inference applies.
     pub stop_reason: Option<String>,
+    #[cfg(feature = "crs")]
+    pub refusal_details: Option<Value>,
     /// Custom Claude stop sequence matched by the proxy response filter.
     pub stop_sequence: Option<String>,
 }
@@ -126,6 +128,14 @@ impl ThinkingContentFilter {
 
     pub fn push(&mut self, event: KiroEvent) -> Vec<KiroEvent> {
         match event {
+            #[cfg(feature = "crs")]
+            KiroEvent::MessageMetadata { usage }
+                if super::crs::native_refusal_details(&usage).is_some() =>
+            {
+                self.pending.clear();
+                self.in_tagged_thinking = false;
+                vec![KiroEvent::MessageMetadata { usage }]
+            }
             KiroEvent::AssistantResponse { content } => {
                 self.pending.push_str(&content);
                 self.drain(false)
@@ -411,6 +421,10 @@ pub struct ToolLeakFilter {
     enabled: bool,
     #[cfg(feature = "crs")]
     tools_disabled: bool,
+    #[cfg(feature = "crs")]
+    native_claude_refusals: bool,
+    #[cfg(feature = "crs")]
+    terminal_refusal: bool,
     known_tools: HashSet<String>,
     tool_schemas: BTreeMap<String, Value>,
     position: MarkdownPosition,
@@ -426,6 +440,10 @@ impl ToolLeakFilter {
             enabled,
             #[cfg(feature = "crs")]
             tools_disabled: false,
+            #[cfg(feature = "crs")]
+            native_claude_refusals: false,
+            #[cfg(feature = "crs")]
+            terminal_refusal: false,
             known_tools: known_tools.into_iter().collect(),
             tool_schemas: BTreeMap::new(),
             position: MarkdownPosition::default(),
@@ -462,7 +480,24 @@ impl ToolLeakFilter {
         filter
     }
 
+    #[cfg(feature = "crs")]
+    pub fn set_native_claude_refusals(&mut self, enabled: bool) {
+        self.native_claude_refusals = enabled;
+    }
+
     pub fn push(&mut self, event: KiroEvent) -> Vec<KiroEvent> {
+        #[cfg(feature = "crs")]
+        if self.terminal_refusal
+            && matches!(
+                event,
+                KiroEvent::AssistantResponse { .. }
+                    | KiroEvent::ToolUse { .. }
+                    | KiroEvent::Reasoning { .. }
+                    | KiroEvent::Citations { .. }
+            )
+        {
+            return Vec::new();
+        }
         #[cfg(feature = "crs")]
         if let KiroEvent::MessageMetadata { usage } = &event {
             let metadata = usage
@@ -470,6 +505,13 @@ impl ToolLeakFilter {
                 .or_else(|| usage.get("messageMetadataEvent"))
                 .unwrap_or(usage);
             if metadata["stopReason"] == "CONTENT_FILTERED" {
+                if self.native_claude_refusals {
+                    self.terminal_refusal = true;
+                    self.pending.clear();
+                    self.recovered.clear();
+                    self.structured.clear();
+                    return vec![event];
+                }
                 return vec![
                     event,
                     KiroEvent::Error {
@@ -517,6 +559,10 @@ impl ToolLeakFilter {
     }
 
     pub fn finish(mut self) -> Vec<KiroEvent> {
+        #[cfg(feature = "crs")]
+        if self.terminal_refusal {
+            return Vec::new();
+        }
         let mut output = Vec::new();
         if !self.pending.is_empty() {
             output.push(KiroEvent::AssistantResponse {
@@ -1079,6 +1125,18 @@ impl DecodedResponse {
     }
 
     pub fn push(&mut self, event: KiroEvent) -> Result<(), String> {
+        #[cfg(feature = "crs")]
+        if self.refusal_details.is_some()
+            && matches!(
+                event,
+                KiroEvent::AssistantResponse { .. }
+                    | KiroEvent::ToolUse { .. }
+                    | KiroEvent::Reasoning { .. }
+                    | KiroEvent::Citations { .. }
+            )
+        {
+            return Ok(());
+        }
         match event {
             KiroEvent::AssistantResponse { content } => {
                 // Shared filters already classified this text. A second
@@ -1130,6 +1188,15 @@ impl DecodedResponse {
                 tool.complete |= stop;
             }
             KiroEvent::MessageMetadata { usage } | KiroEvent::Usage { usage } => {
+                #[cfg(feature = "crs")]
+                if let Some(details) = super::crs::native_refusal_details(&usage) {
+                    self.stop_reason = Some("refusal".into());
+                    self.refusal_details = Some(details);
+                    // A refused round may end after emitting a syntactically
+                    // valid but incomplete tool input. Buffered calls have not
+                    // run and must never be published or executed as results.
+                    self.tools.clear();
+                }
                 merge_usage(&mut self.usage, &usage);
                 if self.usage.input_tokens > 0 {
                     self.upstream_input_tokens = Some(self.usage.input_tokens);
@@ -1320,6 +1387,10 @@ impl DecodedResponse {
                 "cache_read_input_tokens":self.usage.cache_read_tokens
             }
         });
+        #[cfg(feature = "crs")]
+        if let Some(details) = self.refusal_details.as_ref() {
+            response["stop_details"] = details.clone();
+        }
         if !self.web_searches.is_empty() {
             response["usage"]["server_tool_use"] = json!({
                 "web_search_requests":self.web_searches.iter()

@@ -221,6 +221,8 @@ pub fn response(
             || context.web_search_max_rounds > 0
             || !pending_initial.is_empty()
             || !client_has_tools;
+        #[cfg(feature = "crs")]
+        let mut buffer_tool_calls = buffer_tool_calls;
         let mut auto_round = 0;
         let mut search_round = 0u32;
         let mut empty_tool_result_retries = 0u8;
@@ -236,6 +238,15 @@ pub fn response(
             .filter(|search| search.executed)
             .count() as u32;
         'rounds: loop {
+            #[cfg(feature = "crs")]
+            if endpoint_key == crosslane_kiro::endpoint::EndpointKey::Runtime
+                && payload.requires_native_tool_termination()
+            {
+                // Native refusal metadata may follow a tool stop event. A
+                // client must not execute that call before its terminal state
+                // is known, even if ordinary tool delta buffering is disabled.
+                buffer_tool_calls = true;
+            }
             #[cfg(feature = "crs")]
             if downstream_cancel.is_cancelled() {
                 failed = Some(CLIENT_CANCELLED_ERROR.to_owned());
@@ -275,6 +286,8 @@ pub fn response(
                 break 'rounds;
             }
             let mut leak_filter = ToolLeakFilter::for_payload(context.enable_tool_leak_filter, &payload);
+            #[cfg(feature = "crs")]
+            leak_filter.set_native_claude_refusals(matches!(protocol, StreamProtocol::Claude));
             let mut upstream_tool_names = std::collections::HashMap::new();
             let mut thinking_filter = ThinkingContentFilter::new(context.thinking_enabled && effective_thinking)
                 .with_omitted_summary(payload.thinking_summary_omitted());
@@ -1210,6 +1223,14 @@ pub fn response(
             decoded.log_context_usage(&context.trace_id, context.input_tokens);
             fill_missing_usage(&context.state, &mut decoded, &payload).await;
             if stop_filter.matched().is_some() {
+                for data in std::mem::take(&mut guarded_output) {
+                    yield Ok::<Bytes, Infallible>(Bytes::from(data));
+                }
+                break 'rounds;
+            }
+            #[cfg(feature = "crs")]
+            if decoded.stop_reason.as_deref() == Some("refusal") {
+                event_diagnostics.log_summary(Some(&decoded), "refusal");
                 for data in std::mem::take(&mut guarded_output) {
                     yield Ok::<Bytes, Infallible>(Bytes::from(data));
                 }

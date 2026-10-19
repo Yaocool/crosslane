@@ -59,6 +59,25 @@ fn refusal() -> Vec<u8> {
     )
 }
 
+pub(super) fn assert_native_refusal(status: u16, body: &str, stream: bool, category: &str) {
+    assert_eq!(status, 200, "{body}");
+    let terminal = if stream {
+        assert!(body.contains("message_stop"), "{body}");
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|value| value["type"] == "message_delta")
+            .unwrap()["delta"]
+            .clone()
+    } else {
+        serde_json::from_str::<Value>(body).unwrap()
+    };
+    assert_eq!(terminal["stop_reason"], "refusal", "{body}");
+    assert_eq!(terminal["stop_details"]["type"], "refusal", "{body}");
+    assert_eq!(terminal["stop_details"]["category"], category, "{body}");
+    assert!(!body.contains("\"type\":\"error\""), "{body}");
+}
+
 fn event_response(body: Vec<u8>) -> ResponseTemplate {
     ResponseTemplate::new(200)
         .insert_header("content-type", "application/vnd.amazon.eventstream")
@@ -375,10 +394,7 @@ async fn auto_empty_uses_one_isolated_runtime_attempt_in_json_and_sse() {
                     }
                 }
                 RuntimeReply::Refusal => {
-                    assert_eq!(status, if stream { 200 } else { 400 }, "{body}");
-                    assert!(body.contains("upstream_content_filtered"), "{body}");
-                    assert!(body.contains("\"retryable\":false"), "{body}");
-                    assert!(!body.contains("message_stop"), "{body}");
+                    assert_native_refusal(status, &body, stream, "reasoning_extraction");
                 }
                 RuntimeReply::Empty => {
                     assert_eq!(status, if stream { 200 } else { 502 }, "{body}");
@@ -449,7 +465,7 @@ async fn auto_empty_uses_one_isolated_runtime_attempt_in_json_and_sse() {
 }
 
 #[tokio::test]
-async fn model_capacity_fallback_keeps_its_target_for_the_isolated_runtime_retry() {
+async fn model_capacity_fallback_preserves_native_tool_termination() {
     const SOURCE: &str = "claude-opus-5.5";
     const TARGET: &str = "claude-opus-5";
 
@@ -477,26 +493,22 @@ async fn model_capacity_fallback_keeps_its_target_for_the_isolated_runtime_retry
                     requests.push((actual, payload));
                     match attempt {
                         0 => {
-                            assert_eq!(actual, ObservedEndpoint::Amazonq);
+                            assert_eq!(actual, ObservedEndpoint::Runtime);
                             ResponseTemplate::new(500).set_body_json(json!({
                                 "message":"Encountered unexpectedly high load when processing the request, please try again.",
                                 "reason":"MODEL_TEMPORARILY_UNAVAILABLE"
                             }))
                         }
                         1 => {
-                            assert_eq!(actual, ObservedEndpoint::Amazonq);
-                            event_response(context_only())
-                        }
-                        2 => {
                             assert_eq!(actual, ObservedEndpoint::Runtime);
                             runtime_response(reply)
                         }
                         _ => panic!(
-                            "model fallback plus empty recovery made a fourth generation: stream={stream}, reply={reply:?}"
+                            "native tool fallback made an extra generation: stream={stream}, reply={reply:?}"
                         ),
                     }
                 })
-                .expect(3)
+                .expect(2)
                 .mount(&mock)
                 .await;
             // Exactly one lower version in this family makes the configured
@@ -516,7 +528,7 @@ async fn model_capacity_fallback_keeps_its_target_for_the_isolated_runtime_retry
                 let requests = observed.lock().unwrap();
                 assert_eq!(
                     requests.len(),
-                    3,
+                    2,
                     "stream={stream}, reply={reply:?}: {body}"
                 );
                 assert_eq!(
@@ -524,17 +536,13 @@ async fn model_capacity_fallback_keeps_its_target_for_the_isolated_runtime_retry
                         .iter()
                         .map(|(endpoint, _)| *endpoint)
                         .collect::<Vec<_>>(),
-                    [
-                        ObservedEndpoint::Amazonq,
-                        ObservedEndpoint::Amazonq,
-                        ObservedEndpoint::Runtime
-                    ]
+                    [ObservedEndpoint::Runtime, ObservedEndpoint::Runtime]
                 );
-                let (source, fallback, runtime) = (&requests[0].1, &requests[1].1, &requests[2].1);
+                let (source, fallback) = (&requests[0].1, &requests[1].1);
                 assert_eq!(source["profileArn"], PROFILE);
                 for message in source["conversationState"]["history"].as_array().unwrap() {
                     if let Some(user) = message.get("userInputMessage") {
-                        assert_eq!(user["modelId"], SOURCE);
+                        assert!(user.get("modelId").is_none());
                     }
                 }
                 let mut expected_fallback = normalized_transport(source.clone());
@@ -545,22 +553,11 @@ async fn model_capacity_fallback_keeps_its_target_for_the_isolated_runtime_retry
                     normalized_transport(fallback.clone()),
                     "capacity fallback changed the source contract beyond its selected model"
                 );
-                assert_preserved_for_model(fallback, runtime, TARGET);
+                assert_eq!(fallback["inferenceConfig"]["maxTokens"], 128_000);
+                assert_eq!(fallback["profileArn"], PROFILE);
             }
             if reply == RuntimeReply::Refusal {
-                assert_eq!(status, if stream { 200 } else { 400 }, "{body}");
-                let error = if stream {
-                    sse_error_payload(&body)
-                } else {
-                    serde_json::from_str::<Value>(&body).unwrap()
-                };
-                assert_eq!(error["error"]["type"], "invalid_request_error", "{body}");
-                assert_eq!(
-                    error["error"]["code"], "upstream_content_filtered",
-                    "{body}"
-                );
-                assert_eq!(error["error"]["retryable"], false, "{body}");
-                assert!(!body.contains("message_stop"), "{body}");
+                assert_native_refusal(status, &body, stream, "reasoning_extraction");
             } else {
                 assert_eq!(status, 200, "{body}");
                 assert_eq!(text(&body, stream), RUNTIME_TEXT);
@@ -571,7 +568,7 @@ async fn model_capacity_fallback_keeps_its_target_for_the_isolated_runtime_retry
             }
             assert_eq!(
                 observed.lock().unwrap().len(),
-                3,
+                2,
                 "no replay after Runtime result"
             );
             daemon.stop().await;
@@ -768,8 +765,7 @@ async fn visible_sse_output_cannot_be_replayed_to_runtime_after_a_terminal_refus
     }
     let output = String::from_utf8(output).unwrap();
     assert_eq!(text(&output, true), "VISIBLE_BEFORE_TERMINAL_REFUSAL ");
-    assert!(output.contains("upstream_content_filtered"), "{output}");
-    assert!(!output.contains("message_stop"), "{output}");
+    assert_native_refusal(200, &output, true, "reasoning_extraction");
     assert_eq!(generation_calls.load(Ordering::SeqCst), 1);
     assert_eq!(
         profile_calls.load(Ordering::SeqCst),
@@ -778,4 +774,93 @@ async fn visible_sse_output_cannot_be_replayed_to_runtime_after_a_terminal_refus
     );
     daemon.stop().await;
     task.abort();
+}
+
+#[tokio::test]
+async fn runtime_refusal_discards_partial_tool_calls_and_settles_reported_usage_once() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    for (stream, buffered) in [(false, false), (true, true), (true, false)] {
+        let mock = MockServer::start().await;
+        let mut body = event_stream_frame(
+            "toolUseEvent",
+            json!({
+                "name":READER,"toolUseId":"never-execute","input":"{\"path\":\"/partial"
+            }),
+        );
+        body.extend(event_stream_frame("metadataEvent", json!({
+            "stopReason":"CONTENT_FILTERED",
+            "stopDetails":{"refusal":{"category":"REASONING_EXTRACTION","explanation":"Owned refusal."}},
+            "usage":{"inputTokens":31,"outputTokens":7,"creditsConsumed":0.125}
+        })));
+        Mock::given(method("POST"))
+            .respond_with(event_response(body))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        let mut models = catalog();
+        models["models"][0]["modelId"] = json!("claude-opus-5");
+        let (daemon, port) = start_daemon_with_catalog(&mock, None, models).await;
+        model_policy::configure(&daemon, |config| {
+            config.features.buffer_tool_calls = buffered
+        })
+        .await;
+        let mut input = request(stream);
+        input["model"] = json!("claude-opus-5");
+        let (status, response) = send(&daemon, port, &input).await;
+        assert_native_refusal(status, &response, stream, "reasoning_extraction");
+        assert!(!response.contains("never-execute"), "{response}");
+        assert!(!response.contains("/partial"), "{response}");
+        let stats = expect_ok(
+            daemon
+                .call("stats", json!({"detail":true,"recent":10}))
+                .await,
+        );
+        assert_eq!(stats["stats"]["total"]["requests"], 1, "{stats}");
+        assert_eq!(stats["stats"]["total"]["credits"], 0.125, "{stats}");
+        let row = &stats["stats"]["recent_requests"][0];
+        assert_eq!(row["input_tokens"], 31, "{row}");
+        assert_eq!(row["output_tokens"], 7, "{row}");
+        daemon.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn native_refusal_preserves_prior_round_charges_without_estimated_refusal_usage() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    for stream in [false, true] {
+        let mock = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        Mock::given(method("POST"))
+            .respond_with(move |_: &wiremock::Request| {
+                match observed.fetch_add(1, Ordering::SeqCst) {
+                    0 => event_response(event_stream_frame(
+                        "messageMetadataEvent",
+                        json!({"usage":{
+                            "inputTokens":41,"outputTokens":0,"creditsConsumed":0.25
+                        }}),
+                    )),
+                    1 => event_response(refusal()),
+                    _ => panic!("no proxy retry after native refusal"),
+                }
+            })
+            .expect(2)
+            .mount(&mock)
+            .await;
+        let (daemon, port) = start_daemon(&mock, None).await;
+        let (status, body) = send(&daemon, port, &request(stream)).await;
+        assert_native_refusal(status, &body, stream, "reasoning_extraction");
+        let stats = expect_ok(
+            daemon
+                .call("stats", json!({"detail":true,"recent":10}))
+                .await,
+        );
+        let row = &stats["stats"]["recent_requests"][0];
+        assert_eq!(row["input_tokens"], 41, "{row}");
+        assert_eq!(row["output_tokens"], 0, "{row}");
+        assert_eq!(row["credits"], 0.25, "{row}");
+        assert_eq!(stats["stats"]["total"]["requests"], 1, "{stats}");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        daemon.stop().await;
+    }
 }

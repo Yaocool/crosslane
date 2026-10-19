@@ -1051,6 +1051,13 @@ fn stream_finish(
         StreamProtocol::Claude => {
             let mut output = Vec::new();
             claude.ensure_message(&mut output);
+            #[cfg(feature = "crs")]
+            if decoded.refusal_details.is_some() && claude.next_index == 0 {
+                // Keep an empty refusal a complete native Messages stream.
+                // Claude Code handles this terminal reason (including its own
+                // bounded recovery) instead of treating it as a transport error.
+                claude.switch_block(&mut output, "text", json!({"type":"text","text":""}));
+            }
             if let Some((index, _kind)) = claude.block.take() {
                 output.push(sse(&json!({"type":"content_block_stop","index":index})));
             }
@@ -1104,6 +1111,10 @@ fn stream_finish(
                 },
                 "usage":usage
             });
+            #[cfg(feature = "crs")]
+            if let Some(details) = decoded.refusal_details.as_ref() {
+                event["delta"]["stop_details"] = details.clone();
+            }
             let mut applied_edits = claude.context_edit_stats.applied_edits();
             if let Some(original_input_tokens) = claude.auto_compaction_original_input_tokens {
                 applied_edits.push(json!({
