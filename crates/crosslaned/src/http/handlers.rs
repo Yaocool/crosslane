@@ -399,6 +399,8 @@ struct RequestLogContext {
     model_path: Vec<String>,
     model_mapping_rule: Option<String>,
     attempts: Vec<UpstreamAttemptLog>,
+    #[cfg(feature = "crs")]
+    confirmed_usage: Option<crosslane_kiro::UsageInfo>,
 }
 
 struct DispatchFailure {

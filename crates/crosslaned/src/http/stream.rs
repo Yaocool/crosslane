@@ -36,6 +36,8 @@ use super::tool_names::{TOOL_NAME_MISMATCH_CODE, TOOL_NAME_MISMATCH_MESSAGE};
 use super::usage::{fallback_credits, fill_missing_usage, produced_output};
 
 const WEB_SEARCH_REPLAY_FAILURE_MESSAGE: &str = "failed to protect web-search replay data";
+#[cfg(feature = "crs")]
+const CLIENT_CANCELLED_ERROR: &str = "downstream cancelled before transport completion";
 
 #[derive(Clone)]
 pub struct KeepaliveHub {
@@ -1400,6 +1402,10 @@ async fn finish_accounting(
         );
     }
     let status = failure_details.map_or(200, |details| {
+        #[cfg(feature = "crs")]
+        if details.error_code == "client_cancelled" {
+            return 499;
+        }
         if details.scope == StreamFailureScope::Proxy {
             500
         } else {
@@ -1573,6 +1579,15 @@ fn classify_stream_failure(
     message: &str,
     diagnostics: Option<&StreamFailureDiagnostics>,
 ) -> StreamFailureDetails {
+    #[cfg(feature = "crs")]
+    if message == CLIENT_CANCELLED_ERROR {
+        return StreamFailureDetails {
+            upstream_status: None,
+            error_code: "client_cancelled",
+            error_stage: "client_disconnect",
+            scope: StreamFailureScope::Client,
+        };
+    }
     #[cfg(feature = "crs")]
     if message == super::crs::CONTENT_FILTERED_ERROR {
         return StreamFailureDetails {

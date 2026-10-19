@@ -75,6 +75,8 @@ pub(super) fn dispatch_error(
             model_path: model_path.to_vec(),
             model_mapping_rule,
             attempts,
+            #[cfg(feature = "crs")]
+            confirmed_usage: None,
         },
         error,
     }))
@@ -215,6 +217,9 @@ pub(super) async fn collect_nonstream_rounds(
     resumed_server_events: Vec<ClaudeServerEvent>,
     tool_names: &super::super::tool_names::ClientToolNames,
     tool_name_trace: &super::super::tool_names::ToolNameTrace<'_>,
+    #[cfg(feature = "crs")] mut confirmed_usage: Option<
+        &mut super::super::crs::ConfirmedNonstreamUsage,
+    >,
 ) -> Result<(DecodedResponse, String, u64), ExecuteError> {
     let config = state.config.current();
     let max_tool_search_rounds = config.features.tool_search_max_rounds.clamp(1, 8);
@@ -271,6 +276,10 @@ pub(super) async fn collect_nonstream_rounds(
             .collect_events(response)
             .await
             .map_err(ExecuteError::Upstream)?;
+        #[cfg(feature = "crs")]
+        if let Some(usage) = confirmed_usage.as_deref_mut() {
+            usage.observe_completed_round(&events, &endpoint);
+        }
         // The collected body has reached EOF. Free its connection slot before
         // an empty-response retry or server-tool continuation opens another one.
         drop(upstream_permit);
@@ -1467,7 +1476,9 @@ pub(super) async fn nonstream_claude(
         path: &path,
         streaming: false,
     };
-    let (mut decoded, endpoint, current_round_output_tokens) = collect_nonstream_rounds(
+    #[cfg(feature = "crs")]
+    let mut confirmed_usage = super::super::crs::ConfirmedNonstreamUsage::default();
+    let collected = collect_nonstream_rounds(
         &state,
         &trace_id,
         &lease,
@@ -1489,9 +1500,72 @@ pub(super) async fn nonstream_claude(
         resumed_server_events,
         &tool_names,
         &tool_name_trace,
+        #[cfg(feature = "crs")]
+        Some(&mut confirmed_usage),
     )
-    .await
-    .map_err(|error| upstream_error(error, ErrorFormat::Claude))?;
+    .await;
+    let (mut decoded, endpoint, current_round_output_tokens) = match collected {
+        Ok(value) => value,
+        Err(error) => {
+            let error = upstream_error(error, ErrorFormat::Claude);
+            #[cfg(feature = "crs")]
+            let error = {
+                let mut error = error;
+                let endpoint = confirmed_usage.last_endpoint().to_owned();
+                if let Some(usage) = confirmed_usage.into_reported() {
+                    let account = lease.account().await;
+                    let context = &mut error.log_context;
+                    if context.provider_id.is_empty() {
+                        context.provider_id = "kiro".into();
+                    }
+                    if context.account_id.is_empty() {
+                        context.account_id = account.id.clone();
+                        context.account_name = account.display_name().to_owned();
+                    }
+                    if context.endpoint.is_empty() {
+                        context.endpoint = endpoint;
+                    }
+                    if context.mapped_model.is_empty() {
+                        context.mapped_model = mapped_model.clone();
+                        context.kiro_model = kiro_model.clone();
+                        context.model_path = model_path;
+                        context.model_mapping_rule = model_mapping_rule;
+                    }
+                    if context.attempts.is_empty() {
+                        context.attempts = attempts;
+                    }
+                    let reported = DecodedResponse {
+                        usage: usage.clone(),
+                        ..DecodedResponse::default()
+                    };
+                    let mut record = usage_record(
+                        &mapped_model,
+                        &request.model,
+                        &kiro_model,
+                        &path,
+                        &reported,
+                        usage.credits,
+                    );
+                    record.token_usage_source = "server".into();
+                    lease.settle_credits(usage.credits).await;
+                    // Settlement mutates the ledger before persistence. A
+                    // persistence failure must not settle the same usage twice
+                    // or replace the original supplier error.
+                    if let Err(settlement_error) = reservation.settle(record).await {
+                        tracing::error!(
+                            trace_id,
+                            request_id,
+                            error = %settlement_error,
+                            "failed to persist confirmed nonstream error usage"
+                        );
+                    }
+                    error.log_context.confirmed_usage = Some(usage);
+                }
+                error
+            };
+            return Err(error);
+        }
+    };
     if let Some(stats) = &decoded.automatic_compaction {
         input_tokens = stats.compacted_tokens as u64;
         auto_compaction_original_input_tokens.get_or_insert(stats.original_tokens as u64);
@@ -1652,6 +1726,8 @@ pub(super) async fn nonstream_openai(
         Vec::new(),
         &tool_names,
         &tool_name_trace,
+        #[cfg(feature = "crs")]
+        None,
     )
     .await
     .map_err(|error| upstream_error(error, ErrorFormat::OpenAi))?;

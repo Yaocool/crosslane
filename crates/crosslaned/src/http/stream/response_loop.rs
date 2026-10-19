@@ -2,6 +2,8 @@ use super::super::handlers::{
     current_message_has_tool_results, empty_tool_result_disposition, EmptyToolResultDisposition,
 };
 use super::super::tool_names::{ClientToolNames, ToolNameTrace, TOOL_NAME_MISMATCH_CODE};
+#[cfg(feature = "crs")]
+use super::CLIENT_CANCELLED_ERROR;
 use super::{
     accumulate_usage, apply_stream_stop, auto_continue_payload, build_claude_state,
     classified_stream_error, classify_stream_failure, claude_initial_events, client_visible_event,
@@ -95,6 +97,10 @@ pub fn response(
     let bridge_trace_id = context.trace_id.clone();
     let bridge_request_id = context.request_id.clone();
     let bridge_user_agent = context.user_agent.clone();
+    #[cfg(feature = "crs")]
+    let downstream_cancel = tokio_util::sync::CancellationToken::new();
+    #[cfg(feature = "crs")]
+    let bridge_cancel = downstream_cancel.clone();
     tracing::info!(
         event = "proxy.stream.started",
         trace_id = %context.trace_id,
@@ -151,6 +157,47 @@ pub fn response(
         };
         let created = now_secs();
         let mut stream_failure = None::<StreamFailureDiagnostics>;
+        // Cancellation must unwind through the accounting tail. Dropping this
+        // generator would release its reservation without settling seen usage.
+        macro_rules! active_transport {
+            ($rounds:lifetime, $work:expr) => {{
+                #[cfg(feature = "crs")]
+                {
+                    tokio::select! {
+                        biased;
+                        _ = downstream_cancel.cancelled() => {
+                            failed = Some(CLIENT_CANCELLED_ERROR.to_owned());
+                            stream_failure = None;
+                            break $rounds;
+                        }
+                        result = $work => result,
+                    }
+                }
+                #[cfg(not(feature = "crs"))]
+                { $work.await }
+            }};
+        }
+        // Refreshes, summaries and server tools can own internal state or
+        // usage finalizers. Finish work already started before honoring the
+        // disconnect, then prevent every following generation request.
+        macro_rules! settled_work {
+            ($rounds:lifetime, $work:expr) => {{
+                #[cfg(feature = "crs")]
+                if downstream_cancel.is_cancelled() {
+                    failed = Some(CLIENT_CANCELLED_ERROR.to_owned());
+                    stream_failure = None;
+                    break $rounds;
+                }
+                let result = $work.await;
+                #[cfg(feature = "crs")]
+                if downstream_cancel.is_cancelled() {
+                    failed = Some(CLIENT_CANCELLED_ERROR.to_owned());
+                    stream_failure = None;
+                    break $rounds;
+                }
+                result
+            }};
+        }
         let mut upstream_metrics = UpstreamStreamMetrics::new();
         let mut upstream_access_token = context.upstream_access_token.clone();
         let mut pre_data_retries = 0;
@@ -190,6 +237,12 @@ pub fn response(
             .count() as u32;
         'rounds: loop {
             #[cfg(feature = "crs")]
+            if downstream_cancel.is_cancelled() {
+                failed = Some(CLIENT_CANCELLED_ERROR.to_owned());
+                stream_failure = None;
+                break 'rounds;
+            }
+            #[cfg(feature = "crs")]
             let mut event_diagnostics = {
                 diagnostic_round = diagnostic_round.saturating_add(1);
                 super::super::crs::KiroEventDiagnostics::new(
@@ -227,6 +280,19 @@ pub fn response(
                 .with_omitted_summary(payload.thinking_summary_omitted());
             loop {
                 tokio::select! {
+                    _ = async {
+                        #[cfg(feature = "crs")]
+                        downstream_cancel.cancelled().await;
+                        #[cfg(not(feature = "crs"))]
+                        std::future::pending::<()>().await;
+                    } => {
+                        #[cfg(feature = "crs")]
+                        {
+                            failed = Some(CLIENT_CANCELLED_ERROR.to_owned());
+                            stream_failure = None;
+                            break 'rounds;
+                        }
+                    },
                     chunk = source.as_mut().expect("active upstream stream").next() => match chunk {
                         Some(Ok(chunk)) => {
                             upstream_metrics.observe_chunk(chunk.len());
@@ -616,14 +682,14 @@ pub fn response(
                 let mut account_health_handled = false;
                 if !data_started && pre_data_retries < retry_limit && may_switch && is_auth {
                     let mut disable_account = true;
-                    if context
+                    let pool = context.state.pool();
+                    if settled_work!('rounds, context
                         .state
                         .refresh_account_token_after_auth_failure(
-                            &context.state.pool(),
+                            &pool,
                             &failed_account_id,
                             &upstream_access_token,
-                        )
-                        .await
+                        ))
                         .is_ok()
                     {
                         tracing::info!(
@@ -635,7 +701,7 @@ pub fn response(
                         let account = context.lease.account().await;
                         payload.profile_arn.clone_from(&account.profile_arn);
                         pre_data_retries += 1;
-                        match context.state.generate(&account, &payload).await {
+                        match active_transport!('rounds, context.state.generate(&account, &payload)) {
                             Ok(retry) => {
                                 upstream_access_token = account.credentials.access_token.clone();
                                 effective_thinking = retry.thinking_enabled();
@@ -730,9 +796,9 @@ pub fn response(
                             Some(fallback.clone())
                         };
                         if let Some(resolved) = resolved {
-                            let fallback_input_tokens = match super::super::handlers::truncate_context_if_requested(
+                            let fallback_input_tokens = match settled_work!('rounds, super::super::handlers::truncate_context_if_requested(
                             &context.state, &mut payload, context.input_tokens, context.compact, &resolved,
-                        ).await {
+                        )) {
                             Ok(tokens) => tokens,
                             Err(error) => {
                                 failed = Some(error.clone());
@@ -764,7 +830,7 @@ pub fn response(
                                 context.kiro_model.clone_from(&resolved);
                                 super::super::handlers::set_payload_model(&mut payload, &resolved);
                                 pre_data_retries += 1;
-                                match context.state.generate(&account, &payload).await {
+                                match active_transport!('rounds, context.state.generate(&account, &payload)) {
                                     Ok(retry) => {
                                         upstream_access_token =
                                             account.credentials.access_token.clone();
@@ -837,6 +903,25 @@ pub fn response(
                 }
                 attempted_accounts.insert(failed_account_id.clone());
                 if !data_started && pre_data_retries < retry_limit && may_switch {
+                    // Keep the accepted round's attribution until a candidate
+                    // response is accepted. A disconnect during selection or
+                    // backoff still belongs to the previous account/model.
+                    #[cfg(feature = "crs")]
+                    let (mut candidate_mapped_model, mut candidate_kiro_model,
+                        mut candidate_input_tokens, mut candidate_payload) = (
+                        context.mapped_model.clone(), context.kiro_model.clone(),
+                        context.input_tokens, payload.clone(),
+                    );
+                    #[cfg(feature = "crs")]
+                    let (mapped_model, kiro_model, input_tokens, retry_payload) = (
+                        &mut candidate_mapped_model, &mut candidate_kiro_model,
+                        &mut candidate_input_tokens, &mut candidate_payload,
+                    );
+                    #[cfg(not(feature = "crs"))]
+                    let (mapped_model, kiro_model, input_tokens, retry_payload) = (
+                        &mut context.mapped_model, &mut context.kiro_model,
+                        &mut context.input_tokens, &mut payload,
+                    );
                     let (new_lease, account) = loop {
                         let pool = context.state.pool();
                         let candidate_ids = pool
@@ -858,7 +943,7 @@ pub fn response(
                         }
                         let new_lease = match pool
                             .acquire_scoped_excluding(
-                                &context.kiro_model,
+                                kiro_model,
                                 context.estimated_credits,
                                 &context.account_ids,
                                 &attempted_accounts,
@@ -871,7 +956,7 @@ pub fn response(
                                     .state
                                     .pool()
                                     .all_matching_credit_exhausted_scoped(
-                                        &context.kiro_model,
+                                        kiro_model,
                                         &context.account_ids,
                                     )
                                     .await
@@ -894,9 +979,9 @@ pub fn response(
                         let remaining = account.usage.as_ref().and_then(|usage| {
                             crosslane_pool::remaining_credit_percent(usage, &config.pool)
                         });
-                        context.mapped_model = retry_mapped_model(
+                        *mapped_model = retry_mapped_model(
                             context.lock_model_mapping,
-                            &context.mapped_model,
+                            mapped_model,
                             &context.original_model,
                             fallback_model.as_deref(),
                             &config,
@@ -904,38 +989,38 @@ pub fn response(
                             context.api_key_id.as_deref(),
                             remaining,
                         );
-                        context.kiro_model.clone_from(&context.mapped_model);
-                        if let Some(resolved) = runtime.resolve_model(&context.kiro_model).await {
-                            context.kiro_model = resolved;
-                            super::super::handlers::set_payload_model(&mut payload, &context.kiro_model);
+                        kiro_model.clone_from(mapped_model);
+                        if let Some(resolved) = runtime.resolve_model(kiro_model).await {
+                            *kiro_model = resolved;
+                            super::super::handlers::set_payload_model(retry_payload, kiro_model);
                         } else if runtime.has_model_cache().await {
                             if let Some(resolved) = runtime
                                 .resolve_model(&config.features.default_model_id)
                                 .await
                             {
-                                context.kiro_model = resolved;
+                                *kiro_model = resolved;
                                 super::super::handlers::set_payload_model(
-                                    &mut payload,
-                                    &context.kiro_model,
+                                    retry_payload,
+                                    kiro_model,
                                 );
                             } else {
                                 incompatible = true;
                             }
                         } else if let Some(resolved) = super::super::handlers::resolve_static_model(
                             &account,
-                            &context.kiro_model,
+                            kiro_model,
                         ) {
-                            context.kiro_model = resolved;
+                            *kiro_model = resolved;
                             super::super::handlers::set_payload_model(
-                                &mut payload,
-                                &context.kiro_model,
+                                retry_payload,
+                                kiro_model,
                             );
                         }
                         if !incompatible
                             && !super::super::handlers::model_is_allowed(
                                 &context.allowed_models,
                                 "kiro",
-                                &context.kiro_model,
+                                kiro_model,
                             )
                         {
                             incompatible = true;
@@ -944,16 +1029,16 @@ pub fn response(
                                 request_id = %context.request_id,
                                 user_agent = %context.user_agent,
                                 account_id = %account.id,
-                                resolved_model = %context.kiro_model,
+                                resolved_model = %kiro_model,
                                 "skipping stream retry account because its resolved model is outside the API key model scope"
                             );
                         }
                         let retry_input_tokens = if incompatible {
-                            context.input_tokens
+                            *input_tokens
                         } else {
-                            match super::super::handlers::truncate_context_if_requested(
-                                &context.state, &mut payload, context.input_tokens, context.compact, &context.kiro_model,
-                            ).await {
+                            match settled_work!('rounds, super::super::handlers::truncate_context_if_requested(
+                                &context.state, retry_payload, *input_tokens, context.compact, kiro_model,
+                            )) {
                                 Ok(tokens) => tokens,
                                 Err(error) => {
                                     failed = Some(error.clone());
@@ -967,7 +1052,7 @@ pub fn response(
                                 &context.state,
                                 retry_input_tokens,
                                 context.compact,
-                                &context.kiro_model,
+                                kiro_model,
                             )
                             .is_err()
                         {
@@ -977,13 +1062,13 @@ pub fn response(
                                 request_id = %context.request_id,
                                 user_agent = %context.user_agent,
                                 account_id = %account.id,
-                                resolved_model = %context.kiro_model,
-                                input_tokens = context.input_tokens,
+                                resolved_model = %kiro_model,
+                                input_tokens = *input_tokens,
                                 "skipping stream retry account because resolved model context is too small"
                             );
                         }
                         if !incompatible {
-                            context.input_tokens = retry_input_tokens;
+                            *input_tokens = retry_input_tokens;
                         }
                         }
                         if incompatible {
@@ -993,12 +1078,18 @@ pub fn response(
                         }
                         break (new_lease, account);
                     };
-                    context.lease = new_lease;
-                    prompt_cache_plan = context.state.prompt_cache.plan(
-                        &context.lease.account_id(),
+                    let next_input_tokens = *input_tokens;
+                    let next_prompt_cache_plan = context.state.prompt_cache.plan(
+                        &new_lease.account_id(),
                         context.prompt_cache.as_ref(),
                     );
-                    claude = build_claude_state(&context, &prompt_cache_plan);
+                    #[cfg(not(feature = "crs"))]
+                    {
+                        context.lease = new_lease;
+                        prompt_cache_plan = next_prompt_cache_plan.clone();
+                    }
+                    claude = build_claude_state(&context, &next_prompt_cache_plan);
+                    claude.input_tokens = next_input_tokens;
                     pending_initial = if matches!(protocol, StreamProtocol::Claude) {
                         match claude_initial_events(
                             &mut claude,
@@ -1035,15 +1126,24 @@ pub fn response(
                         retry = pre_data_retries + 1,
                         "switching stream to another account"
                     );
-                    payload.profile_arn.clone_from(&account.profile_arn);
+                    retry_payload.profile_arn.clone_from(&account.profile_arn);
                     let exponent = pre_data_retries.min(5);
                     tokio::time::sleep(std::time::Duration::from_millis(
                         200u64.saturating_mul(1u64 << exponent).min(5_000),
                     ))
                     .await;
                     pre_data_retries += 1;
-                    match context.state.generate(&account, &payload).await {
+                    match active_transport!('rounds, context.state.generate(&account, retry_payload)) {
                         Ok(retry) => {
+                            #[cfg(feature = "crs")]
+                            {
+                                context.lease = new_lease;
+                                context.mapped_model = candidate_mapped_model;
+                                context.kiro_model = candidate_kiro_model;
+                                context.input_tokens = candidate_input_tokens;
+                                payload = candidate_payload;
+                                prompt_cache_plan = next_prompt_cache_plan;
+                            }
                             upstream_access_token = account.credentials.access_token.clone();
                             effective_thinking = retry.thinking_enabled();
                             #[cfg(feature = "crs")]
@@ -1204,9 +1304,9 @@ pub fn response(
                                 u32::from(empty_tool_result_retries),
                                 "empty_assistant_runtime_retry",
                             );
-                            match context.state.generate_runtime_isolated_with_client(
+                            match active_transport!('rounds, context.state.generate_runtime_isolated_with_client(
                                 &client, &account, &frozen_payload, endpoint_key,
-                            ).await.unwrap_or_else(|| Err(crosslane_kiro::KiroError {
+                            )).unwrap_or_else(|| Err(crosslane_kiro::KiroError {
                                 status: None,
                                 endpoint: "KiroRuntime".into(),
                                 message: "isolated Runtime retry became unavailable".into(),
@@ -1275,15 +1375,14 @@ pub fn response(
                     if matches!(protocol, StreamProtocol::Claude) {
                         super::super::crs::clarify_tool_execution_boundary(&mut payload);
                     }
-                    match super::super::handlers::validate_internal_continuation(
+                    match settled_work!('rounds, super::super::handlers::validate_internal_continuation(
                         &context.state,
                         &mut payload,
                         context.compact,
                         &endpoint,
                         "empty assistant retry",
                         context.tool_search.is_some(),
-                    )
-                    .await
+                    ))
                     {
                         Ok(tokens) => context.input_tokens = tokens,
                         Err(error) => {
@@ -1324,7 +1423,7 @@ pub fn response(
                         u32::from(empty_tool_result_retries),
                         "empty_assistant_retry",
                     );
-                    match context.state.generate(&account, &payload).await {
+                    match active_transport!('rounds, context.state.generate(&account, &payload)) {
                         Ok(next) => {
                             upstream_access_token = account.credentials.access_token.clone();
                             effective_thinking = next.thinking_enabled();
@@ -1518,12 +1617,11 @@ pub fn response(
                     break 'rounds;
                 }
                 let previous_search_count = accumulated_searches.len();
-                let mut budget = match super::super::handlers::tool_search_budget_with_compaction(
+                let mut budget = match settled_work!('rounds, super::super::handlers::tool_search_budget_with_compaction(
                     &context.state,
                     &payload,
                     context.compact,
-                )
-                .await
+                ))
                 {
                     Ok(budget) => budget,
                     Err(error) => {
@@ -1599,12 +1697,12 @@ pub fn response(
                         )
                     } else {
                         web_search_round += 1;
-                        match super::super::handlers::execute_filtered_kiro_web_search(
+                        match settled_work!('rounds, super::super::handlers::execute_filtered_kiro_web_search(
                             &context.state,
                             &context.lease,
                             &query,
                             &context.web_search_domains,
-                        ).await {
+                        )) {
                             Ok(results) => ClaudeWebSearchTrace::success(server_id, &query, results),
                             Err(error) => {
                                 let message = format!("web_search is not supported: {}", crosslane_translate::sanitize_error_message(&error.message));
@@ -1687,9 +1785,9 @@ pub fn response(
                     break 'rounds;
                 }
 
-                let local_compaction = match super::super::handlers::compact_tool_search_continuation(
+                let local_compaction = match settled_work!('rounds, super::super::handlers::compact_tool_search_continuation(
                     &context.state, &mut payload, context.compact,
-                ).await {
+                )) {
                     Ok(stats) => stats,
                     Err(error) => {
                         failed = Some(error.clone());
@@ -1877,7 +1975,7 @@ pub fn response(
                     break 'rounds;
                 }
                 let account = context.lease.account().await;
-                match context.state.generate(&account, &payload).await {
+                match active_transport!('rounds, context.state.generate(&account, &payload)) {
                     Ok(next) => {
                         upstream_access_token = account.credentials.access_token.clone();
                         effective_thinking = next.thinking_enabled();
@@ -1992,12 +2090,12 @@ pub fn response(
                         )
                     } else {
                         web_search_round += 1;
-                        match super::super::handlers::execute_filtered_kiro_web_search(
+                        match settled_work!('rounds, super::super::handlers::execute_filtered_kiro_web_search(
                             &context.state,
                             &context.lease,
                             &query,
                             &context.web_search_domains,
-                        ).await {
+                        )) {
                             Ok(results) => ClaudeWebSearchTrace::success(server_id, &query, results),
                             Err(error) => {
                                 let message = format!("web_search is not supported: {}", crosslane_translate::sanitize_error_message(&error.message));
@@ -2059,15 +2157,14 @@ pub fn response(
                     accumulated_usage.output_tokens,
                 );
                 debug_assert!(budget_available);
-                match super::super::handlers::validate_internal_continuation(
+                match settled_work!('rounds, super::super::handlers::validate_internal_continuation(
                     &context.state,
                     &mut payload,
                     context.compact,
                     &endpoint,
                     "Web Search",
                     context.tool_search.is_some(),
-                )
-                .await
+                ))
                 {
                     Ok(tokens) => context.input_tokens = tokens,
                     Err(error) => {
@@ -2097,7 +2194,7 @@ pub fn response(
                     break 'rounds;
                 }
                 let account = context.lease.account().await;
-                match context.state.generate(&account, &payload).await {
+                match active_transport!('rounds, context.state.generate(&account, &payload)) {
                     Ok(next) => {
                         upstream_access_token = account.credentials.access_token.clone();
                         effective_thinking = next.thinking_enabled();
@@ -2180,15 +2277,14 @@ pub fn response(
                 accumulated_usage.output_tokens,
             );
             debug_assert!(budget_available);
-            match super::super::handlers::validate_internal_continuation(
+            match settled_work!('rounds, super::super::handlers::validate_internal_continuation(
                 &context.state,
                 &mut payload,
                 context.compact,
                 &endpoint,
                 "automatic continuation",
                 context.tool_search.is_some(),
-            )
-            .await
+            ))
             {
                 Ok(tokens) => context.input_tokens = tokens,
                 Err(error) => {
@@ -2218,7 +2314,7 @@ pub fn response(
                 break 'rounds;
             }
             let account = context.lease.account().await;
-            match context.state.generate(&account, &payload).await {
+            match active_transport!('rounds, context.state.generate(&account, &payload)) {
                 Ok(next) => {
                     upstream_access_token = account.credentials.access_token.clone();
                     effective_thinking = next.thinking_enabled();
@@ -2263,6 +2359,12 @@ pub fn response(
                     break 'rounds;
                 }
             }
+        }
+        #[cfg(feature = "crs")]
+        {
+            // Cancellation can leave the round before its normal EOF cleanup.
+            drop(source.take());
+            drop(upstream_permit.take());
         }
         let trailing = stop_filter.finish();
         if failed.is_none() && !trailing.is_empty() {
@@ -2400,7 +2502,34 @@ pub fn response(
     let stats_attempt = crate::stats::RequestStatsAttempt::current();
     let bridge = async move {
         futures::pin_mut!(stream);
-        while let Some(item) = stream.next().await {
+        #[cfg(feature = "crs")]
+        let mut forwarding = true;
+        loop {
+            #[cfg(feature = "crs")]
+            let item = if forwarding {
+                tokio::select! {
+                    biased;
+                    _ = sender.closed() => {
+                        bridge_cancel.cancel();
+                        forwarding = false;
+                        continue;
+                    }
+                    item = stream.next() => item,
+                }
+            } else {
+                // Resume the generator through its accounting tail instead
+                // of dropping the observed usage along with the client body.
+                stream.next().await
+            };
+            #[cfg(not(feature = "crs"))]
+            let item = stream.next().await;
+            let Some(item) = item else {
+                break;
+            };
+            #[cfg(feature = "crs")]
+            if !forwarding {
+                continue;
+            }
             match tokio::time::timeout(std::time::Duration::from_secs(30), sender.send(item)).await
             {
                 Ok(Ok(())) => {}
@@ -2411,6 +2540,13 @@ pub fn response(
                         user_agent = %bridge_user_agent,
                         "client disconnected before stream completed"
                     );
+                    #[cfg(feature = "crs")]
+                    {
+                        bridge_cancel.cancel();
+                        forwarding = false;
+                        continue;
+                    }
+                    #[cfg(not(feature = "crs"))]
                     break;
                 }
                 Err(_) => {
@@ -2420,6 +2556,13 @@ pub fn response(
                         user_agent = %bridge_user_agent,
                         "client stream write timed out"
                     );
+                    #[cfg(feature = "crs")]
+                    {
+                        bridge_cancel.cancel();
+                        forwarding = false;
+                        continue;
+                    }
+                    #[cfg(not(feature = "crs"))]
                     break;
                 }
             }

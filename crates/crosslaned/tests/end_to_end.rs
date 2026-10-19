@@ -88,6 +88,18 @@ mod empty_responses;
 #[path = "end_to_end/crs_isolated_runtime.rs"]
 mod crs_isolated_runtime;
 
+#[cfg(feature = "crs")]
+#[path = "end_to_end/crs_stream_cancel.rs"]
+mod crs_stream_cancel;
+
+#[cfg(feature = "crs")]
+#[path = "end_to_end/crs_nonstream_accounting.rs"]
+mod crs_nonstream_accounting;
+
+#[cfg(feature = "crs")]
+#[path = "end_to_end/crs_stream_cancel_account.rs"]
+mod crs_stream_cancel_account;
+
 #[path = "end_to_end/tool_names.rs"]
 mod tool_names;
 

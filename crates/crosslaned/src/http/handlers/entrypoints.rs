@@ -643,7 +643,7 @@ pub(super) fn record_failed_request(
             "client request rejected"
         );
     }
-    state.stats.record(RequestLog {
+    let log = RequestLog {
         timestamp: now_secs(),
         trace_id: trace_id.into(),
         request_id,
@@ -683,5 +683,19 @@ pub(super) fn record_failed_request(
             context_overflow: error.context_overflow.as_deref().cloned(),
             ..RequestDiagnostics::default()
         },
-    });
+    };
+    #[cfg(feature = "crs")]
+    let log = {
+        let mut log = log;
+        if let Some(usage) = error.log_context.confirmed_usage.as_ref() {
+            log.input_tokens = usage.input_tokens;
+            log.output_tokens = usage.output_tokens;
+            log.credits = usage.credits;
+            if usage.credits > 0.0 {
+                log.diagnostics.credits_source = "server".into();
+            }
+        }
+        log
+    };
+    state.stats.record(log);
 }
