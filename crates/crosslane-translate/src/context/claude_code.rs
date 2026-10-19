@@ -75,11 +75,17 @@ pub fn prepare_claude_code_compaction(request: &mut ClaudeRequest) -> bool {
             }),
         ));
     }
-    for tool in crate::claude_loaded_tools(request) {
+    #[cfg(feature = "crs")]
+    let preserve_none_intent = request.crs_tools_disabled();
+    #[cfg(not(feature = "crs"))]
+    let preserve_none_intent = false;
+    for tool in summary_source_tools(request) {
         source.push(source_block("Original tool definition", json!(tool)));
     }
     request.tools.clear();
-    request.tool_choice = None;
+    if !preserve_none_intent {
+        request.tool_choice = None;
+    }
     if !source.is_empty() {
         request.messages.insert(
             0,
@@ -93,6 +99,30 @@ pub fn prepare_claude_code_compaction(request: &mut ClaudeRequest) -> bool {
         );
     }
     true
+}
+
+fn summary_source_tools(request: &ClaudeRequest) -> Vec<&crate::ClaudeTool> {
+    #[cfg(feature = "crs")]
+    if request.crs_tools_disabled() {
+        // Disabled tools remain unavailable for new calls. Only definitions
+        // that explain actual assistant tool records become summary source;
+        // an undiscovered deferred catalog must not enter the model context.
+        let used = request
+            .messages
+            .iter()
+            .filter(|message| message.role == "assistant")
+            .filter_map(|message| message.content.as_array())
+            .flatten()
+            .filter(|block| matches!(block["type"].as_str(), Some("tool_use" | "server_tool_use")))
+            .filter_map(|block| block["name"].as_str())
+            .collect::<std::collections::HashSet<_>>();
+        return request
+            .tools
+            .iter()
+            .filter(|tool| used.contains(tool.name.as_str()))
+            .collect();
+    }
+    crate::claude_loaded_tools(request)
 }
 
 fn source_block(label: &str, source: Value) -> Value {
@@ -196,9 +226,96 @@ mod tests {
         assert!(source.contains("Complete contract for discovered_tool"));
         assert!(!source.contains("undiscovered_tool"));
         assert!(prepare_claude_code_compaction(&mut disabled));
-        assert!(!disabled.messages[0]
+        #[cfg(feature = "crs")]
+        {
+            let source = disabled.messages[0].content.to_string();
+            assert!(source.contains("Complete contract for discovered_tool"));
+            assert!(!source.contains("Read approved records only"));
+            assert!(!source.contains("undiscovered_tool"));
+            assert!(disabled.crs_tools_disabled());
+        }
+        #[cfg(not(feature = "crs"))]
+        {
+            assert!(!disabled.messages[0]
+                .content
+                .to_string()
+                .contains("Original tool definition"));
+            assert!(disabled.tool_choice.is_none());
+        }
+    }
+
+    #[cfg(feature = "crs")]
+    #[test]
+    fn disabled_summary_retains_used_tool_source_without_enabling_calls() {
+        let mut request = request(PROMPT);
+        request.tools[0].description.push_str(" 中文😀");
+        for (name, deferred) in [
+            ("used_deferred", true),
+            ("unused_regular", false),
+            ("undiscovered_deferred", true),
+        ] {
+            request.tools.push(
+                serde_json::from_value(json!({
+                    "name":name,"description":format!("Complete contract for {name}"),
+                    "input_schema":{"type":"object","properties":{
+                        "path":{"type":"string","description":"Owned path 中文😀"}},
+                        "required":["path"],"additionalProperties":false},
+                    "input_examples":[{"path":"owned/中文😀.json"}],
+                    "defer_loading":deferred
+                }))
+                .unwrap(),
+            );
+        }
+        let expected_definitions = vec![json!(request.tools[0]), json!(request.tools[1])];
+        request.messages.splice(1..1, serde_json::from_value::<Vec<ClaudeMessage>>(json!([
+            {"role":"user","content":"Inspect the owned records"},
+            {"role":"assistant","content":[
+                {"type":"tool_use","id":"read-1","name":"Read","input":{"path":"owned/a.json"}},
+                {"type":"tool_use","id":"read-2","name":"used_deferred","input":{"path":"owned/b.json"}}
+            ]},
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"read-1","content":"FIRST=exact-a"},
+                {"type":"tool_result","tool_use_id":"read-2","content":"SECOND=exact-b"}
+            ]}
+        ])).unwrap());
+        request.tool_choice = Some(serde_json::from_value(json!({"type":"none"})).unwrap());
+        crate::validate_claude(&request).unwrap();
+
+        assert!(prepare_claude_code_compaction(&mut request));
+        let definitions = request.messages[0]
             .content
-            .to_string()
-            .contains("Original tool definition"));
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|block| {
+                let text = block["text"].as_str()?;
+                text.strip_prefix("Original tool definition (complete JSON source):\n")
+                    .map(|source| serde_json::from_str::<Value>(source).unwrap())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(definitions, expected_definitions);
+        assert!(request.tools.is_empty());
+        assert!(request.crs_tools_disabled());
+        let payload = crate::claude_to_kiro(
+            &request,
+            &crate::TranslationOptions::new("target", "AI_EDITOR"),
+        );
+        assert!(
+            payload
+                .model_request_intent
+                .as_ref()
+                .unwrap()
+                .crs_tool_choice_none
+        );
+        assert!(payload
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .as_ref()
+            .is_none_or(|context| context.tools.is_empty()));
+        let prepared = json!(request);
+        assert!(prepare_claude_code_compaction(&mut request));
+        assert_eq!(json!(request), prepared);
     }
 }
