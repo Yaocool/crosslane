@@ -40,3 +40,6 @@ Thumbs.db
 .codegraph/
 .remember/
 output/
+
+# Machine-local request audit.
+/docs/kiro-request-audit.zh-CN.md

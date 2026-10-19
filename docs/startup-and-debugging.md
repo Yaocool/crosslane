@@ -117,9 +117,7 @@ use separate protocols and identity headers. Management defaults to
 `management.{region}.kiro.dev`. Missing-profile discovery successes use an
 account-scoped cache of up to 500 entries for 15 minutes. Default Web Search uses
 `InvokeMCP` at the Runtime root; explicit `CROSSLANE_MCP_URL` or
-`upstream.web_search_endpoint` retains legacy JSON-RPC compatibility. See the
-[Kiro request audit (Chinese)](kiro-request-audit.zh-CN.md) for overrides,
-CLI/API key compatibility, and verification limits.
+`upstream.web_search_endpoint` retains legacy JSON-RPC compatibility.
 
 ### GitHub Copilot
 
