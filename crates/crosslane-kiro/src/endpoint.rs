@@ -279,6 +279,22 @@ impl EndpointCache {
             .copied()
     }
 
+    /// Checks a temporary rejection without cleaning up expired entries or
+    /// changing any preference, revision, or eviction state.
+    #[cfg(feature = "crs")]
+    pub(crate) fn is_disabled_for(
+        &self,
+        account_id: &str,
+        purpose: EndpointPurpose,
+        endpoint: EndpointKey,
+    ) -> bool {
+        self.lock_state()
+            .disabled
+            .get(&(account_id.into(), purpose))
+            .and_then(|failures| failures.get(&endpoint))
+            .is_some_and(|until| *until > Instant::now())
+    }
+
     pub fn mark_disabled(&self, account_id: &str, purpose: EndpointPurpose, endpoint: EndpointKey) {
         let mut state = self.lock_state();
         self.mark_disabled_locked(&mut state, account_id, purpose, endpoint);
@@ -590,6 +606,31 @@ mod tests {
             cache.order(&account, None, EndpointPurpose::Models),
             vec![EndpointKey::Amazonq, EndpointKey::Codewhisperer]
         );
+    }
+
+    #[test]
+    #[cfg(feature = "crs")]
+    fn disabled_lookup_is_read_only_and_scoped_to_account_purpose_and_endpoint() {
+        let cache = EndpointCache::default();
+        cache.mark_disabled("acc_1", EndpointPurpose::Generation, EndpointKey::Runtime);
+        let before = format!("{:?}", cache.lock_state());
+
+        assert!(cache.is_disabled_for("acc_1", EndpointPurpose::Generation, EndpointKey::Runtime));
+        assert!(!cache.is_disabled_for("acc_2", EndpointPurpose::Generation, EndpointKey::Runtime));
+        assert!(!cache.is_disabled_for("acc_1", EndpointPurpose::Models, EndpointKey::Runtime));
+        assert!(!cache.is_disabled_for("acc_1", EndpointPurpose::Generation, EndpointKey::Amazonq));
+        assert_eq!(format!("{:?}", cache.lock_state()), before);
+    }
+
+    #[test]
+    #[cfg(feature = "crs")]
+    fn disabled_lookup_does_not_prune_expired_entries() {
+        let cache = EndpointCache::new(Duration::ZERO);
+        cache.mark_disabled("acc_1", EndpointPurpose::Generation, EndpointKey::Runtime);
+        let before = format!("{:?}", cache.lock_state());
+
+        assert!(!cache.is_disabled_for("acc_1", EndpointPurpose::Generation, EndpointKey::Runtime));
+        assert_eq!(format!("{:?}", cache.lock_state()), before);
     }
 
     #[test]

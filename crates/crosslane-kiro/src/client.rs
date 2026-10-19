@@ -247,6 +247,8 @@ pub struct KiroResponse {
     permit: tokio::sync::OwnedSemaphorePermit,
     stream_slot_wait_ms: u64,
     thinking_enabled: bool,
+    #[cfg(feature = "crs")]
+    prepared_payload: KiroPayload,
 }
 
 impl KiroResponse {
@@ -268,6 +270,25 @@ impl KiroResponse {
         tokio::sync::OwnedSemaphorePermit,
     ) {
         (self.endpoint, self.response, self.permit)
+    }
+
+    /// Includes the prepared payload used by this actual attempt, so an
+    /// isolated endpoint retry need not resolve model controls a second time.
+    #[cfg(feature = "crs")]
+    pub fn into_parts_with_payload(
+        self,
+    ) -> (
+        EndpointDefinition,
+        Response,
+        tokio::sync::OwnedSemaphorePermit,
+        KiroPayload,
+    ) {
+        (
+            self.endpoint,
+            self.response,
+            self.permit,
+            self.prepared_payload,
+        )
     }
 }
 
@@ -745,6 +766,126 @@ impl KiroClient {
             endpoint: "none".into(),
             message: "no usable upstream endpoint".into(),
         })
+    }
+
+    /// Checks whether an automatic legacy request can use the native Runtime
+    /// for its existing empty-response retry without changing endpoint state.
+    #[cfg(feature = "crs")]
+    pub fn runtime_isolated_retry_eligible(
+        &self,
+        account: &Account,
+        prepared_payload: &KiroPayload,
+        previous_endpoint: EndpointKey,
+    ) -> bool {
+        let Some(profile) = prepared_payload
+            .profile_arn
+            .as_deref()
+            .map(str::trim)
+            .filter(|profile| !profile.is_empty())
+        else {
+            return false;
+        };
+        let mut frozen_account = account.clone();
+        frozen_account.profile_arn = Some(profile.into());
+        self.upstream.preferred_endpoint.is_none()
+            && matches!(
+                previous_endpoint,
+                EndpointKey::Amazonq | EndpointKey::Codewhisperer
+            )
+            && account.credentials.auth_method != AuthMethod::ApiKey
+            && account_api_region(account).is_ok_and(|region| !region.starts_with("us-gov-"))
+            && account_api_region(&frozen_account)
+                .is_ok_and(|region| !region.starts_with("us-gov-"))
+            && !self.cache.is_disabled_for(
+                &account.id,
+                EndpointPurpose::Generation,
+                EndpointKey::Runtime,
+            )
+    }
+
+    /// Tries the native Runtime once after a legacy endpoint returned an empty
+    /// response. This deliberately neither learns endpoint preferences nor
+    /// updates endpoint failures; the caller owns the existing retry budget.
+    /// `None` means this isolated attempt is not applicable.
+    #[cfg(feature = "crs")]
+    pub async fn generate_runtime_isolated(
+        &self,
+        account: &Account,
+        prepared_payload: &KiroPayload,
+        previous_endpoint: EndpointKey,
+    ) -> Option<Result<KiroResponse, KiroError>> {
+        if !self.runtime_isolated_retry_eligible(account, prepared_payload, previous_endpoint) {
+            return None;
+        }
+        Some(
+            self.generate_at_endpoint_isolated(account, prepared_payload, EndpointKey::Runtime)
+                .await,
+        )
+    }
+
+    /// Sends a prepared attempt to exactly one endpoint without changing
+    /// endpoint cache state or trying another endpoint after an error.
+    #[cfg(feature = "crs")]
+    pub async fn generate_at_endpoint_isolated(
+        &self,
+        account: &Account,
+        prepared_payload: &KiroPayload,
+        endpoint: EndpointKey,
+    ) -> Result<KiroResponse, KiroError> {
+        drop(self.admit_model(prepared_payload).await?);
+        let endpoint = EndpointDefinition::for_account(endpoint, &self.overrides, account)?;
+        if (account.credentials.auth_method == AuthMethod::ApiKey
+            || account_api_region(account)?.starts_with("us-gov-"))
+            && endpoint.key != EndpointKey::Runtime
+        {
+            return Err(KiroError {
+                status: Some(400),
+                endpoint: "isolated-endpoint-policy".into(),
+                message: "This account requires the Kiro Runtime endpoint".into(),
+            });
+        }
+        if self
+            .cache
+            .is_disabled_for(&account.id, EndpointPurpose::Generation, endpoint.key)
+        {
+            return Err(KiroError {
+                status: Some(400),
+                endpoint: "isolated-endpoint-policy".into(),
+                message: "The isolated Kiro endpoint is temporarily disabled".into(),
+            });
+        }
+        let mut frozen_account = account.clone();
+        if endpoint.key == EndpointKey::Runtime
+            && account.credentials.auth_method != AuthMethod::ApiKey
+        {
+            // Isolated retries must not discover a different profile or issue
+            // any control-plane requests. The original prepared attempt
+            // supplies the profile retained in this snapshot.
+            let govcloud = account_api_region(account)?.starts_with("us-gov-");
+            let profile = prepared_payload
+                .profile_arn
+                .as_deref()
+                .map(str::trim)
+                .filter(|profile| !profile.is_empty())
+                .filter(|profile| {
+                    !govcloud || profile.starts_with("arn:aws-us-gov:codewhisperer:us-gov-")
+                })
+                .ok_or_else(|| KiroError {
+                    status: Some(400),
+                    endpoint: "isolated-endpoint-policy".into(),
+                    message: "The isolated Runtime attempt requires its prepared profile ARN"
+                        .into(),
+                })?;
+            frozen_account.profile_arn = Some(profile.into());
+        }
+        self.send_generation(&frozen_account, prepared_payload, endpoint)
+            .await
+            .map_err(|mut error| {
+                if error.status == Some(403) && (error.is_quota() || error.is_throttle()) {
+                    error.status = Some(429);
+                }
+                error
+            })
     }
 
     /// Resolves the profile ARN required by Kiro MCP requests. Existing ARN
@@ -1269,6 +1410,8 @@ impl KiroClient {
                 permit,
                 stream_slot_wait_ms,
                 thinking_enabled: payload.thinking_enabled(),
+                #[cfg(feature = "crs")]
+                prepared_payload: payload,
             });
         }
         Err(response_error(response, &endpoint).await)

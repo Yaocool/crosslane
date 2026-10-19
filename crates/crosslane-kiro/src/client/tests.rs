@@ -8,6 +8,10 @@ use super::*;
 #[path = "request_contracts.rs"]
 mod request_contracts;
 
+#[cfg(feature = "crs")]
+#[path = "runtime_isolated.rs"]
+mod runtime_isolated;
+
 #[tokio::test]
 async fn disabled_models_block_direct_calls_and_clones_already_waiting_for_a_slot() {
     let server = MockServer::start().await;

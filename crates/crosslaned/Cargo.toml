@@ -8,7 +8,7 @@ license.workspace = true
 [features]
 default = ["sso"]
 sso = ["dep:chromiumoxide", "dep:tempfile"]
-crs = ["crosslane-translate/crs"]
+crs = ["crosslane-translate/crs", "crosslane-kiro/crs"]
 
 [[bin]]
 name = "crosslaned"
