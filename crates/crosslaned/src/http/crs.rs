@@ -19,10 +19,14 @@ use serde_json::Value;
 
 mod capability;
 mod empty_tool_retry;
+mod event_diagnostics;
+mod request_diagnostics;
 mod stream;
 mod tools;
 pub(super) use capability::execute_with_effort_recovery;
 pub(super) use empty_tool_retry::clarify_tool_execution_boundary;
+pub(super) use event_diagnostics::{collect_events as collect_kiro_events, KiroEventDiagnostics};
+pub(super) use request_diagnostics::log_generation_request;
 pub(super) use stream::ClaudeStreamState;
 pub(super) use tools::normalize_tool_changes;
 
@@ -134,7 +138,9 @@ pub(super) fn enrich_error_envelope(
 
 fn error_hint(code: &str) -> &'static str {
     match code {
-        "upstream_content_filtered" => "Review the conversation content; the provider declined this request. Retrying the same request is not recommended.",
+        "upstream_content_filtered" => {
+            "Review the conversation content; the provider declined this request. Retrying the same request is not recommended."
+        }
         "context_length_exceeded" => {
             "Run /compact, reduce large tool results or attachments, or start a new session."
         }
@@ -388,7 +394,7 @@ pub(super) async fn inspect_provider_candidate(response: Response, request_id: &
                     parts,
                     prefix,
                     futures::stream::iter([chunk]).chain(source),
-                )
+                );
             }
             Ok(None) => {
                 return rejected_candidate(json_error(
@@ -1238,8 +1244,13 @@ mod tests {
     async fn oversized_event_resynchronizes_before_later_error_for_lf_and_crlf() {
         for newline in ["\n", "\r\n"] {
             for chunk_size in [257, 4093, 131072] {
-                let content = format!("event: content_block_delta{newline}data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{}\"}}}}{newline}{newline}", "x".repeat(70_000));
-                let error = format!("event: error{newline}data: {{\"type\":\"error\",\"error\":{{\"type\":\"invalid_request_error\",\"message\":\"large event followed by rejected field\"}}}}{newline}{newline}");
+                let content = format!(
+                    "event: content_block_delta{newline}data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{}\"}}}}{newline}{newline}",
+                    "x".repeat(70_000)
+                );
+                let error = format!(
+                    "event: error{newline}data: {{\"type\":\"error\",\"error\":{{\"type\":\"invalid_request_error\",\"message\":\"large event followed by rejected field\"}}}}{newline}{newline}"
+                );
                 let input = content.clone() + &error;
                 let chunks = input
                     .as_bytes()

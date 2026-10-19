@@ -456,6 +456,13 @@ async fn dispatch_upstream(
             );
         }
         let account = lease.account().await;
+        #[cfg(feature = "crs")]
+        super::super::super::crs::log_generation_request(
+            &request_payload,
+            trace_id,
+            attempt + 1,
+            "initial",
+        );
         match state.generate(&account, &request_payload).await {
             Ok(response) => {
                 tracing::info!(
@@ -530,6 +537,13 @@ async fn dispatch_upstream(
                     request_payload
                         .profile_arn
                         .clone_from(&refreshed.profile_arn);
+                    #[cfg(feature = "crs")]
+                    super::super::super::crs::log_generation_request(
+                        &request_payload,
+                        trace_id,
+                        attempt + 1,
+                        "refreshed_account",
+                    );
                     match state.generate(&refreshed, &request_payload).await {
                         Ok(response) => {
                             let refreshed_name = refreshed.display_name().to_owned();
@@ -744,6 +758,13 @@ async fn dispatch_upstream(
                                 push_model_path(&mut model_path, &actual_model);
                                 set_payload_model(&mut request_payload, &actual_model);
                                 state.prepare_model_request(&mut request_payload);
+                                #[cfg(feature = "crs")]
+                                super::super::super::crs::log_generation_request(
+                                    &request_payload,
+                                    trace_id,
+                                    attempt + 1,
+                                    "model_fallback",
+                                );
                                 match state.generate(&account, &request_payload).await {
                                     Ok(response) => {
                                         tracing::info!(

@@ -171,12 +171,25 @@ pub fn response(
         let mut auto_round = 0;
         let mut search_round = 0u32;
         let mut empty_tool_result_retries = 0u8;
+        #[cfg(feature = "crs")]
+        let mut diagnostic_round = 0u64;
         let mut tool_search_operations = context.tool_search_operations;
         let mut web_search_round = accumulated_web_searches
             .iter()
             .filter(|search| search.executed)
             .count() as u32;
         'rounds: loop {
+            #[cfg(feature = "crs")]
+            let mut event_diagnostics = {
+                diagnostic_round = diagnostic_round.saturating_add(1);
+                super::super::crs::KiroEventDiagnostics::new(
+                    &context.trace_id,
+                    &context.request_id,
+                    &endpoint,
+                    true,
+                    diagnostic_round,
+                )
+            };
             // A Kiro round following tool output is not semantically complete
             // until it contains visible text, another tool call, or a terminal
             // reason. Buffer reasoning-only attempts, but release the guard as
@@ -212,6 +225,8 @@ pub fn response(
                                 match decoder.decode(&mut buffer) {
                                     Ok(Some(event)) => {
                                         upstream_metrics.observe_event();
+                                        #[cfg(feature = "crs")]
+                                        event_diagnostics.observe(&event);
                                         tracing::trace!(
                                             trace_id = %context.trace_id,
                                             request_id = %context.request_id,
@@ -509,6 +524,8 @@ pub fn response(
                 }
             }
             if failed.is_some() {
+                #[cfg(feature = "crs")]
+                event_diagnostics.log_summary(Some(&decoded), "failed");
                 // Once semantic output has been emitted, neither replay the
                 // attempt nor restore the pre-output protocol state.
                 if !data_started {
@@ -1063,12 +1080,22 @@ pub fn response(
                     .saturating_add(decoded.usage.output_tokens)
                     >= u64::from(maximum)
             });
-            match empty_tool_result_disposition(
+            let empty_disposition = empty_tool_result_disposition(
                 &payload,
                 &decoded,
                 output_exhausted,
                 empty_tool_result_retries,
-            ) {
+            );
+            #[cfg(feature = "crs")]
+            event_diagnostics.log_summary(
+                Some(&decoded),
+                match empty_disposition {
+                    EmptyToolResultDisposition::Accept => "complete",
+                    EmptyToolResultDisposition::Retry => "empty_retry",
+                    EmptyToolResultDisposition::Fail => "empty_fail",
+                },
+            );
+            match empty_disposition {
                 EmptyToolResultDisposition::Accept => {
                     data_started |= !guarded_output.is_empty();
                     for data in std::mem::take(&mut guarded_output) {
@@ -1147,6 +1174,13 @@ pub fn response(
                         break 'rounds;
                     }
                     let account = context.lease.account().await;
+                    #[cfg(feature = "crs")]
+                    super::super::crs::log_generation_request(
+                        &payload,
+                        &context.trace_id,
+                        u32::from(empty_tool_result_retries),
+                        "empty_assistant_retry",
+                    );
                     match context.state.generate(&account, &payload).await {
                         Ok(next) => {
                             upstream_access_token = account.credentials.access_token.clone();

@@ -236,6 +236,8 @@ pub(super) async fn collect_nonstream_rounds(
     let mut round = 0;
     let mut search_round = 0;
     let mut empty_tool_result_retries = 0u8;
+    #[cfg(feature = "crs")]
+    let mut diagnostic_round = 0u64;
     let mut web_search_round = accumulated_web_searches
         .iter()
         .filter(|search| search.executed)
@@ -244,6 +246,22 @@ pub(super) async fn collect_nonstream_rounds(
         let effective_thinking = thinking_enabled && upstream.thinking_enabled();
         let (endpoint_definition, response, upstream_permit) = upstream.into_parts();
         let endpoint = endpoint_definition.name.to_string();
+        #[cfg(feature = "crs")]
+        let mut event_diagnostics = {
+            diagnostic_round = diagnostic_round.saturating_add(1);
+            super::super::crs::KiroEventDiagnostics::new(
+                trace_id,
+                tool_name_trace.request_id,
+                &endpoint,
+                false,
+                diagnostic_round,
+            )
+        };
+        #[cfg(feature = "crs")]
+        let events = super::super::crs::collect_kiro_events(response, &mut event_diagnostics)
+            .await
+            .map_err(ExecuteError::Upstream)?;
+        #[cfg(not(feature = "crs"))]
         let events = state
             .kiro()
             .collect_events(response)
@@ -270,6 +288,8 @@ pub(super) async fn collect_nonstream_rounds(
                         event,
                     )
                     .map_err(|message| {
+                        #[cfg(feature = "crs")]
+                        event_diagnostics.log_summary(Some(&decoded), "filter_failure");
                         ExecuteError::Upstream(KiroError {
                             status: None,
                             endpoint: endpoint.clone(),
@@ -291,6 +311,8 @@ pub(super) async fn collect_nonstream_rounds(
             for event in trailing_events {
                 if push_nonstream_event(&mut decoded, &mut stop_filter, &mut visible_text, event)
                     .map_err(|message| {
+                        #[cfg(feature = "crs")]
+                        event_diagnostics.log_summary(Some(&decoded), "filter_failure");
                         ExecuteError::Upstream(KiroError {
                             status: None,
                             endpoint: endpoint.clone(),
@@ -337,6 +359,8 @@ pub(super) async fn collect_nonstream_rounds(
         );
         fill_missing_usage(state, &mut decoded, &payload).await;
         if decoded.stop_sequence.is_some() {
+            #[cfg(feature = "crs")]
+            event_diagnostics.log_summary(Some(&decoded), "complete");
             accumulated_text.push_str(&decoded.text);
             accumulated_reasoning.push_str(&decoded.reasoning);
             decoded.text = accumulated_text;
@@ -356,12 +380,22 @@ pub(super) async fn collect_nonstream_rounds(
                 >= u64::from(maximum)
         });
 
-        match empty_tool_result_disposition(
+        let empty_disposition = empty_tool_result_disposition(
             &payload,
             &decoded,
             output_exhausted,
             empty_tool_result_retries,
-        ) {
+        );
+        #[cfg(feature = "crs")]
+        event_diagnostics.log_summary(
+            Some(&decoded),
+            match empty_disposition {
+                EmptyToolResultDisposition::Accept => "complete",
+                EmptyToolResultDisposition::Retry => "empty_retry",
+                EmptyToolResultDisposition::Fail => "empty_fail",
+            },
+        );
+        match empty_disposition {
             EmptyToolResultDisposition::Accept => {}
             EmptyToolResultDisposition::Retry => {
                 empty_tool_result_retries += 1;
@@ -406,6 +440,13 @@ pub(super) async fn collect_nonstream_rounds(
                     .extend(continuation_estimate)
                     .map_err(ExecuteError::Meter)?;
                 let account = lease.account().await;
+                #[cfg(feature = "crs")]
+                super::super::crs::log_generation_request(
+                    &payload,
+                    trace_id,
+                    u32::from(empty_tool_result_retries),
+                    "empty_assistant_retry",
+                );
                 upstream = state
                     .generate(&account, &payload)
                     .await
@@ -611,7 +652,7 @@ pub(super) async fn collect_nonstream_rounds(
                     {
                         Ok(results) => ClaudeWebSearchTrace::success(server_id, &query, results),
                         Err(error) => {
-                            return Err(ExecuteError::UnsupportedWebSearch(error.message))
+                            return Err(ExecuteError::UnsupportedWebSearch(error.message));
                         }
                     }
                 };
@@ -886,7 +927,7 @@ pub(super) async fn collect_nonstream_rounds(
                     {
                         Ok(results) => ClaudeWebSearchTrace::success(server_id, &query, results),
                         Err(error) => {
-                            return Err(ExecuteError::UnsupportedWebSearch(error.message))
+                            return Err(ExecuteError::UnsupportedWebSearch(error.message));
                         }
                     }
                 };
