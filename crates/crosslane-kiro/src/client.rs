@@ -1487,17 +1487,12 @@ impl KiroClient {
         let mut last_error = None;
         for (attempt, url) in urls.into_iter().enumerate() {
             let endpoint = usage_endpoint_label(&url);
+            // RequestBuilder::header appends; keep auth and SDK singleton
+            // headers in the shared map instead of adding them a second time.
             let response = self
                 .short
                 .get(url)
                 .headers(profile_headers(account)?)
-                .header("accept", "application/json")
-                .header(
-                    "authorization",
-                    format!("Bearer {}", account.credentials.access_token),
-                )
-                .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
-                .header("amz-sdk-request", "attempt=1; max=1")
                 .send()
                 .await
                 .map_err(|error| KiroError {

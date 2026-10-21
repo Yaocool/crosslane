@@ -327,6 +327,49 @@ async fn management_override_is_shared_by_rest_profiles_usage_and_subscriptions(
 }
 
 #[tokio::test]
+async fn usage_limits_management_headers_are_singleton_across_auth_methods() {
+    for auth in [AuthMethod::Idc, AuthMethod::Social, AuthMethod::ApiKey] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/management/getUsageLimits"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "userInfo":{"userId":"synthetic-user"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut client = test_client(&server);
+        client.overrides.management_url = Some(format!("{}/management", server.uri()));
+        let account = account(auth);
+        client.get_usage_limits(&account).await.unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let request = &requests[0];
+        for name in [
+            "authorization",
+            "accept",
+            "content-type",
+            "user-agent",
+            "x-amz-user-agent",
+            "amz-sdk-invocation-id",
+            "amz-sdk-request",
+        ] {
+            assert_eq!(
+                request.headers.get_all(name).iter().count(),
+                1,
+                "{auth:?}: management header {name} must appear exactly once"
+            );
+        }
+        assert_eq!(request.headers["authorization"], "Bearer access-token");
+        assert_eq!(request.headers["amz-sdk-request"], "attempt=1; max=1");
+        if auth == AuthMethod::ApiKey {
+            assert_eq!(request.headers["tokentype"], "API_KEY");
+        } else {
+            assert!(!request.headers.contains_key("tokentype"));
+        }
+    }
+}
+
+#[tokio::test]
 async fn kiro_http_retry_hints_survive_error_decoding_and_are_bounded() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
