@@ -99,6 +99,14 @@ crosslane account add-sso --email user@example.com --password-stdin < /secure/ki
 `crosslane account list` 检查账号，刷新选项见 `crosslane account refresh --help`。
 账号导出默认脱敏；包含凭证的导出只应存放在受保护的备份中。
 
+Kiro 批量添加使用独立的 `email,password` 两列 CSV；支持带引号的字段和 UTF-8 BOM。
+`crosslane account add --provider kiro --auth sso --batch accounts.csv` 与单个添加提交
+相同的 IAM 登录凭据。逐账号进度写入 stderr，`--json` 的 stdout 保持为一个最终
+结果。Copilot 的 Device Flow 和 GitHub/Azure CSV 字段不参与 Kiro 登录。
+如果组织登录要求额外的凭据更新，后台登录会立即返回具体原因；需在组织登录页面
+完成后，再使用当前登录密码重试。Crosslane 不会自动修改组织密码；`add-sso --headful`
+仍可用于手工处理浏览器中的验证步骤。
+
 原生 Runtime 的 OAuth 请求、ControlPlane 模型目录和 extension 管理 REST 使用各自的
 协议与身份头。管理请求默认访问 `management.{region}.kiro.dev`；缺失 Profile 的发现
 结果有 15 分钟、最多 500 项的账号隔离缓存。默认 Web Search 使用 Runtime 根路径的

@@ -112,6 +112,16 @@ options. Check accounts with `crosslane account list` and
 `crosslane account refresh --help`. Export output is redacted by default;
 use secret-bearing exports only in protected backups.
 
+Kiro batch login uses its own two-column `email,password` CSV, supporting quoted
+fields and a UTF-8 BOM. `crosslane account add --provider kiro --auth sso --batch
+accounts.csv` submits the same IAM credentials as single-account login. Per-account
+progress goes to stderr; `--json` keeps one final result on stdout. Copilot Device
+Flow and its GitHub/Azure credential columns are separate from Kiro login.
+If the identity provider requires a credential update, background login reports
+the specific blocker immediately. Complete that organization sign-in step, then
+retry with the current login password. Crosslane does not change organization
+passwords; `add-sso --headful` remains available for manual browser verification.
+
 Native OAuth Runtime calls, the ControlPlane catalog, and extension management REST
 use separate protocols and identity headers. Management defaults to
 `management.{region}.kiro.dev`. Missing-profile discovery successes use an

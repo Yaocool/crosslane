@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use chromiumoxide::{Browser, BrowserConfig, Page};
 use futures::StreamExt;
 use tempfile::TempDir;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -13,23 +14,28 @@ pub struct BrowserSession {
     page: Page,
     handler: JoinHandle<()>,
     injector: Option<JoinHandle<()>>,
+    kiro_failure: Option<oneshot::Receiver<LoginFailure>>,
     cancel: CancellationToken,
     profile_dir: Option<TempDir>,
 }
 
 impl BrowserSession {
-    pub async fn launch(
+    pub async fn launch_kiro(
         authorize_url: &str,
         email: &str,
         password: &str,
         headful: bool,
     ) -> Result<Self> {
         let mut session = Self::launch_page(authorize_url, headful).await?;
-        session.injector = Some(spawn_injector(
+        let (failure, receiver) = oneshot::channel();
+        session.kiro_failure = Some(receiver);
+        session.injector = Some(spawn_kiro_injector(
             session.page.clone(),
             email,
             password,
             session.cancel.clone(),
+            headful,
+            failure,
         )?);
         Ok(session)
     }
@@ -88,6 +94,7 @@ impl BrowserSession {
             page,
             handler,
             injector: None,
+            kiro_failure: None,
             cancel,
             profile_dir: Some(profile_dir),
         })
@@ -95,6 +102,10 @@ impl BrowserSession {
 
     pub fn page(&self) -> &Page {
         &self.page
+    }
+
+    pub(super) fn take_kiro_failure(&mut self) -> Option<oneshot::Receiver<LoginFailure>> {
+        self.kiro_failure.take()
     }
 
     pub async fn close(&mut self) {
@@ -155,11 +166,39 @@ impl Drop for BrowserSession {
     }
 }
 
-fn spawn_injector(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LoginFailure {
+    PasswordUpdateRequired,
+    InvalidCredentials,
+    AccountLocked,
+}
+
+impl LoginFailure {
+    fn from_action(action: &str) -> Option<Self> {
+        match action {
+            "blocked:password-update-required" => Some(Self::PasswordUpdateRequired),
+            "blocked:invalid-credentials" => Some(Self::InvalidCredentials),
+            "blocked:account-locked" => Some(Self::AccountLocked),
+            _ => None,
+        }
+    }
+
+    pub(super) fn message(self) -> &'static str {
+        match self {
+            Self::PasswordUpdateRequired => "Kiro SSO: the identity provider requires a password update before sign-in can continue; complete that organization sign-in step, then retry with the current login password",
+            Self::InvalidCredentials => "Kiro SSO: the identity provider rejected the login credentials",
+            Self::AccountLocked => "Kiro SSO: the identity provider locked the account or blocked further login attempts",
+        }
+    }
+}
+
+fn spawn_kiro_injector(
     page: Page,
     email: &str,
     password: &str,
     cancel: CancellationToken,
+    headful: bool,
+    failure: oneshot::Sender<LoginFailure>,
 ) -> Result<JoinHandle<()>> {
     let email = serde_json::to_string(email)?;
     let password = serde_json::to_string(password)?;
@@ -178,6 +217,13 @@ fn spawn_injector(
                             evaluate_error_logged = false;
                             navigation_error_logged = false;
                             if let Ok(action) = result.into_value::<String>() {
+                                if let Some(reason) = LoginFailure::from_action(&action) {
+                                    if !headful {
+                                        tracing::info!(reason = %action, "Kiro SSO requires operator action");
+                                        let _ = failure.send(reason);
+                                        return;
+                                    }
+                                }
                                 if last_action.as_deref() != Some(action.as_str()) {
                                     if let Some(stage) = action.strip_prefix("waiting:") {
                                         tracing::info!(%stage, "SSO browser automation waiting");
@@ -214,55 +260,114 @@ fn is_navigation_context_error(error: &str) -> bool {
 }
 
 fn automation_script(email: &str, password: &str) -> String {
-    format!(
-        r#"(() => {{
-          const email = {email};
-          const password = {password};
-          const visible = el => !!el && !el.disabled && el.offsetParent !== null;
-          const setValue = (el, value) => {{
-            if (!visible(el) || el.value) return false;
-            const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
-            setter.call(el, value);
-            el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-            return true;
-          }};
-          const first = selectors => selectors.map(s => document.querySelector(s)).find(visible);
-          const user = first(['input[name="loginfmt"]','input[name="username"]','input[type="email"]','input[name="email"]','#i0116','#username','#email','input[autocomplete="username"]','input[autocomplete="email"]']);
-          if (setValue(user, email)) {{
-            const next = first(['#idSIButton9','button[type="submit"]','input[type="submit"]']);
-            if (next) next.click();
-            return 'username';
-          }}
-          const pass = first(['input[name="passwd"]','input[type="password"]','input[name="password"]','#i0118','#passwordInput','#password']);
-          if (setValue(pass, password)) {{
-            const submit = first(['#idSIButton9','button[type="submit"]','input[type="submit"]']);
-            if (submit) submit.click();
-            return 'password';
-          }}
-          const no = first(['#idBtn_Back']);
-          if (no && /stay signed in/i.test(document.body.innerText)) {{ no.click(); return 'kmsi'; }}
-          const allow = first(['button[name="allow"]','[data-testid="allow-button"]','[data-testid="allow-access-button"]','button[value="allow"]','#allow-button','button.awsui-button--primary','#cli_login_button','button[data-analytics="allowButton"]']);
-          if (allow) {{ allow.click(); return 'allow'; }}
-          const textAllow = [...document.querySelectorAll('button,input[type="submit"]')]
-            .find(el => visible(el) && /^(allow|authorize|allow access|continue|confirm|允许|确认授权)/i.test((el.innerText || el.value || '').trim()));
-          if (textAllow) {{ textAllow.click(); return 'allow-text'; }}
-          const visibleInputs = [...document.querySelectorAll('input')].filter(visible);
-          const hasOtp = visibleInputs.some(el =>
-            /otp|code|verification|one.?time/i.test(`${{el.name}} ${{el.id}} ${{el.autocomplete}}`));
-          const hasAlert = [...document.querySelectorAll('[role="alert"],.error,.error-message')]
-            .some(visible);
-          if (hasOtp) return 'waiting:mfa';
-          if (hasAlert) return 'waiting:error';
-          if (visibleInputs.length) return 'waiting:unrecognized-input';
-          return 'waiting:page';
-        }})()"#
-    )
+    let driver = include_str!("kiro_login.js");
+    format!("({driver})({email},{password})")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn fixture_page(html: &'static str) -> (String, JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || async move { axum::response::Html(html) }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}/"), server)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a local Chromium executable"]
+    async fn kiro_password_update_page_fails_without_filling_or_submitting_fields() {
+        let (url, server) = fixture_page(
+            r#"<form onsubmit="event.preventDefault();window.submitted=true">
+            <input type="password" id="currentPassword" name="currentpasswd">
+            <input type="password" id="newPassword" name="newpasswd">
+            <input type="password" id="confirmNewPassword" name="confirmnewpasswd">
+            <input type="submit" id="idSIButton9"></form>"#,
+        )
+        .await;
+        let mut browser =
+            BrowserSession::launch_kiro(&url, "test@example.invalid", "fixture-secret", false)
+                .await
+                .unwrap();
+        let reason = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            browser.take_kiro_failure().unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(reason, LoginFailure::PasswordUpdateRequired);
+        let untouched = browser
+            .page()
+            .evaluate("!window.submitted && [...document.querySelectorAll('input[type=password]')].every(x => !x.value)")
+            .await
+            .unwrap()
+            .into_value::<bool>()
+            .unwrap();
+        browser.close().await;
+        server.abort();
+        assert!(untouched);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a local Chromium executable"]
+    async fn kiro_normal_password_page_submits_the_same_single_login_password() {
+        let (url, server) = fixture_page(
+            r#"<form onsubmit="event.preventDefault();window.submitted=true">
+            <input type="password" id="i0118" name="passwd">
+            <input type="submit" id="idSIButton9"></form>"#,
+        )
+        .await;
+        let password = "  fixture,\"中文🙂  ";
+        let mut browser =
+            BrowserSession::launch_kiro(&url, "test@example.invalid", password, false)
+                .await
+                .unwrap();
+        let received = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let result = browser
+                    .page()
+                    .evaluate("window.submitted ? document.querySelector('#i0118').value : null")
+                    .await
+                    .unwrap();
+                if let Ok(value) = result.into_value::<String>() {
+                    break value;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+        browser.close().await;
+        server.abort();
+        assert_eq!(received.unwrap(), password);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a local Chromium executable"]
+    async fn kiro_invalid_credentials_page_returns_a_specific_failure() {
+        let (url, server) = fixture_page(
+            r#"<div id="passwordError" role="alert">Your account or password is incorrect.</div>
+            <input type="password" name="passwd" value="already-submitted">"#,
+        )
+        .await;
+        let mut browser =
+            BrowserSession::launch_kiro(&url, "test@example.invalid", "fixture-secret", false)
+                .await
+                .unwrap();
+        let reason = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            browser.take_kiro_failure().unwrap(),
+        )
+        .await;
+        browser.close().await;
+        server.abort();
+        assert_eq!(reason.unwrap().unwrap(), LoginFailure::InvalidCredentials);
+    }
 
     #[test]
     fn navigation_errors_are_distinct_from_real_browser_failures() {

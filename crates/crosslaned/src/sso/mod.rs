@@ -94,16 +94,19 @@ async fn login_full(request: SsoLoginRequest) -> Result<Credentials> {
         .append_pair("state", &state)
         .append_pair("code_challenge", &challenge)
         .append_pair("code_challenge_method", "S256");
-    let mut session = browser::BrowserSession::launch(
+    let mut session = browser::BrowserSession::launch_kiro(
         authorize.as_str(),
         &request.email,
         &request.password,
         request.headful,
     )
     .await?;
+    let failure = session
+        .take_kiro_failure()
+        .context("Kiro SSO browser did not initialize its login observer")?;
     let callback_result = tokio::time::timeout(
         Duration::from_secs(120),
-        wait_for_callback(listener, &state),
+        wait_for_login_outcome(listener, &state, failure),
     )
     .await;
     session.close().await;
@@ -129,6 +132,21 @@ async fn login_full(request: SsoLoginRequest) -> Result<Credentials> {
         expires_at: now_secs() + tokens.expires_in,
         auth_method: AuthMethod::Idc,
     })
+}
+
+#[cfg(feature = "sso")]
+async fn wait_for_login_outcome(
+    listener: TcpListener,
+    state: &str,
+    failure: tokio::sync::oneshot::Receiver<browser::LoginFailure>,
+) -> Result<String> {
+    tokio::select! {
+        callback = wait_for_callback(listener, state) => callback,
+        failure = failure => match failure {
+            Ok(reason) => Err(anyhow!(reason.message())),
+            Err(_) => Err(anyhow!("Kiro SSO browser automation stopped before sign-in completed")),
+        }
+    }
 }
 
 #[cfg(feature = "sso")]
@@ -322,6 +340,41 @@ fn now_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "sso")]
+    #[tokio::test]
+    async fn kiro_terminal_browser_failure_does_not_wait_for_the_callback_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        sender
+            .send(browser::LoginFailure::InvalidCredentials)
+            .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_login_outcome(listener, "state", receiver),
+        )
+        .await
+        .expect("terminal login errors must not wait for an OAuth callback");
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("rejected the login credentials"));
+    }
+
+    #[cfg(feature = "sso")]
+    #[tokio::test]
+    async fn kiro_successful_callback_still_returns_the_authorization_code() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (_sender, receiver) = tokio::sync::oneshot::channel();
+        let outcome = tokio::spawn(wait_for_login_outcome(listener, "fixture-state", receiver));
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream.write_all(b"GET /oauth/callback?state=fixture-state&code=fixture-code HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert_eq!(outcome.await.unwrap().unwrap(), "fixture-code");
+    }
 
     #[test]
     fn pkce_values_are_urlsafe_and_unique() {
