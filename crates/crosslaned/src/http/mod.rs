@@ -5,7 +5,7 @@ pub(crate) mod client_context;
 mod client_context_tests;
 mod context_recovery;
 #[cfg(feature = "crs")]
-mod crs;
+pub(crate) mod crs;
 mod handlers;
 #[cfg(test)]
 mod model_scope_tests;

@@ -133,7 +133,7 @@ async fn start_daemon(
     start_daemon_with_catalog(mock, preferred, catalog()).await
 }
 
-async fn start_daemon_with_catalog(
+pub(super) async fn start_daemon_with_catalog(
     mock: &MockServer,
     preferred: Option<crosslane_core::config::Endpoint>,
     models: Value,

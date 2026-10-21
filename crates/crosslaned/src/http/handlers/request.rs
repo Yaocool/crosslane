@@ -553,6 +553,7 @@ async fn handle_claude_route_inner(
             trigger_tokens: context_maximum(&state, false, &route.mapped),
             target_tokens: compact_target_from_maximum(maximum),
             maximum_tokens: maximum,
+            pressure_ratio: 1.0,
         };
         let summary_model = if config.context.compaction_summary_model.trim().is_empty() {
             route.mapped.as_str()
@@ -901,13 +902,28 @@ async fn handle_claude_route_inner(
         .as_ref()
         .map(|stats| stats.original_tokens as u64);
     let mut compaction_iteration = early_compaction_iteration;
-    if let Some(decision) = initial_compaction_decision(
+    let compaction_decision = initial_compaction_decision(
         &state,
         &resolved_model,
         input_tokens,
         compact_trigger,
         config.context.auto_compact_on_overflow || client_compaction,
-    ) {
+    );
+    #[cfg(feature = "crs")]
+    let compaction_decision = super::compaction::with_observed_context_pressure(
+        &state,
+        &payload,
+        &prepared
+            .as_ref()
+            .expect("prepared account")
+            .lease
+            .account_id(),
+        &resolved_model,
+        input_tokens,
+        config.context.auto_compact_on_overflow || client_compaction,
+        compaction_decision,
+    );
+    if let Some(decision) = compaction_decision {
         // The summary may use this same single-concurrency account. Release
         // its slot first; dispatch rechecks any new target after compaction.
         drop(prepared.take());

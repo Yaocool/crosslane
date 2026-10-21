@@ -166,6 +166,8 @@ pub struct AppState {
     pub body_budget: Arc<BodyBudget>,
     pub keepalive: KeepaliveHub,
     pub(crate) compaction_replay: CompactionReplayTracker,
+    #[cfg(feature = "crs")]
+    pub(crate) context_pressure: crate::http::crs::ContextPressure,
     pub prompt_cache: PromptCacheTracker,
     /// Ephemeral, credential-scoped state for Responses `store=true` turns.
     pub responses_sessions: ResponsesSessionStore,
@@ -324,6 +326,8 @@ impl AppState {
             body_budget: Arc::new(BodyBudget::new(128 * 1024 * 1024)),
             keepalive: KeepaliveHub::new(),
             compaction_replay: CompactionReplayTracker::default(),
+            #[cfg(feature = "crs")]
+            context_pressure: crate::http::crs::ContextPressure::default(),
             prompt_cache: PromptCacheTracker::default(),
             responses_sessions: ResponsesSessionStore::default(),
             response_client_contexts: crate::http::responses::ResponseClientContexts::default(),

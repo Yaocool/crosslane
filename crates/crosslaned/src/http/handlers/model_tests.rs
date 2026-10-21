@@ -1274,6 +1274,7 @@ async fn multiwave_summary_failure_preserves_context_without_lossy_fallback() {
         trigger_tokens: 9_500,
         target_tokens: 7_125,
         maximum_tokens: 9_900,
+        pressure_ratio: 1.0,
     };
 
     let error = match run_compaction(
@@ -1323,6 +1324,7 @@ async fn multiwave_summary_failure_preserves_context_without_lossy_fallback() {
         trigger_tokens: indivisible_tokens + 100,
         target_tokens: indivisible_tokens.saturating_sub(1).max(1),
         maximum_tokens: indivisible_tokens + 1_000,
+        pressure_ratio: 1.0,
     };
     let relaxed_target = match compaction_operation_target(&state, &source_payload, &relaxed).await
     {
@@ -1337,6 +1339,7 @@ async fn multiwave_summary_failure_preserves_context_without_lossy_fallback() {
         trigger_tokens: indivisible_tokens.saturating_sub(1).max(1),
         target_tokens: indivisible_tokens.saturating_sub(2).max(1),
         maximum_tokens: indivisible_tokens + 1_000,
+        pressure_ratio: 1.0,
     };
     let client_relaxed_target =
         compaction_operation_target(&state, &source_payload, &client_trigger_below_current)
@@ -1453,6 +1456,7 @@ async fn semantic_reapply_failure_keeps_the_context_limit_contract() {
         trigger_tokens: 60,
         target_tokens: 45,
         maximum_tokens: 60,
+        pressure_ratio: 1.0,
     };
 
     let error = match reapply_compaction(&state, &artifact, &decision, None).await {

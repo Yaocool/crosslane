@@ -364,15 +364,21 @@ pub(super) async fn collect_nonstream_rounds(
                 }));
             }
         }
-        decoded.log_context_usage(
-            trace_id,
-            state
-                .tokenizer
-                .estimate_kiro_payload(&payload)
-                .await
-                .unwrap_or(0) as u64,
-        );
+        let estimated_input_tokens = state
+            .tokenizer
+            .estimate_kiro_payload(&payload)
+            .await
+            .unwrap_or(0) as u64;
+        decoded.log_context_usage(trace_id, estimated_input_tokens);
         fill_missing_usage(state, &mut decoded, &payload).await;
+        #[cfg(feature = "crs")]
+        super::super::usage::observe_context_pressure(
+            state,
+            &lease.account_id(),
+            &payload,
+            &decoded,
+            estimated_input_tokens,
+        );
         if decoded.stop_sequence.is_some() || decoded.stop_reason.as_deref() == Some("refusal") {
             #[cfg(feature = "crs")]
             event_diagnostics.log_summary(Some(&decoded), "complete");

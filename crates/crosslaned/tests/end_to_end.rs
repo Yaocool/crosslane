@@ -78,6 +78,10 @@ mod manual_compaction;
 #[path = "end_to_end/client_summary_retry.rs"]
 mod client_summary_retry;
 
+#[cfg(feature = "crs")]
+#[path = "end_to_end/crs_context_pressure.rs"]
+mod crs_context_pressure;
+
 #[path = "end_to_end/automatic_compaction.rs"]
 mod automatic_compaction;
 

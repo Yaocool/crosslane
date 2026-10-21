@@ -9,6 +9,37 @@ use crate::state::AppState;
 
 use super::response::DecodedResponse;
 
+#[cfg(feature = "crs")]
+pub(in crate::http) fn observe_context_pressure(
+    state: &AppState,
+    account: &str,
+    payload: &KiroPayload,
+    decoded: &DecodedResponse,
+    estimated: u64,
+) {
+    if decoded.refusal_details.is_some() {
+        return;
+    }
+    let Some(percentage) = decoded.upstream_context_usage_percentage else {
+        return;
+    };
+    let model = &payload
+        .conversation_state
+        .current_message
+        .user_input_message
+        .model_id;
+    let Some(window) = state
+        .resolved_model_info(model)
+        .and_then(|info| info.token_limits)
+        .and_then(|limits| limits.max_input_tokens)
+    else {
+        return;
+    };
+    state
+        .context_pressure
+        .observe(account, payload, window, estimated, percentage);
+}
+
 /// Fill token fields only when Kiro did not report them. Input usage is
 /// estimated from the exact payload for this round; output usage includes
 /// visible text, reasoning, and structured tool calls.

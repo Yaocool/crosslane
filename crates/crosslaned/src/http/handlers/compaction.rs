@@ -150,6 +150,69 @@ fn compaction_summary_concurrency(state: &AppState) -> usize {
         .clamp(1, 2)
 }
 
+#[cfg(feature = "crs")]
+pub(super) fn with_observed_context_pressure(
+    state: &Arc<AppState>,
+    payload: &KiroPayload,
+    account: &str,
+    model: &str,
+    input_tokens: u64,
+    enabled: bool,
+    decision: Option<CompactionDecision>,
+) -> Option<CompactionDecision> {
+    if !enabled {
+        return decision;
+    }
+    let Some(window) = state
+        .resolved_model_info(model)
+        .and_then(|info| info.token_limits)
+        .and_then(|limits| limits.max_input_tokens)
+    else {
+        return decision;
+    };
+    let ratio = state.context_pressure.ratio(account, payload, window);
+    if ratio <= 1.0 {
+        return decision;
+    }
+    let trigger = (context_maximum(state, false, model) as f64 / ratio) as u64;
+    let maximum = (context_maximum(state, true, model) as f64 / ratio) as u64;
+    if let Some(mut decision) = decision {
+        decision.trigger_tokens = decision.trigger_tokens.min(trigger);
+        decision.maximum_tokens = decision.maximum_tokens.min(maximum);
+        decision.target_tokens = decision
+            .target_tokens
+            .min(compact_target_from_maximum(trigger));
+        decision.pressure_ratio = ratio;
+        return Some(decision);
+    }
+    (input_tokens > trigger).then(|| CompactionDecision {
+        reasons: vec![CompactionReason::ObservedContextPressure],
+        model: model.to_owned(),
+        trigger_tokens: trigger,
+        target_tokens: compact_target_from_maximum(trigger),
+        maximum_tokens: maximum,
+        pressure_ratio: ratio,
+    })
+}
+
+fn summary_context_maximum(state: &Arc<AppState>, request: &CompactionRequest<'_>) -> u64 {
+    let maximum = conservative_summary_context_maximum(state, request.summary_model);
+    // A separately configured summary model has no observation from the source
+    // model. Never apply one model's pressure to a different target.
+    let resolved_key = |model: &str| {
+        crosslane_core::model_policy::model_key(
+            &state
+                .resolved_model_info(model)
+                .map_or_else(|| model.to_owned(), |info| info.model_id),
+        )
+    };
+    if resolved_key(request.summary_model) == resolved_key(&request.decision.model) {
+        (maximum as f64 / request.decision.pressure_ratio) as u64
+    } else {
+        maximum
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn generate_compaction_summary(
     state: &Arc<AppState>,
@@ -613,10 +676,7 @@ async fn consolidate_deferred_summary(
             message,
             usage: Some(previous_usage),
         })?;
-    let input_limit = compact_target_from_maximum(conservative_summary_context_maximum(
-        state,
-        request.summary_model,
-    ));
+    let input_limit = compact_target_from_maximum(summary_context_maximum(state, request));
     if timeout_ms == 0
         || input_tokens as u64 > input_limit
         || super::serialized_payload_bytes(&payload, ErrorFormat::Claude).map_err(|error| {
@@ -1123,6 +1183,7 @@ pub(super) fn initial_compaction_decision(
         trigger_tokens,
         target_tokens: compact_target_tokens(state, model, trigger_tokens),
         maximum_tokens: context_maximum(state, true, model),
+        pressure_ratio: 1.0,
     })
 }
 
@@ -1133,6 +1194,7 @@ pub(super) fn resolved_compaction_decision(limit: &ContextLimitError) -> Compact
         trigger_tokens: limit.maximum,
         target_tokens: compact_target_from_maximum(limit.maximum),
         maximum_tokens: limit.maximum,
+        pressure_ratio: 1.0,
     }
 }
 
@@ -1160,6 +1222,7 @@ pub(super) fn upstream_overflow_compaction_decision(
         trigger_tokens: maximum_tokens,
         target_tokens: compact_target_from_maximum(maximum_tokens),
         maximum_tokens,
+        pressure_ratio: 1.0,
     })
 }
 
@@ -1332,7 +1395,7 @@ pub(super) async fn run_compaction(
     // Bound each request without discarding source facts before the model can
     // inspect them. An extractive checkpoint here silently lost the middle of
     // long messages even when the later semantic call reported success.
-    let summary_context_maximum = conservative_summary_context_maximum(state, summary_model);
+    let summary_context_maximum = summary_context_maximum(state, &merge_request);
     // Leave headroom for tokenizer differences, upstream framing and output.
     // Real DeepSeek rejected a ~162k estimated input despite advertising 164k.
     let summary_chunk_input_limit = compact_target_from_maximum(summary_context_maximum);

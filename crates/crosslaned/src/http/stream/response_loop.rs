@@ -1221,6 +1221,10 @@ pub fn response(
                 }
             }
             decoded.log_context_usage(&context.trace_id, context.input_tokens);
+            #[cfg(feature = "crs")]
+            super::super::usage::observe_context_pressure(
+                &context.state, &context.lease.account_id(), &payload, &decoded, context.input_tokens,
+            );
             fill_missing_usage(&context.state, &mut decoded, &payload).await;
             if stop_filter.matched().is_some() {
                 for data in std::mem::take(&mut guarded_output) {

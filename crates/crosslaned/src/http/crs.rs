@@ -19,6 +19,7 @@ use serde_json::Value;
 
 mod capability;
 mod client_summary_retry;
+mod context_pressure;
 mod empty_tool_retry;
 mod event_diagnostics;
 mod isolated_empty_retry;
@@ -31,6 +32,7 @@ pub(super) use capability::execute_with_effort_recovery;
 pub(super) use client_summary_retry::{
     reacquire_summary_account, summary_recovery_permitted, ClientSummaryRecovery,
 };
+pub(crate) use context_pressure::ContextPressure;
 pub(super) use empty_tool_retry::clarify_tool_execution_boundary;
 pub(super) use event_diagnostics::{collect_events as collect_kiro_events, KiroEventDiagnostics};
 pub(super) use isolated_empty_retry::{isolated_empty_retry_client, EmptyRetryConditions};

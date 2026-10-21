@@ -264,6 +264,8 @@ enum CompactionReason {
     MappedWindowOverflow,
     ResolvedWindowOverflow,
     UpstreamWindowOverflow,
+    #[cfg(feature = "crs")]
+    ObservedContextPressure,
 }
 
 impl CompactionReason {
@@ -273,6 +275,8 @@ impl CompactionReason {
             Self::MappedWindowOverflow => "mapped_overflow",
             Self::ResolvedWindowOverflow => "resolved_overflow",
             Self::UpstreamWindowOverflow => "upstream_overflow",
+            #[cfg(feature = "crs")]
+            Self::ObservedContextPressure => "observed_context_pressure",
         }
     }
 }
@@ -284,6 +288,8 @@ struct CompactionDecision {
     trigger_tokens: u64,
     target_tokens: u64,
     maximum_tokens: u64,
+    /// Request-local admission calibration, never a token or credit charge.
+    pressure_ratio: f64,
 }
 
 impl CompactionDecision {
