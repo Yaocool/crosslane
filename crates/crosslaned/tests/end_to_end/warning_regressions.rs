@@ -214,7 +214,7 @@ async fn compaction_failure_accounting_does_not_duplicate_warnings_or_invent_cre
             .unwrap()
             .to_owned();
         let response: Value = response.json().await.unwrap();
-        assert_eq!(response["error"]["code"], "compaction_failed");
+        assert_compaction_failure_json(&response);
         assert!(response.get("content").is_none());
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -393,11 +393,15 @@ async fn compaction_checkpoints_round_trip_without_another_summary() {
                 .unwrap();
             assert_eq!(
                 response.status(),
-                if fallback && !stream { 422 } else { 200 }
+                if fallback && (!stream || !cfg!(feature = "crs")) {
+                    422
+                } else {
+                    200
+                }
             );
             let body = response.text().await.unwrap();
             let body = if fallback {
-                assert!(body.contains("compaction_failed"), "{body}");
+                assert_compaction_failure_text(&body);
                 assert!(!body.contains("\"type\":\"compaction\""));
                 assert!(summaries.load(Ordering::SeqCst) > before);
                 before = summaries.load(Ordering::SeqCst);

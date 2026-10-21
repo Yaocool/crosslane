@@ -2878,7 +2878,7 @@ priority = 10
         .expect("call summary timeout path");
     assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
     let body: serde_json::Value = response.json().await.expect("Claude response JSON");
-    assert_eq!(body["error"]["code"], "compaction_failed");
+    assert_compaction_failure_json(&body);
     assert!(body.get("content").is_none());
 
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -2966,7 +2966,7 @@ priority = 10
         .expect("call malformed summary stream path");
     assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
     let body: serde_json::Value = response.json().await.expect("Claude response JSON");
-    assert_eq!(body["error"]["code"], "compaction_failed");
+    assert_compaction_failure_json(&body);
     assert!(body.get("content").is_none());
 
     let stats = expect_ok(
@@ -3158,7 +3158,7 @@ priority = 10
         .expect("call two-window compact path");
         assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
         let body: serde_json::Value = response.json().await.unwrap();
-        assert_eq!(body["error"]["code"], "compaction_failed");
+        assert_compaction_failure_json(&body);
         assert!(
             body.get("content").is_none(),
             "must not clip an oversized checkpoint"
@@ -3292,7 +3292,7 @@ priority = 10
         })
         .collect::<Vec<_>>();
     assert_eq!(status, reqwest::StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-    assert_eq!(body["error"]["code"], "compaction_failed");
+    assert_compaction_failure_json(&body);
     assert!(body.get("content").is_none());
 
     assert_eq!(
@@ -3579,4 +3579,33 @@ async fn second_daemon_cannot_delete_a_live_socket() {
     let still_alive = expect_ok(daemon.call("status", serde_json::json!({})).await);
     assert_eq!(still_alive["pid"], daemon.child.id().expect("pid"));
     daemon.stop().await;
+}
+
+// CRS adds diagnostic fields and preflight SSE transport. Base builds retain
+// Anthropic error JSON; both must preserve compaction failure semantics.
+fn assert_compaction_failure_json(body: &serde_json::Value) {
+    assert_eq!(body["type"], "error", "{body}");
+    assert_eq!(body["error"]["type"], "invalid_request_error", "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("Compaction could not produce a complete checkpoint"),
+        "{body}"
+    );
+    if cfg!(feature = "crs") {
+        assert_eq!(body["error"]["code"], "compaction_failed", "{body}");
+    } else {
+        assert!(body["error"].get("code").is_none(), "{body}");
+    }
+}
+
+fn assert_compaction_failure_text(body: &str) {
+    assert!(
+        body.contains("Compaction could not produce a complete checkpoint"),
+        "{body}"
+    );
+    if cfg!(feature = "crs") {
+        assert!(body.contains("compaction_failed"), "{body}");
+    }
 }

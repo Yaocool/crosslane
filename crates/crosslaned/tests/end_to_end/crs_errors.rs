@@ -428,6 +428,7 @@ async fn checkpoint_tool_changes_restore_the_same_catalog_for_count_and_generati
     daemon.stop().await;
 }
 
+#[cfg(feature = "crs")]
 #[tokio::test]
 async fn none_preserves_historical_pairs_without_publishing_callable_tools() {
     let _guard = HTTP_TEST_LOCK.lock().await;
@@ -563,6 +564,7 @@ async fn none_preserves_historical_pairs_without_publishing_callable_tools() {
     daemon.stop().await;
 }
 
+#[cfg(feature = "crs")]
 #[tokio::test]
 async fn removed_tool_discoveries_allow_counting_and_kiro_continuation() {
     let _guard = HTTP_TEST_LOCK.lock().await;
@@ -644,6 +646,7 @@ async fn removed_tool_discoveries_allow_counting_and_kiro_continuation() {
     daemon.stop().await;
 }
 
+#[cfg(feature = "crs")]
 #[tokio::test]
 async fn late_tool_catalog_updates_preserve_kiro_generation_and_token_counting() {
     let _guard = HTTP_TEST_LOCK.lock().await;

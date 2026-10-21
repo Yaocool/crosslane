@@ -107,8 +107,16 @@ async fn failed_summary_parts_are_repartitioned_once_without_replaying_successfu
         let status = response.status();
         let body = response.text().await.unwrap();
         if repeat_failure {
-            assert_eq!(status, if stream { 200 } else { 422 }, "{body}");
-            assert!(body.contains("compaction_failed"), "{body}");
+            assert_eq!(
+                status,
+                if stream && cfg!(feature = "crs") {
+                    200
+                } else {
+                    422
+                },
+                "{body}"
+            );
+            assert_compaction_failure_text(&body);
             assert!(!body.contains("\"type\":\"compaction\""), "{body}");
         } else {
             assert_eq!(status, 200, "{body}");
@@ -249,9 +257,17 @@ async fn partitioned_compaction_reconciles_missing_fact_claims_and_accounts_for_
             .unwrap();
         let status = response.status();
         let body = response.text().await.unwrap();
-        assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+        assert_eq!(
+            status.as_u16(),
+            if fail_merge && (!stream || !cfg!(feature = "crs")) {
+                422
+            } else {
+                200
+            },
+            "{body}"
+        );
         if fail_merge {
-            assert!(body.contains("compaction_failed"), "{body}");
+            assert_compaction_failure_text(&body);
             assert!(!body.contains(CLIENT_SUMMARY), "{body}");
             assert!(!body.contains("\"type\":\"compaction\""), "{body}");
         } else {
