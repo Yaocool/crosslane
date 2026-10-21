@@ -242,6 +242,10 @@ async fn generate_compaction_summary(
     let task_cancel = cancel.clone();
     let completed_usage = Arc::new(std::sync::Mutex::new(None));
     let progress = Arc::clone(&completed_usage);
+    #[cfg(feature = "crs")]
+    let completed_refusal = Arc::new(std::sync::Mutex::new(None::<String>));
+    #[cfg(feature = "crs")]
+    let refusal_progress = Arc::clone(&completed_refusal);
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let task = tokio::spawn(async move {
         let count = payloads.len();
@@ -286,6 +290,8 @@ async fn generate_compaction_summary(
                             model,
                             payload,
                             cancel,
+                            #[cfg(feature = "crs")]
+                            failed,
                             summary_input_limit,
                             deadline,
                         )
@@ -306,7 +312,14 @@ async fn generate_compaction_summary(
                 }
                 Err(error) => {
                     let part_usage = error.usage;
-                    if failure.is_none() {
+                    #[cfg(feature = "crs")]
+                    if summary_failure_is_more_specific(&error.message) {
+                        *refusal_progress
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner()) =
+                            Some(error.message.clone());
+                    }
+                    if failure.is_none() || summary_failure_is_more_specific(&error.message) {
                         failure = Some(error.message);
                     }
                     part_usage
@@ -451,6 +464,20 @@ async fn generate_compaction_summary(
     )
     .await;
     if let Err(error) = &mut result {
+        // A still-settling accepted sibling may exhaust the operation deadline.
+        // Keep the terminal refusal already observed from another part instead
+        // of hiding it behind that timeout. Background accounting is unchanged.
+        #[cfg(feature = "crs")]
+        if let Some(message) = completed_refusal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .filter(|_| {
+                error.message == format!("Kiro compaction summary timed out after {timeout_ms} ms")
+            })
+        {
+            error.message = message.clone();
+        }
         if error.usage.is_none() {
             error.usage = *completed_usage
                 .lock()
@@ -458,6 +485,13 @@ async fn generate_compaction_summary(
         }
     }
     result
+}
+
+// Accepted sibling streams settle even after another part fails. A native
+// refusal is final and must remain visible if a transient sibling failed first.
+fn summary_failure_is_more_specific(message: &str) -> bool {
+    cfg!(feature = "crs")
+        && message.starts_with("Upstream declined compaction summary (CONTENT_FILTERED:")
 }
 
 /// A discarded partial checkpoint can be retried because no source boundary
@@ -475,6 +509,7 @@ async fn generate_compaction_summary_part(
     summary_model: &str,
     payload: KiroPayload,
     cancel: CancellationToken,
+    #[cfg(feature = "crs")] failed: &std::sync::atomic::AtomicBool,
     input_limit: usize,
     deadline: Instant,
 ) -> Result<GeneratedCompactionSummary, CompactionSummaryFailure> {
@@ -500,6 +535,15 @@ async fn generate_compaction_summary_part(
         .to_ascii_lowercase()
         .contains("service temporarily unavailable");
     let incomplete = failure.message == "Kiro returned an unterminated <summary> block";
+    #[cfg(feature = "crs")]
+    let transient = transient
+        || failure.message == "Kiro returned an empty compaction summary"
+        || super::super::crs::recoverable_summary_stream_error(&failure.message)
+        || super::super::crs::recoverable_summary_capacity_error(&failure.message);
+    #[cfg(feature = "crs")]
+    if failed.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(failure);
+    }
     // Authentication, tools and cancellation must never trigger recovery.
     // Small malformed outputs fail explicitly; a large source part that
     // produces an incomplete wrapper may be split once without using any of
@@ -557,6 +601,15 @@ async fn generate_compaction_summary_part(
     // Sequential child dispatch preserves the parent's two-request concurrency
     // ceiling and operation deadline. There is no recursive or second retry.
     for part in parts {
+        // Do not launch another child after a peer has already made this
+        // checkpoint impossible. In-flight children still settle normally.
+        #[cfg(feature = "crs")]
+        if failed.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(CompactionSummaryFailure {
+                message: "Kiro compaction summary stopped after a failed part".into(),
+                usage: Some(usage),
+            });
+        }
         if cancel.is_cancelled() || Instant::now() >= deadline {
             return Err(CompactionSummaryFailure {
                 message: "Kiro compaction summary timed out during failed-part recovery".into(),
@@ -866,6 +919,11 @@ async fn generate_compaction_summary_inner(
         .reserve(key_id, estimate)
         .map_err(|error| error.to_string())?;
     let default_model = state.config.current().features.default_model_id.clone();
+    #[cfg(feature = "crs")]
+    let mut recovery = Some(super::super::crs::ClientSummaryRecovery::new(
+        state.config.current().upstream.max_retries,
+        state.config.current().upstream.stream_read_timeout_ms,
+    ));
     let execution = tokio::select! {
         result = execute_upstream(
             state,
@@ -885,7 +943,7 @@ async fn generate_compaction_summary_inner(
             None,
             true,
             #[cfg(feature = "crs")]
-            None,
+            recovery.as_mut(),
         ) => result.map_err(execute_error_message)?,
         _ = cancel.cancelled() => {
             return Err(CompactionSummaryFailure {
@@ -909,6 +967,16 @@ async fn generate_compaction_summary_inner(
     let account_name = lease.account().await.display_name().to_owned();
     let (endpoint_definition, response, upstream_permit) = response.into_parts();
     let endpoint = endpoint_definition.name.to_string();
+    let summary_request_id = format!("cmp_{}", Uuid::new_v4().simple());
+    #[cfg(feature = "crs")]
+    let mut event_diagnostics = super::super::crs::KiroEventDiagnostics::new(
+        trace_id,
+        &summary_request_id,
+        &endpoint,
+        true,
+        0,
+    )
+    .with_info_logging();
     let mut source = response.bytes_stream();
     let mut buffer = BytesMut::new();
     let mut decoder = EventStreamDecoder;
@@ -929,11 +997,13 @@ async fn generate_compaction_summary_inner(
                 buffer.extend_from_slice(&chunk);
                 loop {
                     match decoder.decode(&mut buffer) {
-                        Ok(Some(KiroEvent::Error { kind, message })) => {
-                            collection_error = Some(format!("{kind}: {message}"));
-                            break 'collect;
-                        }
                         Ok(Some(event)) => {
+                            #[cfg(feature = "crs")]
+                            event_diagnostics.observe(&event);
+                            if let KiroEvent::Error { kind, message } = event {
+                                collection_error = Some(format!("{kind}: {message}"));
+                                break 'collect;
+                            }
                             if let Err(error) = decoded.push(event) {
                                 collection_error = Some(error);
                                 break 'collect;
@@ -957,11 +1027,13 @@ async fn generate_compaction_summary_inner(
     if collection_error.is_none() {
         loop {
             match decoder.decode_eof(&mut buffer) {
-                Ok(Some(KiroEvent::Error { kind, message })) => {
-                    collection_error = Some(format!("{kind}: {message}"));
-                    break;
-                }
                 Ok(Some(event)) => {
+                    #[cfg(feature = "crs")]
+                    event_diagnostics.observe(&event);
+                    if let KiroEvent::Error { kind, message } = event {
+                        collection_error = Some(format!("{kind}: {message}"));
+                        break;
+                    }
                     if let Err(error) = decoded.push(event) {
                         collection_error = Some(error);
                         break;
@@ -977,10 +1049,43 @@ async fn generate_compaction_summary_inner(
     }
     drop(source);
     drop(upstream_permit);
+    #[cfg(feature = "crs")]
+    event_diagnostics.log_summary(
+        Some(&decoded),
+        if collection_error.is_some() {
+            "failed"
+        } else {
+            "complete"
+        },
+    );
     let received_output = produced_output(&decoded);
     decoded.log_context_usage(trace_id, input_tokens);
     fill_missing_usage(state, &mut decoded, &payload).await;
-    let parsed_summary = if let Some(error) = collection_error.clone() {
+    #[cfg(feature = "crs")]
+    if collection_error.is_none() {
+        super::super::usage::observe_context_pressure(
+            state,
+            &account_id,
+            &payload,
+            &decoded,
+            input_tokens,
+        );
+    }
+    #[cfg(feature = "crs")]
+    let refusal_category = (decoded.stop_reason.as_deref() == Some("refusal")).then(|| {
+        decoded
+            .refusal_details
+            .as_ref()
+            .and_then(|details| details["category"].as_str())
+            .unwrap_or("unspecified")
+    });
+    #[cfg(not(feature = "crs"))]
+    let refusal_category: Option<&str> = None;
+    let parsed_summary = if let Some(category) = refusal_category {
+        Err(format!(
+            "Upstream declined compaction summary (CONTENT_FILTERED: {category})"
+        ))
+    } else if let Some(error) = collection_error.clone() {
         Err(error)
     } else if decoded.tools.is_empty() {
         parse_compaction_summary(&decoded.text)
@@ -1014,7 +1119,7 @@ async fn generate_compaction_summary_inner(
         .map(|error| error.to_string());
     let mut log = request_log(
         trace_id,
-        &format!("cmp_{}", Uuid::new_v4().simple()),
+        &summary_request_id,
         COMPACTION_USAGE_PATH,
         &mapped_model,
         summary_model,
@@ -1038,7 +1143,9 @@ async fn generate_compaction_summary_inner(
         log.status = if cancel.is_cancelled() { 504 } else { 502 };
         log.error = Some(sanitize_error_message(error));
         log.diagnostics.client_status = log.status;
-        log.diagnostics.error_code = if cancel.is_cancelled() {
+        log.diagnostics.error_code = if refusal_category.is_some() {
+            "upstream_content_filtered"
+        } else if cancel.is_cancelled() {
             "compaction_timeout"
         } else if collection_error.is_some() {
             "compaction_stream_error"
@@ -1046,7 +1153,9 @@ async fn generate_compaction_summary_inner(
             "compaction_invalid_summary"
         }
         .into();
-        log.diagnostics.error_stage = if collection_error.is_some() {
+        log.diagnostics.error_stage = if refusal_category.is_some() {
+            "upstream_generation"
+        } else if collection_error.is_some() {
             "upstream_stream"
         } else {
             "response_validation"
@@ -1501,6 +1610,7 @@ pub(super) async fn run_compaction(
     let mut failure_reason: String;
 
     {
+        let mut apply_target = operation_target;
         loop {
             let mut payload = source_payload.clone();
             let apply_started = Instant::now();
@@ -1512,7 +1622,7 @@ pub(super) async fn run_compaction(
                         &mut payload,
                         &plan,
                         &generated.content,
-                        operation_target as usize,
+                        apply_target as usize,
                     )
                     .await
             } else {
@@ -1522,7 +1632,7 @@ pub(super) async fn run_compaction(
                         &mut payload,
                         &plan,
                         &generated.content,
-                        operation_target as usize,
+                        apply_target as usize,
                     )
                     .await
             };
@@ -1535,7 +1645,7 @@ pub(super) async fn run_compaction(
                         "semantic compaction",
                     )
                     .await?;
-                    if stats.compacted_tokens as u64 <= operation_target
+                    if stats.compacted_tokens as u64 <= apply_target
                         && super::serialized_payload_bytes(&payload, ErrorFormat::Claude)?
                             <= state.config.current().context.max_upstream_payload_bytes
                     {
@@ -1569,7 +1679,7 @@ pub(super) async fn run_compaction(
                     tracing::warn!(
                     trace_id,
                     compacted_tokens = stats.compacted_tokens,
-                    target_tokens = operation_target,
+                    target_tokens = apply_target,
                     "semantic compaction exceeded the target after tool-history preparation; original context preserved"
                 );
                 }
@@ -1581,6 +1691,14 @@ pub(super) async fn run_compaction(
                         "semantic compaction could not satisfy the target; original context preserved"
                     );
                 }
+            }
+            if cfg!(feature = "crs") && apply_target < decision.maximum_tokens {
+                // A complete checkpoint and required current/tool history can
+                // exceed desired headroom while still fitting the safe window.
+                // Reuse the same summary transactionally; never clip it or pay
+                // for another generation just to satisfy the softer target.
+                apply_target = decision.maximum_tokens;
+                continue;
             }
             let Some(parts) = generated.deferred_parts.take() else {
                 break;
@@ -1597,7 +1715,10 @@ pub(super) async fn run_compaction(
             )
             .await
             {
-                Ok(summary) => generated = summary,
+                Ok(summary) => {
+                    generated = summary;
+                    apply_target = operation_target;
+                }
                 Err(error) => {
                     failure_reason = error.message.clone();
                     tracing::warn!(trace_id, reason = %sanitize_error_message(&error.message),

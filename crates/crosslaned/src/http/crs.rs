@@ -30,7 +30,8 @@ mod stream;
 mod tools;
 pub(super) use capability::execute_with_effort_recovery;
 pub(super) use client_summary_retry::{
-    reacquire_summary_account, summary_recovery_permitted, ClientSummaryRecovery,
+    reacquire_summary_account, recoverable_summary_capacity_error,
+    recoverable_summary_stream_error, summary_recovery_permitted, ClientSummaryRecovery,
 };
 pub(crate) use context_pressure::ContextPressure;
 pub(super) use empty_tool_retry::clarify_tool_execution_boundary;

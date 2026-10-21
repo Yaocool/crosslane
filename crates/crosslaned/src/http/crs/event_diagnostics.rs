@@ -133,6 +133,7 @@ pub(crate) struct KiroEventDiagnostics<'a> {
     reasoning_bytes: u64,
     other_object_fields: u64,
     finished: Cell<bool>,
+    info_only: bool,
     #[cfg(test)]
     summary_emissions: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -168,9 +169,17 @@ impl<'a> KiroEventDiagnostics<'a> {
             reasoning_bytes: 0,
             other_object_fields: 0,
             finished: Cell::new(false),
+            info_only: false,
             #[cfg(test)]
             summary_emissions: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// Nested summaries already report failure through their owning request.
+    /// Keep structural observations without duplicating its warning.
+    pub(crate) fn with_info_logging(mut self) -> Self {
+        self.info_only = true;
+        self
     }
 
     /// Observe before filters while retaining the original event unchanged.
@@ -287,7 +296,7 @@ impl<'a> KiroEventDiagnostics<'a> {
         self.summary_emissions
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let summary = self.snapshot(decoded, outcome);
-        if outcome == "complete" {
+        if outcome == "complete" || self.info_only {
             tracing::info!(
                 event = "crs.kiro.round.observed",
                 trace_id = self.trace_id,

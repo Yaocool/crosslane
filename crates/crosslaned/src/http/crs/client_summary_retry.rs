@@ -72,7 +72,11 @@ fn is_generic_summary_failure(error: &KiroError) -> bool {
     {
         return false;
     }
-    let text = error.message.trim();
+    generic_summary_message(&error.message)
+}
+
+fn generic_summary_message(message: &str) -> bool {
+    let text = message.trim();
     if text == GENERIC_FAILURE {
         return true;
     }
@@ -101,6 +105,45 @@ fn is_generic_summary_failure(error: &KiroError) -> bool {
                     == Some("InternalServerException")
             })
         })
+}
+
+/// Stream errors are protocol events, not model-generated summary prose.
+/// Keep specialized refusal/auth/quota reasons out of generic recovery.
+pub(in crate::http) fn recoverable_summary_stream_error(message: &str) -> bool {
+    let Some((kind, message)) = message.split_once(": ") else {
+        return false;
+    };
+    matches!(kind, "error" | "upstream_error" | "InternalServerException")
+        && generic_summary_message(message)
+}
+
+/// Native Runtime capacity events can arrive after HTTP 200. Match the
+/// structured reason, rather than treating arbitrary service errors as empty
+/// output or a generic HTTP failure. This uses the same one-part recovery.
+pub(in crate::http) fn recoverable_summary_capacity_error(message: &str) -> bool {
+    let Some((kind, message)) = message.split_once(": ") else {
+        return false;
+    };
+    if !matches!(
+        kind,
+        "serviceUnavailableError" | "ServiceUnavailableException" | "error" | "upstream_error"
+    ) {
+        return false;
+    }
+    let Ok(serde_json::Value::Object(body)) = serde_json::from_str(message) else {
+        return false;
+    };
+    if body.get("reason").and_then(serde_json::Value::as_str)
+        != Some("MODEL_TEMPORARILY_UNAVAILABLE")
+    {
+        return false;
+    }
+    let error = KiroError {
+        status: None,
+        endpoint: "KiroRuntime".into(),
+        message: message.into(),
+    };
+    !error.is_auth() && !error.is_quota() && !error.is_request_rejection()
 }
 
 /// Pool acquire intentionally does not wait for a cooling account. Poll only
@@ -206,6 +249,64 @@ pub(in crate::http) fn summary_recovery_permitted(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summary_stream_recovery_excludes_specialized_reasons() {
+        assert!(recoverable_summary_stream_error(&format!(
+            "error: {GENERIC_FAILURE}"
+        )));
+        assert!(recoverable_summary_stream_error(&format!(
+            "error: {}",
+            serde_json::json!({"message":GENERIC_FAILURE,"reason":null})
+        )));
+        for kind in ["validationError", "throttlingError", "CONTENT_FILTERED"] {
+            assert!(!recoverable_summary_stream_error(&format!(
+                "{kind}: {GENERIC_FAILURE}"
+            )));
+        }
+        for reason in [
+            "CONTENT_FILTERED",
+            "REASONING_EXTRACTION",
+            "MODEL_TEMPORARILY_UNAVAILABLE",
+            "Unauthorized",
+        ] {
+            assert!(!recoverable_summary_stream_error(&format!(
+                "error: {}",
+                serde_json::json!({"message":GENERIC_FAILURE,"reason":reason})
+            )));
+        }
+    }
+
+    #[test]
+    fn summary_capacity_recovery_requires_native_capacity_reason() {
+        let message = "The service is temporarily unavailable. Please try again later.";
+        let capacity =
+            serde_json::json!({"message":message,"reason":"MODEL_TEMPORARILY_UNAVAILABLE"});
+        assert!(recoverable_summary_capacity_error(&format!(
+            "serviceUnavailableError: {capacity}"
+        )));
+        for reason in [
+            "CONTENT_FILTERED",
+            "CYBER",
+            "REASONING_EXTRACTION",
+            "MONTHLY_REQUEST_COUNT",
+            "Unauthorized",
+            "SERVICE_UNAVAILABLE",
+        ] {
+            let body = serde_json::json!({"message":message,"reason":reason});
+            assert!(!recoverable_summary_capacity_error(&format!(
+                "serviceUnavailableError: {body}"
+            )));
+        }
+        for kind in ["validationError", "throttlingError", "CONTENT_FILTERED"] {
+            assert!(!recoverable_summary_capacity_error(&format!(
+                "{kind}: {capacity}"
+            )));
+        }
+        assert!(!recoverable_summary_capacity_error(&format!(
+            "serviceUnavailableError: {message}"
+        )));
+    }
     use sha2::{Digest, Sha256};
 
     fn generic() -> KiroError {
