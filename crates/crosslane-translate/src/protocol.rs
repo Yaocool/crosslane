@@ -266,6 +266,9 @@ pub struct ModelRequestIntent {
     /// This is proxy-local protocol intent, not a client-supplied wire field.
     #[cfg(feature = "crs")]
     pub crs_native_messages: bool,
+    /// Tool-free summary generation needs native completion/refusal metadata too.
+    #[cfg(feature = "crs")]
+    pub crs_native_summary: bool,
 }
 
 impl ModelRequestIntent {
@@ -303,6 +306,34 @@ pub struct KiroPayload {
 }
 
 impl KiroPayload {
+    #[cfg(feature = "crs")]
+    pub fn requires_native_generation(&self) -> bool {
+        self.requires_native_tool_termination()
+            || self
+                .model_request_intent
+                .as_ref()
+                .is_some_and(|intent| intent.crs_native_summary)
+                && self.is_claude_five()
+    }
+
+    #[cfg(feature = "crs")]
+    fn is_claude_five(&self) -> bool {
+        let model = crosslane_core::model_policy::model_key(
+            &self
+                .conversation_state
+                .current_message
+                .user_input_message
+                .model_id,
+        );
+        ["claude-opus-5", "claude-sonnet-5", "claude-haiku-5"]
+            .iter()
+            .any(|prefix| {
+                model == *prefix
+                    || model
+                        .strip_prefix(prefix)
+                        .is_some_and(|tail| tail.starts_with('-'))
+            })
+    }
     /// Claude 5 tool turns need a native terminal reason before any buffered
     /// call is committed. Legacy EOF alone cannot distinguish tool completion
     /// from a refusal that cut its arguments short.
@@ -316,11 +347,7 @@ impl KiroPayload {
             return false;
         }
         let current = &self.conversation_state.current_message.user_input_message;
-        let model = crosslane_core::model_policy::model_key(&current.model_id);
-        let claude_five = ["claude-opus-5", "claude-sonnet-5", "claude-haiku-5"]
-            .iter()
-            .any(|prefix| model == *prefix || model.starts_with(&format!("{prefix}-")));
-        claude_five
+        self.is_claude_five()
             && current
                 .user_input_message_context
                 .as_ref()

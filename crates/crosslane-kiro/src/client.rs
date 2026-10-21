@@ -699,7 +699,7 @@ impl KiroClient {
     ) -> Result<KiroResponse, KiroError> {
         #[cfg(feature = "crs")]
         if explicit.is_none()
-            && payload.requires_native_tool_termination()
+            && payload.requires_native_generation()
             && self.runtime_isolated_retry_eligible(account, payload, EndpointKey::Amazonq)
         {
             // Legacy generation omits refusal metadata and can terminate in

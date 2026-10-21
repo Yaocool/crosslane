@@ -110,6 +110,43 @@ fn native_termination_is_scoped_to_claude_five_tool_requests() {
 }
 
 #[tokio::test]
+async fn tool_free_native_summary_keeps_output_controls_and_endpoint_policy() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = test_client(&server);
+    let account = power_account(AuthMethod::Idc);
+    let mut payload = prepared_tool_payload();
+    payload
+        .conversation_state
+        .current_message
+        .user_input_message
+        .user_input_message_context = None;
+    crosslane_translate::prepare_compaction_source_history(&mut payload);
+    payload.model_request_intent = Some(crosslane_translate::ModelRequestIntent {
+        crs_native_summary: true,
+        ..Default::default()
+    });
+    assert!(!payload.requires_native_tool_termination());
+    assert!(payload.requires_native_generation());
+    let before = format!("{:?}", client.cache);
+    drop(client.generate(&account, &payload, None).await.unwrap());
+    assert_eq!(format!("{:?}", client.cache), before);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests[0].url.path(), "/runtime");
+    let wire: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(wire["inferenceConfig"]["maxTokens"], 128000);
+    assert_eq!(
+        wire["additionalModelRequestFields"]["output_config"]["effort"],
+        "high"
+    );
+    assert!(!String::from_utf8_lossy(&requests[0].body).contains("crs_native_summary"));
+}
+
+#[tokio::test]
 async fn runtime_isolated_preserves_frozen_controls_history_and_native_wire_contract() {
     for (auth, previous) in [
         (AuthMethod::Idc, EndpointKey::Amazonq),

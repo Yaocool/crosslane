@@ -293,6 +293,8 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
             crs_tool_choice_none: request.crs_tools_disabled(),
             #[cfg(feature = "crs")]
             crs_native_messages: true,
+            #[cfg(feature = "crs")]
+            crs_native_summary: false,
         }),
         protected_history_messages,
     };

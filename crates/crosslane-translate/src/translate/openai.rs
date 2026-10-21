@@ -316,6 +316,8 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
             crs_tool_choice_none: false,
             #[cfg(feature = "crs")]
             crs_native_messages: false,
+            #[cfg(feature = "crs")]
+            crs_native_summary: false,
         }),
         protected_history_messages,
     };

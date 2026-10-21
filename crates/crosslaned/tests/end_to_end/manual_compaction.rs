@@ -498,9 +498,15 @@ async fn client_summary_input_threshold_rejection_partitions_complete_source_and
             for message in &part.conversation_state.history {
                 if let Some(user) = &message.user_input_message {
                     transcript.push_str(&user.content);
+                    source_tool_call_found |=
+                        user.content.contains("[Tool call: id=read-1, name=Read]")
+                            && user.content.contains("approved.txt");
                 }
                 if let Some(assistant) = &message.assistant_response_message {
-                    source_tool_call_found |= assistant.content.contains("approved.txt");
+                    source_tool_call_found |= assistant
+                        .content
+                        .contains("[Tool call: id=read-1, name=Read]")
+                        && assistant.content.contains("approved.txt");
                 }
             }
         }

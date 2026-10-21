@@ -501,6 +501,10 @@ async fn handle_claude_route_inner(
     let mut payload = claude_to_kiro(&request, &options);
     if client_compaction {
         crosslane_translate::prepare_compaction_source_history(&mut payload);
+        #[cfg(feature = "crs")]
+        if let Some(intent) = payload.model_request_intent.as_mut() {
+            intent.crs_native_summary = true;
+        }
     }
     // Client-managed ToolSearch also uses deferred definitions, without a
     // proxy-managed server-tool catalog. Count them before catalog extraction.
