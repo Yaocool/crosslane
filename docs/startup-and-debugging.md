@@ -527,6 +527,26 @@ validation and records wrapper counts without logging summary content.
 counts separately from local estimates; content-dependent tokenizer differences
 must not be interpreted as a fixed byte or token limit.
 
+With `crs`, valid upstream occupancy can also bring automatic compaction forward
+when the local tokenizer underestimates the selected model's input. Calibration
+is isolated by account, model, conversation and source checkpoint, expires after
+30 minutes, and only makes admission more conservative. It does not change billed
+tokens, the client's output limit, or the advertised model window. The same
+calibration bounds complete source parts sent to that model for summarization.
+Internal summaries quote visible messages as source records, retaining their
+original speaker labels and complete text before partitioning; earlier assistant
+replies are data rather than the summarizer's own assistant history. Claude 5 summaries use native
+completion/refusal metadata where the account and endpoint policy permit it. Empty summaries and narrowly identified generic
+internal stream errors, and native `MODEL_TEMPORARILY_UNAVAILABLE` stream capacity
+errors receive one failed-part recovery; explicit refusals, authentication, quota
+and other specialized errors are not retried. A native refusal takes precedence
+over transient errors or an operation timeout while an accepted sibling is still
+settling. Recovery keeps the original source, accepted
+attempt accounting and operation deadline. A complete summary may use the safe
+window when the softer headroom target cannot fit its required current context.
+Once a part fails permanently, no new recovery children are dispatched; already
+accepted calls still settle their usage.
+
 Tool Search checks the complete continuation including new definitions and
 results. While holding an account slot, it may publish only a complete verbatim
 checkpoint that fits the budget. Otherwise it preserves history and rejects the
