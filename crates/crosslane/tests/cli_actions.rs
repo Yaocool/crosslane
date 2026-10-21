@@ -10,6 +10,222 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::process::Command;
 
+fn kiro_login_summary(email: &str) -> Value {
+    json!({
+        "id":"acc_fixture", "email":email, "enabled":true,
+        "token_expires_at":2_000_000_000_i64, "credit_exhausted":false
+    })
+}
+
+#[tokio::test]
+async fn kiro_single_legacy_and_csv_inputs_use_the_same_single_password_rpc() {
+    let password = "  fixture,\"中文🙂  ";
+    let cases = [
+        (
+            vec![
+                "account",
+                "add",
+                "--provider",
+                "kiro",
+                "--auth",
+                "sso",
+                "--email",
+                "test@example.invalid",
+                "--password-stdin",
+            ],
+            format!("{password}\n"),
+        ),
+        (
+            vec![
+                "account",
+                "add-sso",
+                "--email",
+                "test@example.invalid",
+                "--password-stdin",
+            ],
+            format!("{password}\n"),
+        ),
+        (
+            vec![
+                "account",
+                "add",
+                "--provider",
+                "kiro",
+                "--auth",
+                "sso",
+                "--batch",
+                "-",
+            ],
+            "\u{feff}email,password\r\n\"test@example.invalid\",\"  fixture,\"\"中文🙂  \"\r\n"
+                .to_owned(),
+        ),
+    ];
+    for (mut args, input) in cases {
+        args.extend(["--start-url", "https://example.awsapps.com/start"]);
+        let (output, request) =
+            run_with_secret_input(&args, &input, kiro_login_summary("test@example.invalid")).await;
+        assert_eq!(request.method, method::ACCOUNT_ADD_SSO);
+        assert_eq!(
+            request.params,
+            json!({
+                "email":"test@example.invalid", "password":password,
+                "start_url":"https://example.awsapps.com/start", "region":"us-east-1",
+                "headful":false, "tags":[]
+            })
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(password));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(password));
+    }
+}
+
+#[tokio::test]
+async fn kiro_batch_file_stays_separate_from_copilot_credentials() {
+    let workspace = tempfile::tempdir().unwrap();
+    let csv = workspace.path().join("accounts.csv");
+    fs::write(
+        &csv,
+        "email,password\n\"test@example.invalid\",\"fixture-secret\"\n",
+    )
+    .unwrap();
+    let args = [
+        "account",
+        "add",
+        "--provider",
+        "kiro",
+        "--auth",
+        "sso",
+        "--batch",
+        csv.to_str().unwrap(),
+        "--start-url",
+        "https://example.awsapps.com/start",
+    ];
+    let (output, requests) = run_in_workspace(
+        workspace.path(),
+        &args,
+        vec![kiro_login_summary("test@example.invalid")],
+    )
+    .await;
+    assert_success(&output);
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, method::ACCOUNT_ADD_SSO);
+    assert_eq!(requests[0].params["password"], "fixture-secret");
+    assert!(requests[0].params.get("browser").is_none());
+
+    fs::remove_file(workspace.path().join("admin.sock")).unwrap();
+    fs::write(
+        &csv,
+        "github_username,github_password\nexample,fixture-secret\n",
+    )
+    .unwrap();
+    let (output, requests) = run_in_workspace(workspace.path(), &args, vec![]).await;
+    assert!(!output.status.success());
+    assert!(requests.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Kiro CSV"));
+}
+
+#[tokio::test]
+async fn kiro_batch_reports_a_failure_before_later_rows_finish_and_keeps_json_atomic() {
+    let workspace = tempfile::tempdir().unwrap();
+    let socket = workspace.path().join("admin.sock");
+    let csv = workspace.path().join("accounts.csv");
+    fs::write(
+        &csv,
+        "email,password\nfirst@example.invalid,fixture-one\nsecond@example.invalid,fixture-two\n",
+    )
+    .unwrap();
+    let listener = UnixListener::bind(&socket).unwrap();
+    let (second_seen, wait_second) = tokio::sync::oneshot::channel();
+    let (release, wait_release) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut second_seen = Some(second_seen);
+        let mut wait_release = Some(wait_release);
+        for index in 0..2 {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let raw = BufReader::new(read)
+                .lines()
+                .next_line()
+                .await
+                .unwrap()
+                .unwrap();
+            let request: Request = decode_line(&raw).unwrap();
+            assert_eq!(request.method, method::ACCOUNT_ADD_SSO);
+            let response = if index == 0 {
+                Response::err(
+                    request.id,
+                    crosslane_ipc::protocol::RpcError::internal("fixture login rejected"),
+                )
+            } else {
+                second_seen.take().unwrap().send(()).unwrap();
+                wait_release.take().unwrap().await.unwrap();
+                Response::ok(request.id, kiro_login_summary("second@example.invalid"))
+            };
+            write
+                .write_all(encode_line(&response).unwrap().as_bytes())
+                .await
+                .unwrap();
+        }
+    });
+    let mut child = Command::new(env!("CARGO_BIN_EXE_crosslane"))
+        .current_dir(workspace.path())
+        .args(["--json", "--socket"])
+        .arg(&socket)
+        .args([
+            "account",
+            "add",
+            "--provider",
+            "kiro",
+            "--auth",
+            "sso",
+            "--batch",
+        ])
+        .arg(&csv)
+        .args(["--start-url", "https://example.awsapps.com/start"])
+        .env_remove("CROSSLANE_PROVIDER")
+        .env_remove("CROSSLANE_WRAPPER_BATCH_STDIN")
+        .env_remove("CROSSLANE_WRAPPER_LOCAL_ONLY")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stderr = BufReader::new(child.stderr.take().unwrap()).lines();
+    let early = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let line = stderr
+                .next_line()
+                .await
+                .unwrap()
+                .expect("early batch progress");
+            if line.contains("添加失败") {
+                break line;
+            }
+        }
+    })
+    .await
+    .expect("first failure must be visible before the second row completes");
+    assert!(early.contains("first@example.invalid"));
+    assert!(!early.contains("fixture-one"));
+    tokio::time::timeout(Duration::from_secs(5), wait_second)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(child.try_wait().unwrap().is_none());
+    release.send(()).unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    server.await.unwrap();
+    assert!(!output.status.success());
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["accounts"].as_array().unwrap().len(), 1);
+    assert_eq!(result["errors"].as_array().unwrap().len(), 1);
+    assert_eq!(result["complete"], false);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("fixture-two"));
+}
+
 async fn run(args: &[&str], results: Vec<Value>) -> (std::process::Output, Vec<Request>) {
     let workspace = tempfile::tempdir().expect("tempdir");
     run_in_workspace(workspace.path(), args, results).await

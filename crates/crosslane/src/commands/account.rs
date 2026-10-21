@@ -6,7 +6,7 @@ use crosslane_core::account::Account;
 use crosslane_core::ids::{new_account_id, new_machine_id};
 use crosslane_ipc::copilot::{enrich_account, CopilotQuotaSummary, CopilotQuotaUnit};
 use crosslane_ipc::protocol::{
-    method, AccountImportResult, AccountServiceBinding, AccountServicesResult, AccountSummary,
+    method, AccountImportResult, AccountServiceBinding, AccountServicesResult,
     AccountTagBatchResult, AccountTagResult, ConfigShowResult, CopilotBrowserCredentials,
     ProviderAccountListResult, ProviderAccountSummary,
 };
@@ -15,6 +15,10 @@ use crate::client::AdminClient;
 use crate::output::{format_timestamp, print_json, render_table};
 
 mod copilot_input;
+mod kiro_sso;
+
+#[cfg(test)]
+use crosslane_ipc::protocol::AccountSummary;
 
 /// Kiro 账号池 overage 配置。
 #[derive(Debug, Subcommand)]
@@ -115,7 +119,7 @@ pub enum AccountCommand {
     },
     /// 统一添加 Kiro SSO/API key 或 Copilot Device Flow/token 账号。
     #[command(
-        after_help = "--provider 填 provider add --id 创建的实例 ID。--headless 交互填写账号并隐藏输入密码；--batch 从 CSV 逐个登录。提供浏览器凭证时，由远端 daemon 的独立无痕 Chromium 完成 Device Flow；--sso-username 表示标准输入的密码仅用于 Azure SSO。未提供浏览器凭证时，仍可在本地无痕窗口手动授权。Kiro 使用 account add --provider kiro --auth sso --email EMAIL --password-stdin，或 --token-stdin 导入 API key；原 add-sso/add-api-key 命令继续可用。\n\n示例：\n  crosslane account add --provider copilot --auth device-flow --headless\n  crosslane account add --provider copilot --batch copilot.csv\n  crosslane account add --provider copilot --auth device-flow --username USER_SHORTCODE --sso-username user@example.com --password-stdin\n  crosslane account add --provider copilot --auth device-flow --credentials-stdin < login.json\n  crosslane account add --provider copilot --auth device-flow\n  printf '%s\\n' \"$GITHUB_TOKEN\" | crosslane account add --provider copilot --token-stdin\n\nCSV 表头：github_username,github_password,sso_username,sso_password,sso_start_url,label；仅 github_username 为必选列，密码需提供 GitHub 或 Azure SSO 其中一套。",
+        after_help = "--provider 填 provider add --id 创建的实例 ID。\n\nKiro：--auth sso 使用 IAM Identity Center；单个使用 --email EMAIL --password-stdin，批量使用 --batch accounts.csv，CSV 仅含 email,password 两列。两种方式提交相同的 Kiro 登录凭据，逐账号显示进度；--token-stdin 导入 API key。原 add-sso/add-api-key 命令继续可用。\n\nCopilot：使用独立的 Device Flow。--headless 交互填写账号并隐藏输入密码；提供浏览器凭证时，由远端 daemon 的独立无痕 Chromium 完成授权。--sso-username 表示标准输入密码仅用于 Azure SSO。未提供浏览器凭证时，在本地无痕窗口手动授权。\n\n示例：\n  crosslane account add --provider kiro --auth sso --email user@example.com --password-stdin\n  crosslane account add --provider kiro --auth sso --batch accounts.csv\n  crosslane account add --provider copilot --auth device-flow --headless\n  crosslane account add --provider copilot --batch copilot.csv\n  crosslane account add --provider copilot --auth device-flow --username USER_SHORTCODE --sso-username user@example.com --password-stdin\n  crosslane account add --provider copilot --auth device-flow --credentials-stdin < login.json\n  crosslane account add --provider copilot --auth device-flow\n  printf '%s\\n' \"$GITHUB_TOKEN\" | crosslane account add --provider copilot --token-stdin\n\nCopilot CSV 表头：github_username,github_password,sso_username,sso_password,sso_start_url,label；仅 github_username 为必选列，密码需提供 GitHub 或 Azure SSO 其中一套。",
         group(clap::ArgGroup::new("browser_credentials").args(["username", "credentials_stdin", "headless", "batch"]).multiple(true))
     )]
     Add {
@@ -133,7 +137,7 @@ pub enum AccountCommand {
         /// Kiro 邮箱（--email）或 GitHub 用户名/邮箱；Copilot SSO 必须用完整用户名。
         #[arg(long, visible_alias = "email", conflicts_with_all = ["credentials_stdin", "batch"])]
         username: Option<String>,
-        /// 从标准输入读取一行密码；指定 --sso-username 时仅发送给 Azure。
+        /// Kiro：读取 IAM 登录密码；Copilot：指定 --sso-username 时仅发送给 Azure。
         #[arg(long, requires = "username", conflicts_with_all = ["headless", "credentials_stdin", "batch"])]
         password_stdin: bool,
         /// Copilot：Azure SSO 登录名，可与 GitHub 用户名不同。
@@ -1389,7 +1393,7 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
                 }
             } else if let Some(file) = batch {
                 // Validate the entire input before starting any OAuth task.
-                let raw = read_sso_batch_source(&file).await?;
+                let raw = read_batch_source(&file).await?;
                 let rows = copilot_input::parse_csv(&raw)?;
                 run_copilot_batch(
                     client,
@@ -1565,15 +1569,17 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
             let start_url = resolve_start_url(client, start_url.as_deref()).await?;
             if let Some(file) = batch {
                 let concurrency = concurrency.unwrap_or(1);
-                run_sso_batch(
+                kiro_sso::run_batch(
                     client,
                     &file,
-                    SsoBatchOptions {
-                        start_url: &start_url,
-                        region: &region,
+                    kiro_sso::BatchOptions {
+                        login: kiro_sso::LoginOptions {
+                            start_url: &start_url,
+                            region: &region,
+                            headful,
+                            tags: &tags,
+                        },
                         concurrency,
-                        headful,
-                        tags: &tags,
                         json,
                     },
                 )
@@ -1585,19 +1591,18 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
             }
             let email = email.ok_or_else(|| anyhow!("单账号登录需提供 --email"))?;
             let password = read_password_line().await?;
-            let result: AccountSummary = client
-                .call(
-                    method::ACCOUNT_ADD_SSO,
-                    serde_json::json!({
-                        "email":email,
-                        "password":password,
-                        "start_url":start_url,
-                        "region":region,
-                        "headful":headful,
-                        "tags":tags
-                    }),
-                )
-                .await?;
+            let result = kiro_sso::add(
+                client,
+                &email,
+                &password,
+                kiro_sso::LoginOptions {
+                    start_url: &start_url,
+                    region: &region,
+                    headful,
+                    tags: &tags,
+                },
+            )
+            .await?;
             if json {
                 print_json(&result)?;
             } else {
@@ -2144,96 +2149,13 @@ async fn read_password_line() -> Result<String> {
     Ok(password)
 }
 
-struct SsoBatchOptions<'a> {
-    start_url: &'a str,
-    region: &'a str,
-    concurrency: usize,
-    headful: bool,
-    tags: &'a [String],
-    json: bool,
-}
-
-async fn run_sso_batch(
-    client: &AdminClient,
-    file: &str,
-    options: SsoBatchOptions<'_>,
-) -> Result<()> {
-    use futures::{stream, StreamExt};
-
-    if !(1..=8).contains(&options.concurrency) {
-        return Err(anyhow!("并发数必须在 1..=8 之间"));
-    }
-    let raw = read_sso_batch_source(file).await?;
-    let rows = parse_sso_csv(&raw)?;
-    let socket = client.socket_path();
-    let start_url = options.start_url.to_string();
-    let region = options.region.to_string();
-    let tags = options.tags.to_vec();
-    let headful = options.headful;
-    let results = stream::iter(rows.into_iter().map(|(email, password)| {
-        let socket = socket.clone();
-        let start_url = start_url.clone();
-        let region = region.clone();
-        let tags = tags.clone();
-        async move {
-            let mut client = AdminClient::connect(socket);
-            let result = client
-                .call::<AccountSummary>(
-                    method::ACCOUNT_ADD_SSO,
-                    serde_json::json!({
-                        "email":email,
-                        "password":password,
-                        "start_url":start_url,
-                        "region":region,
-                        "headful":headful,
-                        "tags":tags
-                    }),
-                )
-                .await;
-            (email, result)
-        }
-    }))
-    .buffer_unordered(options.concurrency)
-    .collect::<Vec<_>>()
-    .await;
-    let mut failures = Vec::new();
-    let mut successes = Vec::new();
-    for (email, result) in results {
-        match result {
-            Ok(summary) => {
-                if !options.json {
-                    println!("已添加 {}（{}）", summary.email, summary.id);
-                }
-                successes.push(summary);
-            }
-            Err(error) => failures.push(format!("{email}: {error}")),
-        }
-    }
-    if options.json {
-        print_json(&serde_json::json!({
-            "accounts": successes,
-            "errors": failures,
-            "complete": failures.is_empty()
-        }))?;
-    }
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "{} 个账号登录失败：\n{}",
-            failures.len(),
-            failures.join("\n")
-        ))
-    }
-}
-
 const WRAPPER_BATCH_STDIN_ENV: &str = "CROSSLANE_WRAPPER_BATCH_STDIN";
 
 fn sso_batch_reads_stdin(file: &str, wrapper_override: Option<&std::ffi::OsStr>) -> bool {
     file == "-" || wrapper_override == Some(std::ffi::OsStr::new("1"))
 }
 
-async fn read_sso_batch_source(file: &str) -> Result<String> {
+async fn read_batch_source(file: &str) -> Result<String> {
     if sso_batch_reads_stdin(file, std::env::var_os(WRAPPER_BATCH_STDIN_ENV).as_deref()) {
         use tokio::io::AsyncReadExt;
 
@@ -2247,36 +2169,6 @@ async fn read_sso_batch_source(file: &str) -> Result<String> {
     tokio::fs::read_to_string(file)
         .await
         .with_context(|| format!("读取 {file} 失败"))
-}
-
-fn parse_sso_csv(raw: &str) -> Result<Vec<(String, String)>> {
-    let mut rows = Vec::new();
-    for (index, line) in raw.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let fields =
-            parse_csv_line(line).with_context(|| format!("CSV 第 {} 行无效", index + 1))?;
-        if index == 0
-            && fields
-                .first()
-                .map(|field| field.eq_ignore_ascii_case("email"))
-                == Some(true)
-        {
-            continue;
-        }
-        if fields.len() != 2 || fields[0].trim().is_empty() || fields[1].is_empty() {
-            return Err(anyhow!(
-                "CSV 第 {} 行必须只有 email,password 两列",
-                index + 1
-            ));
-        }
-        rows.push((fields[0].trim().to_ascii_lowercase(), fields[1].clone()));
-    }
-    if rows.is_empty() {
-        return Err(anyhow!("CSV 中没有账号"));
-    }
-    Ok(rows)
 }
 
 fn parse_csv_line(line: &str) -> Result<Vec<String>> {
@@ -2747,12 +2639,13 @@ mod tests {
 
     #[test]
     fn sso_csv_supports_headers_quotes_and_commas() {
-        let rows =
-            parse_sso_csv("email,password\na@example.com,secret\n\"b@example.com\",\"p,a\"\n")
-                .expect("csv");
+        let rows = kiro_sso::parse_csv(
+            "email,password\na@example.com,secret\n\"b@example.com\",\"p,a\"\n",
+        )
+        .expect("csv");
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1], ("b@example.com".into(), "p,a".into()));
-        assert!(parse_sso_csv("a@example.com,\"unterminated").is_err());
+        assert!(kiro_sso::parse_csv("a@example.com,\"unterminated").is_err());
     }
 
     #[test]
