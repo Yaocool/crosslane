@@ -247,11 +247,17 @@ pub struct KiroResponse {
     permit: tokio::sync::OwnedSemaphorePermit,
     stream_slot_wait_ms: u64,
     thinking_enabled: bool,
+    redaction_session: crosslane_translate::RedactionSession,
     #[cfg(feature = "crs")]
     prepared_payload: KiroPayload,
 }
 
 impl KiroResponse {
+    /// Private request-local mapping; never serialize this into model context.
+    pub fn redaction_session(&self) -> &crosslane_translate::RedactionSession {
+        &self.redaction_session
+    }
+
     /// Thinking requested by this actual attempt, after model-specific preparation.
     pub fn thinking_enabled(&self) -> bool {
         self.thinking_enabled
@@ -1158,6 +1164,18 @@ impl KiroClient {
         account: &Account,
         query: &str,
     ) -> Result<WebSearchResults, KiroError> {
+        self.web_search_with_redaction(account, query, &Default::default())
+            .await
+    }
+
+    /// Keep secrets learned by the owning generation private when its restored
+    /// tool query is sent back to Kiro's separately authenticated MCP endpoint.
+    pub async fn web_search_with_redaction(
+        &self,
+        account: &Account,
+        query: &str,
+        redaction_session: &crosslane_translate::RedactionSession,
+    ) -> Result<WebSearchResults, KiroError> {
         let query = query.trim();
         if query.is_empty() {
             return Err(KiroError {
@@ -1171,6 +1189,14 @@ impl KiroClient {
                 status: Some(400),
                 endpoint: "MCP web_search".into(),
                 message: "web search query exceeds 2000 characters".into(),
+            });
+        }
+        let query = redaction_session.redact_text(query, &content_secrets(account));
+        if query.chars().count() > 2_000 {
+            return Err(KiroError {
+                status: Some(400),
+                endpoint: "MCP web_search".into(),
+                message: "redacted web search query exceeds 2000 characters".into(),
             });
         }
         let _permit = Arc::clone(&self.short_slots)
@@ -1279,6 +1305,9 @@ impl KiroClient {
         if results.query.is_empty() {
             results.query = query.to_owned();
         }
+        // Keep the local result usable by its owning generation. Its shared
+        // session masks the restored query again on every later trip to Kiro.
+        results.query = redaction_session.restore_text(&results.query);
         sanitize_web_search_results(&mut results);
         debug!(
             account = %account.id,
@@ -1356,6 +1385,14 @@ impl KiroClient {
             }
         }
         set_payload_origin(&mut payload, endpoint.origin);
+        let redaction_session = payload.redaction_session.clone().unwrap_or_default();
+        payload.redaction_session = Some(redaction_session.clone());
+        // Keep real context private for endpoint retries. Each outgoing copy is
+        // masked; tools are restored and checkpoints made replayable locally.
+        #[cfg(feature = "crs")]
+        let prepared_payload = payload.clone();
+        payload =
+            crosslane_translate::prepare_redacted_kiro_payload(&payload, &content_secrets(account));
         validate_kiro_tool_history(&payload).map_err(|message| KiroError {
             status: Some(400),
             endpoint: endpoint.name.into(),
@@ -1418,14 +1455,22 @@ impl KiroClient {
             })?;
         drop(model_permit);
         if response.status().is_success() {
+            let mut response = response;
+            response.extensions_mut().insert(redaction_session.clone());
+            let response = crate::response_redaction::restore_tool_response(
+                response,
+                redaction_session.clone(),
+                payload.restore_summary_secrets,
+            );
             return Ok(KiroResponse {
                 endpoint,
                 response,
                 permit,
                 stream_slot_wait_ms,
                 thinking_enabled: payload.thinking_enabled(),
+                redaction_session,
                 #[cfg(feature = "crs")]
-                prepared_payload: payload,
+                prepared_payload,
             });
         }
         Err(response_error(response, &endpoint).await)
@@ -1870,6 +1915,14 @@ fn set_payload_origin(payload: &mut KiroPayload, origin: &str) {
             user.origin = origin.into();
         }
     }
+}
+
+fn content_secrets(account: &Account) -> [&str; 3] {
+    [
+        account.credentials.access_token.as_str(),
+        account.credentials.refresh_token.as_deref().unwrap_or(""),
+        account.credentials.client_secret.as_deref().unwrap_or(""),
+    ]
 }
 
 fn headers(
