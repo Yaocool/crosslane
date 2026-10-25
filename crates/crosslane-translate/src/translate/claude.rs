@@ -296,6 +296,8 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
             #[cfg(feature = "crs")]
             crs_native_summary: false,
         }),
+        redaction_session: Some(crate::RedactionSession::new()),
+        restore_summary_secrets: false,
         protected_history_messages,
     };
     crate::model::apply_adaptive_thinking(

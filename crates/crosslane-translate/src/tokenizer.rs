@@ -5,7 +5,8 @@ mod context;
 pub use context::ContextTokenBreakdown;
 
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
+use std::ops::Range;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use base64::Engine;
 use lru::LruCache;
@@ -131,6 +132,11 @@ impl TokenCountCache {
     /// excluding base64 blobs from the tokenizer and applying structural and
     /// image overhead compatible with the TypeScript proxy.
     pub async fn estimate_kiro_payload(&self, payload: &KiroPayload) -> Result<usize, String> {
+        let prepared = crate::prepare_redacted_kiro_payload(payload, &[]);
+        self.estimate_prepared_kiro_payload(&prepared).await
+    }
+
+    async fn estimate_prepared_kiro_payload(&self, payload: &KiroPayload) -> Result<usize, String> {
         let mut segments = Vec::new();
         let mut fixed = CONVERSATION_OVERHEAD_TOKENS;
         for message in &payload.conversation_state.history {
@@ -159,6 +165,8 @@ impl TokenCountCache {
     /// Estimates only loaded tool definitions as serialized in the Kiro
     /// request. Deferred Claude tools are intentionally absent from this value.
     pub async fn estimate_kiro_tools(&self, payload: &KiroPayload) -> Result<usize, String> {
+        let prepared = crate::prepare_redacted_kiro_payload(payload, &[]);
+        let payload = &prepared;
         let mut segments = Vec::new();
         let mut fixed = 0usize;
         for message in &payload.conversation_state.history {
@@ -215,7 +223,9 @@ impl TokenCountCache {
             .user_input_message_context
             .as_ref()
             .is_some_and(|context| !context.tool_results.is_empty());
-        let mut tokens = self.estimate_kiro_payload(payload).await?;
+        let prepared = crate::prepare_redacted_kiro_payload(payload, &[]);
+        payload.redaction_session = prepared.redaction_session.clone();
+        let mut tokens = self.estimate_prepared_kiro_payload(&prepared).await?;
         let mut removed = 0;
         while tokens > maximum {
             let history = &payload.conversation_state.history[protected + removed..];
@@ -228,7 +238,9 @@ impl TokenCountCache {
             // every iteration, and shift the retained history only once.
             let mut segments = Vec::new();
             let mut turn_tokens = 0;
-            for message in &history[..remove] {
+            let prepared_history = &prepared.conversation_state.history
+                [protected + removed..protected + removed + remove];
+            for message in prepared_history {
                 if let Some(user) = &message.user_input_message {
                     collect_user_message(user, &mut segments, &mut turn_tokens);
                 }
@@ -485,7 +497,18 @@ impl TokenCountCache {
                 ..ContextCompactionStats::default()
             });
         };
-        let source = payload.clone();
+        let mut source = crate::prepare_redacted_kiro_payload(payload, &[]);
+        payload.redaction_session = source.redaction_session.clone();
+        // The local extractive checkpoint summarizes user data. Its output
+        // should not spend the summary budget repeating transport instructions.
+        let content = &mut source
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content;
+        if let Some(original) = content.strip_prefix(crate::transport::CREDENTIAL_REFERENCE_HINT) {
+            *content = original.to_owned();
+        }
         let current = &source.conversation_state.current_message.user_input_message;
         let model_id = current.model_id.clone();
         let origin = current.origin.clone();
@@ -542,11 +565,23 @@ impl TokenCountCache {
                 "local compaction did not reach target: tokens {compacted_tokens}/{target_tokens}, bytes {compacted_bytes}/{maximum_bytes}"
             ));
         }
+        let published_summary = if let Some(session) = &source.redaction_session {
+            // The client checkpoint carries replayable capsules rather than
+            // request-local references. Bound their expansion before allocating
+            // originals that may be much larger than the masked checkpoint.
+            let checkpoint_limit = maximum_bytes.min(50 * 1024 * 1024);
+            if session.checkpoint_expansion_bound(&summary) > checkpoint_limit {
+                return Err("local checkpoint credentials exceed its byte limit".into());
+            }
+            session.checkpoint_text(&summary)
+        } else {
+            summary
+        };
         Ok(ContextCompactionStats {
             original_tokens: plan.original_tokens,
             compacted_tokens,
             removed_messages: plan.original_history_len.saturating_sub(retained.len()),
-            summary: Some(summary),
+            summary: Some(published_summary),
         })
     }
 
@@ -554,6 +589,7 @@ impl TokenCountCache {
         let tokenizer = Arc::clone(&self.tokenizer);
         tokio::task::spawn_blocking(move || {
             let tokens = encode_text_bounded(&tokenizer, &text);
+            let references = credential_reference_ranges(&text);
             if estimated_text_tokens(&tokenizer, &text) <= maximum {
                 return Ok(text);
             }
@@ -569,14 +605,27 @@ impl TokenCountCache {
                 // never insert replacement characters into a checkpoint.
                 let mut output = loop {
                     match tokenizer.decode(tokens[..head].to_vec()) {
-                        Ok(text) => break text,
+                        Ok(text)
+                            if safe_reference_prefix(text.len(), &references) == text.len() =>
+                        {
+                            break text;
+                        }
+                        Ok(_) if head > 0 => head -= 1,
+                        Ok(_) => return Err("cannot preserve credential reference boundary".into()),
                         Err(_) if head > 0 => head -= 1,
                         Err(error) => return Err(error.to_string()),
                     }
                 };
                 let suffix = loop {
                     match tokenizer.decode(tokens[tokens.len() - tail..].to_vec()) {
-                        Ok(text) => break text,
+                        Ok(suffix)
+                            if safe_reference_suffix(text.len() - suffix.len(), &references)
+                                == text.len() - suffix.len() =>
+                        {
+                            break suffix;
+                        }
+                        Ok(_) if tail > 0 => tail -= 1,
+                        Ok(_) => return Err("cannot preserve credential reference boundary".into()),
                         Err(_) if tail > 0 => tail -= 1,
                         Err(error) => return Err(error.to_string()),
                     }
@@ -684,6 +733,8 @@ pub fn compaction_summary_payload(
                 None
             }
         },
+        redaction_session: source.redaction_session.clone(),
+        restore_summary_secrets: true,
         protected_history_messages: 0,
     }
 }
@@ -927,7 +978,7 @@ fn recent_turn_start(history: &[KiroHistoryMessage], preserve_turns: usize) -> u
 }
 
 fn payload_size(payload: &KiroPayload) -> Result<usize, String> {
-    serde_json::to_vec(payload)
+    serde_json::to_vec(&crate::prepare_redacted_kiro_payload(payload, &[]))
         .map(|body| body.len())
         .map_err(|error| error.to_string())
 }
@@ -1154,13 +1205,51 @@ fn normalize_compaction_text(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn credential_reference_ranges(text: &str) -> Vec<Range<usize>> {
+    if !text.contains("__CROSSLANE_") {
+        return Vec::new();
+    }
+    static REFERENCES: OnceLock<regex::Regex> = OnceLock::new();
+    REFERENCES
+        .get_or_init(|| {
+            regex::Regex::new(
+                r"__CROSSLANE_(?:SECRET_[0-9a-f]{32}_[0-9]+|CHECKPOINT_[A-Za-z0-9+/]+={0,2})__",
+            )
+            .expect("static credential reference pattern")
+        })
+        .find_iter(text)
+        .map(|reference| reference.range())
+        .collect()
+}
+
+fn safe_reference_prefix(cut: usize, references: &[Range<usize>]) -> usize {
+    references
+        .iter()
+        .find(|reference| reference.start < cut && cut < reference.end)
+        .map_or(cut, |reference| reference.start)
+}
+
+fn safe_reference_suffix(cut: usize, references: &[Range<usize>]) -> usize {
+    references
+        .iter()
+        .find(|reference| reference.start < cut && cut < reference.end)
+        .map_or(cut, |reference| reference.end)
+}
+
 fn compact_excerpt(value: &str, maximum: usize) -> String {
     let characters = value.chars().collect::<Vec<_>>();
     if characters.len() <= maximum {
         return value.to_owned();
     }
+    let references = credential_reference_ranges(value);
+    let byte_at = |index| {
+        value
+            .char_indices()
+            .nth(index)
+            .map_or(value.len(), |(offset, _)| offset)
+    };
     if maximum < 32 {
-        return characters.into_iter().take(maximum).collect();
+        return value[..safe_reference_prefix(byte_at(maximum), &references)].to_owned();
     }
     let marker = " … [compressed] … ";
     let content = maximum.saturating_sub(marker.chars().count());
@@ -1168,11 +1257,9 @@ fn compact_excerpt(value: &str, maximum: usize) -> String {
     let tail = content.saturating_sub(head);
     format!(
         "{}{}{}",
-        characters[..head].iter().collect::<String>(),
+        &value[..safe_reference_prefix(byte_at(head), &references)],
         marker,
-        characters[characters.len() - tail..]
-            .iter()
-            .collect::<String>()
+        &value[safe_reference_suffix(byte_at(characters.len() - tail), &references)..]
     )
 }
 
@@ -1294,6 +1381,220 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
     use crate::translate::SYSTEM_PROMPT_ACKNOWLEDGEMENT;
+
+    #[tokio::test]
+    async fn local_fallback_publishes_replayable_credentials_without_raw_request_markers() {
+        let cache = TokenCountCache::new(32).unwrap();
+        let secret = "opaqueLocalFallbackP5m9Q2r7S4t6U8v3".repeat(20);
+        let mut payload: KiroPayload = serde_json::from_value(serde_json::json!({
+            "conversationState": {
+                "chatTriggerType":"MANUAL", "conversationId":"fixture",
+                "history":[
+                    {"userInputMessage":{"content":format!("password={secret}\n{}", "old work ".repeat(3000)),"modelId":"model","origin":"CLI"}},
+                    {"assistantResponseMessage":{"content":"ack"}}
+                ],
+                "currentMessage":{"userInputMessage":{
+                    "content":"Continue.", "modelId":"model", "origin":"CLI"
+                }}
+            }
+        })).unwrap();
+        let stats = cache
+            .compact_kiro_payload(&mut payload, 4000, 0)
+            .await
+            .unwrap();
+        let checkpoint = stats.summary.unwrap();
+        assert!(!checkpoint.contains("__CROSSLANE_SECRET_"));
+        assert!(!checkpoint.contains(&secret));
+        assert!(checkpoint.contains("__CROSSLANE_CHECKPOINT_"));
+        let next_session = crate::RedactionSession::new();
+        let masked = next_session.redact_text(&checkpoint, &[]);
+        assert!(!masked.contains(&secret));
+        assert!(next_session.restore_text(&masked).contains(&secret));
+    }
+
+    #[tokio::test]
+    async fn local_fallback_bounds_checkpoint_capsule_expansion() {
+        let cache = TokenCountCache::new(16).unwrap();
+        let secret = "opaqueCheckpointExpansion".repeat(256);
+        let mut payload: KiroPayload = serde_json::from_value(serde_json::json!({
+            "conversationState": {
+                "chatTriggerType":"MANUAL", "conversationId":"fixture",
+                "history":[
+                    {"userInputMessage":{"content":format!("password={secret}\n{}", "old work ".repeat(3000)),"modelId":"model","origin":"CLI"}},
+                    {"assistantResponseMessage":{"content":"ack"}}
+                ],
+                "currentMessage":{"userInputMessage":{
+                    "content":"Continue.", "modelId":"model", "origin":"CLI"
+                }}
+            }
+        })).unwrap();
+        let error = cache
+            .compact_kiro_payload_with_limits(&mut payload, 4000, 4000, 0)
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("local checkpoint credentials exceed its byte limit"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_shortening_never_keeps_a_partial_credential_reference() {
+        let cache = TokenCountCache::new(16).unwrap();
+        let reference = "__CROSSLANE_SECRET_0123456789abcdef0123456789abcdef_0__";
+        let capsule = format!(
+            "__CROSSLANE_CHECKPOINT_{}__",
+            base64::engine::general_purpose::STANDARD.encode(b"\"capsule-fixture\"")
+        );
+        let source = format!(
+            "{} {reference} {} {capsule} {}",
+            "old fact ".repeat(12),
+            "middle fact ".repeat(12),
+            "new fact ".repeat(12)
+        );
+        let without_references = |text: &str| text.replace(reference, "").replace(&capsule, "");
+        for maximum in [4, 16, 40, 80, 120, 160] {
+            for shortened in [
+                compact_excerpt(&source, maximum),
+                cache
+                    .compact_text_to_tokens(source.clone(), maximum)
+                    .await
+                    .unwrap(),
+            ] {
+                let remaining = without_references(&shortened);
+                assert!(!remaining.contains("__CROSSLANE_"), "{shortened}");
+                assert!(!remaining.contains("0123456789abcdef"), "{shortened}");
+                assert!(!remaining.contains("Y2Fwc3VsZS1maXh0dXJl"), "{shortened}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_estimate_includes_short_secret_and_schema_expansion() {
+        let mut payload: KiroPayload = serde_json::from_value(serde_json::json!({
+            "conversationState": {
+                "chatTriggerType":"MANUAL", "conversationId":"fixture",
+                "currentMessage":{"userInputMessage":{
+                    "content":"password=abcd\n".repeat(256), "modelId":"model", "origin":"CLI",
+                    "userInputMessageContext":{"tools":[{"toolSpecification":{
+                        "name":"request", "description":"Make a request",
+                        "inputSchema":{"json":{"type":"object","properties":{
+                            "password":{"type":"string","maxLength":8}
+                        }}}}
+                    }]}
+                }}
+            }
+        }))
+        .unwrap();
+        payload.redaction_session = Some(crate::RedactionSession::new());
+        let before = serde_json::to_value(&payload).unwrap();
+        let cache = TokenCountCache::new(64).unwrap();
+        let raw = cache
+            .estimate_prepared_kiro_payload(&payload)
+            .await
+            .unwrap();
+        let prepared = crate::prepare_redacted_kiro_payload(&payload, &[]);
+        let sent = cache
+            .estimate_prepared_kiro_payload(&prepared)
+            .await
+            .unwrap();
+        let estimated = cache.estimate_kiro_payload(&payload).await.unwrap();
+        assert_eq!(estimated, sent);
+        assert!(sent > raw * 2, "short credentials expand substantially");
+        assert_eq!(serde_json::to_value(&payload).unwrap(), before);
+        assert_eq!(
+            cache.estimate_kiro_tools(&payload).await.unwrap(),
+            cache.estimate_kiro_tools(&prepared).await.unwrap()
+        );
+        assert_eq!(
+            cache
+                .context_token_breakdown(&payload)
+                .await
+                .unwrap()
+                .total_input_tokens,
+            estimated as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn truncation_subtracts_redacted_history_segments() {
+        let mut payload: KiroPayload = serde_json::from_value(serde_json::json!({
+            "conversationState": {
+                "chatTriggerType":"MANUAL", "conversationId":"fixture",
+                "history":[
+                    {"userInputMessage":{"content":"password=abcd\n".repeat(128),"modelId":"model","origin":"CLI"}},
+                    {"assistantResponseMessage":{"content":"Finished the old task."}},
+                    {"userInputMessage":{"content":"More ordinary previous work","modelId":"model","origin":"CLI"}},
+                    {"assistantResponseMessage":{"content":"Finished the newer task."}}
+                ],
+                "currentMessage":{"userInputMessage":{
+                    "content":"Continue.", "modelId":"model", "origin":"CLI"
+                }}
+            }
+        })).unwrap();
+        payload.redaction_session = Some(crate::RedactionSession::new());
+        let cache = TokenCountCache::new(64).unwrap();
+        cache.estimate_kiro_payload(&payload).await.unwrap();
+        let mut minimum = payload.clone();
+        minimum.conversation_state.history.clear();
+        let maximum = cache.estimate_kiro_payload(&minimum).await.unwrap() + 1;
+        let retained = cache
+            .truncate_kiro_history(&mut payload, maximum)
+            .await
+            .unwrap();
+        assert!(payload.conversation_state.history.is_empty());
+        assert_eq!(
+            retained,
+            cache.estimate_kiro_payload(&payload).await.unwrap()
+        );
+        assert!(retained <= maximum);
+    }
+
+    #[test]
+    fn summaries_and_continuations_retain_the_private_mapping() {
+        let session = crate::redaction::RedactionSession::new();
+        let original = "token=synthetic-summary-secret";
+        let masked = session.redact_text(original, &[]);
+        assert!(!masked.contains("synthetic-summary-secret"));
+        let mut source: KiroPayload = serde_json::from_value(serde_json::json!({
+            "conversationState": {
+                "chatTriggerType":"MANUAL", "conversationId":"summary-fixture",
+                "currentMessage":{"userInputMessage":{
+                    "content":masked, "modelId":"model", "origin":"CLI"
+                }}
+            }
+        }))
+        .expect("source payload");
+        source.redaction_session = Some(session);
+        let plan = KiroCompactionPlan {
+            original_tokens: 100,
+            original_history_len: 0,
+            summary_max_tokens: 128,
+            protected_history: Vec::new(),
+            retained_history: Vec::new(),
+            required_history_len: 0,
+        };
+        let summary = compaction_summary_payload(&source, &plan, "summary-model");
+        assert!(summary.restore_summary_secrets);
+        assert_eq!(
+            summary
+                .redaction_session
+                .as_ref()
+                .expect("summary mapping")
+                .restore_text(&masked),
+            original
+        );
+        let continuation = crate::auto_continue_payload(&source, "continue", Vec::new());
+        assert!(!continuation.restore_summary_secrets);
+        assert_eq!(
+            continuation
+                .redaction_session
+                .as_ref()
+                .expect("continuation mapping")
+                .restore_text(&masked),
+            original
+        );
+    }
 
     #[tokio::test]
     async fn checkpoint_truncation_preserves_unicode_and_final_token_budget() {

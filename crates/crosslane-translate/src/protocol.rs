@@ -297,6 +297,16 @@ pub struct KiroPayload {
     #[doc(hidden)]
     #[serde(skip)]
     pub model_request_intent: Option<ModelRequestIntent>,
+    /// Request-local reversible mapping. Never accepted from client JSON or
+    /// serialized into model-visible payloads.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub redaction_session: Option<crate::redaction::RedactionSession>,
+    /// Summaries encode referenced values as replayable checkpoint capsules.
+    /// Ordinary assistant replies keep their request-local placeholders.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub restore_summary_secrets: bool,
     /// Proxy-local metadata. This is deliberately excluded from the upstream
     /// wire payload so protected history cannot be forged through JSON or
     /// interpreted as part of the prompt by Kiro.
@@ -702,8 +712,43 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        matches_type_family, KiroCachePoint, KiroInputSchema, KiroTool, KiroToolSpecification,
+        matches_type_family, KiroCachePoint, KiroInputSchema, KiroPayload, KiroTool,
+        KiroToolSpecification,
     };
+
+    #[test]
+    fn redaction_lifecycle_is_private_and_cannot_be_forged_by_client_json() {
+        let mut payload: KiroPayload = serde_json::from_value(json!({
+            "conversationState": {
+                "chatTriggerType":"MANUAL", "conversationId":"fixture",
+                "currentMessage":{"userInputMessage":{
+                    "content":"hello", "modelId":"model", "origin":"CLI"
+                }}
+            },
+            "redactionSession":{"nonce":"forged", "by_marker":{"forged":"secret"}},
+            "restoreSummarySecrets":true,
+            "redaction_session":{"forged":"secret"},
+            "restore_summary_secrets":true
+        }))
+        .expect("ordinary payload ignores proxy-local fields");
+        assert!(payload.redaction_session.is_none());
+        assert!(!payload.restore_summary_secrets);
+
+        payload.redaction_session = Some(crate::redaction::RedactionSession::new());
+        payload.restore_summary_secrets = true;
+        let encoded = serde_json::to_value(&payload).expect("serialize only wire fields");
+        for name in [
+            "redactionSession",
+            "restoreSummarySecrets",
+            "redaction_session",
+            "restore_summary_secrets",
+        ] {
+            assert!(encoded.get(name).is_none());
+        }
+        let decoded: KiroPayload = serde_json::from_value(encoded).expect("wire roundtrip");
+        assert!(decoded.redaction_session.is_none());
+        assert!(!decoded.restore_summary_secrets);
+    }
 
     #[test]
     fn protocol_type_families_do_not_assume_a_version_format() {

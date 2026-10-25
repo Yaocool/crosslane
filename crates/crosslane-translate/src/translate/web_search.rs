@@ -446,6 +446,8 @@ mod tests {
             inference_config: None,
             additional_model_request_fields: None,
             model_request_intent: None,
+            redaction_session: None,
+            restore_summary_secrets: false,
             protected_history_messages: 0,
         };
         let use_ = KiroToolUse {
@@ -612,6 +614,8 @@ mod tests {
             inference_config: None,
             additional_model_request_fields: None,
             model_request_intent: None,
+            redaction_session: None,
+            restore_summary_secrets: false,
             protected_history_messages: 2,
         };
         let use_ = KiroToolUse {

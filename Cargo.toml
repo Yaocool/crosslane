@@ -31,6 +31,7 @@ crosslane-kiro = { path = "crates/crosslane-kiro" }
 crosslane-pool = { path = "crates/crosslane-pool" }
 crosslane-notify = { path = "crates/crosslane-notify" }
 anyhow = "=1.0.86"
+aho-corasick = "=1.1.5"
 thiserror = "=1.0.63"
 serde = { version = "=1.0.209", features = ["derive"] }
 serde_json = "=1.0.127"

@@ -719,6 +719,7 @@ dependencies = [
 name = "crosslane-translate"
 version = "2.0.2"
 dependencies = [
+ "aho-corasick",
  "base64 0.22.1",
  "crosslane-core",
  "fancy-regex",

@@ -27,6 +27,8 @@ impl TokenCountCache {
         &self,
         payload: &KiroPayload,
     ) -> Result<ContextTokenBreakdown, String> {
+        let prepared = crate::prepare_redacted_kiro_payload(payload, &[]);
+        let payload = &prepared;
         let (prefix, history) = payload
             .conversation_state
             .history

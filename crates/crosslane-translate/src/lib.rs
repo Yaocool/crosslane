@@ -6,11 +6,13 @@ pub mod context;
 pub mod error;
 pub mod model;
 pub mod protocol;
+pub mod redaction;
 pub mod responses;
 pub mod tokenizer;
 pub mod tool_history;
 pub mod tool_schema;
 pub mod translate;
+pub mod transport;
 pub mod validate;
 
 pub use compatibility::parse_openai_request;
@@ -24,6 +26,7 @@ pub use context::{
 };
 pub use error::{error_envelope, sanitize_error_message, ErrorFormat};
 pub use protocol::*;
+pub use redaction::{redact_kiro_payload, redact_text, RedactionSession, RedactionStats};
 pub use responses::{
     responses_to_openai, ResponsesRequest, ResponsesToolName, ResponsesTranslation,
 };
@@ -45,6 +48,7 @@ pub use translate::{
     ClaudeWebSearchError, ClaudeWebSearchTrace, ToolNameRegistry, TranslationOptions,
     WebSearchReplayCodec, WebSearchReplayError,
 };
+pub use transport::prepare_redacted_kiro_payload;
 pub use validate::document_bytes_match_format;
 mod web_search_domains;
 pub use validate::{

@@ -4,8 +4,8 @@
 use std::collections::VecDeque;
 
 use super::{
-    encode_text_bounded, estimated_text_tokens, Arc, KiroHistoryMessage, KiroPayload,
-    TokenCountCache,
+    credential_reference_ranges, encode_text_bounded, estimated_text_tokens, Arc,
+    KiroHistoryMessage, KiroPayload, TokenCountCache,
 };
 use crate::sanitize_kiro_tool_history;
 
@@ -29,10 +29,14 @@ impl TokenCountCache {
     /// Enforce serialized bytes as well as estimated tokens before dispatch.
     pub async fn partition_compaction_summary_with_limits(
         &self,
-        mut payload: KiroPayload,
+        payload: KiroPayload,
         maximum: usize,
         maximum_bytes: usize,
     ) -> Result<Vec<KiroPayload>, String> {
+        // Discover and replace complete credentials before we split source
+        // records. Sending raw fragments would lose their field-name context
+        // and their exact match against the request-local known value.
+        let mut payload = crate::prepare_redacted_kiro_payload(&payload, &[]);
         let mut normalized = payload.clone();
         sanitize_kiro_tool_history(&mut normalized);
         if self.estimate_kiro_payload(&normalized).await? <= maximum
@@ -178,7 +182,9 @@ impl TokenCountCache {
         let tokenizer = Arc::clone(&self.tokenizer);
         tokio::task::spawn_blocking(move || {
             let tokens = encode_text_bounded(&tokenizer, &text);
+            let references = credential_reference_ranges(&text);
             let mut start = 0;
+            let mut byte_start = 0;
             let mut parts = Vec::new();
             while start < tokens.len() {
                 if parts.len() >= MAX_SUMMARY_PARTS {
@@ -187,9 +193,22 @@ impl TokenCountCache {
                 let mut end = (start + maximum).min(tokens.len());
                 let fragment = loop {
                     if end == start {
-                        return Err("summary token budget cannot hold one UTF-8 character".into());
+                        return Err(if references.is_empty() {
+                            "summary token budget cannot hold one UTF-8 character"
+                        } else {
+                            "summary budget cannot hold an indivisible credential reference"
+                        }
+                        .into());
                     }
                     if let Ok(fragment) = tokenizer.decode(tokens[start..end].to_vec()) {
+                        let byte_end = byte_start + fragment.len();
+                        if references
+                            .iter()
+                            .any(|range| range.start < byte_end && byte_end < range.end)
+                        {
+                            end -= 1;
+                            continue;
+                        }
                         let estimate = estimated_text_tokens(&tokenizer, &fragment);
                         let bytes = serde_json::to_vec(&fragment)
                             .map_err(|error| error.to_string())?
@@ -209,6 +228,7 @@ impl TokenCountCache {
                     }
                     end -= 1;
                 };
+                byte_start += fragment.len();
                 parts.push(fragment);
                 start = end;
             }
@@ -220,7 +240,7 @@ impl TokenCountCache {
 }
 
 fn payload_bytes(payload: &KiroPayload) -> Result<usize, String> {
-    serde_json::to_vec(payload)
+    serde_json::to_vec(&crate::prepare_redacted_kiro_payload(payload, &[]))
         .map(|bytes| bytes.len())
         .map_err(|error| error.to_string())
 }
@@ -239,6 +259,98 @@ fn history_text_mut(message: &mut KiroHistoryMessage) -> Result<&mut String, Str
 mod tests {
     use super::*;
     use crate::{claude_to_kiro, compaction_summary_payload, ClaudeRequest, TranslationOptions};
+
+    #[tokio::test]
+    async fn source_credentials_are_masked_before_small_summary_parts_are_split() {
+        let cache = TokenCountCache::new(32).unwrap();
+        let secret = "opaqueP5m9Q2r7S4t6U8v3".repeat(30);
+        let source = format!(
+            "Before {}\npassword={secret}\nAfter {}",
+            "background fact ".repeat(200),
+            "later fact ".repeat(200)
+        );
+        let mut payload: KiroPayload = serde_json::from_value(serde_json::json!({
+            "conversationState":{
+                "chatTriggerType":"MANUAL", "conversationId":"fixture",
+                "history":[{"userInputMessage":{
+                    "content":source, "modelId":"model", "origin":"CLI"
+                }}],
+                "currentMessage":{"userInputMessage":{
+                    "content":"Summarize the supplied source.", "modelId":"model", "origin":"CLI"
+                }}
+            }
+        }))
+        .unwrap();
+        let session = crate::RedactionSession::new();
+        payload.redaction_session = Some(session.clone());
+        let prepared = crate::prepare_redacted_kiro_payload(&payload, &[]);
+        let expected = &prepared.conversation_state.history[0]
+            .user_input_message
+            .as_ref()
+            .unwrap()
+            .content;
+        let parts = cache
+            .partition_compaction_summary_with_limits(payload, 500, 3500)
+            .await
+            .unwrap();
+        assert!(parts.len() > 1);
+        let mut joined = String::new();
+        for part in parts {
+            let wire =
+                serde_json::to_string(&crate::prepare_redacted_kiro_payload(&part, &[])).unwrap();
+            for fragment in [secret.as_str(), &secret[..64], &secret[64..128]] {
+                assert!(
+                    !wire.contains(fragment),
+                    "a source credential fragment reached a summary part"
+                );
+            }
+            for user in part
+                .conversation_state
+                .history
+                .iter()
+                .filter_map(|record| record.user_input_message.as_ref())
+            {
+                joined.push_str(&user.content);
+            }
+        }
+        assert_eq!(&joined, expected);
+        assert_eq!(credential_reference_ranges(&joined).len(), 1);
+        assert_eq!(session.restore_text(&joined), source);
+    }
+
+    #[tokio::test]
+    async fn summary_splits_preserve_whole_references_and_reject_an_indivisible_one() {
+        let cache = TokenCountCache::new(16).unwrap();
+        let session = crate::RedactionSession::new();
+        let reference = session
+            .redact_text("password=opaque-reference-fixture", &[])
+            .strip_prefix("password=")
+            .unwrap()
+            .to_owned();
+        let capsule = format!(
+            "__CROSSLANE_CHECKPOINT_{}__",
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                b"\"capsule-fixture\""
+            )
+        );
+        let source = format!(
+            "{} {reference} {} {capsule} {}",
+            "old fact ".repeat(20),
+            "middle fact ".repeat(20),
+            "new fact ".repeat(20)
+        );
+        let parts = cache.split_summary_text(source.clone(), 64).await.unwrap();
+        assert!(parts.len() > 1);
+        assert_eq!(parts.concat(), source);
+        assert!(parts.iter().any(|part| part.contains(&reference)));
+        assert!(parts.iter().any(|part| part.contains(&capsule)));
+        let error = cache.split_summary_text(reference, 4).await.unwrap_err();
+        assert!(
+            error.contains("indivisible credential reference"),
+            "{error}"
+        );
+    }
 
     #[tokio::test]
     async fn oversized_current_source_is_partitioned_once_with_byte_and_token_limits() {
