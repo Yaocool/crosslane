@@ -75,6 +75,7 @@ pub fn response(
     mut context: StreamContext,
 ) -> Response {
     let mut effective_thinking = upstream.thinking_enabled();
+    let mut redaction = upstream.redaction_session().clone();
     #[cfg(feature = "crs")]
     let (initial_endpoint, initial_response, initial_permit, mut frozen_payload) =
         upstream.into_parts_with_payload();
@@ -206,6 +207,7 @@ pub fn response(
         let mut accumulated_text = String::new();
         let mut accumulated_reasoning = String::new();
         let mut payload = context.payload.clone();
+        payload.redaction_session = Some(redaction.clone());
         let tool_names = match protocol {
             StreamProtocol::Claude => ClientToolNames::claude(&context.web_tool_names),
             StreamProtocol::OpenAi => ClientToolNames::openai(&context.openai_tools),
@@ -285,7 +287,8 @@ pub fn response(
                 )));
                 break 'rounds;
             }
-            let mut leak_filter = ToolLeakFilter::for_payload(context.enable_tool_leak_filter, &payload);
+            let mut leak_filter = ToolLeakFilter::for_payload(context.enable_tool_leak_filter, &payload)
+                .with_redaction(redaction.clone());
             #[cfg(feature = "crs")]
             leak_filter.set_native_claude_refusals(matches!(protocol, StreamProtocol::Claude));
             let mut upstream_tool_names = std::collections::HashMap::new();
@@ -718,6 +721,8 @@ pub fn response(
                             Ok(retry) => {
                                 upstream_access_token = account.credentials.access_token.clone();
                                 effective_thinking = retry.thinking_enabled();
+                                redaction = retry.redaction_session().clone();
+                                payload.redaction_session = Some(redaction.clone());
                                 #[cfg(feature = "crs")]
                                 let (next_endpoint, next_response, next_permit, next_frozen_payload) =
                                     retry.into_parts_with_payload();
@@ -848,6 +853,8 @@ pub fn response(
                                         upstream_access_token =
                                             account.credentials.access_token.clone();
                                         effective_thinking = retry.thinking_enabled();
+                                        redaction = retry.redaction_session().clone();
+                                        payload.redaction_session = Some(redaction.clone());
                                         #[cfg(feature = "crs")]
                                         let (next_endpoint, next_response, next_permit, next_frozen_payload) =
                                             retry.into_parts_with_payload();
@@ -1159,6 +1166,8 @@ pub fn response(
                             }
                             upstream_access_token = account.credentials.access_token.clone();
                             effective_thinking = retry.thinking_enabled();
+                            redaction = retry.redaction_session().clone();
+                            payload.redaction_session = Some(redaction.clone());
                             #[cfg(feature = "crs")]
                             let (next_endpoint, next_response, next_permit, next_frozen_payload) =
                                 retry.into_parts_with_payload();
@@ -1339,6 +1348,8 @@ pub fn response(
                                 Ok(next) => {
                                     upstream_access_token = account.credentials.access_token.clone();
                                     effective_thinking = next.thinking_enabled();
+                                    redaction = next.redaction_session().clone();
+                                    payload.redaction_session = Some(redaction.clone());
                                     let (next_endpoint, next_response, next_permit, next_frozen_payload) =
                                         next.into_parts_with_payload();
                                     endpoint_key = next_endpoint.key;
@@ -1452,6 +1463,8 @@ pub fn response(
                         Ok(next) => {
                             upstream_access_token = account.credentials.access_token.clone();
                             effective_thinking = next.thinking_enabled();
+                            redaction = next.redaction_session().clone();
+                            payload.redaction_session = Some(redaction.clone());
                             #[cfg(feature = "crs")]
                             let (next_endpoint, next_response, next_permit, next_frozen_payload) =
                                 next.into_parts_with_payload();
@@ -1727,6 +1740,7 @@ pub fn response(
                             &context.lease,
                             &query,
                             &context.web_search_domains,
+                            Some(&redaction),
                         )) {
                             Ok(results) => ClaudeWebSearchTrace::success(server_id, &query, results),
                             Err(error) => {
@@ -1918,7 +1932,7 @@ pub fn response(
                         break 'rounds;
                     }
                 };
-                let next_payload_bytes = match serde_json::to_vec(&payload) {
+                let next_payload_bytes = match serde_json::to_vec(&crosslane_translate::prepare_redacted_kiro_payload(&payload, &[])) {
                     Ok(payload) => payload.len(),
                     Err(error) => {
                         failed = Some(error.to_string());
@@ -2004,6 +2018,8 @@ pub fn response(
                     Ok(next) => {
                         upstream_access_token = account.credentials.access_token.clone();
                         effective_thinking = next.thinking_enabled();
+                        redaction = next.redaction_session().clone();
+                        payload.redaction_session = Some(redaction.clone());
                         #[cfg(feature = "crs")]
                         let (next_endpoint, next_response, next_permit, next_frozen_payload) =
                             next.into_parts_with_payload();
@@ -2120,6 +2136,7 @@ pub fn response(
                             &context.lease,
                             &query,
                             &context.web_search_domains,
+                            Some(&redaction),
                         )) {
                             Ok(results) => ClaudeWebSearchTrace::success(server_id, &query, results),
                             Err(error) => {
@@ -2223,6 +2240,8 @@ pub fn response(
                     Ok(next) => {
                         upstream_access_token = account.credentials.access_token.clone();
                         effective_thinking = next.thinking_enabled();
+                        redaction = next.redaction_session().clone();
+                        payload.redaction_session = Some(redaction.clone());
                         #[cfg(feature = "crs")]
                         let (next_endpoint, next_response, next_permit, next_frozen_payload) =
                             next.into_parts_with_payload();
@@ -2343,6 +2362,8 @@ pub fn response(
                 Ok(next) => {
                     upstream_access_token = account.credentials.access_token.clone();
                     effective_thinking = next.thinking_enabled();
+                    redaction = next.redaction_session().clone();
+                    payload.redaction_session = Some(redaction.clone());
                     #[cfg(feature = "crs")]
                     let (next_endpoint, next_response, next_permit, next_frozen_payload) =
                         next.into_parts_with_payload();

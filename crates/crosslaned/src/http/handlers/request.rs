@@ -499,6 +499,7 @@ async fn handle_claude_route_inner(
         .resolved_model_info(&route.mapped)
         .and_then(|model| model.additional_model_request_fields_schema);
     let mut payload = claude_to_kiro(&request, &options);
+    payload.restore_summary_secrets = client_compaction;
     if client_compaction {
         crosslane_translate::prepare_compaction_source_history(&mut payload);
         #[cfg(feature = "crs")]
@@ -702,6 +703,11 @@ async fn handle_claude_route_inner(
         resumed_tool_searches.push(outcome.trace);
     }
     if !pending_web_searches.is_empty() {
+        // Resumed hosted tools run before the first generation transport. Learn
+        // credentials from the complete context without masking local history.
+        if let Some(redaction) = &payload.redaction_session {
+            redaction.redact_payload(&mut payload.clone(), &[]);
+        }
         let needs_search_account = pending_web_searches
             .iter()
             .filter(|tool_use| {
@@ -767,6 +773,7 @@ async fn handle_claude_route_inner(
                         lease,
                         &query,
                         &web_search_domains,
+                        payload.redaction_session.as_ref(),
                     )
                     .await
                     {

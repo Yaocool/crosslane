@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use crosslane_kiro::{KiroCitation, KiroEvent, UsageInfo};
+use crosslane_translate::redaction::RedactionSession;
 use crosslane_translate::{
     ClaudeContextEditStats, ClaudeServerToolEmission, ClaudeToolSearchTrace, ClaudeWebSearchTrace,
     KiroToolUse, WebSearchReplayCodec, WebSearchReplayError,
@@ -435,6 +436,7 @@ pub struct ToolLeakFilter {
     pending: String,
     recovered: Vec<KiroEvent>,
     structured: BTreeMap<String, (String, String)>,
+    redaction: Option<RedactionSession>,
 }
 
 impl ToolLeakFilter {
@@ -454,6 +456,7 @@ impl ToolLeakFilter {
             pending: String::new(),
             recovered: Vec::new(),
             structured: BTreeMap::new(),
+            redaction: None,
         }
     }
 
@@ -481,6 +484,13 @@ impl ToolLeakFilter {
                 .insert(tool.name.clone(), tool.input_schema.json.clone());
         }
         filter
+    }
+
+    /// Native tool inputs are restored at the transport boundary. This session
+    /// is used only for tool calls recovered later from assistant text.
+    pub fn with_redaction(mut self, redaction: RedactionSession) -> Self {
+        self.redaction = Some(redaction);
+        self
     }
 
     #[cfg(feature = "crs")]
@@ -572,17 +582,35 @@ impl ToolLeakFilter {
                 content: std::mem::take(&mut self.pending),
             });
         }
-        output.extend(self.recovered.into_iter().filter(|event| match event {
-            KiroEvent::ToolUse {
+        for mut event in self.recovered {
+            if let KiroEvent::ToolUse {
                 name, input_delta, ..
-            } => {
-                let input = repair_json(input_delta);
-                !self.structured.values().any(|(seen_name, seen_input)| {
+            } = &mut event
+            {
+                // Restore before comparing with native calls, which have
+                // already been restored by the HTTP response adapter.
+                let mut input = repair_json(input_delta);
+                if let Some(redaction) = &self.redaction {
+                    if redaction.tool_input_expansion_bound(&input)
+                        > MAX_CUMULATIVE_TOOL_INPUT_BYTES
+                    {
+                        output.push(KiroEvent::Error {
+                            kind: "tool_input_too_large".into(),
+                            message: "restored tool input exceeded its expansion limit".into(),
+                        });
+                        continue;
+                    }
+                    redaction.restore_tool_input_for_tool(name, &mut input);
+                    *input_delta = input.to_string();
+                }
+                if self.structured.values().any(|(seen_name, seen_input)| {
                     seen_name == name && repair_json(seen_input) == input
-                })
+                }) {
+                    continue;
+                }
             }
-            _ => true,
-        }));
+            output.push(event);
+        }
         output
     }
 
@@ -1892,6 +1920,87 @@ fn normalize_partial_json(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovered_tools_restore_parameters_without_unmasking_assistant_text() {
+        let secret = "ksk_synthetic-fallback-token";
+        let session = RedactionSession::new();
+        let marker = session.redact_text(secret, &[secret]);
+        assert_ne!(marker, secret);
+        let input = json!({"headers":{"Authorization":format!("Bearer {marker}")}});
+        let mut filter = ToolLeakFilter::new(true, ["request".into()]).with_redaction(session);
+        let mut events = filter.push(KiroEvent::AssistantResponse {
+            content: format!(
+                "Visible reference {marker}\n<tool_use name=\"request\">{input}</tool_use>"
+            ),
+        });
+        events.extend(filter.finish());
+        let visible: String = events
+            .iter()
+            .filter_map(|event| match event {
+                KiroEvent::AssistantResponse { content } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(visible.contains(&marker));
+        assert!(!visible.contains(secret));
+        let restored = events
+            .iter()
+            .find_map(|event| match event {
+                KiroEvent::ToolUse { input_delta, .. } => Some(repair_json(input_delta)),
+                _ => None,
+            })
+            .expect("recovered call");
+        assert_eq!(
+            restored["headers"]["Authorization"],
+            format!("Bearer {secret}")
+        );
+    }
+
+    #[test]
+    fn restored_fallback_calls_are_deduplicated_against_native_calls() {
+        let secret = "ksk_synthetic-dedup-token";
+        let session = RedactionSession::new();
+        let marker = session.redact_text(secret, &[secret]);
+        let mut filter = ToolLeakFilter::new(true, ["request".into()]).with_redaction(session);
+        assert!(filter
+            .push(KiroEvent::AssistantResponse {
+                content: format!(
+                    "<tool_use name=\"request\">{}</tool_use>",
+                    json!({"token":marker})
+                ),
+            })
+            .is_empty());
+        let native = filter.push(KiroEvent::ToolUse {
+            id: "native-tool".into(),
+            name: "request".into(),
+            input_delta: json!({"token":secret}).to_string(),
+            stop: true,
+        });
+        assert_eq!(native.len(), 1);
+        assert!(filter.finish().is_empty());
+    }
+
+    #[test]
+    fn fallback_tools_cannot_restore_another_requests_markers() {
+        let owner = RedactionSession::new();
+        let secret = "ksk_synthetic-isolated-token";
+        let marker = owner.redact_text(secret, &[secret]);
+        let mut filter =
+            ToolLeakFilter::new(true, ["request".into()]).with_redaction(RedactionSession::new());
+        filter.push(KiroEvent::AssistantResponse {
+            content: format!(
+                "<tool_use name=\"request\">{}</tool_use>",
+                json!({"token":marker})
+            ),
+        });
+        let events = filter.finish();
+        let KiroEvent::ToolUse { input_delta, .. } = &events[0] else {
+            panic!("recovered call expected");
+        };
+        assert_eq!(repair_json(input_delta)["token"], marker);
+        assert!(!input_delta.contains(secret));
+    }
 
     #[cfg(feature = "crs")]
     #[test]

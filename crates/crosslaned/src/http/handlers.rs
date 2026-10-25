@@ -1956,15 +1956,53 @@ fn serialized_payload_bytes(
     payload: &crosslane_translate::KiroPayload,
     format: ErrorFormat,
 ) -> Result<usize, ApiError> {
-    serde_json::to_vec(payload)
-        .map(|payload| payload.len())
-        .map_err(|error| {
-            ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to serialize upstream request: {error}"),
-                format,
-            )
-        })
+    serde_json::to_vec(&crosslane_translate::prepare_redacted_kiro_payload(
+        payload,
+        &[],
+    ))
+    .map(|payload| payload.len())
+    .map_err(|error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to serialize upstream request: {error}"),
+            format,
+        )
+    })
+}
+
+#[cfg(test)]
+#[test]
+fn serialized_budget_includes_redaction_expansion() {
+    let mut payload: KiroPayload = serde_json::from_value(json!({
+        "conversationState": {
+            "chatTriggerType":"MANUAL", "conversationId":"fixture",
+            "currentMessage":{"userInputMessage":{
+                "content":"password=abcd\n".repeat(128), "modelId":"model", "origin":"CLI"
+            }}
+        }
+    }))
+    .unwrap();
+    payload.redaction_session = Some(crosslane_translate::RedactionSession::new());
+    let raw = serde_json::to_vec(&payload).unwrap();
+    let expected = serde_json::to_vec(&crosslane_translate::prepare_redacted_kiro_payload(
+        &payload,
+        &[],
+    ))
+    .unwrap()
+    .len();
+    let budgeted = serialized_payload_bytes(&payload, ErrorFormat::Claude)
+        .unwrap_or_else(|_| panic!("synthetic payload must serialize"));
+    assert_eq!(budgeted, expected);
+    assert!(budgeted > raw.len() * 2);
+    let context = crosslane_core::config::ContextConfig {
+        max_upstream_payload_bytes: raw.len() + 128,
+        ..Default::default()
+    };
+    assert!(
+        enforce_payload_budget_limits(&context, 0, budgeted, 0, false, ErrorFormat::Claude)
+            .is_err()
+    );
+    assert_eq!(serde_json::to_vec(&payload).unwrap(), raw);
 }
 
 fn claude_validation_error(error: ValidationError) -> ApiError {
@@ -2029,9 +2067,11 @@ pub(super) async fn remaining_tool_search_budget(
     let current_tools = loaded_tool_count(payload);
     let current_tool_tokens = state.tokenizer.estimate_kiro_tools(payload).await? as u64;
     let current_input_tokens = state.tokenizer.estimate_kiro_payload(payload).await? as u64;
-    let current_payload_bytes = serde_json::to_vec(payload)
-        .map_err(|error| format!("failed to serialize Tool Search payload: {error}"))?
-        .len();
+    let current_payload_bytes = serde_json::to_vec(
+        &crosslane_translate::prepare_redacted_kiro_payload(payload, &[]),
+    )
+    .map_err(|error| format!("failed to serialize Tool Search payload: {error}"))?
+    .len();
     let model = &payload
         .conversation_state
         .current_message

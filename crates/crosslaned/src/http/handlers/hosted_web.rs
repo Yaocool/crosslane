@@ -632,7 +632,7 @@ async fn search(
     {
         search_query.push_str(&format!(" [approximate user location: {location}]"));
     }
-    let mut results = super::execute_kiro_web_search(&service.app, &lease, &search_query)
+    let mut results = super::execute_kiro_web_search(&service.app, &lease, &search_query, None)
         .await
         .map_err(|error| {
             ApiError::new(StatusCode::BAD_GATEWAY, error.message, ErrorFormat::OpenAi)

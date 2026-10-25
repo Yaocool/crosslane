@@ -16,7 +16,7 @@ use super::{
 };
 
 mod dispatch;
-use crosslane_translate::WebSearchDomainFilter;
+use crosslane_translate::{RedactionSession, WebSearchDomainFilter};
 
 pub(super) use dispatch::{execute_upstream, prepare_upstream};
 
@@ -249,6 +249,8 @@ pub(super) async fn collect_nonstream_rounds(
         .count() as u32;
     loop {
         let effective_thinking = thinking_enabled && upstream.thinking_enabled();
+        let redaction = upstream.redaction_session().clone();
+        payload.redaction_session = Some(redaction.clone());
         #[cfg(feature = "crs")]
         let (endpoint_definition, response, upstream_permit, frozen_payload) =
             upstream.into_parts_with_payload();
@@ -285,7 +287,8 @@ pub(super) async fn collect_nonstream_rounds(
         drop(upstream_permit);
         let event_count = events.len();
         let mut leak_filter =
-            ToolLeakFilter::for_payload(config.features.enable_tool_leak_filter, &payload);
+            ToolLeakFilter::for_payload(config.features.enable_tool_leak_filter, &payload)
+                .with_redaction(redaction);
         #[cfg(feature = "crs")]
         leak_filter.set_native_claude_refusals(tool_names.is_claude());
         let mut thinking_filter = ThinkingContentFilter::new(effective_thinking)
@@ -734,8 +737,14 @@ pub(super) async fn collect_nonstream_rounds(
                     )
                 } else {
                     web_search_round += 1;
-                    match execute_filtered_kiro_web_search(state, lease, &query, web_search_domains)
-                        .await
+                    match execute_filtered_kiro_web_search(
+                        state,
+                        lease,
+                        &query,
+                        web_search_domains,
+                        payload.redaction_session.as_ref(),
+                    )
+                    .await
                     {
                         Ok(results) => ClaudeWebSearchTrace::success(server_id, &query, results),
                         Err(error) => {
@@ -857,15 +866,17 @@ pub(super) async fn collect_nonstream_rounds(
                     })
                 })? as u64)
                 .saturating_add(documentation_tokens);
-            let next_payload_bytes = serde_json::to_vec(&payload)
-                .map_err(|error| {
-                    ExecuteError::Upstream(KiroError {
-                        status: None,
-                        endpoint: endpoint.clone(),
-                        message: error.to_string(),
-                    })
-                })?
-                .len();
+            let next_payload_bytes = serde_json::to_vec(
+                &crosslane_translate::prepare_redacted_kiro_payload(&payload, &[]),
+            )
+            .map_err(|error| {
+                ExecuteError::Upstream(KiroError {
+                    status: None,
+                    endpoint: endpoint.clone(),
+                    message: error.to_string(),
+                })
+            })?
+            .len();
             let next_loaded_tools = loaded_tool_count(&payload);
             let max_loaded_tools = config
                 .context
@@ -1009,8 +1020,14 @@ pub(super) async fn collect_nonstream_rounds(
                     )
                 } else {
                     web_search_round += 1;
-                    match execute_filtered_kiro_web_search(state, lease, &query, web_search_domains)
-                        .await
+                    match execute_filtered_kiro_web_search(
+                        state,
+                        lease,
+                        &query,
+                        web_search_domains,
+                        payload.redaction_session.as_ref(),
+                    )
+                    .await
                     {
                         Ok(results) => ClaudeWebSearchTrace::success(server_id, &query, results),
                         Err(error) => {
@@ -1194,8 +1211,10 @@ pub(in crate::http) async fn execute_filtered_kiro_web_search(
     lease: &AccountLease,
     query: &str,
     domains: &WebSearchDomainFilter,
+    redaction: Option<&RedactionSession>,
 ) -> Result<crosslane_translate::WebSearchResults, KiroError> {
-    let mut results = execute_kiro_web_search(state, lease, &domains.search_query(query)).await?;
+    let mut results =
+        execute_kiro_web_search(state, lease, &domains.search_query(query), redaction).await?;
     domains.filter_results(query, &mut results);
     Ok(results)
 }
@@ -1204,11 +1223,12 @@ pub(in crate::http) async fn execute_kiro_web_search(
     state: &Arc<AppState>,
     lease: &AccountLease,
     query: &str,
+    redaction: Option<&RedactionSession>,
 ) -> Result<crosslane_translate::WebSearchResults, KiroError> {
     let account = lease.account().await;
     let account_id = account.id;
     let rejected_access_token = account.credentials.access_token;
-    match execute_kiro_web_search_once(state, lease, query).await {
+    match execute_kiro_web_search_once(state, lease, query, redaction).await {
         Err(error) if error.is_auth() => {
             state
                 .refresh_account_token_after_auth_failure(
@@ -1222,7 +1242,7 @@ pub(in crate::http) async fn execute_kiro_web_search(
                     endpoint: "MCP web_search".into(),
                     message: format!("web search authentication recovery failed: {refresh}"),
                 })?;
-            execute_kiro_web_search_once(state, lease, query).await
+            execute_kiro_web_search_once(state, lease, query, redaction).await
         }
         result => result,
     }
@@ -1232,9 +1252,18 @@ pub(super) async fn execute_kiro_web_search_once(
     state: &Arc<AppState>,
     lease: &AccountLease,
     query: &str,
+    redaction: Option<&RedactionSession>,
 ) -> Result<crosslane_translate::WebSearchResults, KiroError> {
     let account = ensure_web_search_profile_arn(state, lease).await?;
-    state.kiro().web_search(&account, query).await
+    match redaction {
+        Some(redaction) => {
+            state
+                .kiro()
+                .web_search_with_redaction(&account, query, redaction)
+                .await
+        }
+        None => state.kiro().web_search(&account, query).await,
+    }
 }
 
 pub(super) async fn ensure_web_search_profile_arn(
@@ -1363,13 +1392,16 @@ pub(in crate::http) async fn validate_internal_continuation(
             endpoint: endpoint.into(),
             message,
         })? as u64;
-    let payload_bytes = serde_json::to_vec(payload)
-        .map_err(|error| KiroError {
-            status: None,
-            endpoint: endpoint.into(),
-            message: error.to_string(),
-        })?
-        .len();
+    let payload_bytes = serde_json::to_vec(&crosslane_translate::prepare_redacted_kiro_payload(
+        payload,
+        &[],
+    ))
+    .map_err(|error| KiroError {
+        status: None,
+        endpoint: endpoint.into(),
+        message: error.to_string(),
+    })?
+    .len();
     let loaded_tools = loaded_tool_count(payload);
     let max_loaded_tools = config
         .context
