@@ -437,6 +437,72 @@ completion/failure event formats are preserved. With `crs`, streaming Messages
 service errors still use HTTP 200 SSE and carry the actual status in
 `error.status`, for example 503 for local overload.
 
+## Kiro request secret redaction
+
+Kiro generation requests always pass through local, deterministic redaction at
+the final transport boundary. Detection uses no language model, remote classifier,
+or extra network request. It covers current messages, system/history messages,
+tool arguments/results, tool descriptions and schema examples. Automatic summary
+inputs, summary merging and generation retries share this boundary. Kiro MCP web
+search queries use the same text rules.
+
+Sensitive field names, credential assignments in configuration or commands,
+recognizable key/token formats, authentication headers, credential URLs, private
+key blocks and exact copies of the current Kiro account's known credentials are
+replaced with unique placeholders containing a random request identifier. Equal
+values share a placeholder within a logical request. The in-memory mapping is
+shared by internal retries, tool continuations and automatic summaries, and is
+never written to logs or disk. Actual HTTP authentication, profile/model/tool
+names, call correlation IDs and token limit controls remain usable.
+Context and byte budgets use the same redacted copy, including the cost of
+placeholders, the reference hint and schema alternatives.
+Summary sources are masked before partitioning, and splitting or local truncation
+keeps credential references intact. A budget too small for one reference fails
+explicitly.
+
+Cloud rules recognize characteristic prefixes in prose: Tencent `AKID`, Alibaba
+`LTAI` / `STS.`, Volcengine and Kingsoft `AKLT`, AWS `AKIA` / `ASIA`, and Google
+`AIza`. Opaque secrets use credential fields and assignments such as `SecretId`,
+`SecretKey`, `AccessKeyId`, `AccessKeySecret`, `SecretAccessKey`, `SecurityToken`
+and `ak` / `sk`, covering common Tencent, Alibaba, Huawei, Baidu, Qiniu and JD
+credential names. Azure `AccountKey`, `SharedAccessSignature` and `sig` are also
+covered. Environment assignments and command flags use the same rules. Random
+unlabeled SecretKeys without a recognized prefix or previously identified value
+cannot be reliably detected.
+
+The model is instructed to copy placeholders exactly into tool arguments. The
+gateway parses complete arguments as JSON and restores their original string,
+number and boolean values locally, preserving escaping and fragmented parallel
+calls. Ordinary answers stay masked. Secrets actually referenced in compaction
+checkpoints become reversible checkpoint capsules. When a client replays that
+summary, the gateway decodes them locally into a fresh mapping; Kiro receives
+only the current request's placeholders. Capsules encode credentials and are not
+encryption. Environment references such as `$TOKEN`, `${TOKEN}`,
+`%TOKEN%` and `$env:TOKEN` remain expressions; literal secrets still match the rules.
+
+For explicitly recognized POSIX tools such as Bash, shell and exec_command,
+restoration escapes common unquoted, single-quoted and double-quoted arguments so
+secret characters do not become shell syntax. Ordinary HTTP/JSON parameters get
+no shell quoting. Commands and JSON text copied unchanged use request-local
+source records to retain their original escaping, whitespace and newlines.
+Arbitrary heredocs, nested substitutions, PowerShell and
+languages embedded in shell arguments such as Python/SQL are not interpreted;
+those tools should use structured credential parameters or executor environment
+variables.
+
+Mappings are not shared across independent HTTP requests. Clients should replay
+the restored tool parameters in later history or retain checkpoint capsules so a
+new request can recreate the mapping. Unknown request placeholders are
+not guessed, and placeholders changed or omitted by the model cannot be reliably
+recovered.
+
+UTF-8 txt, md, csv and html attachments are decoded from Base64, redacted and
+encoded again. Binary PDF, Office and image attachments are not OCRed or parsed;
+secrets inside them are outside the text rules' coverage. Rules cannot guarantee
+recognition of arbitrary unlabeled passwords, unknown credential formats, or
+encoded/split secrets. Matching business data is also shown to the model only as
+references; restoration happens in trusted local execution paths using the map.
+
 ## Logs and troubleshooting
 
 ```bash
