@@ -302,6 +302,15 @@ async fn common_auth_forms_are_filtered_before_send_and_recover_working_curl_arg
             "has_password":true,
             "env_command":"curl -u \"$BASIC_USER:$BASIC_PASSWORD\" https://example.invalid/",
             "env_command_ps":"curl.exe -u \"${Env:BASIC_USER}:${ENV:BASIC_PASSWORD}\" https://example.invalid/",
+            "runtime_references":{
+                "go":"var api_token=os.Getenv(\"API_TOKEN\")",
+                "java":"String api_token=System.getenv(\"API_TOKEN\")",
+                "rust":"let api_token=std::env::var(\"API_TOKEN\")",
+                "dotnet":"var api_token=Environment.GetEnvironmentVariable(\"API_TOKEN\")",
+                "ruby":"```ruby\napi_token=ENV.fetch('API_TOKEN')\n```",
+                "php":"```php\n$api_token=getenv('API_TOKEN');\n```"
+            },
+            "default_expression":"const options = {token: Deno.env.get(\"API_TOKEN\") ?? \"$WIRE_LITERAL_SECRET\", retries: 3}",
             "api_token":"process.env.APP_SETTING ?? 'opaque-wire-default'",
             "fetch_options":{"credentials":"include","method":"GET"},
             "authorization_code_request":{"grant_type":"authorization_code","code":"opaque-code-fixture"},
@@ -328,14 +337,15 @@ async fn common_auth_forms_are_filtered_before_send_and_recover_working_curl_arg
             .respond_with(move |request: &wiremock::Request| {
                 let wire: Value = serde_json::from_slice(&request.body).unwrap();
                 let encoded = wire.to_string();
-                for secret in ["admin:admin", "wire-password-123", "opaque-code-fixture", "opaque-sdk-fixture", "opaque-db-fixture", "opaque-p12-fixture", "opaque-wire-default", "dXNlcjpvcGFxdWUtZG9ja2VyLWZpeHR1cmU="] {
+                for secret in ["admin:admin", "wire-password-123", "opaque-code-fixture", "opaque-sdk-fixture", "opaque-db-fixture", "opaque-p12-fixture", "opaque-wire-default", "$WIRE_LITERAL_SECRET", "dXNlcjpvcGFxdWUtZG9ja2VyLWZpeHR1cmU="] {
                     assert_eq!(encoded.contains(secret), !enabled, "wire policy for synthetic {secret}");
                 }
                 let tool = historical_tool_input(&wire);
-                for field in ["headers", "has_password", "env_command", "env_command_ps", "fetch_options", "timeout"] {
+                for field in ["headers", "has_password", "env_command", "env_command_ps", "runtime_references", "fetch_options", "timeout"] {
                     assert_eq!(tool[field], expected[field], "public control changed");
                 }
                 assert!(encoded.contains("access-control-allow-credentials: true"));
+                assert!(tool["default_expression"].as_str().unwrap().contains(", retries: 3}"));
                 let encoded = tool.to_string();
                 let split = encoded.find(PLACEHOLDER_PREFIX).map_or(encoded.len() / 2, |offset| offset + 8);
                 let mut response = event_frame("toolUseEvent", json!({"toolUseId":"auth-returned","name":"Bash","input":&encoded[..split],"stop":false}));

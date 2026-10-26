@@ -922,6 +922,7 @@ fn redact_text_with_session(
     let mut discovered = collector.discovered;
     discovered.sort_unstable();
     discovered.dedup();
+    remember_literal_getters(session, &discovered);
     let secrets: Vec<&str> = known_secrets
         .iter()
         .copied()
@@ -953,6 +954,7 @@ fn redact_payload_impl(
     collector.payload(payload);
     collector.discovered.sort_unstable();
     collector.discovered.dedup();
+    remember_literal_getters(session, &collector.discovered);
     let secrets: Vec<&str> = known_secrets
         .iter()
         .copied()
@@ -962,6 +964,20 @@ fn redact_payload_impl(
     redactor.session = session.cloned();
     redactor.payload(payload);
     redactor.stats
+}
+
+fn remember_literal_getters(session: Option<&RedactionSession>, discovered: &[String]) {
+    if let Some(session) = session {
+        for literal in discovered
+            .iter()
+            .filter(|text| named_getter_reference(text))
+        {
+            // An enclosing Basic-auth pair may become one marker. Retain the
+            // getter-shaped password too, so future rounds cannot reclassify
+            // that proven literal credential as a public environment reference.
+            session.marker(Value::String(literal.clone()));
+        }
+    }
 }
 
 struct Redactor<'a> {
@@ -1221,8 +1237,8 @@ impl<'a> Redactor<'a> {
                                 .as_str()
                                 .is_some_and(|text| auth::credential_field(&name, text)));
                     if !secret_field {
-                        if let Some(password) = auth::basic_password(&name, &mut child) {
-                            self.data(password, true);
+                        for password in auth::basic_passwords(&name, &mut child) {
+                            self.authentication_literal(password);
                         }
                     }
                     self.text(&mut name);
@@ -1282,7 +1298,9 @@ impl<'a> Redactor<'a> {
             }
             Value::String(text)
                 if sensitive
-                    && (symbolic_sensitive_value(text) || marker_pattern().is_match(text)) =>
+                    && ((structured_reference(text)
+                        && !self.known_secrets.contains(&text.as_str()))
+                        || marker_pattern().is_match(text)) =>
             {
                 let ranges = exclude_references(text, std::iter::once(0..text.len()).collect())
                     .into_iter()
@@ -1352,6 +1370,25 @@ impl<'a> Redactor<'a> {
             }
         }
         self.data(value, false);
+    }
+
+    fn authentication_literal(&mut self, value: &mut Value) {
+        if let Some(text) = value.as_str().filter(|text| named_getter_reference(text)) {
+            // A structured Basic-auth tuple/object contains an actual password,
+            // not source code that will evaluate a getter expression.
+            if self.collecting {
+                self.discovered.push(text.to_owned());
+            } else {
+                let marker = self.session.as_ref().map_or_else(
+                    || REDACTED.to_owned(),
+                    |session| session.marker(value.clone()),
+                );
+                *value = Value::String(marker);
+                self.stats.redacted_values += 1;
+            }
+        } else {
+            self.data(value, true);
+        }
     }
 
     // JSON Schema property names, types, required names and structural keywords
@@ -1447,15 +1484,19 @@ impl<'a> Redactor<'a> {
                 .as_str()
                 .is_some_and(|text| auth::credential_field(name, text));
         if !sensitive {
-            if let Some(password) = auth::basic_password(name, value) {
-                self.data(password, true);
+            for password in auth::basic_passwords(name, value) {
+                self.authentication_literal(password);
             }
             if auth::challenge_header(name) {
                 self.challenge(value);
                 return;
             }
         }
-        self.data(value, sensitive);
+        if sensitive {
+            self.authentication_literal(value);
+        } else {
+            self.data(value, false);
+        }
     }
 }
 
@@ -1599,7 +1640,6 @@ fn reusable_secret(secret: &str) -> bool {
     secret.chars().count() >= 4
         && !REDACTED.contains(secret)
         && !matches!(secret, "true" | "false" | "null")
-        && !symbolic_sensitive_value(secret)
         && !marker_pattern()
             .find(secret)
             .is_some_and(|matched| matched.as_str() == secret)
@@ -1609,8 +1649,137 @@ fn symbolic_pattern() -> &'static Regex {
     static SYMBOLIC: OnceLock<Regex> = OnceLock::new();
     regex(
         &SYMBOLIC,
-        r#"\$\{(?:(?i:env):)?[A-Za-z_][A-Za-z0-9_]*(?::[-+?=][^{}\r\n]*)?\}|\$(?:(?i:env):)?[A-Za-z_][A-Za-z0-9_]*|%[A-Za-z_][A-Za-z0-9_]*%|process\.env(?:\.[A-Za-z_][A-Za-z0-9_]*|\[\s*["'][A-Za-z_][A-Za-z0-9_]*["']\s*\])|os\.(?:getenv|environ\.get)\(\s*["'][A-Za-z_][A-Za-z0-9_]*["']\s*\)|os\.environ\[\s*["'][A-Za-z_][A-Za-z0-9_]*["']\s*\]"#,
+        // Only named environment lookups without defaults or arbitrary call
+        // arguments are references. Matching quotes and identifier boundaries
+        // matter: a lookalike function or malformed literal is not exempt.
+        concat!(
+            r#"\$\{(?:(?i:env):)?[A-Za-z_][A-Za-z0-9_]*(?::[-+?=][^{}\r\n]*)?\}"#,
+            r#"|\$_ENV\[\s*(?:"[A-Za-z_][A-Za-z0-9_]*"|'[A-Za-z_][A-Za-z0-9_]*')\s*\]"#,
+            r#"|\$(?:(?i:env):)?[A-Za-z_][A-Za-z0-9_]*|%[A-Za-z_][A-Za-z0-9_]*%"#,
+            r#"|\b(?:process|Bun|import\.meta)\.env(?:\.[A-Za-z_][A-Za-z0-9_]*|\[\s*(?:"[A-Za-z_][A-Za-z0-9_]*"|'[A-Za-z_][A-Za-z0-9_]*')\s*\])"#,
+            r#"|\b(?:os\.(?:getenv|Getenv|environ\.get)|System\.getenv|(?:System\.)?Environment\.GetEnvironmentVariable|(?:std::)?env::var(?:_os)?|Deno\.env\.get|ENV\.fetch|getenv)\s*\(\s*(?:"[A-Za-z_][A-Za-z0-9_]*"|'[A-Za-z_][A-Za-z0-9_]*')\s*\)"#,
+            r#"|\b(?:os\.environ|ENV)\[\s*(?:"[A-Za-z_][A-Za-z0-9_]*"|'[A-Za-z_][A-Za-z0-9_]*')\s*\]"#,
+        ),
     )
+}
+
+fn symbolic_at_start() -> &'static Regex {
+    static AT_START: OnceLock<Regex> = OnceLock::new();
+    AT_START.get_or_init(|| {
+        Regex::new(&format!(r"\A(?:{})", symbolic_pattern().as_str()))
+            .expect("anchored environment reference")
+    })
+}
+
+fn named_getter_reference(text: &str) -> bool {
+    (!text.starts_with(['$', '%']) || text.starts_with("$_ENV["))
+        && symbolic_at_start()
+            .find(text)
+            .is_some_and(|reference| reference.end() == text.len())
+}
+
+fn source_contexts(text: &str) -> Vec<Range<usize>> {
+    static DECLARATION: OnceLock<Regex> = OnceLock::new();
+    let declaration = regex(
+        &DECLARATION,
+        r"\A[ \t]*(?:(?:const|let|var|String|java\.lang\.String|final[ \t]+String)[ \t]+(?:mut[ \t]+)?[A-Za-z_][A-Za-z0-9_]*(?:[ \t]*:[ \t]*[A-Za-z_][A-Za-z0-9_:<> ,&]*)?[ \t]*=|\$[A-Za-z_][A-Za-z0-9_]*[ \t]*=)",
+    );
+    let mut contexts = Vec::new();
+    let mut fence: Option<(char, usize, usize, bool)> = None;
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start_matches([' ', '\t']);
+        if let Some(marker @ ('`' | '~')) = trimmed.chars().next() {
+            let count = trimmed.chars().take_while(|ch| *ch == marker).count();
+            if count >= 3 {
+                let suffix = trimmed[count..].trim();
+                if let Some((opened, length, start, source)) = fence {
+                    if marker == opened && count >= length && suffix.is_empty() {
+                        if source {
+                            contexts.push(start..offset);
+                        }
+                        fence = None;
+                    }
+                } else {
+                    let source = matches!(
+                        suffix.to_ascii_lowercase().as_str(),
+                        "go" | "golang"
+                            | "java"
+                            | "cs"
+                            | "csharp"
+                            | "c#"
+                            | "rust"
+                            | "rs"
+                            | "ruby"
+                            | "rb"
+                            | "php"
+                            | "javascript"
+                            | "js"
+                            | "typescript"
+                            | "ts"
+                    );
+                    fence = Some((marker, count, offset + line.len(), source));
+                }
+                offset += line.len();
+                continue;
+            }
+        }
+        if fence.is_none() && declaration.is_match(line) {
+            contexts.push(offset..offset + line.len());
+        }
+        offset += line.len();
+    }
+    if let Some((_, _, start, true)) = fence {
+        contexts.push(start..text.len());
+    }
+    contexts
+}
+
+fn inside(ranges: &[Range<usize>], offset: usize) -> bool {
+    let index = ranges.partition_point(|range| range.start <= offset);
+    index > 0 && ranges[index - 1].contains(&offset)
+}
+
+fn intersects(ranges: &[Range<usize>], range: &Range<usize>) -> bool {
+    let index = ranges.partition_point(|candidate| candidate.end <= range.start);
+    ranges
+        .get(index)
+        .is_some_and(|candidate| candidate.start < range.end)
+}
+
+fn legacy_reference(reference: &str) -> bool {
+    (reference.starts_with(['$', '%']) && !reference.starts_with("$_ENV["))
+        || ["process.env", "os.getenv", "os.environ"]
+            .iter()
+            .any(|prefix| reference.starts_with(prefix))
+}
+
+// Existing explicit environment substitutions remain supported in structured
+// parameters. Newly recognized source-language getters are only exempt in code:
+// a JSON password/header string does not evaluate Go/Java/Rust/PHP source.
+fn structured_reference(value: &str) -> bool {
+    let trimmed = value.trim();
+    let candidate = trimmed
+        .split_once(char::is_whitespace)
+        .filter(|(scheme, _)| auth::is_scheme(scheme))
+        .map_or(trimmed, |(_, reference)| reference.trim());
+    let mut offset = 0;
+    let mut found = false;
+    for reference in symbolic_pattern().find_iter(candidate) {
+        if !legacy_reference(reference.as_str())
+            || !candidate[offset..reference.start()]
+                .chars()
+                .all(|ch| ch.is_whitespace() || matches!(ch, ':' | '"' | '\''))
+        {
+            return false;
+        }
+        found = true;
+        offset = reference.end();
+    }
+    found
+        && candidate[offset..]
+            .chars()
+            .all(|ch| ch.is_whitespace() || matches!(ch, ':' | '"' | '\''))
 }
 
 fn symbolic_sensitive_value(value: &str) -> bool {
@@ -1629,7 +1798,11 @@ fn symbolic_sensitive_value(value: &str) -> bool {
 }
 
 fn may_contain_symbolic_reference(text: &str) -> bool {
-    text.contains('$') || text.contains('%') || text.contains("process.env") || text.contains("os.")
+    text.contains('$')
+        || text.contains('%')
+        || text.contains("env")
+        || text.contains("Env")
+        || text.contains("ENV")
 }
 
 fn exclude_references(text: &str, ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
@@ -1639,7 +1812,17 @@ fn exclude_references(text: &str, ranges: Vec<Range<usize>>) -> Vec<Range<usize>
     let protected = protected_reference_ranges(text);
     let mut safe = Vec::new();
     for range in ranges {
-        if auth::only_references(&text[range.clone()]) {
+        if auth::only_references(&text[range.clone()])
+            && symbolic_pattern()
+                .find_iter(&text[range.clone()])
+                .all(|reference| {
+                    legacy_reference(reference.as_str()) || {
+                        let start = range.start + reference.start();
+                        let index = protected.partition_point(|candidate| candidate.start <= start);
+                        index > 0 && protected[index - 1].end >= range.start + reference.end()
+                    }
+                })
+        {
             continue;
         }
         let mut offset = range.start;
@@ -1689,7 +1872,11 @@ fn literal_default_ranges(text: &str, range: Range<usize>) -> Vec<Range<usize>> 
 fn protected_reference_ranges(text: &str) -> Vec<Range<usize>> {
     let mut protected = Vec::new();
     if may_contain_symbolic_reference(text) {
+        let contexts = source_contexts(text);
         for reference in symbolic_pattern().find_iter(text) {
+            if !legacy_reference(reference.as_str()) && !inside(&contexts, reference.start()) {
+                continue;
+            }
             // A shell-escaped dollar is literal credential data. Treating it as an
             // environment reference leaks the suffix and splits a quoted secret.
             if reference.as_str().starts_with('$')
@@ -1743,7 +1930,10 @@ fn discover_text_secrets_with_context(
     if decode_auth_literals {
         secrets.extend(
             auth.literal_secrets()
-                .filter(|secret| reusable_secret(secret))
+                .filter(|secret| {
+                    reusable_secret(secret)
+                        && (!symbolic_sensitive_value(secret) || named_getter_reference(secret))
+                })
                 .map(str::to_owned),
         );
     }
@@ -1786,6 +1976,20 @@ fn secret_ranges_with_auth(
 ) -> Vec<Range<usize>> {
     let mut ranges = Vec::<Range<usize>>::new();
     let mut literal_defaults = auth.literal_defaults.clone();
+    let contexts = if may_contain_symbolic_reference(text) {
+        source_contexts(text)
+    } else {
+        Vec::new()
+    };
+    let source_getters: Vec<Range<usize>> = if may_contain_symbolic_reference(text) {
+        symbolic_pattern()
+            .find_iter(text)
+            .filter(|reference| !legacy_reference(reference.as_str()))
+            .map(|reference| reference.range())
+            .collect()
+    } else {
+        Vec::new()
+    };
     ranges.extend(auth.secrets.iter().cloned());
     if text.contains("__CROSSLANE_CHECKPOINT_") {
         ranges.extend(
@@ -1883,8 +2087,7 @@ fn secret_ranges_with_auth(
             r"(?:AKID[A-Za-z0-9]{16,}|LTAI[A-Za-z0-9]{12,}|STS\.[A-Za-z0-9_-]{12,}|AKLT[A-Za-z0-9_-]{16,})",
         )),
     ].into_iter().flatten() {
-        ranges.extend(
-            pattern
+        for range in pattern
                 .find_iter(text)
                 .filter(|matched| {
                     matched.start() == 0
@@ -1893,8 +2096,11 @@ fn secret_ranges_with_auth(
                             .next_back()
                             .is_some_and(|ch| ch.is_ascii_alphanumeric())
                 })
-                .map(|matched| matched.range()),
-        );
+                .map(|matched| matched.range())
+        {
+            if intersects(&source_getters, &range) { literal_defaults.push(range.clone()); }
+            ranges.push(range);
+        }
     }
     if AUTH_PREFIXES
         .get_or_init(|| {
@@ -1938,6 +2144,9 @@ fn secret_ranges_with_auth(
                     continue;
                 }
                 if !basic || auth::encoded_basic(secret.as_str()) {
+                    if intersects(&source_getters, &secret.range()) {
+                        literal_defaults.push(secret.range());
+                    }
                     ranges.push(secret.range());
                 }
             }
@@ -1950,6 +2159,9 @@ fn secret_ranges_with_auth(
             regex(&USERINFO, r"(?i)\b[a-z][a-z0-9+.-]*://(?P<secret>[^/\s]+)@").captures_iter(text)
         {
             if let Some(secret) = captures.name("secret") {
+                if intersects(&source_getters, &secret.range()) {
+                    literal_defaults.push(secret.range());
+                }
                 ranges.push(secret.range());
             }
         }
@@ -2003,6 +2215,37 @@ fn secret_ranges_with_auth(
             };
             if let Some(range) = value_range(text, assignment.value_start, context, name) {
                 if !auth::public_assignment(name, &text[range.clone()]) {
+                    if matches!(
+                        context,
+                        ValueContext::Query | ValueContext::Connection | ValueContext::Shell
+                    ) || ["\"", "'", "\\\"", "\\'", "|", ">"]
+                        .iter()
+                        .any(|delimiter| text[assignment.value_start..].starts_with(delimiter))
+                    {
+                        for reference in symbolic_pattern().find_iter(&text[range.clone()]) {
+                            if named_getter_reference(reference.as_str()) {
+                                literal_defaults.push(
+                                    range.start + reference.start()..range.start + reference.end(),
+                                );
+                            }
+                        }
+                    }
+                    if expression_value_range(text, assignment.value_start, context).as_ref()
+                        == Some(&range)
+                    {
+                        if let Some(literal) = reference_expression_literal(text, range.clone())
+                            .filter(|_| inside(&contexts, range.start))
+                        {
+                            // A fully recognized getter/default expression has
+                            // public operators and quote delimiters. Keep them
+                            // usable; its marker represents just the credential.
+                            literal_defaults.push(literal);
+                            continue;
+                        }
+                        // Quoted defaults/concatenated strings are literal data,
+                        // including strings that happen to spell `$TOKEN`.
+                        literal_defaults.extend(expression_literals(text, range.clone()));
+                    }
                     ranges.push(range);
                 }
             }
@@ -2042,6 +2285,15 @@ fn secret_ranges_with_auth(
     if !known_ranges.is_empty() {
         let protected = protected_reference_ranges(text);
         safe.extend(known_ranges.into_iter().filter(|range| {
+            if intersects(&source_getters, range) {
+                return true;
+            }
+            // A complete reference spelling already identified as an actual
+            // literal credential takes precedence. Substrings that merely match
+            // part of an environment variable's name remain protected below.
+            if protected.iter().any(|reference| reference == range) {
+                return true;
+            }
             let mut covered = range.start;
             for reference in &protected {
                 if reference.end <= covered {
@@ -2215,12 +2467,12 @@ fn value_range(
     if tail.is_empty() {
         return None;
     }
-    // A variable or command substitution is a symbolic reference, not its
-    // runtime value. Stop at its end so a shell command following it survives.
-    if let Some(reference) = symbolic_pattern()
-        .find(tail)
-        .filter(|found| found.start() == 0)
-    {
+    if let Some(range) = expression_value_range(text, start, context) {
+        return Some(range);
+    }
+    // A pure reference is not its runtime value. Stop at its end so a shell
+    // command following it survives; mixed expressions were handled above.
+    if let Some(reference) = symbolic_at_start().find(tail) {
         return Some(start..start + reference.end());
     }
     if let Some(rest) = tail.strip_prefix(REDACTED) {
@@ -2345,6 +2597,126 @@ fn value_range(
     let end = raw.find(" #").unwrap_or(raw.len());
     let length = raw[..end].trim_end().len();
     (length > 0).then_some(start..start + length)
+}
+
+fn expression_value_range(text: &str, start: usize, context: ValueContext) -> Option<Range<usize>> {
+    let tail = text.get(start..)?;
+    if let Some(reference) = symbolic_at_start().find(tail) {
+        let raw_rest = &tail[reference.end()..];
+        let rest = raw_rest.trim_start_matches([' ', '\t']);
+        let same_argument =
+            !matches!(context, ValueContext::Shell) || !raw_rest.starts_with(char::is_whitespace);
+        return (same_argument
+            && (rest.starts_with(['+', '-', '*', '/', '.', '?', '|', '&'])
+                || rest.starts_with("or ")
+                || rest.starts_with("and ")))
+        .then(|| expression_range(text, start, context));
+    }
+    static CALL: OnceLock<Regex> = OnceLock::new();
+    // Commas and quotes inside an unquoted call with default arguments belong
+    // to the expression. They must not end it before a literal credential.
+    regex(&CALL, r"\A[A-Za-z_$][A-Za-z0-9_$.:]*[ \t]*\(")
+        .is_match(tail)
+        .then(|| expression_range(text, start, context))
+}
+
+fn expression_literals(text: &str, range: Range<usize>) -> Vec<Range<usize>> {
+    let mut literals = Vec::new();
+    let mut offset = range.start;
+    let mut references = symbolic_pattern()
+        .find_iter(&text[range.clone()])
+        .peekable();
+    while offset < range.end {
+        while references
+            .peek()
+            .is_some_and(|reference| range.start + reference.end() <= offset)
+        {
+            references.next();
+        }
+        if let Some(reference) = references
+            .peek()
+            .filter(|reference| range.start + reference.start() == offset)
+        {
+            offset = range.start + reference.end();
+            continue;
+        }
+        let ch = text[offset..].chars().next().expect("character boundary");
+        offset += ch.len_utf8();
+        if matches!(ch, '"' | '\'' | '`') {
+            let start = offset;
+            let mut escaped = false;
+            while offset < range.end {
+                let next = text[offset..].chars().next().expect("character boundary");
+                if !escaped && next == ch {
+                    break;
+                }
+                escaped = !escaped && next == '\\';
+                offset += next.len_utf8();
+            }
+            literals.push(start..offset);
+            if offset < range.end {
+                offset += ch.len_utf8();
+            }
+        }
+    }
+    literals
+}
+
+fn reference_expression_literal(text: &str, range: Range<usize>) -> Option<Range<usize>> {
+    let expression = &text[range.clone()];
+    let reference = symbolic_at_start().find(expression)?;
+    if !named_getter_reference(reference.as_str()) {
+        return None;
+    }
+    static DEFAULT: OnceLock<Regex> = OnceLock::new();
+    let pattern = DEFAULT.get_or_init(|| {
+        let literal = r#"(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')"#;
+        Regex::new(&format!(
+            r#"\A(?:\s*(?:\?\?|\|\||\?:|\+|or\b)\s*(?P<value>{literal})\s*|\.(?:unwrap_or|concat)\(\s*(?P<call>{literal})\s*\)|\.unwrap_or_else\(\s*\|\|\s*(?P<closure>{literal})\s*\))\s*\z"#
+        )).expect("literal getter fallback or concatenation")
+    });
+    let captures = pattern.captures(&expression[reference.end()..])?;
+    let literal = captures
+        .name("value")
+        .or_else(|| captures.name("call"))
+        .or_else(|| captures.name("closure"))?;
+    let start = range.start + reference.end() + literal.start() + 1;
+    Some(start..range.start + reference.end() + literal.end() - 1)
+}
+
+/// Bound a labelled expression without evaluating it. Its nested calls and
+/// string literals belong to the value; only a top-level delimiter ends it.
+/// Malformed/unclosed expressions retain the conservative mask-to-end policy.
+fn expression_range(text: &str, start: usize, context: ValueContext) -> Range<usize> {
+    let mut nesting = Vec::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for (relative, ch) in text[start..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if ch == '\\' {
+                escaped = true;
+            } else if ch == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        if nesting.is_empty() && context.ends_at(ch) && !matches!(ch, '"' | '\'' | '`') {
+            return start..start + relative;
+        }
+        match ch {
+            '"' | '\'' | '`' => quote = Some(ch),
+            '(' => nesting.push(')'),
+            '[' => nesting.push(']'),
+            '{' => nesting.push('}'),
+            ')' | ']' | '}' if nesting.pop() != Some(ch) => return start..text.len(),
+            _ => {}
+        }
+    }
+    start..text.len()
 }
 
 #[cfg(test)]
@@ -2671,8 +3043,10 @@ mod tests {
             let session = RedactionSession::new();
             let command =
                 format!("curl -H 'Authorization: Bearer {reference}' https://example.invalid/");
-            assert_eq!(session.redact_text(&command, &[]), command);
-            assert_eq!(redact_text(&command, &[]), command);
+            if reference.starts_with(['$', '%']) {
+                assert_eq!(session.redact_text(&command, &[]), command);
+                assert_eq!(redact_text(&command, &[]), command);
+            }
             let mut value = json!({"token":reference,"headers":{"Authorization":format!("Bearer {reference}")}});
             let original = value.clone();
             let mut redactor = Redactor::new(&[]);
@@ -2684,6 +3058,279 @@ mod tests {
         let command = "API_TOKEN=$TOKEN curl --token=${TOKEN} --password %PASSWORD%";
         let session = RedactionSession::new();
         assert_eq!(session.redact_text(command, &[]), command);
+    }
+
+    #[test]
+    fn named_environment_getters_do_not_become_credentials_or_seed_repeated_matches() {
+        for reference in [
+            "os.Getenv(\"API_TOKEN\")",
+            "System.getenv(\"API_TOKEN\")",
+            "Environment.GetEnvironmentVariable(\"API_TOKEN\")",
+            "System.Environment.GetEnvironmentVariable(\"API_TOKEN\")",
+            "std::env::var(\"API_TOKEN\")",
+            "env::var_os(\"API_TOKEN\")",
+            "Deno.env.get('API_TOKEN')",
+            "Bun.env.API_TOKEN",
+            "Bun.env['API_TOKEN']",
+            "import.meta.env.API_TOKEN",
+            "ENV['API_TOKEN']",
+            "ENV.fetch('API_TOKEN')",
+            "getenv('API_TOKEN')",
+            "$_ENV['API_TOKEN']",
+        ] {
+            let session = RedactionSession::new();
+            let language = if reference.starts_with("ENV") {
+                "ruby"
+            } else if reference.starts_with("getenv") || reference.starts_with("$_ENV") {
+                "php"
+            } else if reference.contains("env::") {
+                "rust"
+            } else if reference.starts_with("os.Getenv") {
+                "go"
+            } else if reference.starts_with("System.getenv") {
+                "java"
+            } else if reference.contains("Environment.GetEnvironmentVariable") {
+                "csharp"
+            } else {
+                "javascript"
+            };
+            let variable = if language == "php" { "$token" } else { "token" };
+            let code = format!("```{language}\n{variable} = {reference}\n```");
+            for source in [code.clone(), json!({"code":code}).to_string()] {
+                assert_eq!(session.redact_text(&source, &[]), source, "{reference}");
+            }
+            assert!(
+                session.is_empty(),
+                "reference seeded a credential: {reference}"
+            );
+            // A real value obtained from a getter is still private when a tool
+            // returns it. Only the expression, never its runtime output, is exempt.
+            let source = json!({"token":"opaque-runtime-value"}).to_string();
+            let safe = session.redact_text(&source, &[]);
+            assert!(!safe.contains("opaque-runtime-value"));
+            assert_eq!(session.restore_text(&safe), source);
+            let repeated = session.redact_text("repeat opaque-runtime-value", &[]);
+            assert!(!repeated.contains("opaque-runtime-value"));
+        }
+    }
+
+    #[test]
+    fn getter_defaults_concatenation_and_lookalikes_do_not_exempt_literal_credentials() {
+        for expression in [
+            "os.Getenv(\"API_TOKEN\") + \"opaque-inline-secret\"",
+            "System.getenv(\"API_TOKEN\") ?? \"opaque-inline-secret\"",
+            "Environment.GetEnvironmentVariable(\"API_TOKEN\") ?? \"opaque-inline-secret\"",
+            "std::env::var(\"API_TOKEN\").unwrap_or(\"opaque-inline-secret\")",
+            "env::var_os(\"API_TOKEN\").unwrap_or_else(|| \"opaque-inline-secret\")",
+            "Deno.env.get('API_TOKEN') || 'opaque-inline-secret'",
+            "Bun.env.API_TOKEN ?? 'opaque-inline-secret'",
+            "import.meta.env.API_TOKEN || 'opaque-inline-secret'",
+            "ENV.fetch('API_TOKEN', 'opaque-inline-secret')",
+            "getenv('API_TOKEN') ?: 'opaque-inline-secret'",
+            "$_ENV['API_TOKEN'] ?? 'opaque-inline-secret'",
+            "os.getenv('API_TOKEN') or 'opaque-inline-secret'",
+            "process.env.API_TOKEN + 'opaque-inline-secret'",
+            "customgetenv('opaque-inline-secret')",
+            "getenv('opaque-inline-secret\")",
+            "os.Getenv(\"API_TOKEN\").concat('$INLINE_SECRET')",
+        ] {
+            for source in [
+                format!("password = {expression}"),
+                format!("options = {{password: {expression}}}"),
+                json!({"password":expression}).to_string(),
+            ] {
+                let session = RedactionSession::new();
+                let safe = session.redact_text(&source, &[]);
+                assert!(!safe.contains("opaque-inline-secret"), "{safe}");
+                assert!(!safe.contains("INLINE_SECRET"), "{safe}");
+                assert_ne!(safe, source, "{source}");
+                assert_eq!(session.restore_text(&safe), source);
+                assert_eq!(session.redact_text(&safe, &[]), safe);
+            }
+        }
+        for source in [
+            "curl --token $API_TOKEN --password $PASSWORD https://example.invalid/",
+            "TOKEN=${API_TOKEN} curl -H 'Authorization: Bearer $API_TOKEN' https://example.invalid/",
+        ] {
+            assert_eq!(redact_text(source, &[]), source);
+        }
+    }
+
+    #[test]
+    fn authentication_literals_cannot_impersonate_environment_getters() {
+        for reference in [
+            "os.Getenv(\"API_TOKEN\")",
+            "System.getenv(\"API_TOKEN\")",
+            "std::env::var(\"API_TOKEN\")",
+            "Environment.GetEnvironmentVariable(\"API_TOKEN\")",
+            "process.env.API_TOKEN",
+            "os.getenv(\"API_TOKEN\")",
+            "getenv(\"API_TOKEN\")",
+            "$_ENV[\"API_TOKEN\"]",
+        ] {
+            for source in [
+                format!("curl --oauth2-bearer '{reference}' https://example.invalid/"),
+                format!("curl -u 'user:{reference}' https://example.invalid/"),
+                format!("HTTPBasicAuth('user', '{reference}')"),
+                format!("machine example.invalid login user password {reference}\n"),
+                format!("password = '{reference}'"),
+            ] {
+                let session = RedactionSession::new();
+                let safe = session.redact_text(&source, &[]);
+                assert!(!safe.contains(reference), "{safe}");
+                assert_eq!(session.restore_text(&safe), source);
+                // Once learned from an actual literal credential, its exact
+                // spelling must also stay private in subsequent data/results.
+                let repeated = session.redact_text(reference, &[]);
+                assert_ne!(repeated, reference, "{reference}");
+                let data = json!({"password":reference}).to_string();
+                let safe = session.redact_text(&data, &[]);
+                let value: Value = serde_json::from_str(&safe).unwrap();
+                assert_ne!(value["password"], reference);
+                assert_eq!(session.restore_text(&safe), data);
+            }
+        }
+    }
+
+    #[test]
+    fn structured_basic_auth_passwords_are_literals_even_when_they_spell_getters() {
+        for reference in [
+            "os.Getenv(\"TOKEN\")",
+            "System.getenv(\"TOKEN\")",
+            "getenv('TOKEN')",
+        ] {
+            for original in [
+                json!({"auth":["user",reference]}),
+                json!({"basic_auth":["user",reference]}),
+                json!({"auth":{"user":"user","pass":reference}}),
+                json!({"auth":{"user":"user","pass":reference,"password":reference,"api_key":reference,"has_password":true}}),
+                json!({"proxyAuth":{"username":"user","pass":reference}}),
+            ] {
+                let session = RedactionSession::new();
+                let source = original.to_string();
+                let safe = session.redact_text(&source, &[]);
+                assert_ne!(safe, source);
+                let mut returned: Value = serde_json::from_str(&safe).unwrap();
+                session.restore_tool_input(&mut returned);
+                assert_eq!(returned, original);
+                assert_ne!(session.redact_text(reference, &[]), reference);
+            }
+        }
+    }
+
+    #[test]
+    fn source_getters_inside_structured_passwords_and_schema_defaults_are_literal() {
+        for reference in [
+            "os.Getenv(\"TOKEN\")",
+            "System.getenv(\"TOKEN\")",
+            "std::env::var(\"TOKEN\")",
+            "getenv('TOKEN')",
+        ] {
+            let session = RedactionSession::new();
+            let original = json!({"password":reference,"headers":{"Authorization":format!("Bearer {reference}")}});
+            let mut returned: Value =
+                serde_json::from_str(&session.redact_text(&original.to_string(), &[])).unwrap();
+            assert_ne!(returned, original);
+            assert!(marker_pattern().is_match(returned["password"].as_str().unwrap()));
+            assert!(
+                marker_pattern().is_match(returned["headers"]["Authorization"].as_str().unwrap())
+            );
+            session.restore_tool_input(&mut returned);
+            assert_eq!(returned, original);
+            for source in [
+                format!("PASSWORD={reference}"),
+                format!("token: {reference}"),
+                format!("```yaml\npassword: {reference}\n```"),
+                format!("password: |\n  ```rust\n  {reference}\n  ```"),
+            ] {
+                let session = RedactionSession::new();
+                let safe = session.redact_text(&source, &[]);
+                assert!(!safe.contains(reference), "{safe}");
+                assert_eq!(session.restore_text(&safe), source);
+            }
+        }
+        let session = RedactionSession::new();
+        let mut redactor = Redactor::new(&[]);
+        redactor.session = Some(session.clone());
+        let reference = "System.getenv(\"TOKEN\")";
+        let mut schema = json!({"type":"object","properties":{"password":{"type":"string","default":reference}}});
+        redactor.schema(&mut schema, false);
+        assert_eq!(schema["properties"]["password"]["type"], "string");
+        assert_ne!(schema["properties"]["password"]["default"], reference);
+        let mut input = json!({"password":schema["properties"]["password"]["default"]});
+        session.restore_tool_input(&mut input);
+        assert_eq!(input["password"], reference);
+    }
+
+    #[test]
+    fn getter_default_markers_represent_the_literal_without_operators_or_quotes() {
+        for source in [
+            "var token = os.Getenv(\"TOKEN\") + \"$LITERAL_DEFAULT\"",
+            "String token = System.getenv(\"TOKEN\") + \"$LITERAL_DEFAULT\"",
+            "let token = std::env::var(\"TOKEN\").unwrap_or(\"$LITERAL_DEFAULT\")",
+        ] {
+            let session = RedactionSession::new();
+            let safe = session.redact_text(source, &[]);
+            let reference = marker_pattern().find(&safe).unwrap().as_str();
+            assert_eq!(safe, source.replace("$LITERAL_DEFAULT", reference));
+            let mut input = json!({"token":reference});
+            session.restore_tool_input(&mut input);
+            assert_eq!(input["token"], "$LITERAL_DEFAULT");
+            assert_eq!(session.restore_text(&safe), source);
+        }
+    }
+
+    #[test]
+    fn source_reference_exemptions_never_override_cloud_formats_or_known_credentials() {
+        for secret in [
+            "AKIA1234567890ABCDEF",
+            "AKIDabcdefghijklmnopqrstuvwx",
+            "LTAIabcdefghijklmnopqrst",
+        ] {
+            let source = format!("var value = os.Getenv(\"{secret}\")");
+            let session = RedactionSession::new();
+            let safe = session.redact_text(&source, &[]);
+            assert!(!safe.contains(secret), "{safe}");
+            assert_eq!(session.restore_text(&safe), source);
+        }
+        let source = "var value = os.Getenv(\"fixture_known\")";
+        let session = RedactionSession::new();
+        let safe = session.redact_text(source, &["fixture_known"]);
+        assert!(!safe.contains("fixture_known"));
+        assert_eq!(session.restore_text(&safe), source);
+        for source in [
+            r#"const url = 'https://example.invalid/?token=os.Getenv("TOKEN")';"#,
+            r#"const dsn = 'Server=localhost;Password=os.Getenv("TOKEN");Database=db';"#,
+        ] {
+            let session = RedactionSession::new();
+            let safe = session.redact_text(source, &[]);
+            assert!(!safe.contains(r#"os.Getenv("TOKEN")"#), "{safe}");
+            assert_eq!(session.restore_text(&safe), source);
+        }
+    }
+
+    #[test]
+    fn ambiguous_business_fields_and_weak_credentials_remain_private() {
+        for (name, literal) in [
+            ("key", "Enter"),
+            ("token", "authentication."),
+            ("password", "true"),
+            ("secret", "include"),
+            ("cache_key", "product:42"),
+            ("密码", "至少8位字符"),
+        ] {
+            let session = RedactionSession::new();
+            let source = json!({name:literal}).to_string();
+            let safe = session.redact_text(&source, &[]);
+            assert!(!safe.contains(literal), "{safe}");
+            assert_eq!(session.restore_text(&safe), source);
+        }
+        let session = RedactionSession::new();
+        session.redact_text("password=test", &[]);
+        let source = "test and prefix-test-suffix";
+        let safe = session.redact_text(source, &[]);
+        assert!(!safe.contains("test"));
+        assert_eq!(session.restore_text(&safe), source);
     }
 
     #[test]

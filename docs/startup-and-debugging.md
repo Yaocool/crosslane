@@ -508,6 +508,26 @@ summary, the gateway decodes them locally into a fresh mapping; Kiro receives
 only the current request's placeholders. Capsules encode credentials and are not
 encryption. Environment references such as `$TOKEN`, `${TOKEN}`,
 `%TOKEN%` and `$env:TOKEN` remain expressions; literal secrets still match the rules.
+Named environment lookups in Go, Java, .NET, Rust, Ruby, PHP, Deno, Bun and
+`import.meta.env` are also preserved in explicit source declarations or named
+source-code fences when they contain only a variable name. Bare .env/YAML values
+remain conservative. Newly supported getters inside JSON credential values or
+tool parameters are literal data and do not receive this source-code exemption.
+Inline defaults and concatenated literals in sensitive fields remain private, including literal
+strings spelling `$TOKEN`. Unknown or malformed expressions are handled
+conservatively; no code, getter or environment expansion is executed.
+Getter spellings inside literal curl/SDK/netrc credentials and sensitive schema
+defaults are still masked;
+an exact value already identified as a credential also takes precedence over
+the reference exemption.
+
+False-positive reduction uses recognized syntax, not exemptions for short,
+common, example or apparently public values. Ambiguous fields such as
+`key: "Enter"`, `cache_key: "product:42"` and `password: "true"` still mask
+their values. Known credential copies still match inside larger strings. Without
+additional context, an arbitrary business value and an actual weak credential
+can be identical; the rules cannot guarantee both zero false positives and zero
+false negatives.
 
 For explicitly recognized POSIX tools such as Bash, shell and exec_command,
 restoration escapes common unquoted, single-quoted and double-quoted arguments so

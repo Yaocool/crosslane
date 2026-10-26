@@ -78,16 +78,24 @@ pub(super) fn challenge_header(name: &str) -> bool {
     )
 }
 
-pub(super) fn basic_password<'a>(name: &str, value: &'a mut Value) -> Option<&'a mut Value> {
+pub(super) fn basic_passwords<'a>(name: &str, value: &'a mut Value) -> Vec<&'a mut Value> {
     if !basic_auth_property(name) {
-        return None;
+        return Vec::new();
     }
     match value {
-        Value::Array(pair) if pair.len() == 2 && pair[0].is_string() => pair.get_mut(1),
-        Value::Object(fields) if fields.contains_key("user") || fields.contains_key("username") => {
-            fields.get_mut("pass")
+        Value::Array(pair) if pair.len() == 2 && pair[0].is_string() => {
+            pair.get_mut(1).into_iter().collect()
         }
-        _ => None,
+        Value::Object(fields) if fields.contains_key("user") || fields.contains_key("username") => {
+            fields
+                .iter_mut()
+                .filter(|(name, child)| {
+                    (name.as_str() == "pass" || sensitive_name(name)) && !public_field(name, child)
+                })
+                .map(|(_, child)| child)
+                .collect()
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -265,6 +273,17 @@ pub(super) fn scan(text: &str) -> Scan {
     for (expression, secret) in environment_defaults(text) {
         scan.managed.push(expression);
         scan.literal_defaults.push(secret);
+    }
+    // Authentication arguments/SDK string literals/netrc data do not execute
+    // source-language getter expressions. A password literally spelling
+    // `System.getenv("NAME")` must not acquire a reference exemption.
+    for range in &scan.secrets {
+        for reference in symbolic_pattern().find_iter(&text[range.clone()]) {
+            if super::named_getter_reference(reference.as_str()) {
+                scan.literal_defaults
+                    .push(range.start + reference.start()..range.start + reference.end());
+            }
+        }
     }
     scan.managed
         .sort_unstable_by_key(|range| (range.start, range.end));

@@ -628,7 +628,7 @@ mod tests {
             let leading_slash = command.contains("$'\\");
             let mut input = json!({"command":command});
             session.restore_tool_input_for_tool("Bash", &mut input);
-            let output = std::process::Command::new("/bin/bash")
+            let output = std::process::Command::new("bash")
                 .arg("-c")
                 .arg(input["command"].as_str().unwrap())
                 .output()
