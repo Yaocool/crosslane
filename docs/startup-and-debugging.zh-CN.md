@@ -416,6 +416,9 @@ Profile、模型名、工具名、调用关联 ID 和正常的 token 数量控�
 这些规则区分实际凭证与公共控制信息：CORS `Access-Control-Allow-Credentials: true`、
 WWW / Proxy-Authenticate 的公共挑战、布尔状态字段、明确的 fetch credentials 模式、
 MySQL / PostgreSQL 的交互密码提示开关、curl 凭证文件路径和纯环境变量引用均保留。
+`GOOGLE_APPLICATION_CREDENTIALS` 的 [ADC 文件路径](https://docs.cloud.google.com/docs/authentication/application-default-credentials)也保留，文件内容仍按凭证规则处理。
+PowerShell 的 `$Env:NAME` / `${env:NAME}` 同样保留；Node / Python 环境变量表达式
+中的明文字面默认凭证会单独替换，引用和表达式结构保留。
 连接串只替换密码部分，不吞掉后续数据库等配置；已识别命令的字面凭证按本地 shell
 语法解码后映射，模型复制引用到另一工具时可恢复实际参数，原始命令重放则保留源码。
 检测不执行命令、展开变量或读取凭证文件，也不会调用模型判断。此规则集覆盖常用明确

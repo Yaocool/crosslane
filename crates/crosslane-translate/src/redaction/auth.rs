@@ -12,6 +12,7 @@ use super::{regex, sensitive_name, symbolic_pattern, value_range, ValueContext};
 #[derive(Default)]
 pub(super) struct Scan {
     pub secrets: Vec<Range<usize>>,
+    pub literal_defaults: Vec<Range<usize>>,
     // A recognized option has its own grammar. Do not let the generic field /
     // long-option scanner consume its path, prompt flag, or following command.
     managed: Vec<Range<usize>>,
@@ -261,6 +262,10 @@ pub(super) fn scan(text: &str) -> Scan {
     if text.contains("machine") || text.contains("default") {
         scan_netrc(text, &mut scan);
     }
+    for (expression, secret) in environment_defaults(text) {
+        scan.managed.push(expression);
+        scan.literal_defaults.push(secret);
+    }
     scan.managed
         .sort_unstable_by_key(|range| (range.start, range.end));
     let mut merged: Vec<Range<usize>> = Vec::new();
@@ -275,6 +280,75 @@ pub(super) fn scan(text: &str) -> Scan {
     }
     scan.managed = merged;
     scan
+}
+
+fn environment_pattern(anchored: bool) -> &'static Regex {
+    static ANY: OnceLock<Regex> = OnceLock::new();
+    static AT_START: OnceLock<Regex> = OnceLock::new();
+    (if anchored { &AT_START } else { &ANY }).get_or_init(|| {
+        let literal = r#"(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')"#;
+        let anchor = if anchored { r"\A" } else { "" };
+        Regex::new(&format!(r#"{anchor}(?:process\.env(?:\.(?P<js>[A-Za-z_][A-Za-z0-9_]*)|\[\s*["'](?P<bracket>[A-Za-z_][A-Za-z0-9_]*)["']\s*\])\s*(?:\|\||\?\?)\s*(?P<js_default>{literal})|os\.(?:getenv|environ\.get)\(\s*["'](?P<py>[A-Za-z_][A-Za-z0-9_]*)["']\s*,\s*(?P<py_default>{literal})\s*\))"#)).expect("literal environment default")
+    })
+}
+
+fn environment_default(captures: &regex::Captures<'_>) -> Option<Range<usize>> {
+    let secret = captures
+        .name("js_default")
+        .or_else(|| captures.name("py_default"))?;
+    Some(unquote(secret.as_str(), secret.start()))
+}
+
+fn environment_defaults(text: &str) -> Vec<(Range<usize>, Range<usize>)> {
+    if !text.contains("process.env") && !text.contains("os.getenv") && !text.contains("os.environ")
+    {
+        return Vec::new();
+    }
+    environment_pattern(false)
+        .captures_iter(text)
+        .filter_map(|captures| {
+            let name = captures
+                .name("js")
+                .or_else(|| captures.name("bracket"))
+                .or_else(|| captures.name("py"))?;
+            if !sensitive_name(name.as_str()) && name.as_str() != "PASS" {
+                return None;
+            }
+            Some((captures.get(0)?.range(), environment_default(&captures)?))
+        })
+        .collect()
+}
+
+/// A labelled password/token field supplies sensitivity even when the
+/// environment variable itself has an ordinary name such as APP_SETTING.
+pub(super) fn environment_literal_at(text: &str, start: usize) -> Option<Range<usize>> {
+    let tail = text.get(start..)?;
+    if !["process.env", "os.getenv", "os.environ"]
+        .iter()
+        .any(|prefix| tail.starts_with(prefix))
+    {
+        return None;
+    }
+    let captures = environment_pattern(true).captures(tail)?;
+    let range = environment_default(&captures)?;
+    Some(start + range.start..start + range.end)
+}
+
+pub(super) fn environment_expression(text: &str) -> Option<Range<usize>> {
+    let trimmed = text.trim();
+    if !["process.env", "os.getenv", "os.environ"]
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix))
+    {
+        return None;
+    }
+    let captures = environment_pattern(true).captures(trimmed)?;
+    if captures.get(0)?.end() != trimmed.len() {
+        return None;
+    }
+    let range = environment_default(&captures)?;
+    let offset = text.len() - text.trim_start().len();
+    Some(offset + range.start..offset + range.end)
 }
 
 #[derive(Clone, Debug)]
@@ -741,6 +815,25 @@ fn scan_command_words(text: &str, scan: &mut Scan, depth: usize) {
     }
 }
 
+fn credential_separator(value: &str) -> Option<usize> {
+    let mut references = symbolic_pattern().find_iter(value).peekable();
+    for (offset, _) in value.match_indices(':') {
+        while references
+            .peek()
+            .is_some_and(|reference| reference.end() <= offset)
+        {
+            references.next();
+        }
+        if !references
+            .peek()
+            .is_some_and(|reference| reference.start() <= offset && offset < reference.end())
+        {
+            return Some(offset);
+        }
+    }
+    None
+}
+
 fn record_argument(
     text: &str,
     scan: &mut Scan,
@@ -760,8 +853,8 @@ fn record_argument(
                 scan.secrets.push(range.clone());
                 // The password can be repeated outside the command in
                 // another message/result. Do not learn usernames alone.
-                if let Some((_, password)) = value.split_once(':') {
-                    scan.secrets.push(range.end - password.len()..range.end);
+                if let Some(separator) = credential_separator(value) {
+                    scan.secrets.push(range.start + separator + 1..range.end);
                 }
             }
         }
@@ -1270,6 +1363,9 @@ mod tests {
             "curl --user public-user https://example.invalid/",
             "curl --user \"$USER:$PASSWORD\" https://example.invalid/",
             "curl --user \"${USER}:${PASSWORD}\" https://example.invalid/",
+            "curl --user \"$Env:USER:$ENV:PASSWORD\" https://example.invalid/",
+            "token=${Env:API_TOKEN}",
+            "token=$ENV:API_TOKEN",
             "https://$USER:$PASSWORD@example.invalid/path",
             "redis-cli --pass \"${REDIS_PASSWORD}\" PING",
             "http -a public-user https://example.invalid/",
@@ -1280,6 +1376,8 @@ mod tests {
             "pg_dump --no-password appdb",
             "openssl pkey -passin env:PRIVATE_KEY_PASSWORD -in client.pem",
             "openssl pkey -passin file:/run/secrets/passphrase -in client.pem",
+            "export GOOGLE_APPLICATION_CREDENTIALS='/run/secrets/adc.json'",
+            "credential_file = os.getenv('GOOGLE_APPLICATION_CREDENTIALS', '/run/secrets/adc.json')",
             "sort -u input.txt",
             "curl --url https://example.invalid/ --data '-ufoo:bar'",
             "curl -A '-ufoo:bar' https://example.invalid/",
@@ -1374,6 +1472,51 @@ mod tests {
     fn large_harmless_command_examples_keep_their_contents() {
         let source = format!("curl --help\n{}", "normal word ".repeat(100_000));
         assert_eq!(redact_text(&source, &[]), source);
+    }
+
+    #[test]
+    fn environment_default_literals_are_private_but_reference_syntax_survives() {
+        for expression in [
+            "process.env.API_TOKEN || 'opaque-default-secret'",
+            "process.env['API_TOKEN'] ?? \"opaque-default-secret\"",
+            "os.getenv('API_TOKEN', 'opaque-default-secret')",
+            "os.environ.get('PASS', 'opaque-default-secret')",
+            "process.env.APP_SETTING || 'opaque-default-secret'",
+            "os.getenv('APP_SETTING', 'opaque-default-secret')",
+        ] {
+            round_trip(
+                &format!("token = {expression}"),
+                &["opaque-default-secret"],
+                &[expression.split(['|', '?', ',']).next().unwrap()],
+            );
+            let source = json!({"token":expression}).to_string();
+            round_trip(&source, &["opaque-default-secret"], &[]);
+        }
+        for source in [
+            "token=$Env:API_TOKEN",
+            "token=${ENV:API_TOKEN}",
+            "token=os.getenv('API_TOKEN')",
+            "port=os.getenv('PORT', '8080')",
+        ] {
+            assert_eq!(redact_text(source, &[]), source);
+        }
+        for expression in [
+            "process.env.API_TOKEN || 'opaque$PART'",
+            "os.getenv('API_TOKEN', '$TOKEN')",
+        ] {
+            for source in [
+                format!("token={expression}"),
+                json!({"token":expression}).to_string(),
+            ] {
+                let session = RedactionSession::new();
+                let safe = session.redact_text(&source, &[]);
+                assert_ne!(safe, source);
+                assert!(!safe.contains("$PART"));
+                assert!(!safe.contains("$TOKEN"));
+                assert_eq!(session.redact_text(&safe, &[]), safe);
+                assert_eq!(session.restore_text(&safe), source);
+            }
+        }
     }
 
     #[test]

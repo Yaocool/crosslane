@@ -301,6 +301,8 @@ async fn common_auth_forms_are_filtered_before_send_and_recover_working_curl_arg
             "headers":{"Access-Control-Allow-Credentials":"true"},
             "has_password":true,
             "env_command":"curl -u \"$BASIC_USER:$BASIC_PASSWORD\" https://example.invalid/",
+            "env_command_ps":"curl.exe -u \"${Env:BASIC_USER}:${ENV:BASIC_PASSWORD}\" https://example.invalid/",
+            "api_token":"process.env.APP_SETTING ?? 'opaque-wire-default'",
             "fetch_options":{"credentials":"include","method":"GET"},
             "authorization_code_request":{"grant_type":"authorization_code","code":"opaque-code-fixture"},
             "docker":{"auth":"dXNlcjpvcGFxdWUtZG9ja2VyLWZpeHR1cmU="},
@@ -326,11 +328,11 @@ async fn common_auth_forms_are_filtered_before_send_and_recover_working_curl_arg
             .respond_with(move |request: &wiremock::Request| {
                 let wire: Value = serde_json::from_slice(&request.body).unwrap();
                 let encoded = wire.to_string();
-                for secret in ["admin:admin", "wire-password-123", "opaque-code-fixture", "opaque-sdk-fixture", "opaque-db-fixture", "opaque-p12-fixture", "dXNlcjpvcGFxdWUtZG9ja2VyLWZpeHR1cmU="] {
+                for secret in ["admin:admin", "wire-password-123", "opaque-code-fixture", "opaque-sdk-fixture", "opaque-db-fixture", "opaque-p12-fixture", "opaque-wire-default", "dXNlcjpvcGFxdWUtZG9ja2VyLWZpeHR1cmU="] {
                     assert_eq!(encoded.contains(secret), !enabled, "wire policy for synthetic {secret}");
                 }
                 let tool = historical_tool_input(&wire);
-                for field in ["headers", "has_password", "env_command", "fetch_options", "timeout"] {
+                for field in ["headers", "has_password", "env_command", "env_command_ps", "fetch_options", "timeout"] {
                     assert_eq!(tool[field], expected[field], "public control changed");
                 }
                 assert!(encoded.contains("access-control-allow-credentials: true"));

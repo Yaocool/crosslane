@@ -1259,6 +1259,27 @@ impl<'a> Redactor<'a> {
                 }
             }
             Value::Null => {}
+            Value::String(text) if sensitive && auth::environment_expression(text).is_some() => {
+                let range =
+                    auth::environment_expression(text).expect("checked environment expression");
+                let ranges = literal_default_ranges(text, range);
+                if self.collecting {
+                    for range in ranges {
+                        if reusable_secret(&text[range.clone()]) {
+                            self.discovered.push(text[range].to_owned());
+                        }
+                    }
+                } else {
+                    let (safe, count) = replace_ranges(text, ranges, self.session.as_ref());
+                    if count > 0 {
+                        *text = self.session.as_ref().map_or_else(
+                            || safe.clone(),
+                            |session| session.remember_source_text(text, safe.clone()),
+                        );
+                        self.stats.redacted_values += count;
+                    }
+                }
+            }
             Value::String(text)
                 if sensitive
                     && (symbolic_sensitive_value(text) || marker_pattern().is_match(text)) =>
@@ -1473,6 +1494,11 @@ fn native_model_control(name: &str, value: &Value) -> bool {
 
 fn sensitive_name(name: &str) -> bool {
     let trimmed = name.trim_matches(['"', '\'', '\\', '-']);
+    // ADC takes a credential file path; the file's contents have their own
+    // private_key/client_secret rules. This variable is not an inline secret.
+    if trimmed == "GOOGLE_APPLICATION_CREDENTIALS" {
+        return false;
+    }
     if ["密码", "口令", "密钥", "令牌"]
         .iter()
         .any(|label| trimmed.ends_with(label))
@@ -1583,7 +1609,7 @@ fn symbolic_pattern() -> &'static Regex {
     static SYMBOLIC: OnceLock<Regex> = OnceLock::new();
     regex(
         &SYMBOLIC,
-        r#"\$\{[A-Za-z_][A-Za-z0-9_]*(?::[-+?=][^{}\r\n]*)?\}|\$(?:env:)?[A-Za-z_][A-Za-z0-9_]*|%[A-Za-z_][A-Za-z0-9_]*%|process\.env(?:\.[A-Za-z_][A-Za-z0-9_]*|\[\s*["'][A-Za-z_][A-Za-z0-9_]*["']\s*\])|os\.(?:getenv|environ\.get)\(\s*["'][A-Za-z_][A-Za-z0-9_]*["']\s*\)|os\.environ\[\s*["'][A-Za-z_][A-Za-z0-9_]*["']\s*\]"#,
+        r#"\$\{(?:(?i:env):)?[A-Za-z_][A-Za-z0-9_]*(?::[-+?=][^{}\r\n]*)?\}|\$(?:(?i:env):)?[A-Za-z_][A-Za-z0-9_]*|%[A-Za-z_][A-Za-z0-9_]*%|process\.env(?:\.[A-Za-z_][A-Za-z0-9_]*|\[\s*["'][A-Za-z_][A-Za-z0-9_]*["']\s*\])|os\.(?:getenv|environ\.get)\(\s*["'][A-Za-z_][A-Za-z0-9_]*["']\s*\)|os\.environ\[\s*["'][A-Za-z_][A-Za-z0-9_]*["']\s*\]"#,
     )
 }
 
@@ -1637,6 +1663,27 @@ fn exclude_references(text: &str, ranges: Vec<Range<usize>>) -> Vec<Range<usize>
         }
     }
     safe
+}
+
+// Quoted getter defaults are literal data, even when they contain `$TOKEN`.
+// Existing opaque references remain atomic on repeated redaction passes.
+fn literal_default_ranges(text: &str, range: Range<usize>) -> Vec<Range<usize>> {
+    if &text[range.clone()] == REDACTED {
+        return Vec::new();
+    }
+    let mut output = Vec::new();
+    let mut offset = range.start;
+    for marker in marker_pattern().find_iter(&text[range.clone()]) {
+        let start = range.start + marker.start();
+        if offset < start {
+            output.push(offset..start);
+        }
+        offset = range.start + marker.end();
+    }
+    if offset < range.end {
+        output.push(offset..range.end);
+    }
+    output
 }
 
 fn protected_reference_ranges(text: &str) -> Vec<Range<usize>> {
@@ -1738,6 +1785,7 @@ fn secret_ranges_with_auth(
     auth: &auth::Scan,
 ) -> Vec<Range<usize>> {
     let mut ranges = Vec::<Range<usize>>::new();
+    let mut literal_defaults = auth.literal_defaults.clone();
     ranges.extend(auth.secrets.iter().cloned());
     if text.contains("__CROSSLANE_CHECKPOINT_") {
         ranges.extend(
@@ -1913,6 +1961,12 @@ fn secret_ranges_with_auth(
         if auth.manages(assignment.start) {
             continue;
         }
+        if sensitive_name(name) {
+            if let Some(range) = auth::environment_literal_at(text, assignment.value_start) {
+                literal_defaults.push(range);
+                continue;
+            }
+        }
         let encoded_auth = auth::credential_field(
             name,
             text[assignment.value_start..]
@@ -2003,6 +2057,9 @@ fn secret_ranges_with_auth(
             }
             true
         }));
+    }
+    for range in literal_defaults {
+        safe.extend(literal_default_ranges(text, range));
     }
     safe
 }
