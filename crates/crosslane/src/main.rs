@@ -902,7 +902,7 @@ enum ConfigCommand {
     Reload,
     /// 用 $VISUAL/$EDITOR 编辑完整配置或指定模块，保存后校验并重载。
     #[command(
-        after_help = "Kiro 上游与账号池使用 upstream/pool 等模块；Copilot OAuth、endpoint、缓存优先用 provider edit <ID> 修改对应实例。不指定模块时编辑完整配置。\n\n示例：\n  crosslane config edit upstream\n  crosslane config edit pool\n  crosslane provider edit copilot --setting 'api_endpoint_fallback=\"https://api.enterprise.githubcopilot.com\"'"
+        after_help = "Kiro 上游与账号池使用 upstream/pool 等模块；请求凭证脱敏开关使用 features 模块。Copilot OAuth、endpoint、缓存优先用 provider edit <ID> 修改对应实例。不指定模块时编辑完整配置。\n\n示例：\n  crosslane config edit upstream\n  crosslane config edit pool\n  crosslane config edit features\n  crosslane provider edit copilot --setting 'api_endpoint_fallback=\"https://api.enterprise.githubcopilot.com\"'"
     )]
     Edit {
         /// 只编辑指定模块；使用 `crosslane config list` 查看模块名。

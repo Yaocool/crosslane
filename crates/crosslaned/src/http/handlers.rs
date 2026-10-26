@@ -819,6 +819,7 @@ async fn count_tokens_route(
         ErrorFormat::Claude,
     )?;
     let mut normal = TranslationOptions::new(route.mapped.clone(), "AI_EDITOR");
+    normal.enable_request_redaction = config.features.enable_request_redaction;
     normal.enhance_system_prompt = config.features.enhance_system_prompt && !client_compaction;
     normal.enable_prompt_cache = config.features.enable_prompt_cache;
     normal.separate_compaction_instruction = client_compaction;

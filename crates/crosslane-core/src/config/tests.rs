@@ -43,6 +43,7 @@ fn defaults_match_the_spec() {
     assert_eq!(config.features.max_thinking_budget_tokens, 8192);
     assert!(config.features.enable_web_tools);
     assert!(config.features.enable_tool_leak_filter);
+    assert!(config.features.enable_request_redaction);
     assert_eq!(config.features.tool_search_max_rounds, 4);
     assert_eq!(config.features.tool_search_max_operations, 32);
     assert!(config.features.enable_tool_search);
@@ -191,9 +192,33 @@ fn default_toml_parses_into_default_config() {
         expected.features.auto_continue_rounds
     );
     assert_eq!(
+        parsed.features.enable_request_redaction,
+        expected.features.enable_request_redaction
+    );
+    assert_eq!(
         parsed.upstream.pool.stream_pipelining,
         expected.upstream.pool.stream_pipelining
     );
+}
+
+#[test]
+fn request_redaction_defaults_on_and_accepts_only_boolean_switches() {
+    for source in ["", "[features]\nenable_web_tools = false\n"] {
+        let config: Config = toml::from_str(source).expect("legacy config");
+        assert!(config.features.enable_request_redaction);
+    }
+    for enabled in [false, true] {
+        let source = format!("[features]\nenable_request_redaction = {enabled}\n");
+        let config: Config = toml::from_str(&source).expect("redaction toggle");
+        assert_eq!(config.features.enable_request_redaction, enabled);
+        let encoded = toml::to_string(&config).expect("serialize configuration");
+        let roundtrip: Config = toml::from_str(&encoded).expect("configuration roundtrip");
+        assert_eq!(roundtrip.features.enable_request_redaction, enabled);
+    }
+    for invalid in ["\"false\"", "0", "[]", "{}"] {
+        let source = format!("[features]\nenable_request_redaction = {invalid}\n");
+        assert!(toml::from_str::<Config>(&source).is_err());
+    }
 }
 
 #[test]

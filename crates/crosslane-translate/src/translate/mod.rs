@@ -48,6 +48,8 @@ pub struct TranslationOptions {
     pub conversation_id: Option<String>,
     /// Emit native Kiro cachePoint blocks for validated Claude cache controls.
     pub enable_prompt_cache: bool,
+    /// Request-local credential policy, including internal retries and summaries.
+    pub enable_request_redaction: bool,
     /// Model metadata used to select output_config/reasoning and valid effort
     /// levels. This is not a generic pass-through allowlist for client fields.
     pub additional_model_request_fields_schema: Option<serde_json::Value>,
@@ -65,6 +67,7 @@ impl TranslationOptions {
             web_search_replay: None,
             conversation_id: None,
             enable_prompt_cache: false,
+            enable_request_redaction: true,
             additional_model_request_fields_schema: None,
         }
     }

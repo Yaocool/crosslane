@@ -658,6 +658,11 @@ impl AppState {
         // Work on an attempt-local copy so routing to another model cannot
         // permanently erase the original request's effort or thinking controls.
         let mut prepared = payload.clone();
+        if prepared.redaction_session.is_none() {
+            prepared.redaction_session = Some(crosslane_translate::RedactionSession::with_enabled(
+                self.config.current().features.enable_request_redaction,
+            ));
+        }
         if let Some(intent) = prepared.model_request_intent.as_mut() {
             let config = self.config.current();
             intent.requested_model = config.unqualified_model(&intent.requested_model).to_owned();

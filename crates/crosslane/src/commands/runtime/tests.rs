@@ -597,6 +597,51 @@ fn config_module_edit_changes_only_the_selected_module() {
 }
 
 #[test]
+fn features_editor_exposes_request_redaction_in_legacy_configs() {
+    let original = "# server settings\n[server]\nport = 6200\n\n[features]\n# keep web tools\nenable_web_tools = false\n";
+    let features = resolve_config_module("features").expect("features module");
+    let editor = render_config_module_editor(original, features).expect("features editor");
+    assert!(editor.contains("enable_request_redaction = true"));
+    assert!(editor.contains("可逆脱敏凭证"));
+    assert!(editor.contains("# keep web tools"));
+    assert!(!editor.contains("[server]"));
+
+    let disabled = editor.replace(
+        "enable_request_redaction = true",
+        "enable_request_redaction = false",
+    );
+    let output =
+        merge_edited_config_module(original, features, &disabled).expect("disable redaction");
+    let parsed: crosslane_core::config::Config = toml::from_str(&output).expect("disabled config");
+    assert!(!parsed.features.enable_request_redaction);
+    assert!(!parsed.features.enable_web_tools);
+    assert_eq!(parsed.server.port, 6200);
+    assert!(output.contains("# server settings"));
+    assert!(output.contains("# keep web tools"));
+
+    let editor = render_config_module_editor(&output, features).expect("existing false value");
+    assert!(editor.contains("enable_request_redaction = false"));
+    let enabled = editor.replace(
+        "enable_request_redaction = false",
+        "enable_request_redaction = true",
+    );
+    let output = merge_edited_config_module(&output, features, &enabled).expect("enable redaction");
+    let parsed: crosslane_core::config::Config = toml::from_str(&output).expect("enabled config");
+    assert!(parsed.features.enable_request_redaction);
+    assert!(!parsed.features.enable_web_tools);
+    assert_eq!(parsed.server.port, 6200);
+}
+
+#[test]
+fn features_edit_rejects_non_boolean_request_redaction() {
+    let features = resolve_config_module("features").expect("features module");
+    for value in ["\"false\"", "0", "[]"] {
+        let edited = format!("[features]\nenable_request_redaction = {value}\n");
+        assert!(merge_edited_config_module("", features, &edited).is_err());
+    }
+}
+
+#[test]
 fn config_module_edit_rejects_other_top_level_modules() {
     let original = crosslane_store::bootstrap::render_default_config(
         &crosslane_core::config::Config::default().admin.socket,

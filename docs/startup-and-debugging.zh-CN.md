@@ -358,9 +358,22 @@ HTTP 200 SSE，并在 `error.status` 中携带实际状态，例如本地过载�
 
 ## Kiro 请求内容脱敏
 
+通过 `crosslane config edit features` 编辑 `[features]` 下的开关：
+
+```toml
+[features]
+enable_request_redaction = true # false 关闭，默认 true
+```
+
+保存后自动校验并热重载，无需重启；可用 `crosslane config show features --effective`
+确认生效值。修改只影响新请求，已开始请求的工具调用、重试和摘要沿用原策略。
+关闭时不再识别和替换新凭证、不添加引用提示或扩展工具 schema，正文、历史、
+工具参数和摘要按真实值发送给 Kiro。此前生成的 checkpoint 封套仍会在本地解包，
+保证旧摘要可继续使用。此开关不控制配置导出、Debug 和错误日志已有的脱敏。
+
 Kiro 生成请求在最终发送前默认执行统一的本地规则脱敏，不使用大模型、远程判别
 接口或额外网络请求。处理范围包括当前消息、system 和历史消息、工具参数和返回值、
-工具描述及 schema 的示例内容。自动压缩的摘要输入、摘要合并和生成重试也经过同一
+工具描述及 schema 的示例内容。启用时，自动压缩的摘要输入、摘要合并和生成重试也经过同一
 发送入口；Kiro MCP 搜索 query 使用同一套文本规则。
 
 规则结合敏感字段名、配置和命令中的凭证赋值、常见 key/token 格式、认证头、

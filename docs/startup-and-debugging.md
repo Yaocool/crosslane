@@ -439,8 +439,24 @@ service errors still use HTTP 200 SSE and carry the actual status in
 
 ## Kiro request secret redaction
 
-Kiro generation requests always pass through local, deterministic redaction at
-the final transport boundary. Detection uses no language model, remote classifier,
+Run `crosslane config edit features` to edit the switch in `[features]`:
+
+```toml
+[features]
+enable_request_redaction = true # false disables it; default: true
+```
+
+Saving validates and hot-reloads the configuration without a restart. Check the
+active value with `crosslane config show features --effective`. Changes apply to
+new requests; existing tool rounds, retries and summaries retain their original
+policy. When disabled, the gateway does not classify or replace new credentials,
+add reference hints or extend tool schemas: messages, history, tool inputs and
+summaries reach Kiro with their real values. Previously generated checkpoint
+capsules are still decoded locally so old summaries remain usable. Existing
+config-export, Debug and error-log sanitization is separate from this switch.
+
+With the switch enabled, Kiro generation requests pass through local,
+deterministic redaction at the final transport boundary. Detection uses no language model, remote classifier,
 or extra network request. It covers current messages, system/history messages,
 tool arguments/results, tool descriptions and schema examples. Automatic summary
 inputs, summary merging and generation retries share this boundary. Kiro MCP web

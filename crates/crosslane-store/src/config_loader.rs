@@ -390,6 +390,20 @@ mod tests {
     }
 
     #[test]
+    fn request_redaction_toggles_are_hot_reloadable_in_both_directions() {
+        let mut current = Config::default();
+        assert!(current.features.enable_request_redaction);
+        for enabled in [false, true] {
+            let mut edited = current.clone();
+            edited.features.enable_request_redaction = enabled;
+            let (next, needs_restart) = merge_hot_reload(&current, edited);
+            assert!(needs_restart.is_empty());
+            assert_eq!(next.features.enable_request_redaction, enabled);
+            current = next;
+        }
+    }
+
+    #[test]
     fn runtime_hook_failure_keeps_previous_config() {
         let directory = tempdir().expect("tempdir");
         let path = directory.path().join("config.toml");

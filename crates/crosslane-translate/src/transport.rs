@@ -19,8 +19,10 @@ pub fn prepare_redacted_kiro_payload(payload: &KiroPayload, known_secrets: &[&st
     // Remove our previous hint before matching remembered values. Otherwise a
     // credential equal to a word in the hint could mask the hint itself and
     // cause repeated preparation to prepend it again.
-    if let Some(original) = content.strip_prefix(CREDENTIAL_REFERENCE_HINT) {
-        *content = original.to_owned();
+    if session.is_enabled() {
+        if let Some(original) = content.strip_prefix(CREDENTIAL_REFERENCE_HINT) {
+            *content = original.to_owned();
+        }
     }
     session.redact_payload(&mut prepared, known_secrets);
     if !session.is_empty() {

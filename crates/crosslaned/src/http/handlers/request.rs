@@ -490,6 +490,7 @@ async fn handle_claude_route_inner(
     };
     let locked_mapping_rule = lock_kiro_mapping.then_some(route.rule.as_deref()).flatten();
     let mut options = TranslationOptions::new(route.mapped.clone(), "AI_EDITOR");
+    options.enable_request_redaction = config.features.enable_request_redaction;
     options.enhance_system_prompt = config.features.enhance_system_prompt && !client_compaction;
     options.web_search_replay = Some(state.web_search_replay.clone());
     options.enable_prompt_cache = config.features.enable_prompt_cache;
@@ -1817,6 +1818,7 @@ pub(super) async fn handle_openai_route(
     };
     let locked_mapping_rule = lock_kiro_mapping.then_some(route.rule.as_deref()).flatten();
     let mut options = TranslationOptions::new(route.mapped.clone(), "AI_EDITOR");
+    options.enable_request_redaction = config.features.enable_request_redaction;
     options.enhance_system_prompt = config.features.enhance_system_prompt;
     options.enable_prompt_cache = config.features.enable_prompt_cache;
     let inherited_responses_conversation_id = responses_options

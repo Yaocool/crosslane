@@ -2379,7 +2379,7 @@ const CONFIG_MODULES: &[ConfigModule] = &[
         key: "features",
         category: "来源参数",
         scope: "kiro",
-        description: "Kiro 协议转换、工具、缓存与 thinking 开关",
+        description: "Kiro 协议转换、请求脱敏、工具、缓存与 thinking 开关",
         preferred_command: "-",
         aliases: &[],
         is_array: false,
@@ -2671,7 +2671,31 @@ fn render_config_module_document(raw: &str, module: &ConfigModule) -> Result<Str
 }
 
 fn render_config_module_editor(raw: &str, module: &ConfigModule) -> Result<String> {
-    let body = render_config_module_document(raw, module)?;
+    let mut body = render_config_module_document(raw, module)?;
+    if module.key == "features" {
+        let mut document = body.parse::<DocumentMut>().context("配置模块 TOML 无效")?;
+        let features = document[module.key]
+            .as_table_like_mut()
+            .ok_or_else(|| anyhow!("配置模块 features 必须是 TOML table"))?;
+        if features.get("enable_request_redaction").is_none() {
+            // Make the new switch discoverable when editing a legacy config.
+            // Clone its default item so the same explanation appears here and
+            // in fresh installations without rewriting unrelated settings.
+            let defaults = crosslane_core::config::DEFAULT_CONFIG_TOML
+                .parse::<DocumentMut>()
+                .context("默认配置 TOML 无效")?;
+            let defaults = defaults["features"]
+                .as_table()
+                .ok_or_else(|| anyhow!("默认 features 配置必须是 TOML table"))?;
+            let key = defaults
+                .key("enable_request_redaction")
+                .ok_or_else(|| anyhow!("默认配置缺少请求脱敏开关"))?;
+            features
+                .entry_format(key)
+                .or_insert(defaults["enable_request_redaction"].clone());
+            body = document.to_string();
+        }
+    }
     Ok(format!(
         "# Crosslane 配置模块：{}（TOML key: {}）\n\
          # 只允许编辑本模块；保存后会合并回完整配置并进行整体校验。\n\

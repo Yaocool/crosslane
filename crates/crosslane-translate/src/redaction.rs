@@ -31,6 +31,7 @@ pub struct RedactionStats {
 /// Debug output intentionally never includes values, markers, or their nonce.
 #[derive(Clone)]
 pub struct RedactionSession {
+    enabled: bool,
     state: Arc<Mutex<SessionState>>,
 }
 
@@ -52,6 +53,7 @@ impl std::fmt::Debug for RedactionSession {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         formatter
             .debug_struct("RedactionSession")
+            .field("enabled", &self.enabled)
             .field("mapped_values", &state.by_marker.len())
             .finish()
     }
@@ -59,7 +61,14 @@ impl std::fmt::Debug for RedactionSession {
 
 impl RedactionSession {
     pub fn new() -> Self {
+        Self::with_enabled(true)
+    }
+
+    /// Freeze the request's redaction policy. Clones and internal continuations
+    /// retain it even when the administrator changes the default for new work.
+    pub fn with_enabled(enabled: bool) -> Self {
         Self {
+            enabled,
             state: Arc::new(Mutex::new(SessionState {
                 nonce: uuid::Uuid::new_v4().simple().to_string(),
                 by_value: HashMap::new(),
@@ -69,7 +78,14 @@ impl RedactionSession {
         }
     }
 
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
     pub fn is_empty(&self) -> bool {
+        if !self.enabled {
+            return true;
+        }
         self.state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -82,6 +98,10 @@ impl RedactionSession {
         payload: &mut KiroPayload,
         known_secrets: &[&str],
     ) -> RedactionStats {
+        if !self.enabled {
+            decode_checkpoint_payload(payload);
+            return RedactionStats::default();
+        }
         let remembered = self.known_values();
         let known: Vec<&str> = known_secrets
             .iter()
@@ -94,6 +114,9 @@ impl RedactionSession {
     }
 
     pub fn redact_text(&self, text: &str, known_secrets: &[&str]) -> String {
+        if !self.enabled {
+            return decode_checkpoint_text(text).0;
+        }
         let remembered = self.known_values();
         let known: Vec<&str> = known_secrets
             .iter()
@@ -514,6 +537,229 @@ fn checkpoint_value(captures: &regex::Captures<'_>) -> Option<Value> {
         .ok()?;
     let value: Value = serde_json::from_slice(&bytes).ok()?;
     (value.is_string() || value.is_number() || value.is_boolean()).then_some(value)
+}
+
+fn exact_checkpoint_value(text: &str) -> Option<Value> {
+    checkpoint_pattern()
+        .captures(text)
+        .filter(|captures| {
+            captures
+                .get(0)
+                .is_some_and(|capsule| capsule.start() == 0 && capsule.end() == text.len())
+        })
+        .and_then(|captures| checkpoint_value(&captures))
+}
+
+/// Disabling detection must still allow a client to replay a checkpoint made
+/// while filtering was enabled. Decode only the reserved, validated capsule
+/// representation; this does not classify, remember, or newly hide any value.
+fn decode_checkpoint_text(text: &str) -> (String, bool) {
+    if !text.contains("__CROSSLANE_CHECKPOINT_") {
+        return (text.to_owned(), false);
+    }
+    if let Ok(mut document) = serde_json::from_str::<Value>(text) {
+        if decode_checkpoint_value(&mut document) {
+            return (document.to_string(), true);
+        }
+        return (text.to_owned(), false);
+    }
+    decode_checkpoint_text_fragment(text)
+}
+
+fn decode_checkpoint_value(value: &mut Value) -> bool {
+    match value {
+        Value::String(text) if text.contains("__CROSSLANE_CHECKPOINT_") => {
+            if let Some(original) = exact_checkpoint_value(text) {
+                *value = original;
+                return true;
+            }
+            // A string may itself carry a complete JSON HTTP body. Handle that
+            // layer semantically so quotes/newlines in a credential remain
+            // valid JSON rather than being spliced into its encoded source.
+            let (decoded, changed) = if text.trim_start().starts_with(['{', '[']) {
+                decode_checkpoint_text(text)
+            } else {
+                decode_checkpoint_text_fragment(text)
+            };
+            if changed {
+                *text = decoded;
+            }
+            changed
+        }
+        Value::Array(values) => {
+            let mut changed = false;
+            for child in values {
+                changed |= decode_checkpoint_value(child);
+            }
+            changed
+        }
+        Value::Object(fields) => {
+            let mut changed = false;
+            let original = std::mem::take(fields);
+            for (name, mut child) in original {
+                let (name, renamed) = if name.contains("__CROSSLANE_CHECKPOINT_") {
+                    decode_checkpoint_text(&name)
+                } else {
+                    (name, false)
+                };
+                changed |= renamed;
+                changed |= decode_checkpoint_value(&mut child);
+                fields.insert(name, child);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+fn decode_checkpoint_text_fragment(text: &str) -> (String, bool) {
+    let mut changed = false;
+    let decoded = checkpoint_pattern()
+        .replace_all(text, |captures: &regex::Captures<'_>| {
+            checkpoint_value(captures).map_or_else(
+                || captures.get(0).expect("checkpoint").as_str().to_owned(),
+                |value| {
+                    changed = true;
+                    value
+                        .as_str()
+                        .map_or_else(|| value.to_string(), str::to_owned)
+                },
+            )
+        })
+        .into_owned();
+    (decoded, changed)
+}
+
+fn decode_checkpoint_payload(payload: &mut KiroPayload) {
+    fn text(value: &mut String) -> bool {
+        if value.contains("__CROSSLANE_CHECKPOINT_") {
+            let (decoded, changed) = decode_checkpoint_text(value);
+            if changed {
+                *value = decoded;
+            }
+            return changed;
+        }
+        false
+    }
+    fn user(user: &mut KiroUserInputMessage) {
+        text(&mut user.content);
+        for document in &mut user.documents {
+            text(&mut document.name);
+            if matches!(
+                document.format.to_ascii_lowercase().as_str(),
+                "txt" | "md" | "csv" | "html"
+            ) {
+                if let Ok(bytes) =
+                    base64::engine::general_purpose::STANDARD.decode(&document.source.bytes)
+                {
+                    if let Ok(mut content) = String::from_utf8(bytes) {
+                        if text(&mut content) {
+                            document.source.bytes =
+                                base64::engine::general_purpose::STANDARD.encode(content);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(context) = &mut user.user_input_message_context {
+            for result in &mut context.tool_results {
+                for part in &mut result.content {
+                    text(&mut part.text);
+                }
+            }
+            for tool in &mut context.tools {
+                if let Some(spec) = tool.specification_mut() {
+                    text(&mut spec.description);
+                    decode_checkpoint_value(&mut spec.input_schema.json);
+                }
+            }
+            if let Some(env) = &mut context.env_state {
+                if let Some(value) = &mut env.current_working_directory {
+                    text(value);
+                }
+                if let Some(value) = &mut env.operating_system {
+                    text(value);
+                }
+            }
+        }
+    }
+    user(
+        &mut payload
+            .conversation_state
+            .current_message
+            .user_input_message,
+    );
+    for item in &mut payload.conversation_state.history {
+        if let Some(message) = &mut item.user_input_message {
+            user(message);
+        }
+        if let Some(assistant) = &mut item.assistant_response_message {
+            text(&mut assistant.content);
+            for tool in &mut assistant.tool_uses {
+                decode_checkpoint_tool_input(&tool.name, &mut tool.input);
+            }
+        }
+    }
+    if let Some(fields) = &mut payload.additional_model_request_fields {
+        decode_checkpoint_value(fields);
+    }
+}
+
+fn decode_checkpoint_tool_input(tool_name: &str, input: &mut Value) {
+    const COMMAND_FIELDS: [&str; 4] = ["command", "cmd", "script", "input"];
+    let Value::Object(fields) = input else {
+        decode_checkpoint_value(input);
+        return;
+    };
+    // Decode metadata such as `shell` first, but defer possible command text
+    // until its executor is known. Ordinary HTTP fields use the generic path.
+    let original = std::mem::take(fields);
+    for (name, mut value) in original {
+        let name = if name.contains("__CROSSLANE_CHECKPOINT_") {
+            decode_checkpoint_text(&name).0
+        } else {
+            name
+        };
+        if !COMMAND_FIELDS.contains(&name.as_str()) || !value.is_string() {
+            decode_checkpoint_value(&mut value);
+        }
+        fields.insert(name, value);
+    }
+    let posix = shell::command_sources(tool_name, input)
+        .iter()
+        .any(|command| command.contains("__CROSSLANE_CHECKPOINT_"));
+    if !posix {
+        for field in COMMAND_FIELDS {
+            if let Some(value) = input.get_mut(field) {
+                decode_checkpoint_value(value);
+            }
+        }
+        return;
+    }
+    let compatibility = RedactionSession::new();
+    for field in COMMAND_FIELDS {
+        let Some(value) = input.get_mut(field) else {
+            continue;
+        };
+        let Value::String(command) = value else {
+            continue;
+        };
+        if !command.contains("__CROSSLANE_CHECKPOINT_") {
+            continue;
+        }
+        if let Some(original) = exact_checkpoint_value(command) {
+            // A complete source command is code, not one shell argument.
+            *value = original;
+        } else {
+            // Reuse established shell quoting for embedded scalar capsules.
+            // This temporary map only imports explicit checkpoint values; it
+            // performs no sensitive-data detection and never reaches Kiro.
+            *command = replace_checkpoint_capsules(command, &compatibility).0;
+        }
+    }
+    if !compatibility.is_empty() {
+        compatibility.restore_tool_input_for_tool(tool_name, input);
+    }
 }
 
 fn checkpoint_secrets(text: &str) -> Vec<String> {

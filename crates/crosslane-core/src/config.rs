@@ -386,6 +386,8 @@ pub struct FeaturesConfig {
     pub enable_web_tools: bool,
     /// 是否过滤 tool leak。
     pub enable_tool_leak_filter: bool,
+    /// 是否在发送 Kiro 请求前可逆脱敏敏感凭证。
+    pub enable_request_redaction: bool,
     /// 空字符串表示自动选择。
     pub default_model_id: String,
 }
@@ -409,6 +411,7 @@ impl Default for FeaturesConfig {
             max_thinking_budget_tokens: 8192,
             enable_web_tools: true,
             enable_tool_leak_filter: true,
+            enable_request_redaction: true,
             default_model_id: String::new(),
         }
     }
@@ -2270,6 +2273,9 @@ max_thinking_budget_tokens = 8192
 enable_web_tools = true
 # 是否过滤模型误输出的内部工具协议文本。
 enable_tool_leak_filter = true
+# 是否在发送 Kiro 请求前可逆脱敏凭证；关闭后正文、历史、工具参数和摘要按原值发送。
+# 工具参数还原与该开关保持一致；修改后热更新，对新请求生效。
+enable_request_redaction = true
 # 客户端未指定模型或模型解析需要兜底时使用的模型 ID；空字符串表示自动选择。
 default_model_id = ""
 

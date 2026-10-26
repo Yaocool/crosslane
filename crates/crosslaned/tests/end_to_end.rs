@@ -107,6 +107,9 @@ mod crs_stream_cancel_account;
 #[path = "end_to_end/tool_names.rs"]
 mod tool_names;
 
+#[path = "end_to_end/redaction_toggle.rs"]
+mod redaction_toggle;
+
 #[path = "end_to_end/client_tool_search.rs"]
 mod client_tool_search;
 

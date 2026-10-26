@@ -1225,10 +1225,15 @@ pub(in crate::http) async fn execute_kiro_web_search(
     query: &str,
     redaction: Option<&RedactionSession>,
 ) -> Result<crosslane_translate::WebSearchResults, KiroError> {
+    // A generation owns its policy for the whole logical request. Standalone
+    // searches freeze the current setting once, including authentication retry.
+    let redaction = redaction.cloned().unwrap_or_else(|| {
+        RedactionSession::with_enabled(state.config.current().features.enable_request_redaction)
+    });
     let account = lease.account().await;
     let account_id = account.id;
     let rejected_access_token = account.credentials.access_token;
-    match execute_kiro_web_search_once(state, lease, query, redaction).await {
+    match execute_kiro_web_search_once(state, lease, query, &redaction).await {
         Err(error) if error.is_auth() => {
             state
                 .refresh_account_token_after_auth_failure(
@@ -1242,7 +1247,7 @@ pub(in crate::http) async fn execute_kiro_web_search(
                     endpoint: "MCP web_search".into(),
                     message: format!("web search authentication recovery failed: {refresh}"),
                 })?;
-            execute_kiro_web_search_once(state, lease, query, redaction).await
+            execute_kiro_web_search_once(state, lease, query, &redaction).await
         }
         result => result,
     }
@@ -1252,18 +1257,13 @@ pub(super) async fn execute_kiro_web_search_once(
     state: &Arc<AppState>,
     lease: &AccountLease,
     query: &str,
-    redaction: Option<&RedactionSession>,
+    redaction: &RedactionSession,
 ) -> Result<crosslane_translate::WebSearchResults, KiroError> {
     let account = ensure_web_search_profile_arn(state, lease).await?;
-    match redaction {
-        Some(redaction) => {
-            state
-                .kiro()
-                .web_search_with_redaction(&account, query, redaction)
-                .await
-        }
-        None => state.kiro().web_search(&account, query).await,
-    }
+    state
+        .kiro()
+        .web_search_with_redaction(&account, query, redaction)
+        .await
 }
 
 pub(super) async fn ensure_web_search_profile_arn(

@@ -895,10 +895,9 @@ pub(super) async fn probe_account_inner(
         metadata: None,
         response_format: None,
     };
-    let payload = crosslane_translate::openai_to_kiro(
-        &request,
-        &crosslane_translate::TranslationOptions::new(model, "CLI"),
-    );
+    let mut options = crosslane_translate::TranslationOptions::new(model, "CLI");
+    options.enable_request_redaction = state.config.current().features.enable_request_redaction;
+    let payload = crosslane_translate::openai_to_kiro(&request, &options);
     let result = match state.kiro().generate(&account, &payload, None).await {
         Ok(response) => {
             let (endpoint, response, _upstream_permit) = response.into_parts();
