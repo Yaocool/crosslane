@@ -1212,14 +1212,14 @@ impl<'a> Redactor<'a> {
                     .collect();
                 let original = std::mem::take(fields);
                 for (mut name, mut child) in original {
-                    let secret_field = sensitive
-                        || (!auth::public_field(&name, &child)
-                            && !(fetch_options && name == "credentials")
-                            && (sensitive_name(&name)
-                                || oauth_fields.contains(&name)
-                                || child
-                                    .as_str()
-                                    .is_some_and(|text| auth::credential_field(&name, text))));
+                    let secret_field = !auth::public_field(&name, &child)
+                        && !(fetch_options && name == "credentials")
+                        && (sensitive
+                            || sensitive_name(&name)
+                            || oauth_fields.contains(&name)
+                            || child
+                                .as_str()
+                                .is_some_and(|text| auth::credential_field(&name, text)));
                     if !secret_field {
                         if let Some(password) = auth::basic_password(&name, &mut child) {
                             self.data(password, true);

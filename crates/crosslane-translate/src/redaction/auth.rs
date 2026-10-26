@@ -1301,6 +1301,7 @@ mod tests {
             r#"{"headers":{"WWW-Authenticate":"Bearer realm=\"api\", error=\"invalid_token\""}}"#,
             r#"{"headers":[["WWW-Authenticate","Bearer realm=\"api\""]]}"#,
             r#"{"Authorization":"Negotiate","headers":[["Proxy-Authorization","NTLM"]]}"#,
+            r#"{"credentials":{"has_password":false,"withCredentials":true}}"#,
         ] {
             assert_eq!(redact_text(source, &[]), source);
         }
@@ -1317,6 +1318,10 @@ mod tests {
             redact_text("password=a&b=c;d=e", &[]),
             format!("password={REDACTED}")
         );
+        let source = r#"{"credentials":{"has_password":true,"password":"opaque-nested-secret"}}"#;
+        let safe: serde_json::Value = serde_json::from_str(&redact_text(source, &[])).unwrap();
+        assert_eq!(safe["credentials"]["has_password"], true);
+        assert_eq!(safe["credentials"]["password"], REDACTED);
         round_trip(
             "curl -u \"$USER:opaque-auth-fixture\" https://example.invalid/",
             &["opaque-auth-fixture"],
