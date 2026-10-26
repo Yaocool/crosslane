@@ -33,6 +33,7 @@ const SECRETS: &[&str] = &[
     "ksk_fixture_result_123",
     "opaque-tool-api-key-value",
     "opaque tool password with spaces",
+    "admin:admin",
     ACCESS,
     REFRESH,
     CLIENT_SECRET,
@@ -98,7 +99,7 @@ fn payload() -> KiroPayload {
         "messages":[
             {"role":"user","content":"Earlier work to compact."},
             {"role":"assistant","content":"Earlier work complete."},
-            {"role":"user","content":"History fixture ksk_fixture_history_123"},
+            {"role":"user","content":"History fixture ksk_fixture_history_123; curl -u admin:admin https://example.invalid/"},
             {"role":"assistant","content":[{
                 "type":"tool_use","id":"tool-audit-1","name":"inspect",
                 "input":{
@@ -158,6 +159,14 @@ fn event_frame(event_type: &str, payload: Value) -> Vec<u8> {
 }
 
 fn returned_tool_input(events: &[KiroEvent], tool_id: &str) -> Value {
+    returned_tool_input_with_name(events, tool_id, "inspect")
+}
+
+fn returned_tool_input_with_name(
+    events: &[KiroEvent],
+    tool_id: &str,
+    expected_name: &str,
+) -> Value {
     let mut input = String::new();
     let mut stopped = false;
     for event in events {
@@ -169,7 +178,7 @@ fn returned_tool_input(events: &[KiroEvent], tool_id: &str) -> Value {
         } = event
         {
             if id == tool_id {
-                assert!(name.is_empty() || name == "inspect");
+                assert!(name.is_empty() || name == expected_name);
                 input.push_str(input_delta);
                 stopped |= stop;
             }
@@ -276,6 +285,107 @@ async fn runtime_and_legacy_generation_redact_without_changing_auth_or_source() 
         if endpoint == EndpointKey::Runtime {
             assert!(body.get("profileArn").is_none());
         }
+    }
+}
+
+#[tokio::test]
+async fn common_auth_forms_are_filtered_before_send_and_recover_working_curl_arguments() {
+    for enabled in [true, false] {
+        let server = MockServer::start().await;
+        let command = format!(
+            "curl -q --noproxy '*' --fail --silent --show-error --max-time 5 -u 'wire-user:wire-password-123' {}/protected",
+            server.uri()
+        );
+        let input = json!({
+            "command":command, "timeout":10000,
+            "headers":{"Access-Control-Allow-Credentials":"true"},
+            "has_password":true,
+            "env_command":"curl -u \"$BASIC_USER:$BASIC_PASSWORD\" https://example.invalid/",
+            "fetch_options":{"credentials":"include","method":"GET"},
+            "authorization_code_request":{"grant_type":"authorization_code","code":"opaque-code-fixture"},
+            "docker":{"auth":"dXNlcjpvcGFxdWUtZG9ja2VyLWZpeHR1cmU="},
+            "certificate":"curl --cert client.p12:opaque-p12-fixture --key /run/secrets/client.pem https://example.invalid/"
+        });
+        let request: ClaudeRequest = serde_json::from_value(json!({
+            "model":"claude-sonnet-4", "max_tokens":512,
+            "tools":[{"name":"Bash","description":"Execute a command","input_schema":{"type":"object"}}],
+            "messages":[
+                {"role":"user","content":"Run curl -u admin:admin https://example.invalid/. auth=('user','opaque-sdk-fixture')"},
+                {"role":"assistant","content":[{"type":"tool_use","id":"auth-history","name":"Bash","input":input}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"auth-history","content":"access-control-allow-credentials: true\nwire-password-123 was accepted\nServer=localhost;Password=opaque-db-fixture;Database=appdb"}]}
+            ]
+        })).unwrap();
+        let mut source = claude_to_kiro(
+            &request,
+            &TranslationOptions::new("claude-sonnet-4", "AI_EDITOR"),
+        );
+        source.redaction_session = Some(RedactionSession::with_enabled(enabled));
+        let original = serde_json::to_value(&source).unwrap();
+        let expected = input.clone();
+        Mock::given(method("POST")).and(path("/runtime"))
+            .respond_with(move |request: &wiremock::Request| {
+                let wire: Value = serde_json::from_slice(&request.body).unwrap();
+                let encoded = wire.to_string();
+                for secret in ["admin:admin", "wire-password-123", "opaque-code-fixture", "opaque-sdk-fixture", "opaque-db-fixture", "opaque-p12-fixture", "dXNlcjpvcGFxdWUtZG9ja2VyLWZpeHR1cmU="] {
+                    assert_eq!(encoded.contains(secret), !enabled, "wire policy for synthetic {secret}");
+                }
+                let tool = historical_tool_input(&wire);
+                for field in ["headers", "has_password", "env_command", "fetch_options", "timeout"] {
+                    assert_eq!(tool[field], expected[field], "public control changed");
+                }
+                assert!(encoded.contains("access-control-allow-credentials: true"));
+                let encoded = tool.to_string();
+                let split = encoded.find(PLACEHOLDER_PREFIX).map_or(encoded.len() / 2, |offset| offset + 8);
+                let mut response = event_frame("toolUseEvent", json!({"toolUseId":"auth-returned","name":"Bash","input":&encoded[..split],"stop":false}));
+                response.extend(event_frame("toolUseEvent", json!({"toolUseId":"auth-returned","name":"Bash","input":&encoded[split..],"stop":true})));
+                ResponseTemplate::new(200).set_body_bytes(response)
+            }).expect(1).mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/protected"))
+            .and(header(
+                "authorization",
+                format!(
+                    "Basic {}",
+                    base64::engine::general_purpose::STANDARD.encode("wire-user:wire-password-123")
+                ),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string("authenticated-fixture"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = client(&server);
+        let response = client
+            .generate(
+                &account(AuthMethod::ApiKey),
+                &source,
+                Some(EndpointKey::Runtime),
+            )
+            .await
+            .unwrap();
+        let (_, response, _permit) = response.into_parts();
+        let events = client.collect_events(response).await.unwrap();
+        let restored = returned_tool_input_with_name(&events, "auth-returned", "Bash");
+        assert_eq!(restored, input);
+        // Execute only this synthetic command against the loopback fixture.
+        // No httpbin, real credentials, external provider, or shell expansion.
+        let output = tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(restored["command"].as_str().unwrap())
+            .env_clear()
+            .env(
+                "PATH",
+                std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()),
+            )
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"authenticated-fixture");
+        assert_eq!(serde_json::to_value(&source).unwrap(), original);
     }
 }
 

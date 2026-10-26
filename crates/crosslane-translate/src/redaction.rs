@@ -5,6 +5,7 @@
 //! Arbitrary unlabeled secrets and opaque binary attachments cannot be classified
 //! reliably by text rules; callers must not treat this as a general DLP guarantee.
 
+mod auth;
 mod shell;
 
 use std::collections::HashMap;
@@ -912,7 +913,13 @@ fn redact_text_with_session(
     known_secrets: &[&str],
     session: Option<&RedactionSession>,
 ) -> String {
-    let mut discovered = discover_text_secrets(text);
+    // Use the same semantic traversal for collection and replacement. Scanning
+    // raw JSON first could learn a public fetch `credentials: "include"` value
+    // as a secret and then redact its otherwise exempt decoded field.
+    let mut collector = Redactor::new(&[]);
+    collector.collecting = true;
+    collector.text(&mut text.to_owned());
+    let mut discovered = collector.discovered;
     discovered.sort_unstable();
     discovered.dedup();
     let secrets: Vec<&str> = known_secrets
@@ -965,6 +972,7 @@ struct Redactor<'a> {
     discovered: Vec<String>,
     session: Option<RedactionSession>,
     shell_commands: Vec<String>,
+    decode_auth_literals: bool,
 }
 
 impl<'a> Redactor<'a> {
@@ -994,6 +1002,7 @@ impl<'a> Redactor<'a> {
             discovered: Vec::new(),
             session: None,
             shell_commands: Vec::new(),
+            decode_auth_literals: true,
         }
     }
 
@@ -1011,6 +1020,10 @@ impl<'a> Redactor<'a> {
             if let Some(assistant) = &mut item.assistant_response_message {
                 self.text(&mut assistant.content);
                 for tool in &mut assistant.tool_uses {
+                    let previous_auth_literals = std::mem::replace(
+                        &mut self.decode_auth_literals,
+                        !shell::explicitly_non_posix(&tool.input),
+                    );
                     let previous_shell_commands = std::mem::replace(
                         &mut self.shell_commands,
                         shell::command_sources(&tool.name, &tool.input)
@@ -1033,6 +1046,7 @@ impl<'a> Redactor<'a> {
                         );
                     }
                     self.shell_commands = previous_shell_commands;
+                    self.decode_auth_literals = previous_auth_literals;
                 }
             }
         }
@@ -1100,8 +1114,11 @@ impl<'a> Redactor<'a> {
             }
         }
         if self.collecting {
-            self.discovered
-                .extend(discover_text_secrets_with_context(value, shell_source));
+            self.discovered.extend(discover_text_secrets_with_context(
+                value,
+                shell_source,
+                self.decode_auth_literals,
+            ));
             return;
         }
         let (safe, count) = redact_text_impl_with_context(
@@ -1110,6 +1127,7 @@ impl<'a> Redactor<'a> {
             self.matcher.as_ref(),
             self.session.as_ref(),
             shell_source,
+            self.decode_auth_literals,
         );
         if count > 0 {
             *value = self.session.as_ref().map_or_else(
@@ -1186,11 +1204,33 @@ impl<'a> Redactor<'a> {
             Value::Object(fields) => {
                 // Input data dictionaries can use a secret as the key. Schema
                 // declarations take their separate, structure-preserving path.
+                let fetch_options = auth::fetch_options(fields);
+                let oauth_fields: Vec<String> = fields
+                    .keys()
+                    .filter(|name| auth::oauth_field(name, fields))
+                    .cloned()
+                    .collect();
                 let original = std::mem::take(fields);
                 for (mut name, mut child) in original {
-                    let secret_field = sensitive || sensitive_name(&name);
+                    let secret_field = sensitive
+                        || (!auth::public_field(&name, &child)
+                            && !(fetch_options && name == "credentials")
+                            && (sensitive_name(&name)
+                                || oauth_fields.contains(&name)
+                                || child
+                                    .as_str()
+                                    .is_some_and(|text| auth::credential_field(&name, text))));
+                    if !secret_field {
+                        if let Some(password) = auth::basic_password(&name, &mut child) {
+                            self.data(password, true);
+                        }
+                    }
                     self.text(&mut name);
-                    self.data(&mut child, secret_field);
+                    if !secret_field && auth::challenge_header(&name) {
+                        self.challenge(&mut child);
+                    } else {
+                        self.data(&mut child, secret_field);
+                    }
                     if fields.contains_key(&name) {
                         let base = name;
                         let mut suffix = 2usize;
@@ -1204,8 +1244,18 @@ impl<'a> Redactor<'a> {
                 }
             }
             Value::Array(values) => {
-                for child in values {
-                    self.data(child, sensitive);
+                let header = values.len() == 2
+                    && values[0].as_str().is_some_and(|name| {
+                        auth::header_name(name) && !auth::public_field(name, &values[1])
+                    });
+                let challenge =
+                    values.len() == 2 && values[0].as_str().is_some_and(auth::challenge_header);
+                for (index, child) in values.iter_mut().enumerate() {
+                    if !sensitive && challenge && index == 1 {
+                        self.challenge(child);
+                    } else {
+                        self.data(child, sensitive || (header && index == 1));
+                    }
                 }
             }
             Value::Null => {}
@@ -1215,12 +1265,7 @@ impl<'a> Redactor<'a> {
             {
                 let ranges = exclude_references(text, std::iter::once(0..text.len()).collect())
                     .into_iter()
-                    .filter(|range| {
-                        !matches!(
-                            text[range.clone()].trim().to_ascii_lowercase().as_str(),
-                            "bearer" | "basic"
-                        )
-                    })
+                    .filter(|range| !auth::is_scheme(text[range.clone()].trim()))
                     .collect::<Vec<_>>();
                 if self.collecting {
                     for range in ranges {
@@ -1273,10 +1318,34 @@ impl<'a> Redactor<'a> {
         }
     }
 
+    fn challenge(&mut self, value: &mut Value) {
+        if let Value::String(text) = value {
+            // Preserve header context when the JSON traversal reaches only the
+            // value, so public `Bearer realm=...` is not mistaken for a token.
+            const PREFIX: &str = "WWW-Authenticate: ";
+            let mut tagged = format!("{PREFIX}{text}");
+            self.text(&mut tagged);
+            if let Some(safe) = tagged.strip_prefix(PREFIX) {
+                *text = safe.to_owned();
+                return;
+            }
+        }
+        self.data(value, false);
+    }
+
     // JSON Schema property names, types, required names and structural keywords
     // must survive. Only human text and data-bearing default/example/const/enum
     // values are eligible for masking.
     fn schema(&mut self, value: &mut Value, sensitive_property: bool) {
+        self.schema_property(value, sensitive_property, None);
+    }
+
+    fn schema_property(
+        &mut self,
+        value: &mut Value,
+        sensitive_property: bool,
+        property_name: Option<&str>,
+    ) {
         match value {
             Value::Object(fields) => {
                 for (name, child) in fields {
@@ -1284,16 +1353,46 @@ impl<'a> Redactor<'a> {
                         "properties" | "patternProperties" | "$defs" | "definitions"
                         | "dependentSchemas" => {
                             if let Value::Object(properties) = child {
+                                let basic_auth = property_name
+                                    .is_some_and(auth::basic_auth_property)
+                                    && (properties.contains_key("user")
+                                        || properties.contains_key("username"));
                                 for (property, schema) in properties {
-                                    self.schema(
+                                    self.schema_property(
                                         schema,
-                                        sensitive_property || sensitive_name(property),
+                                        sensitive_property
+                                            || (basic_auth && property == "pass")
+                                            || (sensitive_name(property)
+                                                && !auth::public_boolean_schema(property, schema)),
+                                        Some(property),
                                     );
                                 }
                             }
                         }
+                        "prefixItems" | "items"
+                            if child.is_array()
+                                && property_name.is_some_and(auth::basic_auth_property) =>
+                        {
+                            for (index, schema) in child
+                                .as_array_mut()
+                                .expect("checked array")
+                                .iter_mut()
+                                .enumerate()
+                            {
+                                self.schema_property(
+                                    schema,
+                                    sensitive_property || index == 1,
+                                    Some(if index == 1 { "password" } else { "username" }),
+                                );
+                            }
+                        }
+                        "examples" | "enum" if child.is_array() => {
+                            for example in child.as_array_mut().expect("checked array") {
+                                self.schema_data(example, sensitive_property, property_name);
+                            }
+                        }
                         "default" | "example" | "examples" | "enum" | "const" => {
-                            self.data(child, sensitive_property)
+                            self.schema_data(child, sensitive_property, property_name)
                         }
                         "description" | "title" | "$comment" => {
                             if let Value::String(text) = child {
@@ -1302,7 +1401,7 @@ impl<'a> Redactor<'a> {
                         }
                         _ => {
                             if child.is_object() || child.is_array() {
-                                self.schema(child, sensitive_property);
+                                self.schema_property(child, sensitive_property, property_name);
                             }
                         }
                     }
@@ -1310,11 +1409,32 @@ impl<'a> Redactor<'a> {
             }
             Value::Array(values) => {
                 for child in values {
-                    self.schema(child, sensitive_property);
+                    self.schema_property(child, sensitive_property, property_name);
                 }
             }
             _ => {}
         }
+    }
+
+    fn schema_data(&mut self, value: &mut Value, sensitive: bool, property_name: Option<&str>) {
+        let Some(name) = property_name else {
+            self.data(value, sensitive);
+            return;
+        };
+        let sensitive = (sensitive && !auth::public_field(name, value))
+            || value
+                .as_str()
+                .is_some_and(|text| auth::credential_field(name, text));
+        if !sensitive {
+            if let Some(password) = auth::basic_password(name, value) {
+                self.data(password, true);
+            }
+            if auth::challenge_header(name) {
+                self.challenge(value);
+                return;
+            }
+        }
+        self.data(value, sensitive);
     }
 }
 
@@ -1386,6 +1506,16 @@ fn sensitive_name(name: &str) -> bool {
             | "signature"
             | "qsignature"
             | "xamzsignature"
+            | "dpop"
+            | "clientassertion"
+            | "authorizationcode"
+            | "devicecode"
+            | "oauthverifier"
+            | "oauthsignature"
+            | "oauthconsumerkey"
+            | "samlresponse"
+            | "xwsse"
+            | "passphrase"
     ) || [
         "apikey",
         "secretid",
@@ -1411,6 +1541,10 @@ fn sensitive_name(name: &str) -> bool {
         "credential",
         "credentials",
         "connectionstring",
+        "identitytoken",
+        "registrytoken",
+        "passphrase",
+        "clientassertion",
     ]
     .iter()
     .any(|suffix| compact.ends_with(suffix))
@@ -1460,13 +1594,12 @@ fn symbolic_sensitive_value(value: &str) -> bool {
     let trimmed = value.trim();
     let candidate = trimmed
         .split_once(char::is_whitespace)
-        .filter(|(scheme, _)| {
-            scheme.eq_ignore_ascii_case("bearer") || scheme.eq_ignore_ascii_case("basic")
-        })
+        .filter(|(scheme, _)| auth::is_scheme(scheme))
         .map_or(trimmed, |(_, reference)| reference.trim());
-    symbolic_pattern()
-        .find(candidate)
-        .is_some_and(|reference| reference.start() == 0 && reference.end() == candidate.len())
+    auth::reference_composition(candidate)
+        || symbolic_pattern()
+            .find(candidate)
+            .is_some_and(|reference| reference.start() == 0 && reference.end() == candidate.len())
 }
 
 fn may_contain_symbolic_reference(text: &str) -> bool {
@@ -1480,6 +1613,9 @@ fn exclude_references(text: &str, ranges: Vec<Range<usize>>) -> Vec<Range<usize>
     let protected = protected_reference_ranges(text);
     let mut safe = Vec::new();
     for range in ranges {
+        if auth::only_references(&text[range.clone()]) {
+            continue;
+        }
         let mut offset = range.start;
         for reference in &protected {
             if reference.end <= offset {
@@ -1547,13 +1683,25 @@ fn protected_reference_ranges(text: &str) -> Vec<Range<usize>> {
 }
 
 fn discover_text_secrets(text: &str) -> Vec<String> {
-    discover_text_secrets_with_context(text, false)
+    discover_text_secrets_with_context(text, false, true)
 }
 
-fn discover_text_secrets_with_context(text: &str, shell_source: bool) -> Vec<String> {
+fn discover_text_secrets_with_context(
+    text: &str,
+    shell_source: bool,
+    decode_auth_literals: bool,
+) -> Vec<String> {
     let mut secrets = checkpoint_secrets(text);
+    let auth = auth::scan(text);
+    if decode_auth_literals {
+        secrets.extend(
+            auth.literal_secrets()
+                .filter(|secret| reusable_secret(secret))
+                .map(str::to_owned),
+        );
+    }
     secrets.extend(
-        secret_ranges_with_context(text, &[], None, shell_source)
+        secret_ranges_with_auth(text, &[], None, shell_source, &auth)
             .into_iter()
             .filter_map(|range| {
                 let secret = &text[range];
@@ -1578,7 +1726,19 @@ fn secret_ranges_with_context(
     matcher: Option<&AhoCorasick>,
     shell_source: bool,
 ) -> Vec<Range<usize>> {
+    let auth = auth::scan(text);
+    secret_ranges_with_auth(text, known_secrets, matcher, shell_source, &auth)
+}
+
+fn secret_ranges_with_auth(
+    text: &str,
+    known_secrets: &[&str],
+    matcher: Option<&AhoCorasick>,
+    shell_source: bool,
+    auth: &auth::Scan,
+) -> Vec<Range<usize>> {
     let mut ranges = Vec::<Range<usize>>::new();
+    ranges.extend(auth.secrets.iter().cloned());
     if text.contains("__CROSSLANE_CHECKPOINT_") {
         ranges.extend(
             checkpoint_pattern()
@@ -1706,14 +1866,30 @@ fn secret_ranges_with_context(
         .captures_iter(text)
         {
             if let Some(secret) = captures.name("secret") {
+                if auth::in_challenge(text, secret.start()) {
+                    continue;
+                }
                 let basic = captures
                     .name("scheme")
                     .is_some_and(|scheme| scheme.as_str().eq_ignore_ascii_case("basic"));
                 if !basic
-                    || base64::engine::general_purpose::STANDARD
-                        .decode(secret.as_str())
-                        .is_ok_and(|decoded| decoded.contains(&b':'))
+                    && matches!(
+                        secret.as_str().to_ascii_lowercase().as_str(),
+                        "token"
+                            | "tokens"
+                            | "authentication"
+                            | "authorization"
+                            | "auth"
+                            | "scheme"
+                            | "header"
+                    )
                 {
+                    // Public prose such as "Bearer authentication" has no
+                    // credential syntax. Labelled Authorization/--token fields
+                    // are still filtered below even with these weak values.
+                    continue;
+                }
+                if !basic || auth::encoded_basic(secret.as_str()) {
                     ranges.push(secret.range());
                 }
             }
@@ -1734,7 +1910,21 @@ fn secret_ranges_with_context(
     // Avoid running the bounded identifier matcher at every byte in that case.
     for assignment in assignments(text) {
         let name = assignment.name;
-        if sensitive_name(name) {
+        if auth.manages(assignment.start) {
+            continue;
+        }
+        let encoded_auth = auth::credential_field(
+            name,
+            text[assignment.value_start..]
+                .trim_start_matches(['"', '\''])
+                .split(['"', '\'', '\r', '\n', ',', ' ', '\t'])
+                .next()
+                .unwrap_or(""),
+        );
+        if sensitive_name(name)
+            || encoded_auth
+            || auth::oauth_assignment(text, name, assignment.value_start)
+        {
             let prefix = &text[..assignment.start];
             let is_flag = prefix.ends_with("--");
             let is_query = prefix.ends_with('?') || prefix.ends_with('&');
@@ -1750,13 +1940,17 @@ fn secret_ranges_with_context(
                 ValueContext::Query
             } else if is_flag || shell_source {
                 ValueContext::Shell
+            } else if let Some(context) = auth::delimited_context(text, assignment.value_start) {
+                context
             } else if whole_line {
                 ValueContext::Line
             } else {
                 ValueContext::Json
             };
             if let Some(range) = value_range(text, assignment.value_start, context, name) {
-                ranges.push(range);
+                if !auth::public_assignment(name, &text[range.clone()]) {
+                    ranges.push(range);
+                }
             }
         }
     }
@@ -1765,7 +1959,7 @@ fn secret_ranges_with_context(
             regex(&FLAG, r"--(?P<name>[A-Za-z_][A-Za-z0-9_.-]{0,127})[ \t]+").captures_iter(text)
         {
             let name = captures.name("name").expect("flag name");
-            if sensitive_name(name.as_str()) {
+            if sensitive_name(name.as_str()) && !auth.manages(name.start()) {
                 if let Some(range) = value_range(
                     text,
                     captures.get(0).expect("flag").end(),
@@ -1868,15 +2062,31 @@ fn redact_text_impl_with_context(
     matcher: Option<&AhoCorasick>,
     session: Option<&RedactionSession>,
     shell_source: bool,
+    decode_auth_literals: bool,
 ) -> (String, usize) {
-    let ranges = secret_ranges_with_context(text, known_secrets, matcher, shell_source);
-    replace_ranges(text, ranges, session)
+    let auth = auth::scan(text);
+    let ranges = secret_ranges_with_auth(text, known_secrets, matcher, shell_source, &auth);
+    replace_ranges_impl(
+        text,
+        ranges,
+        session,
+        (!shell_source && decode_auth_literals).then_some(&auth),
+    )
 }
 
 fn replace_ranges(
     text: &str,
+    ranges: Vec<Range<usize>>,
+    session: Option<&RedactionSession>,
+) -> (String, usize) {
+    replace_ranges_impl(text, ranges, session, None)
+}
+
+fn replace_ranges_impl(
+    text: &str,
     mut ranges: Vec<Range<usize>>,
     session: Option<&RedactionSession>,
+    auth: Option<&auth::Scan>,
 ) -> (String, usize) {
     ranges.retain(|range| range.start < range.end);
     if ranges.is_empty() {
@@ -1898,7 +2108,16 @@ fn replace_ranges(
     for range in &merged {
         safe.push_str(&text[offset..range.start]);
         if let Some(session) = session {
-            safe.push_str(&session.marker(Value::String(text[range.clone()].to_owned())));
+            let literal = auth
+                .and_then(|auth| auth.literal(range))
+                .unwrap_or(&text[range.clone()]);
+            if literal != &text[range.clone()] {
+                // Keep both spellings private across continuations, as the
+                // shell-history normalization path already does. A later raw
+                // tool result may repeat the escaped source spelling.
+                session.marker(Value::String(text[range.clone()].to_owned()));
+            }
+            safe.push_str(&session.marker(Value::String(literal.to_owned())));
         } else {
             safe.push_str(REDACTED);
         }
@@ -1914,6 +2133,7 @@ enum ValueContext {
     Json,
     Shell,
     Query,
+    Connection,
 }
 
 impl ValueContext {
@@ -1923,6 +2143,7 @@ impl ValueContext {
             Self::Json => matches!(ch, '\r' | '\n' | ',' | '}' | ']' | '"' | '\''),
             Self::Shell => ch.is_whitespace() || matches!(ch, ';' | '&' | '|' | '"' | '\'' | '`'),
             Self::Query => ch.is_whitespace() || matches!(ch, '&' | '#' | '"' | '\'' | '`'),
+            Self::Connection => matches!(ch, ';' | '\r' | '\n' | '"' | '\''),
         }
     }
 }
@@ -1951,6 +2172,18 @@ fn value_range(
         }
     }
     // JSON nested in a quoted command often has escaped quote delimiters.
+    if matches!(context, ValueContext::Connection) && tail.starts_with('{') {
+        let mut offset = 1;
+        while let Some(end) = tail[offset..].find('}') {
+            offset += end;
+            if tail[offset..].starts_with("}}") {
+                offset += 2;
+            } else {
+                return Some(start + 1..start + offset);
+            }
+        }
+        return Some(start + 1..text.len());
+    }
     for delimiter in ["\"\"\"", "'''", "\\\"", "\\'", "$'", "\"", "'"] {
         if let Some(inner) = tail.strip_prefix(delimiter) {
             let content_start = start + delimiter.len();
@@ -1958,6 +2191,10 @@ fn value_range(
             let mut offset = 0;
             while offset < inner.len() {
                 if inner[offset..].starts_with(closing) {
+                    if closing.len() == 1 && inner[offset + 1..].starts_with(closing) {
+                        offset += 2;
+                        continue;
+                    }
                     return Some(content_start..content_start + offset);
                 }
                 let character = inner[offset..].chars().next()?;

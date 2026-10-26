@@ -14,6 +14,17 @@ use super::{
 
 const COMMAND_FIELDS: [&str; 4] = ["command", "cmd", "script", "input"];
 
+/// Decode a literal span inside one recognized authentication option's word.
+/// It can originate in prose rather than a historical shell tool invocation.
+/// This never evaluates expansions or substitutions.
+pub(super) fn literal_word_fragment(word: &str, range: Range<usize>) -> Option<String> {
+    let mut position = ShellPosition::default();
+    position.literal(word.get(..range.start)?, &mut String::new());
+    (!position.comment && !position.escaped)
+        .then(|| decode_literal_quoting(word.get(range)?, position.quote))
+        .flatten()
+}
+
 pub(super) fn command_sources<'a>(tool_name: &str, input: &'a Value) -> Vec<&'a str> {
     if !is_shell_tool(tool_name) || explicitly_non_posix(input) {
         return Vec::new();
@@ -47,8 +58,7 @@ pub(super) fn discover_shell_secrets(tool_name: &str, input: &Value) -> Vec<Stri
         for range in merged {
             position.literal(&command[offset..range.start], &mut discarded);
             if !position.comment {
-                if let Some(value) =
-                    decode_literal_fragment(&command[range.clone()], position.quote)
+                if let Some(value) = decode_literal_quoting(&command[range.clone()], position.quote)
                 {
                     values.push(value);
                 }
@@ -124,7 +134,7 @@ fn shell_marker_values(
             return None;
         }
         if !position.comment {
-            if let Some(value) = decode_literal_fragment(raw, position.quote) {
+            if let Some(value) = decode_literal_quoting(raw, position.quote) {
                 if value != raw {
                     output.push((marker.range(), value));
                 }
@@ -194,6 +204,46 @@ fn decode_literal_fragment(raw: &str, quote: Quote) -> Option<String> {
     Some(output)
 }
 
+/// Concatenate adjacent literal quote sections of one word. Keep expansion,
+/// command substitution, globbing and numeric ANSI escapes outside the subset.
+fn decode_literal_quoting(raw: &str, mut quote: Quote) -> Option<String> {
+    let mut output = String::with_capacity(raw.len());
+    let mut offset = 0;
+    let mut part = 0;
+    while offset < raw.len() {
+        let ch = raw[offset..].chars().next()?;
+        if ch == '\\' && quote != Quote::Single {
+            offset += 1;
+            offset += raw[offset..].chars().next()?.len_utf8();
+            continue;
+        }
+        let closing = matches!(
+            (quote, ch),
+            (Quote::Single | Quote::AnsiSingle, '\'') | (Quote::Double, '"')
+        );
+        let ansi = quote == Quote::Unquoted && raw[offset..].starts_with("$'");
+        let opening = quote == Quote::Unquoted && matches!(ch, '\'' | '"');
+        if closing || opening || ansi {
+            output.push_str(&decode_literal_fragment(&raw[part..offset], quote)?);
+            quote = if closing {
+                Quote::Unquoted
+            } else if ansi {
+                Quote::AnsiSingle
+            } else if ch == '\'' {
+                Quote::Single
+            } else {
+                Quote::Double
+            };
+            offset += if ansi { 2 } else { 1 };
+            part = offset;
+        } else {
+            offset += ch.len_utf8();
+        }
+    }
+    output.push_str(&decode_literal_fragment(&raw[part..], quote)?);
+    Some(output)
+}
+
 impl RedactionSession {
     /// Restore native JSON values normally, with shell word escaping only for
     /// command strings belonging to an explicitly recognized POSIX shell tool.
@@ -246,7 +296,7 @@ fn is_shell_tool(name: &str) -> bool {
     })
 }
 
-fn explicitly_non_posix(input: &Value) -> bool {
+pub(super) fn explicitly_non_posix(input: &Value) -> bool {
     input
         .get("shell")
         .and_then(Value::as_str)
@@ -261,7 +311,7 @@ fn explicitly_non_posix(input: &Value) -> bool {
         })
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum Quote {
     #[default]
     Unquoted,

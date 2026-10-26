@@ -402,6 +402,25 @@ Profile、模型名、工具名、调用关联 ID 和正常的 token 数量控�
 `SharedAccessSignature` 和 `sig` 也会处理。环境变量赋值和命令参数沿用同一规则。
 单独出现且没有特征前缀、字段名或已知值上下文的随机 SecretKey 无法可靠识别。
 
+常见鉴权语法另有确定性规则，避免仅依赖字段名：
+
+- `Authorization` / `Proxy-Authorization` 请求头及键值对数组，覆盖 Basic、Bearer、
+  Digest、NTLM / Negotiate、OAuth、HMAC / 云厂商签名等方案；Cookie 和 API key 头同样处理。
+- curl 的 `-u` / `-U`、`--user` / `--proxy-user`、OAuth bearer、内联 Cookie、
+  TLS 证书口令；支持参数连写、引号及常用短选项组合。HTTPie / xh、wget、
+  Redis、MySQL / MariaDB、sshpass 和 OpenSSL 的常见凭证参数也会处理。
+- netrc 的 password / account、Docker / npm 的 Base64 Basic 凭证、常见 Python
+  Basic / Digest / NTLM 构造和 auth 元组、Node auth 用户密码字符串或对象。
+- 凭证 URL、数据库连接串、OAuth 表单及明确授权码流程中的 code / assertion。
+
+这些规则区分实际凭证与公共控制信息：CORS `Access-Control-Allow-Credentials: true`、
+WWW / Proxy-Authenticate 的公共挑战、布尔状态字段、明确的 fetch credentials 模式、
+MySQL / PostgreSQL 的交互密码提示开关、curl 凭证文件路径和纯环境变量引用均保留。
+连接串只替换密码部分，不吞掉后续数据库等配置；已识别命令的字面凭证按本地 shell
+语法解码后映射，模型复制引用到另一工具时可恢复实际参数，原始命令重放则保留源码。
+检测不执行命令、展开变量或读取凭证文件，也不会调用模型判断。此规则集覆盖常用明确
+语法，不能承诺识别所有自定义认证协议、无标签随机字符串或任意混合脚本。
+
 模型应在工具参数中原样复制占位符。网关在本地将完整工具参数解析为 JSON 后还原，
 保留原始字符串、数字和布尔值的类型，并正确处理引号、换行及并行调用的流式分片。
 普通回答不自动展开秘密；压缩摘要中的秘密会按需转换为可还原的 checkpoint 封套，
