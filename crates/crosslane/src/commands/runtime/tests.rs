@@ -642,6 +642,26 @@ fn features_edit_rejects_non_boolean_request_redaction() {
 }
 
 #[test]
+fn features_edit_exposes_and_toggles_redaction_notice_in_legacy_configs() {
+    let features = resolve_config_module("features").unwrap();
+    let mut source = "[features]\nenable_request_redaction = false\n".to_owned();
+    for (from, to) in [(false, true), (true, false)] {
+        let editor = render_config_module_editor(&source, features).unwrap();
+        let old = format!("enable_request_redaction_notice = {from}");
+        assert!(editor.contains(&old));
+        let edited = editor.replace(&old, &format!("enable_request_redaction_notice = {to}"));
+        source = merge_edited_config_module(&source, features, &edited).unwrap();
+        let parsed: crosslane_core::config::Config = toml::from_str(&source).unwrap();
+        assert_eq!(parsed.features.enable_request_redaction_notice, to);
+        assert!(!parsed.features.enable_request_redaction);
+    }
+    for invalid in ["\"false\"", "0", "[]"] {
+        let edited = format!("[features]\nenable_request_redaction_notice = {invalid}\n");
+        assert!(merge_edited_config_module("", features, &edited).is_err());
+    }
+}
+
+#[test]
 fn config_module_edit_rejects_other_top_level_modules() {
     let original = crosslane_store::bootstrap::render_default_config(
         &crosslane_core::config::Config::default().admin.socket,

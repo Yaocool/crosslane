@@ -444,6 +444,7 @@ Run `crosslane config edit features` to edit the switch in `[features]`:
 ```toml
 [features]
 enable_request_redaction = true # false disables it; default: true
+enable_request_redaction_notice = false # opt-in final-answer notice; requires crs
 ```
 
 Saving validates and hot-reloads the configuration without a restart. Check the
@@ -454,6 +455,18 @@ add reference hints or extend tool schemas: messages, history, tool inputs and
 summaries reach Kiro with their real values. Previously generated checkpoint
 capsules are still decoded locally so old summaries remain usable. Existing
 config-export, Debug and error-log sanitization is separate from this switch.
+
+With `crs` builds, set `enable_request_redaction_notice = true` to append a fixed
+security notice to the existing final Claude text block after credentials were
+actually masked in a successful upstream request. This independent switch defaults
+to false and hot-reloads for new requests. The notice contains no credential or
+placeholder values and is generated locally without a model. It is ordinary
+answer text and enters the conversation history, rather than a native Claude Code
+system warning. It does not change tool arguments, IDs, stop reasons or reported
+model usage. Tool-call responses, client compaction summaries, errors, incomplete
+or truncated answers, declared structured output and JSON answers
+are left unchanged. OpenAI responses and providers without this redaction boundary
+do not receive notices. Disabling redaction also prevents notices.
 
 With the switch enabled, Kiro generation requests pass through local,
 deterministic redaction at the final transport boundary. Detection uses no language model, remote classifier,

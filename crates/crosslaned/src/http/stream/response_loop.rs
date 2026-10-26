@@ -2516,6 +2516,18 @@ pub fn response(
                     }
                 }
             }
+            #[cfg(feature = "crs")]
+            if matches!(protocol, StreamProtocol::Claude)
+                && decoded.tools.is_empty()
+            {
+                for data in claude.redaction_notice(
+                    context.redaction_notice,
+                    &redaction,
+                    super::claude_stop_reason(&decoded, context.max_tokens, current_round_output_tokens),
+                ) {
+                    yield Ok::<Bytes, Infallible>(Bytes::from(data));
+                }
+            }
             for data in stream_finish(
                 &protocol,
                 &mut claude,

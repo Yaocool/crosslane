@@ -126,6 +126,8 @@ pub struct StreamContext {
     pub auto_continue_rounds: u32,
     pub buffer_tool_calls: bool,
     pub enable_tool_leak_filter: bool,
+    #[cfg(feature = "crs")]
+    pub redaction_notice: bool,
     /// Actual per-request decision. Beta headers only advertise capability and
     /// remain present when Claude Code sends `thinking.type = "disabled"`.
     pub thinking_enabled: bool,
@@ -670,6 +672,8 @@ struct ClaudeState {
     cache_creation_input_tokens: u64,
     cache_read_input_tokens: u64,
     visible_text: String,
+    #[cfg(feature = "crs")]
+    text_block_offset: usize,
     emitted_citation_links: HashSet<String>,
     web_search_replay: WebSearchReplayCodec,
 }
@@ -699,6 +703,8 @@ impl ClaudeState {
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
             visible_text: String::new(),
+            #[cfg(feature = "crs")]
+            text_block_offset: 0,
             emitted_citation_links: HashSet::new(),
             web_search_replay,
         }
@@ -749,6 +755,10 @@ impl ClaudeState {
         let index = self.next_index;
         self.next_index += 1;
         self.block = Some((index, kind));
+        #[cfg(feature = "crs")]
+        if kind == "text" {
+            self.text_block_offset = self.visible_text.len();
+        }
         output.push(sse(&json!({
             "type":"content_block_start","index":index,"content_block":initial
         })));
@@ -759,9 +769,9 @@ impl ClaudeState {
         let mut output = Vec::new();
         match event {
             KiroEvent::AssistantResponse { content } => {
-                self.visible_text.push_str(content);
                 let index =
                     self.switch_block(&mut output, "text", json!({"type":"text","text":""}));
+                self.visible_text.push_str(content);
                 output.push(sse(&json!({
                     "type":"content_block_delta","index":index,
                     "delta":{"type":"text_delta","text":content}
@@ -812,9 +822,9 @@ impl ClaudeState {
                     .collect::<Vec<_>>();
                 let fallback = kiro_visible_references(&fresh);
                 if !fallback.is_empty() {
-                    self.visible_text.push_str(&fallback);
                     let index =
                         self.switch_block(&mut output, "text", json!({"type":"text","text":""}));
+                    self.visible_text.push_str(&fallback);
                     output.push(sse(&json!({
                         "type":"content_block_delta","index":index,
                         "delta":{"type":"text_delta","text":fallback}
@@ -1004,6 +1014,30 @@ impl ClaudeState {
         Ok(output)
     }
 
+    #[cfg(feature = "crs")]
+    fn redaction_notice(
+        &mut self,
+        requested: bool,
+        session: &crosslane_translate::RedactionSession,
+        stop_reason: &str,
+    ) -> Vec<String> {
+        if !self.block.is_some_and(|(_, kind)| kind == "text")
+            || !super::crs::redaction_notice::should_append(
+                requested,
+                session,
+                stop_reason,
+                &self.visible_text[self.text_block_offset..],
+            )
+        {
+            return Vec::new();
+        }
+        // event() reuses the open block. A separate notice block would hide
+        // the answer in Claude Code's final JSON result.
+        self.event(&KiroEvent::AssistantResponse {
+            content: super::crs::redaction_notice::NOTICE.into(),
+        })
+    }
+
     fn citations(
         &mut self,
         searches: &[ClaudeWebSearchTrace],
@@ -1035,6 +1069,22 @@ impl ClaudeState {
     }
 }
 
+fn claude_stop_reason(
+    decoded: &DecodedResponse,
+    max_tokens: Option<u32>,
+    current_round_output_tokens: u64,
+) -> &str {
+    if let Some(reason) = decoded.stop_reason.as_deref() {
+        reason
+    } else if !decoded.tools.is_empty() {
+        "tool_use"
+    } else if max_tokens.is_some_and(|maximum| current_round_output_tokens >= u64::from(maximum)) {
+        "max_tokens"
+    } else {
+        "end_turn"
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn stream_finish(
     protocol: &StreamProtocol,
@@ -1061,17 +1111,7 @@ fn stream_finish(
             if let Some((index, _kind)) = claude.block.take() {
                 output.push(sse(&json!({"type":"content_block_stop","index":index})));
             }
-            let stop = if let Some(reason) = decoded.stop_reason.as_deref() {
-                reason
-            } else if !decoded.tools.is_empty() {
-                "tool_use"
-            } else if max_tokens
-                .is_some_and(|maximum| current_round_output_tokens >= u64::from(maximum))
-            {
-                "max_tokens"
-            } else {
-                "end_turn"
-            };
+            let stop = claude_stop_reason(decoded, max_tokens, current_round_output_tokens);
             let uncached_input_tokens = decoded
                 .usage
                 .input_tokens

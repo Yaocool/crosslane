@@ -1508,6 +1508,7 @@ pub(super) async fn nonstream_claude(
     resumed_server_events: Vec<ClaudeServerEvent>,
     diagnostics: RequestDiagnostics,
     web_tool_names: std::collections::HashMap<String, String>,
+    #[cfg(feature = "crs")] redaction_notice: bool,
 ) -> Result<Response, ApiError> {
     let tool_names = super::super::tool_names::ClientToolNames::claude(&web_tool_names);
     let tool_name_trace = super::super::tool_names::ToolNameTrace {
@@ -1518,6 +1519,8 @@ pub(super) async fn nonstream_claude(
     };
     #[cfg(feature = "crs")]
     let mut confirmed_usage = super::super::crs::ConfirmedNonstreamUsage::default();
+    #[cfg(feature = "crs")]
+    let redaction = upstream.redaction_session().clone();
     let collected = collect_nonstream_rounds(
         &state,
         &trace_id,
@@ -1671,6 +1674,12 @@ pub(super) async fn nonstream_claude(
                 ErrorFormat::Claude,
             )
         })?;
+    #[cfg(feature = "crs")]
+    let response = super::super::crs::redaction_notice::append_to_response(
+        response,
+        redaction_notice,
+        &redaction,
+    );
     let mut log = request_log(
         &trace_id,
         &request_id,

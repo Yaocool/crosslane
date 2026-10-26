@@ -388,6 +388,8 @@ pub struct FeaturesConfig {
     pub enable_tool_leak_filter: bool,
     /// 是否在发送 Kiro 请求前可逆脱敏敏感凭证。
     pub enable_request_redaction: bool,
+    /// 是否在 Claude 最终回答末尾追加脱敏提示（仅 crs feature）。
+    pub enable_request_redaction_notice: bool,
     /// 空字符串表示自动选择。
     pub default_model_id: String,
 }
@@ -412,6 +414,7 @@ impl Default for FeaturesConfig {
             enable_web_tools: true,
             enable_tool_leak_filter: true,
             enable_request_redaction: true,
+            enable_request_redaction_notice: false,
             default_model_id: String::new(),
         }
     }
@@ -2276,6 +2279,9 @@ enable_tool_leak_filter = true
 # 是否在发送 Kiro 请求前可逆脱敏凭证；关闭后正文、历史、工具参数和摘要按原值发送。
 # 工具参数还原与该开关保持一致；修改后热更新，对新请求生效。
 enable_request_redaction = true
+# 是否在 Claude 最终回答末尾追加脱敏提示；仅 crs feature 生效，默认关闭。
+# 结构化输出、工具调用响应和客户端压缩摘要不会追加；修改后对新请求热更新。
+enable_request_redaction_notice = false
 # 客户端未指定模型或模型解析需要兜底时使用的模型 ID；空字符串表示自动选择。
 default_model_id = ""
 

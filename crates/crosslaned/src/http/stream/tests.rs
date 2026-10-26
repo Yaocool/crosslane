@@ -1,5 +1,61 @@
 use super::*;
 
+#[cfg(feature = "crs")]
+#[test]
+fn redaction_notice_uses_only_the_current_answer_block() {
+    let session = crosslane_translate::RedactionSession::new();
+    let masked = session.redact_text("token=fixture-secret", &[]);
+    session.record_transmitted_payload(&json!({"content":masked}));
+    let mut state = ClaudeState::new("message".into(), "fixture".into(), 10, replay_codec());
+    state.event(&KiroEvent::AssistantResponse {
+        content: "earlier answer".into(),
+    });
+    state.switch_block(
+        &mut Vec::new(),
+        "thinking",
+        json!({"type":"thinking","thinking":""}),
+    );
+    assert!(state
+        .redaction_notice(true, &session, "end_turn")
+        .is_empty());
+    state.switch_block(&mut Vec::new(), "text", json!({"type":"text","text":""}));
+    assert!(
+        state
+            .redaction_notice(true, &session, "end_turn")
+            .is_empty(),
+        "a citation-only block must not become a notice-only result"
+    );
+    state.event(&KiroEvent::AssistantResponse {
+        content: "{\"ok\":true}".into(),
+    });
+    assert!(
+        state
+            .redaction_notice(true, &session, "end_turn")
+            .is_empty(),
+        "JSON in the last block stays valid despite earlier prose"
+    );
+    state.switch_block(
+        &mut Vec::new(),
+        "thinking",
+        json!({"type":"thinking","thinking":""}),
+    );
+    state.event(&KiroEvent::AssistantResponse {
+        content: "final answer".into(),
+    });
+    assert!(state
+        .redaction_notice(true, &session, "tool_use")
+        .is_empty());
+    let original_block = state.block.unwrap().0;
+    let output = streamed_values(&state.redaction_notice(true, &session, "end_turn"));
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0]["type"], "content_block_delta");
+    assert_eq!(output[0]["index"], original_block);
+    assert_eq!(
+        output[0]["delta"]["text"],
+        super::super::crs::redaction_notice::NOTICE
+    );
+}
+
 #[test]
 fn native_error_reasons_preserve_quota_rate_capacity_and_validation_scopes() {
     for reason in [

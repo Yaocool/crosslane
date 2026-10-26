@@ -363,6 +363,7 @@ HTTP 200 SSE，并在 `error.status` 中携带实际状态，例如本地过载�
 ```toml
 [features]
 enable_request_redaction = true # false 关闭，默认 true
+enable_request_redaction_notice = false # 独立的最终回答提示开关，需要 crs feature
 ```
 
 保存后自动校验并热重载，无需重启；可用 `crosslane config show features --effective`
@@ -370,6 +371,15 @@ enable_request_redaction = true # false 关闭，默认 true
 关闭时不再识别和替换新凭证、不添加引用提示或扩展工具 schema，正文、历史、
 工具参数和摘要按真实值发送给 Kiro。此前生成的 checkpoint 封套仍会在本地解包，
 保证旧摘要可继续使用。此开关不控制配置导出、Debug 和错误日志已有的脱敏。
+
+启用 `crs` feature 的构建可设置 `enable_request_redaction_notice = true`：确认实际
+发送的成功上游请求已替换敏感凭证后，在 Claude 最终回答的原文本块末尾追加固定
+安全提示。此开关默认关闭，独立配置，对新请求热更新。提示由本地规则生成，不调用
+模型，也不包含凭证或占位符；它属于回答正文，会进入后续历史，并非 Claude Code
+原生系统 warning。提示不改动工具参数、调用 ID、结束原因和模型用量。工具调用响应、
+客户端压缩摘要、错误、不完整或截断的回答、明确声明的结构化输出及 JSON
+回答均不会追加。OpenAI 响应及未经过此脱敏边界的其他 provider 不追加提示；关闭
+脱敏时也不会提示。
 
 Kiro 生成请求在最终发送前默认执行统一的本地规则脱敏，不使用大模型、远程判别
 接口或额外网络请求。处理范围包括当前消息、system 和历史消息、工具参数和返回值、

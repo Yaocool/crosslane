@@ -404,6 +404,20 @@ mod tests {
     }
 
     #[test]
+    fn redaction_notice_is_hot_reloadable_without_changing_redaction() {
+        let mut current = Config::default();
+        for enabled in [true, false] {
+            let mut edited = current.clone();
+            edited.features.enable_request_redaction_notice = enabled;
+            let (next, needs_restart) = merge_hot_reload(&current, edited);
+            assert!(needs_restart.is_empty());
+            assert_eq!(next.features.enable_request_redaction_notice, enabled);
+            assert!(next.features.enable_request_redaction);
+            current = next;
+        }
+    }
+
+    #[test]
     fn runtime_hook_failure_keeps_previous_config() {
         let directory = tempdir().expect("tempdir");
         let path = directory.path().join("config.toml");

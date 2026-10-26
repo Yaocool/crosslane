@@ -2677,7 +2677,13 @@ fn render_config_module_editor(raw: &str, module: &ConfigModule) -> Result<Strin
         let features = document[module.key]
             .as_table_like_mut()
             .ok_or_else(|| anyhow!("配置模块 features 必须是 TOML table"))?;
-        if features.get("enable_request_redaction").is_none() {
+        for setting in [
+            "enable_request_redaction",
+            "enable_request_redaction_notice",
+        ] {
+            if features.get(setting).is_some() {
+                continue;
+            }
             // Make the new switch discoverable when editing a legacy config.
             // Clone its default item so the same explanation appears here and
             // in fresh installations without rewriting unrelated settings.
@@ -2688,13 +2694,13 @@ fn render_config_module_editor(raw: &str, module: &ConfigModule) -> Result<Strin
                 .as_table()
                 .ok_or_else(|| anyhow!("默认 features 配置必须是 TOML table"))?;
             let key = defaults
-                .key("enable_request_redaction")
+                .key(setting)
                 .ok_or_else(|| anyhow!("默认配置缺少请求脱敏开关"))?;
             features
                 .entry_format(key)
-                .or_insert(defaults["enable_request_redaction"].clone());
-            body = document.to_string();
+                .or_insert(defaults[setting].clone());
         }
+        body = document.to_string();
     }
     Ok(format!(
         "# Crosslane 配置模块：{}（TOML key: {}）\n\

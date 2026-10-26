@@ -44,6 +44,7 @@ fn defaults_match_the_spec() {
     assert!(config.features.enable_web_tools);
     assert!(config.features.enable_tool_leak_filter);
     assert!(config.features.enable_request_redaction);
+    assert!(!config.features.enable_request_redaction_notice);
     assert_eq!(config.features.tool_search_max_rounds, 4);
     assert_eq!(config.features.tool_search_max_operations, 32);
     assert!(config.features.enable_tool_search);
@@ -218,6 +219,33 @@ fn request_redaction_defaults_on_and_accepts_only_boolean_switches() {
     for invalid in ["\"false\"", "0", "[]", "{}"] {
         let source = format!("[features]\nenable_request_redaction = {invalid}\n");
         assert!(toml::from_str::<Config>(&source).is_err());
+    }
+}
+
+#[test]
+fn request_redaction_notice_defaults_off_and_accepts_only_boolean_switches() {
+    for source in [
+        "",
+        "[features]\nenable_request_redaction = false\n",
+        DEFAULT_CONFIG_TOML,
+    ] {
+        let config: Config = toml::from_str(source).unwrap();
+        assert!(!config.features.enable_request_redaction_notice);
+    }
+    for enabled in [false, true] {
+        let config: Config = toml::from_str(&format!(
+            "[features]\nenable_request_redaction_notice = {enabled}\n"
+        ))
+        .unwrap();
+        assert_eq!(config.features.enable_request_redaction_notice, enabled);
+        let roundtrip: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(roundtrip.features.enable_request_redaction_notice, enabled);
+    }
+    for invalid in ["\"false\"", "0", "[]", "{}"] {
+        assert!(toml::from_str::<Config>(&format!(
+            "[features]\nenable_request_redaction_notice = {invalid}\n"
+        ))
+        .is_err());
     }
 }
 

@@ -1006,7 +1006,7 @@ async fn copilot_error_statuses_are_preserved_for_both_protocols_and_modes() {
     daemon.stop().await;
 }
 
-async fn start_crs_console(daemon: &Daemon, port: u16) -> (Child, String) {
+pub(super) async fn start_crs_console(daemon: &Daemon, port: u16) -> (Child, String) {
     let crs = std::env::var("CROSSLANE_CRS_SOURCE").expect("set CROSSLANE_CRS_SOURCE");
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/crs_console.cjs");
     let mut relay = Command::new("node")
@@ -1240,7 +1240,7 @@ async fn copilot_errors_preserve_crs_diagnostics_and_report_build_features() {
     daemon.stop().await;
 }
 
-fn claude_code_command(claude: &str, isolated: &Path, address: &str) -> Command {
+pub(super) fn claude_code_command(claude: &str, isolated: &Path, address: &str) -> Command {
     let mut client = Command::new(claude);
     client.env_clear();
     for name in ["PATH", "HOME", "TMPDIR"] {

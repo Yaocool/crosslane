@@ -110,6 +110,9 @@ mod tool_names;
 #[path = "end_to_end/redaction_toggle.rs"]
 mod redaction_toggle;
 
+#[path = "end_to_end/redaction_notice.rs"]
+mod redaction_notice;
+
 #[path = "end_to_end/client_tool_search.rs"]
 mod client_tool_search;
 

@@ -24,6 +24,7 @@ mod empty_tool_retry;
 mod event_diagnostics;
 mod isolated_empty_retry;
 mod nonstream_usage;
+pub(super) mod redaction_notice;
 mod refusal;
 mod request_diagnostics;
 mod stream;

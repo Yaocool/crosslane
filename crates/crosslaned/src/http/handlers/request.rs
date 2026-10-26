@@ -401,6 +401,12 @@ async fn handle_claude_route_inner(
     let original_tool_count = request.tools.len();
     let client_compaction =
         claude_code && crosslane_translate::prepare_claude_code_compaction(&mut request);
+    #[cfg(feature = "crs")]
+    let redaction_notice = super::super::crs::redaction_notice::requested(
+        &request,
+        config.features.enable_request_redaction_notice,
+        client_compaction,
+    );
     if client_compaction {
         tracing::info!(
             event = "proxy.compaction.client_summary_prepared",
@@ -1371,6 +1377,8 @@ async fn handle_claude_route_inner(
                 thinking_enabled: decision.enabled,
                 thinking_output_format: config.features.thinking_output_format,
                 include_usage_chunk: false,
+                #[cfg(feature = "crs")]
+                redaction_notice,
                 web_tool_names,
                 tool_search,
                 max_tool_search_operations,
@@ -1426,6 +1434,8 @@ async fn handle_claude_route_inner(
         resumed_server_events,
         diagnostics,
         web_tool_names,
+        #[cfg(feature = "crs")]
+        redaction_notice,
     )
     .await
 }
@@ -2104,6 +2114,8 @@ pub(super) async fn handle_openai_route(
                 thinking_enabled: decision.enabled,
                 thinking_output_format,
                 include_usage_chunk,
+                #[cfg(feature = "crs")]
+                redaction_notice: false,
                 web_tool_names: std::collections::HashMap::new(),
                 tool_search: None,
                 max_tool_search_operations: 0,
