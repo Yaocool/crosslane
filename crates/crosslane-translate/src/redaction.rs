@@ -40,6 +40,8 @@ struct SessionState {
     by_value: HashMap<String, String>,
     by_marker: HashMap<String, Value>,
     source_texts: HashMap<String, String>,
+    #[cfg(feature = "crs")]
+    transmitted_redactions: bool,
 }
 
 impl Default for RedactionSession {
@@ -74,12 +76,57 @@ impl RedactionSession {
                 by_value: HashMap::new(),
                 by_marker: HashMap::new(),
                 source_texts: HashMap::new(),
+                #[cfg(feature = "crs")]
+                transmitted_redactions: false,
             })),
         }
     }
 
     pub fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Record protection on an actual outgoing generation payload, rather than
+    /// inferring it from mappings discovered by an input-budget estimate.
+    #[cfg(feature = "crs")]
+    pub fn record_transmitted_payload(&self, payload: &Value) {
+        if !self.enabled {
+            return;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.transmitted_redactions || state.by_marker.is_empty() {
+            return;
+        }
+        let prefix = format!("__CROSSLANE_SECRET_{}_", state.nonce);
+        fn contains(value: &Value, prefix: &str, state: &SessionState) -> bool {
+            let text_contains = |text: &str| {
+                text.contains(prefix)
+                    && marker_pattern()
+                        .find_iter(text)
+                        .any(|marker| state.by_marker.contains_key(marker.as_str()))
+            };
+            match value {
+                Value::String(text) => text_contains(text),
+                Value::Array(values) => values.iter().any(|value| contains(value, prefix, state)),
+                Value::Object(fields) => fields
+                    .iter()
+                    .any(|(key, value)| text_contains(key) || contains(value, prefix, state)),
+                _ => false,
+            }
+        }
+        state.transmitted_redactions = contains(payload, &prefix, &state);
+    }
+
+    /// Safe request-local evidence; neither credential values nor markers leave
+    /// this mapping, and disabled sessions can never produce a notice.
+    #[cfg(feature = "crs")]
+    pub fn has_transmitted_redactions(&self) -> bool {
+        self.enabled
+            && self
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .transmitted_redactions
     }
 
     pub fn is_empty(&self) -> bool {
@@ -2010,6 +2057,31 @@ fn value_range(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[cfg(feature = "crs")]
+    #[test]
+    fn transmitted_redactions_require_a_known_reference_on_the_actual_wire() {
+        let session = RedactionSession::new();
+        let masked = session.redact_text("token=notice-fixture-secret", &[]);
+        assert!(!session.has_transmitted_redactions());
+        for value in [
+            json!({"content":"token=$CLOUD_TOKEN"}),
+            json!({"content":"__CROSSLANE_SECRET_00000000000000000000000000000000_0__"}),
+            json!({"content":"[Gateway credential references] __CROSSLANE_SECRET_"}),
+        ] {
+            session.record_transmitted_payload(&value);
+            assert!(!session.has_transmitted_redactions());
+        }
+        session
+            .clone()
+            .record_transmitted_payload(&json!({"nested":[{"content":masked}]}));
+        assert!(session.has_transmitted_redactions());
+        session.record_transmitted_payload(&json!({"content":"later clean continuation"}));
+        assert!(session.has_transmitted_redactions());
+        let disabled = RedactionSession::with_enabled(false);
+        disabled.record_transmitted_payload(&json!({"content":masked}));
+        assert!(!disabled.has_transmitted_redactions());
+    }
 
     fn assert_schema_allows_marker(schema: &Value, marker: &Value) {
         let pattern = schema["anyOf"][1]["pattern"].as_str().unwrap();

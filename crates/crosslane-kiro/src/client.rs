@@ -1241,6 +1241,10 @@ impl KiroClient {
                 message: error.to_string(),
             })?;
         let status = response.status();
+        #[cfg(feature = "crs")]
+        if status.is_success() {
+            redaction_session.record_transmitted_payload(&request);
+        }
         let body = bounded_response_text(response, 8 * 1024 * 1024, "MCP web_search").await?;
         if !status.is_success() {
             return Err(KiroError {
@@ -1455,6 +1459,8 @@ impl KiroClient {
             })?;
         drop(model_permit);
         if response.status().is_success() {
+            #[cfg(feature = "crs")]
+            redaction_session.record_transmitted_payload(&wire);
             let mut response = response;
             response.extensions_mut().insert(redaction_session.clone());
             let response = crate::response_redaction::restore_tool_response(
