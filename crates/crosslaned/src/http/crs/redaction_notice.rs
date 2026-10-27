@@ -3,7 +3,7 @@
 use crosslane_translate::{ClaudeRequest, RedactionSession};
 use serde_json::Value;
 
-pub(in crate::http) const NOTICE: &str = "\n\n⚠️ Crosslane 安全提示：本次请求检测到敏感凭证，已在发送给上游模型前替换为占位符。工具执行所需参数仍会正常还原。请优先使用环境变量引用或安全凭证配置，避免直接粘贴明文凭证。";
+pub(in crate::http) const NOTICE: &str = "\n\n---\n\n> **⚠️ Crosslane 安全提示：已触发凭证脱敏**\n>\n> 本次识别到的敏感凭证已在发送给上游模型前替换为占位符。工具执行所需参数会在本地还原。\n>\n> **请注意凭证的使用方式：**优先使用环境变量引用或安全凭证配置，避免直接粘贴明文凭证。";
 
 /// Freeze the policy with the request. Unknown non-text formats are treated as
 /// structured; effort-only controls remain eligible.
@@ -159,6 +159,10 @@ mod tests {
             append_to_response(original.clone(), true, &session),
             expected
         );
+        assert!(NOTICE.starts_with("\n\n---\n\n> **⚠️ Crosslane 安全提示："));
+        assert!(NOTICE.contains("\n>\n> **请注意凭证的使用方式：**"));
+        assert!(!NOTICE.contains('\u{1b}'));
+        assert!(!NOTICE.contains('<'));
         assert_eq!(
             append_to_response(original.clone(), false, &session),
             original

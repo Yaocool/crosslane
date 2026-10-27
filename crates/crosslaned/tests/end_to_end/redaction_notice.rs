@@ -174,7 +174,11 @@ fn assert_answer(body: &str, stream: bool, notice: bool, answer: &str) {
     assert_eq!(usage["output_tokens"], 3);
     assert!(text.starts_with(answer), "original answer must be retained");
     assert_eq!(text.matches(NOTICE).count(), usize::from(notice));
-    if !notice {
+    if notice {
+        assert!(text.contains("\n\n---\n\n> **⚠️ Crosslane 安全提示："));
+        assert!(text.contains("\n>\n> **请注意凭证的使用方式：**"));
+        assert!(!text.contains('\u{1b}'));
+    } else {
         assert_eq!(text, answer);
     }
     assert!(!text.contains(SECRET));

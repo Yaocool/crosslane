@@ -467,6 +467,9 @@ model usage. Tool-call responses, client compaction summaries, errors, incomplet
 or truncated answers, declared structured output and JSON answers
 are left unchanged. OpenAI responses and providers without this redaction boundary
 do not receive notices. Disabling redaction also prevents notices.
+The notice uses a separator, a bold heading and a multiline blockquote. Colors
+and backgrounds depend on the client renderer; no ANSI codes, HTML, extra
+response blocks or events are injected.
 
 With the switch enabled, Kiro generation requests pass through local,
 deterministic redaction at the final transport boundary. Detection uses no language model, remote classifier,
