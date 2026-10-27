@@ -41,6 +41,18 @@ pub(super) fn discover_shell_secrets(tool_name: &str, input: &Value) -> Vec<Stri
     let mut values = Vec::new();
     for command in command_sources(tool_name, input) {
         let mut ranges = secret_ranges_shell(command, &[], None);
+        // The main collector decodes embedded JSON through data(), including
+        // public auth controls. Raw shell precollection must not seed values
+        // such as `credentials: "include"` as secrets before that semantic pass.
+        let documents: Vec<_> = super::embedded_json::documents(command, 0)
+            .map(|document| document.range)
+            .collect();
+        ranges.retain(|range| {
+            let index = documents.partition_point(|document| document.end <= range.start);
+            !documents
+                .get(index)
+                .is_some_and(|document| document.start < range.start && range.end < document.end)
+        });
         ranges.sort_unstable_by_key(|range| (range.start, range.end));
         let mut merged: Vec<Range<usize>> = Vec::new();
         for range in ranges {

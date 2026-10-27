@@ -6,6 +6,7 @@
 //! reliably by text rules; callers must not treat this as a general DLP guarantee.
 
 mod auth;
+mod embedded_json;
 mod shell;
 
 use std::collections::HashMap;
@@ -1129,6 +1130,9 @@ impl<'a> Redactor<'a> {
                 }
             }
         }
+        if self.embedded_documents(value, shell_source) {
+            return;
+        }
         if self.collecting {
             self.discovered.extend(discover_text_secrets_with_context(
                 value,
@@ -1152,6 +1156,112 @@ impl<'a> Redactor<'a> {
             );
             self.stats.redacted_values += count;
         }
+    }
+
+    fn embedded_documents(&mut self, value: &mut String, shell_source: bool) -> bool {
+        let Some(first) = embedded_json::documents(value, 0).next() else {
+            return false;
+        };
+        let original = value.clone();
+        let auth = auth::scan(&original);
+        let guards = secret_ranges_with_auth(
+            &original,
+            self.known_secrets,
+            self.matcher.as_ref(),
+            shell_source,
+            self.decode_auth_literals,
+            &auth,
+        );
+        let after_first = first.range.end;
+        let boundaries = merge_ranges(guards.clone());
+        let documents: Vec<_> = std::iter::once(first)
+            .chain(embedded_json::documents(&original, after_first))
+            .filter(|document| {
+                // Keep enclosing or boundary-crossing credentials atomic.
+                let first = boundaries.partition_point(|range| range.end <= document.range.start);
+                let end = boundaries.partition_point(|range| range.start < document.range.end);
+                first == end
+                    || (boundaries[first].start > document.range.start
+                        && boundaries[end - 1].end <= document.range.end)
+            })
+            .collect();
+        if documents.is_empty() {
+            return false;
+        }
+        let outside = |range: &Range<usize>| {
+            let index = documents.partition_point(|document| document.range.end <= range.start);
+            documents
+                .get(index)
+                .is_none_or(|document| document.range.start >= range.end)
+        };
+        // Classify surrounding text in its complete source context. Splitting
+        // it first would lose shell boundaries and enclosing language fences.
+        let ranges: Vec<_> = guards.into_iter().filter(outside).collect();
+        if self.collecting {
+            self.discovered.extend(checkpoint_secrets(&original));
+            if self.decode_auth_literals {
+                self.discovered.extend(
+                    auth.literal_entries()
+                        .filter(|(range, secret)| outside(range) && reusable_secret(secret))
+                        .map(|(_, secret)| secret.to_owned()),
+                );
+            }
+            self.discovered.extend(ranges.iter().filter_map(|range| {
+                let secret = &original[range.clone()];
+                reusable_secret(secret).then(|| secret.to_owned())
+            }));
+            for mut document in documents {
+                self.data(&mut document.value, document.opaque);
+            }
+            return true;
+        }
+        let ranges = merge_ranges(ranges);
+        self.stats.redacted_values += ranges.len();
+        let mut replacements: Vec<_> = ranges
+            .into_iter()
+            .map(|range| {
+                let replacement = range_replacement(
+                    &original,
+                    &range,
+                    self.session.as_ref(),
+                    self.decode_auth_literals.then_some(&auth),
+                );
+                (range, replacement)
+            })
+            .collect();
+        for mut document in documents {
+            let before = self.stats.redacted_values;
+            self.data(&mut document.value, document.opaque);
+            if self.stats.redacted_values > before {
+                let safe = if document.opaque {
+                    document
+                        .value
+                        .as_str()
+                        .expect("opaque JSON string")
+                        .to_owned()
+                } else {
+                    document.value.to_string()
+                };
+                replacements.push((document.range, safe));
+            }
+        }
+        if replacements.is_empty() {
+            return true;
+        }
+        replacements.sort_unstable_by_key(|(range, _)| range.start);
+        let mut safe = String::with_capacity(original.len());
+        let mut offset = 0;
+        for (range, replacement) in replacements {
+            safe.push_str(&original[offset..range.start]);
+            safe.push_str(&replacement);
+            offset = range.end;
+        }
+        safe.push_str(&original[offset..]);
+        *value = self.session.as_ref().map_or_else(
+            || safe.clone(),
+            |session| session.remember_source_text(&original, safe.clone()),
+        );
+        true
     }
 
     fn user(&mut self, user: &mut KiroUserInputMessage) {
@@ -1782,21 +1892,6 @@ fn structured_reference(value: &str) -> bool {
             .all(|ch| ch.is_whitespace() || matches!(ch, ':' | '"' | '\''))
 }
 
-fn symbolic_sensitive_value(value: &str) -> bool {
-    if !may_contain_symbolic_reference(value) {
-        return false;
-    }
-    let trimmed = value.trim();
-    let candidate = trimmed
-        .split_once(char::is_whitespace)
-        .filter(|(scheme, _)| auth::is_scheme(scheme))
-        .map_or(trimmed, |(_, reference)| reference.trim());
-    auth::reference_composition(candidate)
-        || symbolic_pattern()
-            .find(candidate)
-            .is_some_and(|reference| reference.start() == 0 && reference.end() == candidate.len())
-}
-
 fn may_contain_symbolic_reference(text: &str) -> bool {
     text.contains('$')
         || text.contains('%')
@@ -1930,15 +2025,12 @@ fn discover_text_secrets_with_context(
     if decode_auth_literals {
         secrets.extend(
             auth.literal_secrets()
-                .filter(|secret| {
-                    reusable_secret(secret)
-                        && (!symbolic_sensitive_value(secret) || named_getter_reference(secret))
-                })
+                .filter(|secret| reusable_secret(secret))
                 .map(str::to_owned),
         );
     }
     secrets.extend(
-        secret_ranges_with_auth(text, &[], None, shell_source, &auth)
+        secret_ranges_with_auth(text, &[], None, shell_source, decode_auth_literals, &auth)
             .into_iter()
             .filter_map(|range| {
                 let secret = &text[range];
@@ -1964,7 +2056,7 @@ fn secret_ranges_with_context(
     shell_source: bool,
 ) -> Vec<Range<usize>> {
     let auth = auth::scan(text);
-    secret_ranges_with_auth(text, known_secrets, matcher, shell_source, &auth)
+    secret_ranges_with_auth(text, known_secrets, matcher, shell_source, true, &auth)
 }
 
 fn secret_ranges_with_auth(
@@ -1972,10 +2064,14 @@ fn secret_ranges_with_auth(
     known_secrets: &[&str],
     matcher: Option<&AhoCorasick>,
     shell_source: bool,
+    decode_auth_literals: bool,
     auth: &auth::Scan,
 ) -> Vec<Range<usize>> {
     let mut ranges = Vec::<Range<usize>>::new();
     let mut literal_defaults = auth.literal_defaults.clone();
+    if decode_auth_literals {
+        literal_defaults.extend(auth.posix_literals.iter().cloned());
+    }
     let contexts = if may_contain_symbolic_reference(text) {
         source_contexts(text)
     } else {
@@ -2215,6 +2311,12 @@ fn secret_ranges_with_auth(
             };
             if let Some(range) = value_range(text, assignment.value_start, context, name) {
                 if !auth::public_assignment(name, &text[range.clone()]) {
+                    if decode_auth_literals
+                        && (text[assignment.value_start..].starts_with('\'')
+                            || text[assignment.value_start..].starts_with("$'"))
+                    {
+                        literal_defaults.push(range.clone());
+                    }
                     if matches!(
                         context,
                         ValueContext::Query | ValueContext::Connection | ValueContext::Shell
@@ -2257,12 +2359,17 @@ fn secret_ranges_with_auth(
         {
             let name = captures.name("name").expect("flag name");
             if sensitive_name(name.as_str()) && !auth.manages(name.start()) {
-                if let Some(range) = value_range(
-                    text,
-                    captures.get(0).expect("flag").end(),
-                    ValueContext::Shell,
-                    name.as_str(),
-                ) {
+                let start = captures.get(0).expect("flag").end();
+                if let Some(range) = value_range(text, start, ValueContext::Shell, name.as_str()) {
+                    if decode_auth_literals
+                        && shell::literal_word_fragment(
+                            &text[start..range.end],
+                            range.start - start..range.end - start,
+                        )
+                        .is_some()
+                    {
+                        literal_defaults.push(range.clone());
+                    }
                     ranges.push(range);
                 }
             }
@@ -2374,7 +2481,14 @@ fn redact_text_impl_with_context(
     decode_auth_literals: bool,
 ) -> (String, usize) {
     let auth = auth::scan(text);
-    let ranges = secret_ranges_with_auth(text, known_secrets, matcher, shell_source, &auth);
+    let ranges = secret_ranges_with_auth(
+        text,
+        known_secrets,
+        matcher,
+        shell_source,
+        decode_auth_literals,
+        &auth,
+    );
     replace_ranges_impl(
         text,
         ranges,
@@ -2393,14 +2507,24 @@ fn replace_ranges(
 
 fn replace_ranges_impl(
     text: &str,
-    mut ranges: Vec<Range<usize>>,
+    ranges: Vec<Range<usize>>,
     session: Option<&RedactionSession>,
     auth: Option<&auth::Scan>,
 ) -> (String, usize) {
-    ranges.retain(|range| range.start < range.end);
-    if ranges.is_empty() {
-        return (text.to_owned(), 0);
+    let merged = merge_ranges(ranges);
+    let mut safe = String::with_capacity(text.len());
+    let mut offset = 0;
+    for range in &merged {
+        safe.push_str(&text[offset..range.start]);
+        safe.push_str(&range_replacement(text, range, session, auth));
+        offset = range.end;
     }
+    safe.push_str(&text[offset..]);
+    (safe, merged.len())
+}
+
+fn merge_ranges(mut ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
+    ranges.retain(|range| range.start < range.end);
     ranges.sort_unstable_by_key(|range| (range.start, range.end));
     let mut merged = Vec::<Range<usize>>::new();
     for range in ranges {
@@ -2412,28 +2536,29 @@ fn replace_ranges_impl(
         }
         merged.push(range);
     }
-    let mut safe = String::with_capacity(text.len());
-    let mut offset = 0;
-    for range in &merged {
-        safe.push_str(&text[offset..range.start]);
-        if let Some(session) = session {
-            let literal = auth
-                .and_then(|auth| auth.literal(range))
-                .unwrap_or(&text[range.clone()]);
-            if literal != &text[range.clone()] {
-                // Keep both spellings private across continuations, as the
-                // shell-history normalization path already does. A later raw
-                // tool result may repeat the escaped source spelling.
-                session.marker(Value::String(text[range.clone()].to_owned()));
-            }
-            safe.push_str(&session.marker(Value::String(literal.to_owned())));
-        } else {
-            safe.push_str(REDACTED);
+    merged
+}
+
+fn range_replacement(
+    text: &str,
+    range: &Range<usize>,
+    session: Option<&RedactionSession>,
+    auth: Option<&auth::Scan>,
+) -> String {
+    if let Some(session) = session {
+        let literal = auth
+            .and_then(|auth| auth.literal(range))
+            .unwrap_or(&text[range.clone()]);
+        if literal != &text[range.clone()] {
+            // Keep both spellings private across continuations, as the
+            // shell-history normalization path already does. A later raw
+            // tool result may repeat the escaped source spelling.
+            session.marker(Value::String(text[range.clone()].to_owned()));
         }
-        offset = range.end;
+        session.marker(Value::String(literal.to_owned()))
+    } else {
+        REDACTED.to_owned()
     }
-    safe.push_str(&text[offset..]);
-    (safe, merged.len())
 }
 
 #[derive(Clone, Copy)]
@@ -2576,23 +2701,10 @@ fn value_range(
         let end = line_value.find(" #").unwrap_or(line_value.len());
         return (end > 0).then_some(start..start + line_value[..end].trim_end().len());
     }
-    let mut escaped = false;
-    let end = tail
-        .char_indices()
-        .find_map(|(offset, ch)| {
-            if matches!(context, ValueContext::Shell) {
-                if escaped {
-                    escaped = false;
-                    return None;
-                }
-                if ch == '\\' {
-                    escaped = true;
-                    return None;
-                }
-            }
-            context.ends_at(ch).then_some(offset)
-        })
-        .unwrap_or(tail.len());
+    if matches!(context, ValueContext::Shell) {
+        return auth::shell_value_range(text, start);
+    }
+    let end = tail.find(|ch| context.ends_at(ch)).unwrap_or(tail.len());
     let raw = &tail[..end];
     let end = raw.find(" #").unwrap_or(raw.len());
     let length = raw[..end].trim_end().len();
@@ -3041,8 +3153,14 @@ mod tests {
             "os.getenv(\"API_TOKEN\")",
         ] {
             let session = RedactionSession::new();
-            let command =
-                format!("curl -H 'Authorization: Bearer {reference}' https://example.invalid/");
+            let executable = if reference.starts_with('%') || reference.starts_with("$env:") {
+                "curl.exe"
+            } else {
+                "curl"
+            };
+            let command = format!(
+                "{executable} -H \"Authorization: Bearer {reference}\" https://example.invalid/"
+            );
             if reference.starts_with(['$', '%']) {
                 assert_eq!(session.redact_text(&command, &[]), command);
                 assert_eq!(redact_text(&command, &[]), command);
@@ -3055,7 +3173,7 @@ mod tests {
             assert_eq!(value, original);
             assert!(session.is_empty());
         }
-        let command = "API_TOKEN=$TOKEN curl --token=${TOKEN} --password %PASSWORD%";
+        let command = "API_TOKEN=$TOKEN curl --token=${TOKEN} --password \"$PASSWORD\"";
         let session = RedactionSession::new();
         assert_eq!(session.redact_text(command, &[]), command);
     }
@@ -3150,7 +3268,7 @@ mod tests {
         }
         for source in [
             "curl --token $API_TOKEN --password $PASSWORD https://example.invalid/",
-            "TOKEN=${API_TOKEN} curl -H 'Authorization: Bearer $API_TOKEN' https://example.invalid/",
+            "TOKEN=${API_TOKEN} curl -H \"Authorization: Bearer $API_TOKEN\" https://example.invalid/",
         ] {
             assert_eq!(redact_text(source, &[]), source);
         }
@@ -3575,7 +3693,7 @@ mod tests {
     #[test]
     fn reference_fallback_literals_and_markdown_code_are_not_secret_bypasses() {
         let session = RedactionSession::new();
-        let source = "curl -H 'Authorization: Bearer ${API_TOKEN:-ksk_literal_fallback}' https://example.invalid/";
+        let source = "curl -H \"Authorization: Bearer ${API_TOKEN:-ksk_literal_fallback}\" https://example.invalid/";
         let safe = session.redact_text(source, &[]);
         assert!(safe.contains("${API_TOKEN:-__CROSSLANE_SECRET_"));
         assert!(!safe.contains("ksk_literal_fallback"));

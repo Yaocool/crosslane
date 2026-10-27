@@ -293,7 +293,7 @@ async fn common_auth_forms_are_filtered_before_send_and_recover_working_curl_arg
     for enabled in [true, false] {
         let server = MockServer::start().await;
         let command = format!(
-            "curl -q --noproxy '*' --fail --silent --show-error --max-time 5 -u 'wire-user:wire-password-123' {}/protected",
+            "curl -q --noproxy '*' --fail --silent --show-error --max-time 5 -u 'wire-user:$WIRE_LITERAL_AUTH' {}/protected",
             server.uri()
         );
         let input = json!({
@@ -311,6 +311,19 @@ async fn common_auth_forms_are_filtered_before_send_and_recover_working_curl_arg
                 "php":"```php\n$api_token=getenv('API_TOKEN');\n```"
             },
             "default_expression":"const options = {token: Deno.env.get(\"API_TOKEN\") ?? \"$WIRE_LITERAL_SECRET\", retries: 3}",
+            "literal_auth":[
+                "sshpass -p '$WIRE_LITERAL_AUTH' ssh example.invalid",
+                "mysql --password='%WIRE_LITERAL_PERCENT%' -h example.invalid",
+                "curl -H 'X-Api-Key: $WIRE_LITERAL_AUTH' https://example.invalid/",
+                "HTTPBasicAuth(\"user\", \"$WIRE_LITERAL_SDK\")"
+            ],
+            "runtime_defaults":[
+                "const value = Deno.env.get(\"API_TOKEN\") ?? \"opaque-wire-deno-default\";",
+                "const value = Bun.env.API_TOKEN ?? \"opaque-wire-bun-default\";",
+                "let value = std::env::var(\"API_TOKEN\").unwrap_or(\"opaque-wire-rust-default\".to_owned());",
+                "deno eval 'const token = Deno.env.get(\"API_TOKEN\") ?? \"opaque-wire-eval-default\";'"
+            ],
+            "embedded_document":"configuration output:\n```json\n{\"\\u5bc6\\u7801\":\"opaque-wire-escaped-json\"}\n```",
             "api_token":"process.env.APP_SETTING ?? 'opaque-wire-default'",
             "fetch_options":{"credentials":"include","method":"GET"},
             "authorization_code_request":{"grant_type":"authorization_code","code":"opaque-code-fixture"},
@@ -323,7 +336,7 @@ async fn common_auth_forms_are_filtered_before_send_and_recover_working_curl_arg
             "messages":[
                 {"role":"user","content":"Run curl -u admin:admin https://example.invalid/. auth=('user','opaque-sdk-fixture')"},
                 {"role":"assistant","content":[{"type":"tool_use","id":"auth-history","name":"Bash","input":input}]},
-                {"role":"user","content":[{"type":"tool_result","tool_use_id":"auth-history","content":"access-control-allow-credentials: true\nwire-password-123 was accepted\nServer=localhost;Password=opaque-db-fixture;Database=appdb"}]}
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"auth-history","content":"access-control-allow-credentials: true\nwire-user:$WIRE_LITERAL_AUTH was accepted\nServer=localhost;Password=opaque-db-fixture;Database=appdb"}]}
             ]
         })).unwrap();
         let mut source = claude_to_kiro(
@@ -337,7 +350,7 @@ async fn common_auth_forms_are_filtered_before_send_and_recover_working_curl_arg
             .respond_with(move |request: &wiremock::Request| {
                 let wire: Value = serde_json::from_slice(&request.body).unwrap();
                 let encoded = wire.to_string();
-                for secret in ["admin:admin", "wire-password-123", "opaque-code-fixture", "opaque-sdk-fixture", "opaque-db-fixture", "opaque-p12-fixture", "opaque-wire-default", "$WIRE_LITERAL_SECRET", "dXNlcjpvcGFxdWUtZG9ja2VyLWZpeHR1cmU="] {
+                for secret in ["admin:admin", "opaque-code-fixture", "opaque-sdk-fixture", "opaque-db-fixture", "opaque-p12-fixture", "opaque-wire-default", "$WIRE_LITERAL_SECRET", "$WIRE_LITERAL_AUTH", "%WIRE_LITERAL_PERCENT%", "$WIRE_LITERAL_SDK", "opaque-wire-deno-default", "opaque-wire-bun-default", "opaque-wire-rust-default", "opaque-wire-eval-default", "opaque-wire-escaped-json", "dXNlcjpvcGFxdWUtZG9ja2VyLWZpeHR1cmU="] {
                     assert_eq!(encoded.contains(secret), !enabled, "wire policy for synthetic {secret}");
                 }
                 let tool = historical_tool_input(&wire);
@@ -358,7 +371,8 @@ async fn common_auth_forms_are_filtered_before_send_and_recover_working_curl_arg
                 "authorization",
                 format!(
                     "Basic {}",
-                    base64::engine::general_purpose::STANDARD.encode("wire-user:wire-password-123")
+                    base64::engine::general_purpose::STANDARD
+                        .encode("wire-user:$WIRE_LITERAL_AUTH")
                 ),
             ))
             .respond_with(ResponseTemplate::new(200).set_body_string("authenticated-fixture"))
@@ -428,7 +442,7 @@ async fn returned_tool_inputs_restore_secrets_types_and_fragmented_placeholders(
         input["windows_token"] = json!("%API_TOKEN%");
         input["headers"] = json!({"Authorization":"Bearer ${API_TOKEN}"});
         input["command_env"] =
-            json!("curl -H 'Authorization: Bearer $API_TOKEN' https://example.invalid/");
+            json!("curl -H \"Authorization: Bearer $API_TOKEN\" https://example.invalid/");
         let before = serde_json::to_value(&source).unwrap();
         let expected = historical_tool_input(&before).clone();
         let expected_wire = expected.clone();

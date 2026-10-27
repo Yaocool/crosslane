@@ -417,8 +417,11 @@ Profile、模型名、工具名、调用关联 ID 和正常的 token 数量控�
 WWW / Proxy-Authenticate 的公共挑战、布尔状态字段、明确的 fetch credentials 模式、
 MySQL / PostgreSQL 的交互密码提示开关、curl 凭证文件路径和纯环境变量引用均保留。
 `GOOGLE_APPLICATION_CREDENTIALS` 的 [ADC 文件路径](https://docs.cloud.google.com/docs/authentication/application-default-credentials)也保留，文件内容仍按凭证规则处理。
-PowerShell 的 `$Env:NAME` / `${env:NAME}` 同样保留；Node / Python 环境变量表达式
-中的明文字面默认凭证会单独替换，引用和表达式结构保留。
+PowerShell 的 `$Env:NAME` / `${env:NAME}` 同样保留；Node、Python、Deno、Bun、Rust
+等已识别环境变量表达式中的明文字面默认凭证会单独替换，引用和表达式结构保留，
+包括外层绑定使用普通变量名、或表达式位于 shell 的引号内的情况。
+日志前后缀、Markdown 代码围栏中的 JSON 同样解码字段名后脱敏，覆盖 `\u5bc6\u7801`
+等转义键名；包含此类敏感键的损坏 JSON 会保守替换整个片段，工具重放可还原原文。
 连接串只替换密码部分，不吞掉后续数据库等配置；已识别命令的字面凭证按本地 shell
 语法解码后映射，模型复制引用到另一工具时可恢复实际参数，原始命令重放则保留源码。
 检测不执行命令、展开变量或读取凭证文件，也不会调用模型判断。此规则集覆盖常用明确
@@ -430,6 +433,8 @@ PowerShell 的 `$Env:NAME` / `${env:NAME}` 同样保留；Node / Python 环境�
 客户端重放摘要时由网关本地解码并建立新映射，发给 Kiro 的仍是当前请求的占位符。
 封套是凭证的编码载体，并非加密。工具参数中的 `$TOKEN`、`${TOKEN}`、`%TOKEN%`
 和 `$env:TOKEN` 等环境变量引用保持原样，实际字面秘密仍按规则处理。
+POSIX 单引号或 ANSI 引号中的 `$TOKEN`、POSIX 命令中的 `%TOKEN%` 是字面值，
+不会按变量引用放行；明确的 Windows 命令和 shell 声明继续按其引用语法处理。
 Go、Java、.NET、Rust、Ruby、PHP、Deno、Bun 和 `import.meta.env` 的常见环境变量
 取值语法，有明确代码声明或代码语言围栏、且仅含变量名时也会保留。无代码上下文的
 .env / YAML 值继续保守处理。JSON 凭证值、工具参数中的新增 getter

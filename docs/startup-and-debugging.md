@@ -520,6 +520,14 @@ Getter spellings inside literal curl/SDK/netrc credentials and sensitive schema
 defaults are still masked;
 an exact value already identified as a credential also takes precedence over
 the reference exemption.
+Recognized Deno, Bun and Rust defaults are also masked when the outer variable
+has an ordinary name or the expression is inside a quoted shell program.
+Embedded JSON in logs and Markdown fences is parsed with decoded field names,
+including escaped keys such as `\u5bc6\u7801`. Malformed JSON with such sensitive
+keys is conservatively replaced as a whole fragment; tool replay retains the
+original source. POSIX single/ANSI-quoted `$TOKEN` and POSIX `%TOKEN%` credential
+arguments are literal secrets. Explicit Windows commands and shell declarations
+retain their own variable-reference semantics.
 
 False-positive reduction uses recognized syntax, not exemptions for short,
 common, example or apparently public values. Ambiguous fields such as

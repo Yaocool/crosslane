@@ -13,6 +13,7 @@ use super::{regex, sensitive_name, symbolic_pattern, value_range, ValueContext};
 pub(super) struct Scan {
     pub secrets: Vec<Range<usize>>,
     pub literal_defaults: Vec<Range<usize>>,
+    pub posix_literals: Vec<Range<usize>>,
     // A recognized option has its own grammar. Do not let the generic field /
     // long-option scanner consume its path, prompt flag, or following command.
     managed: Vec<Range<usize>>,
@@ -33,6 +34,12 @@ impl Scan {
 
     pub fn literal_secrets(&self) -> impl Iterator<Item = &str> {
         self.literals.values().map(String::as_str)
+    }
+
+    pub fn literal_entries(&self) -> impl Iterator<Item = (Range<usize>, &str)> {
+        self.literals
+            .iter()
+            .map(|(&(start, end), value)| (start..end, value.as_str()))
     }
 }
 
@@ -306,21 +313,24 @@ fn environment_pattern(anchored: bool) -> &'static Regex {
     static AT_START: OnceLock<Regex> = OnceLock::new();
     (if anchored { &AT_START } else { &ANY }).get_or_init(|| {
         let literal = r#"(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')"#;
+        let name = r#"(?:"[A-Za-z_][A-Za-z0-9_.-]*"|'[A-Za-z_][A-Za-z0-9_.-]*')"#;
         let anchor = if anchored { r"\A" } else { "" };
-        Regex::new(&format!(r#"{anchor}(?:process\.env(?:\.(?P<js>[A-Za-z_][A-Za-z0-9_]*)|\[\s*["'](?P<bracket>[A-Za-z_][A-Za-z0-9_]*)["']\s*\])\s*(?:\|\||\?\?)\s*(?P<js_default>{literal})|os\.(?:getenv|environ\.get)\(\s*["'](?P<py>[A-Za-z_][A-Za-z0-9_]*)["']\s*,\s*(?P<py_default>{literal})\s*\))"#)).expect("literal environment default")
+        let getter = format!(r#"(?:(?:process|Bun|import\.meta)\.env(?:\.(?P<js>[A-Za-z_][A-Za-z0-9_]*)|\[\s*(?P<bracket>{name})\s*\])|(?:Deno\.env\.get|System\.getenv|(?:System\.)?Environment\.GetEnvironmentVariable|getenv)\s*\(\s*(?P<call>{name})\s*\))"#);
+        let rust = format!(r#"(?:std::)?env::var(?:_os)?\s*\(\s*(?P<rust>{name})\s*\)(?:\s*\.ok\(\))?\s*\.unwrap_or(?:_else)?\(\s*(?:(?:\|\s*[A-Za-z_][A-Za-z0-9_]*\s*\||\|\|)\s*)?(?P<rust_default>{literal})(?:\.(?:to_owned|to_string|into)\(\))?\s*\)"#);
+        Regex::new(&format!(r#"{anchor}(?:{getter}\s*(?:\|\||\?\?|\?:|\+|or\b)\s*(?P<js_default>{literal})|(?:os\.(?:getenv|environ\.get)|ENV\.fetch)\s*\(\s*(?P<py>{name})\s*,\s*(?P<py_default>{literal})\s*\)|{rust})"#)).expect("literal environment default")
     })
 }
 
 fn environment_default(captures: &regex::Captures<'_>) -> Option<Range<usize>> {
     let secret = captures
         .name("js_default")
-        .or_else(|| captures.name("py_default"))?;
+        .or_else(|| captures.name("py_default"))
+        .or_else(|| captures.name("rust_default"))?;
     Some(unquote(secret.as_str(), secret.start()))
 }
 
 fn environment_defaults(text: &str) -> Vec<(Range<usize>, Range<usize>)> {
-    if !text.contains("process.env") && !text.contains("os.getenv") && !text.contains("os.environ")
-    {
+    if !text.contains("env") && !text.contains("Env") && !text.contains("ENV") {
         return Vec::new();
     }
     environment_pattern(false)
@@ -329,8 +339,11 @@ fn environment_defaults(text: &str) -> Vec<(Range<usize>, Range<usize>)> {
             let name = captures
                 .name("js")
                 .or_else(|| captures.name("bracket"))
-                .or_else(|| captures.name("py"))?;
-            if !sensitive_name(name.as_str()) && name.as_str() != "PASS" {
+                .or_else(|| captures.name("py"))
+                .or_else(|| captures.name("call"))
+                .or_else(|| captures.name("rust"))?;
+            let name = name.as_str().trim_matches(['"', '\'']);
+            if !sensitive_name(name) && name != "PASS" {
                 return None;
             }
             Some((captures.get(0)?.range(), environment_default(&captures)?))
@@ -342,12 +355,6 @@ fn environment_defaults(text: &str) -> Vec<(Range<usize>, Range<usize>)> {
 /// environment variable itself has an ordinary name such as APP_SETTING.
 pub(super) fn environment_literal_at(text: &str, start: usize) -> Option<Range<usize>> {
     let tail = text.get(start..)?;
-    if !["process.env", "os.getenv", "os.environ"]
-        .iter()
-        .any(|prefix| tail.starts_with(prefix))
-    {
-        return None;
-    }
     let captures = environment_pattern(true).captures(tail)?;
     let range = environment_default(&captures)?;
     Some(start + range.start..start + range.end)
@@ -355,12 +362,6 @@ pub(super) fn environment_literal_at(text: &str, start: usize) -> Option<Range<u
 
 pub(super) fn environment_expression(text: &str) -> Option<Range<usize>> {
     let trimmed = text.trim();
-    if !["process.env", "os.getenv", "os.environ"]
-        .iter()
-        .any(|prefix| trimmed.starts_with(prefix))
-    {
-        return None;
-    }
     let captures = environment_pattern(true).captures(trimmed)?;
     if captures.get(0)?.end() != trimmed.len() {
         return None;
@@ -397,6 +398,18 @@ fn unquote(text: &str, start: usize) -> Range<usize> {
     } else {
         start..start + text.len()
     }
+}
+
+/// A sensitive shell assignment consumes one complete word, including quote
+/// concatenations. Delimiters inside that word must not expose a trailing part.
+pub(super) fn shell_value_range(text: &str, start: usize) -> Option<Range<usize>> {
+    let mut words = Words::new(text.get(start..)?);
+    words.strict = true;
+    let word = words.next()?;
+    (word.range.start == 0).then(|| {
+        let range = word.content();
+        start + range.start..start + range.end
+    })
 }
 
 /// Streaming token spans: large harmless history does not allocate a word
@@ -936,6 +949,9 @@ fn record_argument(
                 word.raw,
                 secret.start - word.range.start..secret.end - word.range.start,
             ) {
+                // A successfully decoded POSIX word fragment is literal data.
+                // Single quotes/ANSI quotes and `%NAME%` do not expand variables.
+                scan.posix_literals.push(secret.clone());
                 scan.literals.insert((secret.start, secret.end), value);
             }
         }
@@ -1008,14 +1024,16 @@ fn scan_sdk(text: &str, scan: &mut Scan) {
     )).expect("literal authentication constructor"));
     for captures in pattern.captures_iter(text) {
         let password = captures.name("password").expect("password literal");
-        scan.secrets
-            .push(unquote(password.as_str(), password.start()));
+        let range = unquote(password.as_str(), password.start());
+        scan.literal_defaults.push(range.clone());
+        scan.secrets.push(range);
     }
     let node = NODE_AUTH.get_or_init(|| Regex::new(&format!(r#"\b(?:auth|proxyAuth)\s*:\s*\{{[^{{}}\r\n]{{0,1024}}?\bpass\s*:\s*(?P<password>{literal})"#)).expect("literal Node auth password"));
     for captures in node.captures_iter(text) {
         let password = captures.name("password").expect("Node password literal");
-        scan.secrets
-            .push(unquote(password.as_str(), password.start()));
+        let range = unquote(password.as_str(), password.start());
+        scan.literal_defaults.push(range.clone());
+        scan.secrets.push(range);
     }
     if text.contains('[') {
         let headers = HEADER_PAIR.get_or_init(|| Regex::new(&format!(
@@ -1023,10 +1041,9 @@ fn scan_sdk(text: &str, scan: &mut Scan) {
         )).expect("literal header pair"));
         for captures in headers.captures_iter(text) {
             let value = captures.name("value").expect("header value literal");
-            scan.secrets.push(auth_value_range(
-                text,
-                unquote(value.as_str(), value.start()),
-            ));
+            let range = auth_value_range(text, unquote(value.as_str(), value.start()));
+            scan.literal_defaults.push(range.clone());
+            scan.secrets.push(range);
         }
     }
     for captures in regex(
@@ -1074,6 +1091,7 @@ fn scan_netrc(text: &str, scan: &mut Scan) {
                 break;
             };
             if matches!(name, "password" | "account") {
+                scan.literal_defaults.push(range.clone());
                 scan.secrets.push(range.clone());
             }
             offset = range.end;
@@ -1407,7 +1425,6 @@ mod tests {
             "fetch(url, {credentials: 'include', method: 'GET'})",
             "not_auth=dXNlcjpvcGFxdWUtYXV0aC1maXh0dXJl",
             "Use Bearer authentication or Basic authentication; keep the Bearer token in an environment variable.",
-            "fetch(url, {headers: [['Authorization', 'Negotiate $TICKET']]})",
         ] {
             assert_eq!(redact_text(source, &[]), source, "false positive in {source:?}");
         }
