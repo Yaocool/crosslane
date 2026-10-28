@@ -7,6 +7,7 @@
 
 mod auth;
 mod embedded_json;
+mod policy;
 mod shell;
 
 use std::collections::HashMap;
@@ -1202,7 +1203,11 @@ impl<'a> Redactor<'a> {
             if self.decode_auth_literals {
                 self.discovered.extend(
                     auth.literal_entries()
-                        .filter(|(range, secret)| outside(range) && reusable_secret(secret))
+                        .filter(|(range, secret)| {
+                            outside(range)
+                                && reusable_secret(secret)
+                                && !policy::credential_placeholder(secret)
+                        })
                         .map(|(_, secret)| secret.to_owned()),
                 );
             }
@@ -1347,7 +1352,7 @@ impl<'a> Redactor<'a> {
                                 .as_str()
                                 .is_some_and(|text| auth::credential_field(&name, text)));
                     if !secret_field {
-                        for password in auth::basic_passwords(&name, &mut child) {
+                        for password in auth::credential_values(&name, &mut child) {
                             self.authentication_literal(password);
                         }
                     }
@@ -1385,10 +1390,16 @@ impl<'a> Redactor<'a> {
                 }
             }
             Value::Null => {}
+            // Keep examples out of the discovered credential set. The text
+            // path still masks any explicitly known value inside a placeholder.
+            Value::String(text) if sensitive && policy::credential_placeholder(text) => {
+                self.text(text);
+            }
             Value::String(text) if sensitive && auth::environment_expression(text).is_some() => {
                 let range =
                     auth::environment_expression(text).expect("checked environment expression");
-                let ranges = literal_default_ranges(text, range);
+                let ranges =
+                    self.sensitive_literal_ranges(text, literal_default_ranges(text, range));
                 if self.collecting {
                     for range in ranges {
                         if reusable_secret(&text[range.clone()]) {
@@ -1416,6 +1427,7 @@ impl<'a> Redactor<'a> {
                     .into_iter()
                     .filter(|range| !auth::is_scheme(text[range.clone()].trim()))
                     .collect::<Vec<_>>();
+                let ranges = self.sensitive_literal_ranges(text, ranges);
                 if self.collecting {
                     for range in ranges {
                         let literal = &text[range];
@@ -1465,6 +1477,30 @@ impl<'a> Redactor<'a> {
             }
             _ => {}
         }
+    }
+
+    fn sensitive_literal_ranges(&self, text: &str, ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
+        ranges
+            .into_iter()
+            .flat_map(|range| {
+                let literal = &text[range.clone()];
+                if !policy::credential_placeholder(literal) {
+                    return vec![range];
+                }
+                // A placeholder spelling cannot hide a credential explicitly known
+                // to this request, including a known substring of the placeholder.
+                self.known_secrets
+                    .iter()
+                    .copied()
+                    .filter(|secret| reusable_secret(secret))
+                    .flat_map(|secret| {
+                        literal.match_indices(secret).map(|(start, _)| {
+                            range.start + start..range.start + start + secret.len()
+                        })
+                    })
+                    .collect()
+            })
+            .collect()
     }
 
     fn challenge(&mut self, value: &mut Value) {
@@ -1530,6 +1566,9 @@ impl<'a> Redactor<'a> {
                                         schema,
                                         sensitive_property
                                             || (basic_auth && property == "pass")
+                                            || (property_name
+                                                .is_some_and(auth::authentication_property)
+                                                && property.eq_ignore_ascii_case("key"))
                                             || (sensitive_name(property)
                                                 && !auth::public_boolean_schema(property, schema)),
                                         Some(property),
@@ -1594,7 +1633,7 @@ impl<'a> Redactor<'a> {
                 .as_str()
                 .is_some_and(|text| auth::credential_field(name, text));
         if !sensitive {
-            for password in auth::basic_passwords(name, value) {
+            for password in auth::credential_values(name, value) {
                 self.authentication_literal(password);
             }
             if auth::challenge_header(name) {
@@ -1661,11 +1700,16 @@ fn sensitive_name(name: &str) -> bool {
         .chars()
         .filter(|ch| ch.is_ascii_alphanumeric())
         .collect();
+    // A dictionary/cache/keyboard key has no inherent credential semantics.
+    // Authentication containers, URL parameters and explicit key flags retain
+    // their separate sensitive context; known values and token formats are
+    // always scanned even in these ordinary fields.
+    if policy::ordinary_field_name(&compact) {
+        return false;
+    }
     matches!(
         compact.as_str(),
-        "key"
-            | "ak"
-            | "sk"
+        "ak" | "sk"
             | "sts"
             | "secret"
             | "token"
@@ -2025,7 +2069,7 @@ fn discover_text_secrets_with_context(
     if decode_auth_literals {
         secrets.extend(
             auth.literal_secrets()
-                .filter(|secret| reusable_secret(secret))
+                .filter(|secret| reusable_secret(secret) && !policy::credential_placeholder(secret))
                 .map(str::to_owned),
         );
     }
@@ -2172,7 +2216,7 @@ fn secret_ranges_with_auth(
         )),
         token_candidate.then(|| regex(
             &TOKEN,
-            r#"(?i)(?:ksk_[^\s"'<>\x60,;()\[\]{}]+|sk-(?:(?:ant|proj|svcacct)-)?[a-z0-9_-]{8,}|sk_(?:live|test)_[a-z0-9]{8,}|AIza[a-z0-9_-]{20,}|gh[pousr]_[a-z0-9_]{8,}|github_pat_[a-z0-9_]{8,}|glpat-[a-z0-9_-]{8,}|xox[baprs]-[a-z0-9-]{8,}|(?:AKIA|ASIA)[A-Z0-9]{16})"#,
+            r#"(?i)(?:ksk_[^\s"'<>\x60,;()\[\]{}]+|sk-(?:(?:ant|proj|svcacct)-)?[a-z0-9_-]{8,}|sk_(?:live|test)_[a-z0-9]{8,}|AIza[a-z0-9_-]{20,}|gh[pousr]_[a-z0-9_]{8,}|github_pat_[a-z0-9_]{8,}|glpat-[a-z0-9_-]{8,}|xox[baprs]-[a-z0-9-]{8,}|(?-i:(?:AKIA|ASIA)[A-Z0-9]{16}))"#,
         )),
         text.contains("eyJ").then(|| regex(&JWT, r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*")),
         // Tencent SecretId, Alibaba permanent/STS IDs, and AKLT IDs used by
@@ -2222,18 +2266,7 @@ fn secret_ranges_with_auth(
                 let basic = captures
                     .name("scheme")
                     .is_some_and(|scheme| scheme.as_str().eq_ignore_ascii_case("basic"));
-                if !basic
-                    && matches!(
-                        secret.as_str().to_ascii_lowercase().as_str(),
-                        "token"
-                            | "tokens"
-                            | "authentication"
-                            | "authorization"
-                            | "auth"
-                            | "scheme"
-                            | "header"
-                    )
-                {
+                if !basic && policy::bearer_prose(secret.as_str()) {
                     // Public prose such as "Bearer authentication" has no
                     // credential syntax. Labelled Authorization/--token fields
                     // are still filtered below even with these weak values.
@@ -2264,12 +2297,21 @@ fn secret_ranges_with_auth(
     }
     // Long opaque keys and Base64 data usually contain no assignment delimiter.
     // Avoid running the bounded identifier matcher at every byte in that case.
-    for assignment in assignments(text) {
+    for mut assignment in assignments(text) {
         let name = assignment.name;
         if auth.manages(assignment.start) {
             continue;
         }
-        if sensitive_name(name) {
+        if policy::bearer_prose_assignment(name, &text[..assignment.start]) {
+            continue;
+        }
+        match policy::type_annotation(text, assignment.start, assignment.value_start) {
+            Some(policy::TypeAnnotation::Declaration) => continue,
+            Some(policy::TypeAnnotation::Initializer(start)) => assignment.value_start = start,
+            None => {}
+        }
+        let credential_key = auth::credential_key_assignment(name, &text[..assignment.start]);
+        if sensitive_name(name) || credential_key {
             if let Some(range) = auth::environment_literal_at(text, assignment.value_start) {
                 literal_defaults.push(range);
                 continue;
@@ -2284,6 +2326,7 @@ fn secret_ranges_with_auth(
                 .unwrap_or(""),
         );
         if sensitive_name(name)
+            || credential_key
             || encoded_auth
             || auth::oauth_assignment(text, name, assignment.value_start)
         {
@@ -2358,9 +2401,13 @@ fn secret_ranges_with_auth(
             regex(&FLAG, r"--(?P<name>[A-Za-z_][A-Za-z0-9_.-]{0,127})[ \t]+").captures_iter(text)
         {
             let name = captures.name("name").expect("flag name");
-            if sensitive_name(name.as_str()) && !auth.manages(name.start()) {
+            if (sensitive_name(name.as_str()) || name.as_str().eq_ignore_ascii_case("key"))
+                && !auth.manages(name.start())
+            {
                 let start = captures.get(0).expect("flag").end();
-                if let Some(range) = value_range(text, start, ValueContext::Shell, name.as_str()) {
+                if let Some(range) = value_range(text, start, ValueContext::Shell, name.as_str())
+                    .filter(|range| !auth::public_assignment(name.as_str(), &text[range.clone()]))
+                {
                     if decode_auth_literals
                         && shell::literal_word_fragment(
                             &text[start..range.end],
@@ -2382,13 +2429,23 @@ fn secret_ranges_with_auth(
         )
         .captures_iter(text)
         {
-            if sensitive_name(captures.name("name").expect("variable name").as_str()) {
+            let name = captures.name("name").expect("variable name").as_str();
+            if sensitive_name(name) || name == "KEY" {
                 ranges.push(captures.name("secret").expect("fallback value").range());
             }
         }
     }
-    ranges.retain(|range| range.start < range.end && &text[range.clone()] != REDACTED);
+    ranges.retain(|range| {
+        range.start < range.end
+            && &text[range.clone()] != REDACTED
+            && !policy::credential_placeholder(auth.literal(range).unwrap_or(&text[range.clone()]))
+    });
     let mut safe = exclude_references(text, ranges);
+    // Reference removal can expose just the literal default of `${TOKEN:-...}`.
+    // Classify that value too, before adding authoritative known-value matches.
+    safe.retain(|range| {
+        !policy::credential_placeholder(auth.literal(range).unwrap_or(&text[range.clone()]))
+    });
     if !known_ranges.is_empty() {
         let protected = protected_reference_ranges(text);
         safe.extend(known_ranges.into_iter().filter(|range| {
@@ -2418,7 +2475,11 @@ fn secret_ranges_with_auth(
         }));
     }
     for range in literal_defaults {
-        safe.extend(literal_default_ranges(text, range));
+        safe.extend(
+            literal_default_ranges(text, range)
+                .into_iter()
+                .filter(|range| !policy::credential_placeholder(&text[range.clone()])),
+        );
     }
     safe
 }
@@ -3428,13 +3489,11 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_business_fields_and_weak_credentials_remain_private() {
+    fn explicit_credential_fields_and_weak_credentials_remain_private() {
         for (name, literal) in [
-            ("key", "Enter"),
             ("token", "authentication."),
             ("password", "true"),
             ("secret", "include"),
-            ("cache_key", "product:42"),
             ("密码", "至少8位字符"),
         ] {
             let session = RedactionSession::new();

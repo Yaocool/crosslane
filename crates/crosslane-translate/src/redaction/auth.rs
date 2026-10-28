@@ -85,19 +85,24 @@ pub(super) fn challenge_header(name: &str) -> bool {
     )
 }
 
-pub(super) fn basic_passwords<'a>(name: &str, value: &'a mut Value) -> Vec<&'a mut Value> {
-    if !basic_auth_property(name) {
+pub(super) fn credential_values<'a>(name: &str, value: &'a mut Value) -> Vec<&'a mut Value> {
+    if !authentication_property(name) {
         return Vec::new();
     }
     match value {
-        Value::Array(pair) if pair.len() == 2 && pair[0].is_string() => {
+        Value::Array(pair)
+            if basic_auth_property(name) && pair.len() == 2 && pair[0].is_string() =>
+        {
             pair.get_mut(1).into_iter().collect()
         }
-        Value::Object(fields) if fields.contains_key("user") || fields.contains_key("username") => {
+        Value::Object(fields) => {
+            let basic = fields.contains_key("user") || fields.contains_key("username");
             fields
                 .iter_mut()
                 .filter(|(name, child)| {
-                    (name.as_str() == "pass" || sensitive_name(name)) && !public_field(name, child)
+                    (name.eq_ignore_ascii_case("key")
+                        || (basic && (name.as_str() == "pass" || sensitive_name(name))))
+                        && !public_field(name, child)
                 })
                 .map(|(_, child)| child)
                 .collect()
@@ -110,6 +115,37 @@ pub(super) fn basic_auth_property(name: &str) -> bool {
     matches!(compact(name).as_str(), "auth" | "basicauth" | "proxyauth")
 }
 
+pub(super) fn authentication_property(name: &str) -> bool {
+    basic_auth_property(name) || compact(name) == "authentication"
+}
+
+/// A bare `key` is ambiguous. Preserve protection when the surrounding syntax
+/// explicitly uses it for authentication, including opaque keys without a
+/// provider prefix. Ordinary object literals such as `{key: 'perf'}` do not.
+pub(super) fn credential_key_assignment(name: &str, prefix: &str) -> bool {
+    let name = name.trim_matches(['"', '\'', '\\']);
+    if !name.eq_ignore_ascii_case("key") {
+        return false;
+    }
+    if prefix.ends_with(['?', '&']) || prefix.ends_with("--") {
+        return true;
+    }
+    if name == "KEY" && !prefix.trim_end().ends_with(['{', ',']) {
+        return true;
+    }
+    let start = prefix
+        .char_indices()
+        .rev()
+        .nth(512)
+        .map_or(0, |(offset, _)| offset);
+    static AUTH_OBJECT: OnceLock<Regex> = OnceLock::new();
+    regex(
+        &AUTH_OBJECT,
+        r"(?i)\b(?:auth|authentication|credentials)\s*[:=]\s*\{[^{}]*\z",
+    )
+    .is_match(&prefix[start..])
+}
+
 fn public_boolean_name(name: &str) -> bool {
     let name = compact(name);
     name == "accesscontrolallowcredentials"
@@ -118,7 +154,11 @@ fn public_boolean_name(name: &str) -> bool {
             "needs", "allow",
         ]
         .iter()
-        .any(|prefix| name.strip_prefix(prefix).is_some_and(sensitive_name))
+        .any(|prefix| {
+            name.strip_prefix(prefix).is_some_and(|suffix| {
+                sensitive_name(suffix) || super::policy::ordinary_field_name(suffix)
+            })
+        })
 }
 
 pub(super) fn public_field(name: &str, value: &Value) -> bool {
@@ -128,6 +168,9 @@ pub(super) fn public_field(name: &str, value: &Value) -> bool {
                 matches!(text.trim().to_ascii_lowercase().as_str(), "true" | "false")
             })))
         || empty_auth_header(name, value.as_str().unwrap_or(""))
+        || value
+            .as_str()
+            .is_some_and(|text| super::policy::public_value(name, text))
 }
 
 fn empty_auth_header(name: &str, value: &str) -> bool {
@@ -166,6 +209,7 @@ pub(super) fn public_assignment(name: &str, value: &str) -> bool {
             "true" | "false"
         ))
         || empty_auth_header(name, value)
+        || super::policy::public_value(name, value)
 }
 
 pub(super) fn fetch_options(fields: &Map<String, Value>) -> bool {
@@ -343,7 +387,7 @@ fn environment_defaults(text: &str) -> Vec<(Range<usize>, Range<usize>)> {
                 .or_else(|| captures.name("call"))
                 .or_else(|| captures.name("rust"))?;
             let name = name.as_str().trim_matches(['"', '\'']);
-            if !sensitive_name(name) && name != "PASS" {
+            if !sensitive_name(name) && name != "PASS" && name != "KEY" {
                 return None;
             }
             Some((captures.get(0)?.range(), environment_default(&captures)?))
@@ -909,7 +953,9 @@ fn record_argument(
         }
         Argument::Header => {
             if let Some((name, value)) = value.split_once(':') {
-                if sensitive_name(name.trim()) && !public_assignment(name.trim(), value) {
+                if (sensitive_name(name.trim()) || name.trim().eq_ignore_ascii_case("key"))
+                    && !public_assignment(name.trim(), value)
+                {
                     let start = range.end - value.len();
                     let start = start + value.len() - value.trim_start().len();
                     scan.secrets.push(auth_value_range(text, start..range.end));

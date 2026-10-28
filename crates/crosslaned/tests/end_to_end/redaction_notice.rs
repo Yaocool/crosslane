@@ -223,6 +223,90 @@ async fn notice_reload_preserves_answers_and_reuses_the_original_text_block() {
 }
 
 #[tokio::test]
+async fn image_requests_with_public_documentation_only_warn_for_actual_credentials() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    mount_context_alignment_models(&mock).await;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(NoticeUpstream {
+            requests: Arc::clone(&requests),
+            reply: Reply::Text(ANSWER.into()),
+        })
+        .mount(&mock)
+        .await;
+    let port = unused_tcp_port();
+    let daemon =
+        Daemon::start_http(port, &format!("{}/generateAssistantResponse", mock.uri())).await;
+    import_context_alignment_account(&daemon, 0.0).await;
+    configure(&daemon, true, true).await;
+    let image = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a04cAAAAASUVORK5CYII=";
+    let actual_secret = "ksk_notice_actual_secret_2026";
+    let documentation = concat!(
+        "const DIMENSIONS = [{key: 'bugs'}, {key: 'perf'}]; perform a performance review\n",
+        "Use Bearer authentication. Bearer authorization: see the guide.\n",
+        "interface Options { apiKey: string; password: string; }\n",
+        "api_key=YOUR_OPENAI_API_KEY\nsecret={{API_SECRET}}\n",
+        "curl --key ./certs/client.key https://example.invalid/\n",
+        "next_page_token=cursor-page-2\nshortcut_key=Ctrl+K"
+    );
+    for has_secret in [false, true] {
+        for stream in [false, true] {
+            let body = json!({
+                "model":"source-large", "max_tokens":256, "stream":stream,
+                "system":format!("Example: const apiKey = \"sk-proj-xxxxx\";\n{documentation}"),
+                "tools":[{
+                    "name":"Workflow",
+                    "description":documentation,
+                    "input_schema":{"type":"object","properties":{
+                        "key":{"type":"string","enum":["bugs","perf"]},
+                        "api_key":{"type":"string","default":"sk-proj-xxxxx"},
+                        "hotKey":{"type":"string","enum":["Enter","Escape"]},
+                        "nextPageToken":{"type":"string","default":"cursor-page-2"},
+                        "signature":{"type":"string","default":"fn inspect(input: &str) -> bool"},
+                        "private_key":{"type":"string","default":"./fixtures/id_ed25519"}
+                    }}
+                }],
+                "messages":[{"role":"user","content":[
+                    {"type":"text","text":if has_secret {format!("Describe the image.\napi_key={actual_secret}")} else {"Describe the image.".into()}},
+                    {"type":"image","source":{"type":"base64","media_type":"image/png","data":image}}
+                ]}]
+            });
+            let response = call(&daemon, port, &body).await;
+            assert_eq!(response.status(), 200);
+            assert_answer(
+                &response.text().await.unwrap(),
+                stream,
+                has_secret && cfg!(feature = "crs"),
+                ANSWER,
+            );
+            let wire = requests.lock().unwrap().last().unwrap().clone();
+            let current = &wire["conversationState"]["currentMessage"]["userInputMessage"];
+            assert_eq!(current["images"][0]["source"]["bytes"], image);
+            let specification =
+                &current["userInputMessageContext"]["tools"][0]["toolSpecification"];
+            assert_eq!(specification["description"], documentation);
+            let key_schema = &current["userInputMessageContext"]["tools"][0]["toolSpecification"]
+                ["inputSchema"]["json"]["properties"]["key"];
+            let variants = key_schema.get("enum").or_else(|| {
+                key_schema["anyOf"]
+                    .as_array()?
+                    .iter()
+                    .find_map(|branch| branch.get("enum"))
+            });
+            assert_eq!(variants, Some(&json!(["bugs", "perf"])));
+            let text = wire.to_string();
+            assert!(text.contains("perform a performance review"));
+            assert!(text.contains("sk-proj-xxxxx"));
+            assert!(!text.contains(actual_secret));
+            assert_eq!(text.contains("__CROSSLANE_SECRET_"), has_secret);
+        }
+    }
+    daemon.stop().await;
+}
+
+#[tokio::test]
 async fn notice_skips_disabled_redaction_clean_requests_structured_output_and_truncation() {
     let _guard = HTTP_TEST_LOCK.lock().await;
     let mock = MockServer::start().await;
