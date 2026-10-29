@@ -1721,6 +1721,85 @@ async fn account_import_applies_requested_tags_to_every_account() {
 }
 
 #[tokio::test]
+async fn account_lists_use_natural_numeric_order() {
+    let expected = (1..=125)
+        .map(|number| format!("kiro.svc.{number:02}@example.com"))
+        .collect::<Vec<_>>();
+    let accounts = expected
+        .iter()
+        .rev()
+        .enumerate()
+        .map(|(index, email)| sample_account(&format!("acc_{index:08}"), email, true))
+        .collect();
+    let (_directory, state) = state_with(accounts).await;
+
+    for (method, name_field, provider) in [
+        (method::ACCOUNT_LIST, "email", None),
+        (method::V2_ACCOUNT_LIST, "display_name", None),
+        (method::V2_ACCOUNT_LIST, "display_name", Some("kiro")),
+    ] {
+        for sort in [None, Some("email")] {
+            let mut params = serde_json::json!({"sort":sort});
+            if let Some(provider) = provider {
+                params["provider"] = serde_json::json!(provider);
+            }
+            let result = expect_ok(dispatch(&state, Request::new(1, method, params)).await);
+            let names = result["accounts"]
+                .as_array()
+                .expect("accounts")
+                .iter()
+                .map(|account| account[name_field].as_str().expect("account name"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                names, expected,
+                "{method}, provider={provider:?}, sort={sort:?}"
+            );
+        }
+    }
+
+    let by_id = expect_ok(
+        dispatch(
+            &state,
+            Request::new(2, method::V2_ACCOUNT_LIST, serde_json::json!({"sort":"id"})),
+        )
+        .await,
+    );
+    assert_eq!(by_id["accounts"][0]["display_name"], expected[124]);
+    assert_eq!(by_id["accounts"][124]["display_name"], expected[0]);
+}
+
+#[test]
+fn account_identity_order_compares_numeric_segments_without_overflow() {
+    for (left, right) in [
+        ("kiro.svc.09@example.com", "kiro.svc.10@example.com"),
+        ("kiro.svc.99@example.com", "kiro.svc.100@example.com"),
+        ("user.2.part09", "user.2.part10"),
+        ("user.02.part2", "user.2.part10"),
+        ("User.9", "user.10"),
+        ("用户9", "用户10"),
+        ("user.0", "user.00"),
+        ("user.000", "user.01"),
+        ("user.02", "user.2"),
+        ("", "user.1"),
+        ("user.1", "user.1a"),
+    ] {
+        assert!(
+            compare_account_identity(left, "same", right, "same").is_lt(),
+            "{left} < {right}"
+        );
+        assert!(
+            compare_account_identity(right, "same", left, "same").is_gt(),
+            "{right} > {left}"
+        );
+        assert!(compare_account_identity(left, "same", left, "same").is_eq());
+    }
+    let left = format!("user.{}", "9".repeat(80));
+    let right = format!("user.1{}", "0".repeat(80));
+    assert!(compare_account_identity(&left, "same", &right, "same").is_lt());
+    assert!(compare_account_identity("same", "acc_1", "same", "acc_2").is_lt());
+}
+
+#[tokio::test]
 async fn account_lists_and_exports_default_to_email_order() {
     let (_directory, state) = state_with(vec![
         sample_account("acc_00000001", "z@example.com", true),

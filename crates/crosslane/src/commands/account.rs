@@ -64,7 +64,7 @@ pub enum AccountOverageCommand {
 pub enum AccountCommand {
     /// 列出 Kiro/Copilot 账号、有效期、额度和本机累计 AIU。
     #[command(
-        long_about = "列出 Kiro、GitHub Copilot 或全部账号，默认按邮箱排序。\n\n示例：\n  crosslane account list --provider kiro\n  crosslane account list --provider copilot\n  crosslane account list --provider all\n  crosslane account list --tag prod --enabled-only"
+        long_about = "列出 Kiro、GitHub Copilot 或全部账号，默认按邮箱/账号名自然排序（数字按数值比较）。\n\n示例：\n  crosslane account list --provider kiro\n  crosslane account list --provider copilot\n  crosslane account list --provider all\n  crosslane account list --tag prod --enabled-only"
     )]
     List {
         /// 提供源实例 ID；默认聚合全部提供源。
@@ -94,7 +94,7 @@ pub enum AccountCommand {
             ]
         )]
         status: Option<String>,
-        /// 排序字段：email（默认）/credit/id；credit 主要用于 Kiro。
+        /// 排序字段：email（默认，自然排序）/credit/id；credit 主要用于 Kiro。
         #[arg(long, value_parser = ["email", "credit", "id"])]
         sort: Option<String>,
     },

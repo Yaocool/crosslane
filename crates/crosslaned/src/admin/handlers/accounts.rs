@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+
 use super::{
     account_credit_state, compare_display_text, new_account_id, new_machine_id, now_secs,
     parse_params, persist_pool_snapshot, stream, summarize, to_value, warn, Account,
@@ -27,13 +29,53 @@ pub(super) async fn effective_account_health(
         .unwrap_or_else(|| "unavailable".into())
 }
 
+/// Compare account names case-insensitively, treating digit runs as numbers.
+pub(super) fn compare_account_names(left: &str, right: &str) -> Ordering {
+    fn take_number<'a>(remaining: &mut &'a [u8]) -> &'a [u8] {
+        let length = remaining
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        let (digits, rest) = remaining.split_at(length);
+        *remaining = rest;
+        let zeros = digits.iter().take_while(|&&byte| byte == b'0').count();
+        &digits[zeros..]
+    }
+
+    let (mut left_bytes, mut right_bytes) = (left.as_bytes(), right.as_bytes());
+    while let (Some(&left_byte), Some(&right_byte)) = (left_bytes.first(), right_bytes.first()) {
+        let order = if left_byte.is_ascii_digit() && right_byte.is_ascii_digit() {
+            let left_number = take_number(&mut left_bytes);
+            let right_number = take_number(&mut right_bytes);
+            // Compare significant lengths first to avoid integer overflow.
+            left_number
+                .len()
+                .cmp(&right_number.len())
+                .then_with(|| left_number.cmp(right_number))
+        } else {
+            left_bytes = &left_bytes[1..];
+            right_bytes = &right_bytes[1..];
+            left_byte
+                .to_ascii_lowercase()
+                .cmp(&right_byte.to_ascii_lowercase())
+        };
+        if !order.is_eq() {
+            return order;
+        }
+    }
+    left_bytes
+        .len()
+        .cmp(&right_bytes.len())
+        .then_with(|| left.cmp(right))
+}
+
 pub(super) fn compare_account_identity(
     left_email: &str,
     left_id: &str,
     right_email: &str,
     right_id: &str,
-) -> std::cmp::Ordering {
-    compare_display_text(left_email, right_email).then_with(|| left_id.cmp(right_id))
+) -> Ordering {
+    compare_account_names(left_email, right_email).then_with(|| left_id.cmp(right_id))
 }
 
 pub(super) async fn handle_account_list(

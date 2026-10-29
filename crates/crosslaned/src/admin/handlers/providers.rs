@@ -9,7 +9,7 @@ use crosslane_ipc::protocol::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{parse_params, to_value, Handled};
+use super::{accounts::compare_account_names, parse_params, to_value, Handled};
 use crate::state::AppState;
 
 pub(super) async fn handle_capabilities(state: &Arc<AppState>) -> Handled {
@@ -170,10 +170,9 @@ pub(super) async fn handle_account_list(state: &Arc<AppState>, params: Value) ->
                 .unwrap_or(std::cmp::Ordering::Equal)
         }),
         Some("email") | None => accounts.sort_by(|left, right| {
-            left.display_name
-                .to_ascii_lowercase()
-                .cmp(&right.display_name.to_ascii_lowercase())
+            compare_account_names(&left.display_name, &right.display_name)
                 .then_with(|| left.provider_id.cmp(&right.provider_id))
+                .then_with(|| left.id.cmp(&right.id))
         }),
         Some(other) => {
             return Err(RpcError::bad_params(format!(
