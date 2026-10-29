@@ -120,6 +120,422 @@ fn public_identifiers_pagination_and_function_signatures_are_not_credentials() {
 }
 
 #[test]
+fn business_resource_keys_stay_public_across_text_data_and_schemas() {
+    for name in [
+        "pdf_key",
+        "pdfKey",
+        "file_key",
+        "document_key",
+        "imageKey",
+        "attachment_key",
+        "blob_key",
+        "resource_key",
+        "artifact_key",
+        "record_key",
+        "column_key",
+        "output_pdf_key",
+        "source_document_key",
+        "renderedPdfKey",
+        "prompt_cache_key",
+        "toml_key",
+        "json_key",
+        "yaml_key",
+        "xml_key",
+        "config_key",
+        "setting_key",
+        "property_key",
+        "schema_key",
+        "template_key",
+        "translation_key",
+        "i18n_key",
+        "locale_key",
+        "message_key",
+        "label_key",
+        "component_key",
+        "element_key",
+        "widget_key",
+        "feature_flag_key",
+        "routing_key",
+        "route_key",
+        "operation_key",
+        "command_key",
+        "action_key",
+        "method_key",
+        "task_key",
+        "workflow_key",
+        "job_key",
+        "queue_key",
+        "topic_key",
+        "event_key",
+        "pipeline_key",
+        "stage_key",
+        "step_key",
+        "business_key",
+        "reference_key",
+        "ref_key",
+        "relation_key",
+        "relationship_key",
+        "clustering_key",
+        "shard_key",
+        "composite_key",
+        "dedup_key",
+        "dedupe_key",
+        "idempotency_key",
+        "correlation_key",
+        "trace_key",
+        "cursor_key",
+        "pagination_key",
+        "redis_key",
+        "source_key",
+        "target_key",
+        "child_key",
+        "root_key",
+        "pdf_storage_key",
+        "file_storage_key",
+        "s3_object_key",
+        "cos_object_key",
+        "source_pdf_file_key",
+        "source_output_pdf_key",
+        "theme_key",
+        "style_key",
+        "icon_key",
+        "layout_key",
+        "panel_key",
+        "section_key",
+        "view_key",
+        "form_key",
+        "table_key",
+        "cell_key",
+        "filter_key",
+        "user_reference_key",
+        "project_record_key",
+        "next_cursor_token",
+        "cursor_token",
+        "pagination_token",
+    ] {
+        for value in [
+            "PDF存储Key",
+            "documents/report.pdf",
+            "object-ref-2026",
+            "perf",
+        ] {
+            let text = json!({name:value}).to_string();
+            let mut source = documentation(&text);
+            let schema = &mut source
+                .conversation_state
+                .current_message
+                .user_input_message
+                .user_input_message_context
+                .as_mut()
+                .unwrap()
+                .tools[0]
+                .specification_mut()
+                .unwrap()
+                .input_schema
+                .json;
+            schema["properties"][name] =
+                json!({"type":"string","default":value,"examples":[value]});
+            let assistant = source
+                .conversation_state
+                .history
+                .iter_mut()
+                .find_map(|h| {
+                    h.assistant_response_message
+                        .as_mut()
+                        .filter(|a| !a.tool_uses.is_empty())
+                })
+                .unwrap();
+            assistant.tool_uses[0].input = json!({name:value});
+            assert_unmodified(&source);
+        }
+        for text in [
+            format!("{name}=object-ref-2026"),
+            format!("client --{name} object-ref-2026"),
+            format!("https://example.invalid/?{name}=object-ref-2026"),
+        ] {
+            assert_unmodified(&documentation(&text));
+        }
+    }
+}
+
+#[test]
+fn business_key_exemptions_never_override_real_credentials_or_private_contexts() {
+    const PRIVATE: &str = "opaque-private-credential-2026";
+    for name in [
+        "pdf_key",
+        "file_key",
+        "documentKey",
+        "output_pdf_key",
+        "config_key",
+        "idempotency_key",
+        "templateKey",
+        "s3_object_key",
+        "cursor_token",
+        "next_cursor_token",
+    ] {
+        for container in [
+            "auth",
+            "authentication",
+            "credentials",
+            "encryption",
+            "decryption",
+            "signing",
+            "crypto",
+        ] {
+            let text = json!({container:{name:PRIVATE}}).to_string();
+            let session = crosslane_translate::RedactionSession::new();
+            let safe = session.redact_text(&text, &[]);
+            assert!(!safe.contains(PRIVATE), "credential leaked: {text}");
+            assert_eq!(session.restore_text(&safe), text);
+            let text = format!("const options = {{{container}: {{ {name}: '{PRIVATE}' }} }};");
+            let session = crosslane_translate::RedactionSession::new();
+            assert!(
+                !session.redact_text(&text, &[]).contains(PRIVATE),
+                "credential leaked: {text}"
+            );
+            let mut source = documentation("A normal business response.");
+            source
+                .conversation_state
+                .current_message
+                .user_input_message
+                .user_input_message_context
+                .as_mut()
+                .unwrap()
+                .tools[0]
+                .specification_mut()
+                .unwrap()
+                .input_schema
+                .json["properties"][container] =
+                json!({"type":"object","properties":{name:{"type":"string","default":PRIVATE}}});
+            let sent = prepare_redacted_kiro_payload(&source, &[]);
+            assert!(
+                !serde_json::to_string(&sent).unwrap().contains(PRIVATE),
+                "schema credential leaked: {container}.{name}"
+            );
+        }
+        for secret in [
+            "ksk_private_credential_2026",
+            "sk-proj-Ab12Cd34Ef56Gh78Ij90",
+            "AKIA1234567890ABCDEF",
+        ] {
+            let text = json!({name:secret}).to_string();
+            let session = crosslane_translate::RedactionSession::new();
+            assert!(!session.redact_text(&text, &[]).contains(secret));
+        }
+        let text = json!({name:PRIVATE}).to_string();
+        let session = crosslane_translate::RedactionSession::new();
+        assert!(!session.redact_text(&text, &[PRIVATE]).contains(PRIVATE));
+        let text = json!({name:"PDF存储Key"}).to_string();
+        assert!(!crosslane_translate::RedactionSession::new()
+            .redact_text(&text, &["PDF存储Key"])
+            .contains("PDF存储Key"));
+    }
+    for text in [
+        json!({"auth":{"providers":[{"pdf_key":PRIVATE}]},"pdf_key":"public-object-ref"}).to_string(),
+        json!({"encryption":[{"settings":{"document_key":PRIVATE}}],"file_key":"public-object-ref"}).to_string(),
+        format!("const options = {{auth: {{ providers: [{{ pdf_key: '{PRIVATE}' }}] }}, pdf_key: 'public-object-ref' }};"),
+        format!("const options = {{encryption: [{{ file_key: '{PRIVATE}' }}, {{pdf_key: '{PRIVATE}'}}], file_key: 'public-object-ref' }};"),
+    ] {
+        let session = crosslane_translate::RedactionSession::new();
+        let safe = session.redact_text(&text, &[]);
+        assert!(!safe.contains(PRIVATE), "nested credential leaked: {text}");
+        assert!(safe.contains("public-object-ref"));
+        assert_eq!(session.restore_text(&safe), text);
+    }
+    for text in [
+        format!("PDF_KEY={PRIVATE}"),
+        format!("${{PDF_KEY:-{PRIVATE}}}"),
+        format!("${{FILE_KEY:-{PRIVATE}}}"),
+        format!("pdf_encryption_key={PRIVATE}"),
+        format!("file_access_key={PRIVATE}"),
+        format!("document_secret_key={PRIVATE}"),
+        format!("app_key={PRIVATE}"),
+        format!("application_key={PRIVATE}"),
+        format!("client_key={PRIVATE}"),
+        format!("account_key={PRIVATE}"),
+        format!("user_key={PRIVATE}"),
+        format!("project_key={PRIVATE}"),
+        format!("service_key={PRIVATE}"),
+        format!("tenant_key={PRIVATE}"),
+        format!("storage_key={PRIVATE}"),
+        format!("external_key={PRIVATE}"),
+        format!("api_config_key={PRIVATE}"),
+        format!("config_api_key={PRIVATE}"),
+        format!("source_pdf_encryption_key={PRIVATE}"),
+        format!("source_client_key={PRIVATE}"),
+        format!("source_project_key={PRIVATE}"),
+        format!("config_storage_key={PRIVATE}"),
+        format!("file_aws_key={PRIVATE}"),
+        format!("config_secret_key={PRIVATE}"),
+        format!("download_token={PRIVATE}"),
+        format!("share_token={PRIVATE}"),
+        format!("resume_token={PRIVATE}"),
+        format!("csrf_token={PRIVATE}"),
+        format!("CONFIG_KEY={PRIVATE}"),
+        format!("CURSOR_TOKEN={PRIVATE}"),
+        format!("${{CURSOR_TOKEN:-{PRIVATE}}}"),
+    ] {
+        let session = crosslane_translate::RedactionSession::new();
+        let safe = session.redact_text(&text, &[]);
+        assert!(!safe.contains(PRIVATE), "credential leaked: {text}");
+        assert_eq!(session.restore_text(&safe), text);
+    }
+    // A descriptive-looking value is still private in an actual password field.
+    let text = r#"{"password":"PDF存储Key"}"#;
+    assert!(!crosslane_translate::RedactionSession::new()
+        .redact_text(text, &[])
+        .contains("PDF存储Key"));
+}
+
+#[test]
+fn explicit_cloud_and_design_references_stay_public_on_every_payload_surface() {
+    for (name, reference) in [
+        (
+            "secret_id",
+            "arn:aws:secretsmanager:us-east-1:123456789012:secret:example-AbCdEf",
+        ),
+        (
+            "kms_key",
+            "arn:aws:kms:us-east-1:123456789012:key/12345678-1234-1234-1234-123456789012",
+        ),
+        (
+            "secret_id",
+            "projects/example/secrets/database/versions/latest",
+        ),
+        ("color_token", "var(--color-primary)"),
+        ("design_token", "{color.brand.primary}"),
+        ("font_token", "var(--font-body)"),
+    ] {
+        let text = json!({name:reference}).to_string();
+        let mut source = documentation(&text);
+        source
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .as_mut()
+            .unwrap()
+            .tools[0]
+            .specification_mut()
+            .unwrap()
+            .input_schema
+            .json["properties"][name] = json!({"type":"string","default":reference});
+        assert_unmodified(&source);
+        for text in [
+            reference.to_owned(),
+            format!("{name}={reference}"),
+            format!("client --{name} '{reference}'"),
+        ] {
+            assert_unmodified(&documentation(&text));
+        }
+        let session = crosslane_translate::RedactionSession::new();
+        assert!(
+            !session.redact_text(&text, &[reference]).contains(reference),
+            "known reference-shaped credential leaked: {name}"
+        );
+        for container in [
+            "auth",
+            "encryption",
+            "signing",
+            "secret",
+            "credentials",
+            "password",
+        ] {
+            for text in [
+                json!({container:{name:reference}}).to_string(),
+                format!("const options = {{{container}: {{{name}: '{reference}'}}}};"),
+            ] {
+                let session = crosslane_translate::RedactionSession::new();
+                let safe = session.redact_text(&text, &[]);
+                assert!(
+                    !safe.contains(reference),
+                    "credential context bypass: {text}"
+                );
+                assert_eq!(session.restore_text(&safe), text);
+            }
+            let mut source = documentation("Referenced configuration metadata.");
+            source
+                .conversation_state
+                .current_message
+                .user_input_message
+                .user_input_message_context
+                .as_mut()
+                .unwrap()
+                .tools[0]
+                .specification_mut()
+                .unwrap()
+                .input_schema
+                .json["properties"][container] =
+                json!({"type":"object","properties":{name:{"type":"string","default":reference}}});
+            let sent = prepare_redacted_kiro_payload(&source, &[]);
+            assert!(
+                !serde_json::to_string(&sent).unwrap().contains(reference),
+                "credential schema bypass: {container}.{name}"
+            );
+        }
+    }
+    for name in ["secret_id", "kms_key", "color_token", "design_token"] {
+        let text = json!({name:"opaque-private-reference-2026"}).to_string();
+        assert!(!crosslane_translate::RedactionSession::new()
+            .redact_text(&text, &[])
+            .contains("opaque-private-reference-2026"));
+    }
+    let private = "ksk_private_reference_material_2026";
+    let reference = format!("arn:aws:secretsmanager:us-east-1:123456789012:secret:{private}");
+    assert!(!crosslane_translate::RedactionSession::new()
+        .redact_text(&json!({"secret_id":reference}).to_string(), &[])
+        .contains(private));
+    for reference in [
+        "var(--color-primary)",
+        "arn:aws:secretsmanager:us-east-1:123456789012:secret:example-AbCdEf",
+    ] {
+        let text = json!({"password":reference}).to_string();
+        assert!(!crosslane_translate::RedactionSession::new()
+            .redact_text(&text, &[])
+            .contains(reference));
+    }
+}
+
+#[test]
+fn known_numeric_credentials_override_business_ids_without_corrupting_protocol_budgets() {
+    let mut source = documentation("Business metadata.");
+    source.inference_config = Some(serde_json::from_value(json!({"maxTokens":4096})).unwrap());
+    let assistant = source
+        .conversation_state
+        .history
+        .iter_mut()
+        .find_map(|history| {
+            history
+                .assistant_response_message
+                .as_mut()
+                .filter(|assistant| !assistant.tool_uses.is_empty())
+        })
+        .unwrap();
+    assistant.tool_uses[0].input = json!({"config_key":4096,"idempotency_key":4096});
+    let sent = prepare_redacted_kiro_payload(&source, &["4096"]);
+    let mut input = sent
+        .conversation_state
+        .history
+        .iter()
+        .find_map(|history| {
+            history
+                .assistant_response_message
+                .as_ref()
+                .filter(|assistant| !assistant.tool_uses.is_empty())
+        })
+        .unwrap()
+        .tool_uses[0]
+        .input
+        .clone();
+    assert!(!input.to_string().contains("4096"));
+    let wire = serde_json::to_value(&sent).unwrap();
+    assert_eq!(wire["inferenceConfig"]["maxTokens"], 4096);
+    let session = source.redaction_session.as_ref().unwrap();
+    session.restore_tool_input(&mut input);
+    assert_eq!(input, json!({"config_key":4096,"idempotency_key":4096}));
+}
+
+#[test]
 fn programming_type_declarations_do_not_become_passwords() {
     for text in [
         "```typescript\ninterface Options {\n apiKey: string;\n password: string;\n token: string;\n}\n```",

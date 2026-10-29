@@ -1,36 +1,316 @@
 //! Narrow public spellings, never a blanket exemption for example documents.
 
+use std::ops::Range;
 use std::sync::OnceLock;
 
 use regex::Regex;
 
 pub(super) fn ordinary_field_name(compact: &str) -> bool {
-    matches!(
-        compact,
-        "key"
-            | "cachekey"
-            | "sortkey"
-            | "primarykey"
-            | "foreignkey"
-            | "partitionkey"
-            | "rowkey"
-            | "objectkey"
-            | "mapkey"
-            | "hotkey"
-            | "shortcutkey"
-            | "lookupkey"
-            | "displaykey"
-            | "fieldkey"
-            | "indexkey"
-            | "itemkey"
-            | "publickey"
-            | "pagetoken"
-            | "nextpagetoken"
-            | "previouspagetoken"
-            | "nexttoken"
-            | "nextcontinuationtoken"
-            | "continuationtoken"
-    )
+    business_key_name(compact)
+        || business_token_name(compact)
+        || matches!(
+            compact,
+            "key"
+                | "cachekey"
+                | "sortkey"
+                | "primarykey"
+                | "foreignkey"
+                | "partitionkey"
+                | "rowkey"
+                | "objectkey"
+                | "mapkey"
+                | "hotkey"
+                | "shortcutkey"
+                | "lookupkey"
+                | "displaykey"
+                | "fieldkey"
+                | "indexkey"
+                | "itemkey"
+                | "publickey"
+                | "pagetoken"
+                | "nextpagetoken"
+                | "previouspagetoken"
+                | "nexttoken"
+                | "nextcontinuationtoken"
+                | "continuationtoken"
+        )
+}
+
+/// Storage references and entity identifiers are business data. Match complete
+/// names, so `pdf_encryption_key`, `file_access_key` and `client_secret_key`
+/// retain their credential semantics. Authentication containers override this.
+pub(super) fn business_key_name(compact: &str) -> bool {
+    let Some(mut resource) = compact.strip_suffix("key") else {
+        return false;
+    };
+    let mut has_business_noun = false;
+    let mut has_file_resource = false;
+    let mut ends_with_business_noun = false;
+    // Parse complete business words rather than accepting every `*_key`.
+    // Credential qualifiers (api, auth, access, secret, private, encryption,
+    // signing, etc.) are deliberately absent. Scope words alone, such as
+    // client/user/project/account/storage, cannot establish a business key.
+    const NOUNS: &[&str] = &[
+        "pdf",
+        "word",
+        "excel",
+        "csv",
+        "json",
+        "yaml",
+        "yml",
+        "toml",
+        "xml",
+        "html",
+        "markdown",
+        "archive",
+        "file",
+        "document",
+        "attachment",
+        "image",
+        "photo",
+        "thumbnail",
+        "video",
+        "audio",
+        "object",
+        "blob",
+        "resource",
+        "artifact",
+        "record",
+        "entity",
+        "entry",
+        "column",
+        "node",
+        "parent",
+        "child",
+        "root",
+        "source",
+        "target",
+        "cache",
+        "config",
+        "configuration",
+        "setting",
+        "property",
+        "schema",
+        "template",
+        "translation",
+        "i18n",
+        "locale",
+        "message",
+        "label",
+        "title",
+        "component",
+        "element",
+        "widget",
+        "theme",
+        "style",
+        "icon",
+        "layout",
+        "panel",
+        "section",
+        "view",
+        "form",
+        "table",
+        "cell",
+        "filter",
+        "featureflag",
+        "feature",
+        "routing",
+        "route",
+        "operation",
+        "command",
+        "action",
+        "method",
+        "task",
+        "workflow",
+        "job",
+        "queue",
+        "topic",
+        "event",
+        "pipeline",
+        "stage",
+        "step",
+        "business",
+        "reference",
+        "ref",
+        "relation",
+        "relationship",
+        "clustering",
+        "shard",
+        "composite",
+        "dedup",
+        "dedupe",
+        "idempotency",
+        "correlation",
+        "trace",
+        "span",
+        "cursor",
+        "pagination",
+        "redis",
+        "prompt",
+        "response",
+        "request",
+    ];
+    const QUALIFIERS: &[&str] = &[
+        "source",
+        "target",
+        "input",
+        "output",
+        "original",
+        "generated",
+        "rendered",
+        "exported",
+        "uploaded",
+        "result",
+        "preview",
+        "cropped",
+        "resized",
+        "converted",
+        "compressed",
+        "processed",
+        "previous",
+        "next",
+        "current",
+        "selected",
+        "primary",
+        "secondary",
+        "default",
+        "fallback",
+        "external",
+        "storage",
+        "s3",
+        "cos",
+        "oss",
+        "gcs",
+        "azure",
+        "aws",
+        "user",
+        "owner",
+        "tenant",
+        "project",
+        "workspace",
+        "client",
+        "service",
+    ];
+    while !resource.is_empty() {
+        let noun = NOUNS
+            .iter()
+            .copied()
+            .filter(|word| resource.starts_with(word))
+            .max_by_key(|word| word.len());
+        let qualifier = QUALIFIERS
+            .iter()
+            .copied()
+            .filter(|word| resource.starts_with(word))
+            .max_by_key(|word| word.len());
+        let (word, business) = match (noun, qualifier) {
+            (Some(noun), Some(qualifier)) if qualifier.len() > noun.len() => (qualifier, false),
+            (Some(noun), _) => (noun, true),
+            (None, Some(qualifier)) => (qualifier, false),
+            (None, None) => return false,
+        };
+        has_business_noun |= business;
+        has_file_resource |= business
+            && matches!(
+                word,
+                "pdf"
+                    | "word"
+                    | "excel"
+                    | "csv"
+                    | "html"
+                    | "markdown"
+                    | "archive"
+                    | "file"
+                    | "document"
+                    | "attachment"
+                    | "image"
+                    | "photo"
+                    | "thumbnail"
+                    | "video"
+                    | "audio"
+                    | "object"
+                    | "blob"
+                    | "artifact"
+            );
+        // A trailing scope may denote a credential (source_client_key,
+        // config_storage_key). Only file/object references allow `storage`.
+        ends_with_business_noun = business || (word == "storage" && has_file_resource);
+        resource = &resource[word.len()..];
+    }
+    has_business_noun && ends_with_business_noun
+}
+
+pub(super) fn business_token_name(compact: &str) -> bool {
+    let Some(mut token) = compact.strip_suffix("token") else {
+        return false;
+    };
+    if matches!(token, "next" | "previous" | "prev") {
+        return true;
+    }
+    for qualifier in ["next", "previous", "prev", "current"] {
+        if let Some(rest) = token.strip_prefix(qualifier) {
+            token = rest;
+            break;
+        }
+    }
+    matches!(token, "page" | "cursor" | "pagination" | "continuation")
+}
+
+/// Explicit reference syntax can disambiguate metadata fields whose names are
+/// also used for credentials. Arbitrary opaque values keep their protection.
+pub(super) fn business_reference_value(name: &str, value: &str) -> bool {
+    let name = compact(name);
+    let value = value.trim();
+    if matches!(
+        name.as_str(),
+        "secretid" | "kmskey" | "kmskeyarn" | "masterkeyarn"
+    ) {
+        if cloud_reference_ranges(value)
+            .iter()
+            .any(|range| range.start == 0 && range.end == value.len())
+        {
+            return true;
+        }
+        if name == "secretid" {
+            let parts = value.split('/').collect::<Vec<_>>();
+            if matches!(
+                parts.as_slice(),
+                ["projects", _, "secrets", _] | ["projects", _, "secrets", _, "versions", _]
+            ) && parts.iter().all(|part| {
+                !part.is_empty()
+                    && part.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
+                    })
+            }) {
+                return true;
+            }
+        }
+    }
+    if matches!(
+        name.as_str(),
+        "designtoken"
+            | "colortoken"
+            | "themetoken"
+            | "styletoken"
+            | "fonttoken"
+            | "spacingtoken"
+            | "typographytoken"
+            | "radiustoken"
+            | "shadowtoken"
+            | "bordertoken"
+            | "motiontoken"
+    ) {
+        static DESIGN: OnceLock<Regex> = OnceLock::new();
+        return super::regex(&DESIGN, r"\A(?:var\(--[A-Za-z_][A-Za-z0-9_-]*\)|\{[A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*)+\})\z").is_match(value);
+    }
+    false
+}
+
+pub(super) fn cloud_reference_ranges(text: &str) -> Vec<Range<usize>> {
+    if !text.contains("arn:") {
+        return Vec::new();
+    }
+    static ARN: OnceLock<Regex> = OnceLock::new();
+    super::regex(&ARN, r"\barn:(?:aws|aws-cn|aws-us-gov):(?:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+|kms:[a-z0-9-]+:[0-9]{12}:(?:key/[A-Za-z0-9-]+|alias/[A-Za-z0-9/_-]+))").find_iter(text).map(|matched|matched.range()).collect()
 }
 
 fn compact(name: &str) -> String {

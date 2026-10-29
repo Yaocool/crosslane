@@ -86,7 +86,7 @@ pub(super) fn challenge_header(name: &str) -> bool {
 }
 
 pub(super) fn credential_values<'a>(name: &str, value: &'a mut Value) -> Vec<&'a mut Value> {
-    if !authentication_property(name) {
+    if !credential_container_property(name) {
         return Vec::new();
     }
     match value {
@@ -100,7 +100,7 @@ pub(super) fn credential_values<'a>(name: &str, value: &'a mut Value) -> Vec<&'a
             fields
                 .iter_mut()
                 .filter(|(name, child)| {
-                    (name.eq_ignore_ascii_case("key")
+                    (credential_reference_name(name)
                         || (basic && (name.as_str() == "pass" || sensitive_name(name))))
                         && !public_field(name, child)
                 })
@@ -119,31 +119,96 @@ pub(super) fn authentication_property(name: &str) -> bool {
     basic_auth_property(name) || compact(name) == "authentication"
 }
 
+pub(super) fn credential_container_property(name: &str) -> bool {
+    authentication_property(name)
+        || matches!(
+            compact(name).as_str(),
+            "credentials" | "encryption" | "decryption" | "signing" | "crypto"
+        )
+}
+
+pub(super) fn credential_reference_name(name: &str) -> bool {
+    let name = compact(name);
+    name == "key"
+        || super::policy::business_key_name(&name)
+        || super::policy::business_token_name(&name)
+}
+
+pub(super) fn credential_reference_environment(name: &str) -> bool {
+    credential_reference_name(name)
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte == b'_')
+}
+
 /// A bare `key` is ambiguous. Preserve protection when the surrounding syntax
 /// explicitly uses it for authentication, including opaque keys without a
 /// provider prefix. Ordinary object literals such as `{key: 'perf'}` do not.
-pub(super) fn credential_key_assignment(name: &str, prefix: &str) -> bool {
+pub(super) fn credential_reference_assignment(name: &str, prefix: &str) -> bool {
     let name = name.trim_matches(['"', '\'', '\\']);
-    if !name.eq_ignore_ascii_case("key") {
+    if !credential_reference_name(name) {
         return false;
     }
-    if prefix.ends_with(['?', '&']) || prefix.ends_with("--") {
+    let generic = name.eq_ignore_ascii_case("key");
+    if generic && (prefix.ends_with(['?', '&']) || prefix.ends_with("--")) {
         return true;
     }
-    if name == "KEY" && !prefix.trim_end().ends_with(['{', ',']) {
+    if credential_reference_environment(name) && !prefix.trim_end().ends_with(['{', ',']) {
         return true;
     }
+    credential_object_prefix(prefix)
+}
+
+pub(super) fn credential_object_prefix(prefix: &str) -> bool {
     let start = prefix
         .char_indices()
         .rev()
-        .nth(512)
+        .nth(2048)
         .map_or(0, |(offset, _)| offset);
     static AUTH_OBJECT: OnceLock<Regex> = OnceLock::new();
     regex(
         &AUTH_OBJECT,
-        r"(?i)\b(?:auth|authentication|credentials)\s*[:=]\s*\{[^{}]*\z",
+        r#"(?P<name>(?:\\?["'])?[\p{L}_][\p{L}\p{N}_.-]{0,127}(?:\\?["'])?)[ \t]*[:=]\s*[\[{]"#,
     )
-    .is_match(&prefix[start..])
+    .captures_iter(&prefix[start..])
+    .filter(|captures| {
+        captures.name("name").is_some_and(|name| {
+            credential_container_property(name.as_str().trim_matches(['"', '\'', '\\']))
+                || sensitive_name(name.as_str())
+        })
+    })
+    .map(|captures| captures.get(0).expect("credential container"))
+    .any(|found| {
+        let mut depth = 1usize;
+        let mut quote = None;
+        let mut escaped = false;
+        for ch in prefix[start + found.end()..].chars() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if let Some(delimiter) = quote {
+                if ch == '\\' {
+                    escaped = true;
+                } else if ch == delimiter {
+                    quote = None;
+                }
+                continue;
+            }
+            match ch {
+                '\'' | '"' | '`' => quote = Some(ch),
+                '{' | '[' => depth += 1,
+                '}' | ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        depth > 0
+    })
 }
 
 fn public_boolean_name(name: &str) -> bool {
@@ -387,7 +452,7 @@ fn environment_defaults(text: &str) -> Vec<(Range<usize>, Range<usize>)> {
                 .or_else(|| captures.name("call"))
                 .or_else(|| captures.name("rust"))?;
             let name = name.as_str().trim_matches(['"', '\'']);
-            if !sensitive_name(name) && name != "PASS" && name != "KEY" {
+            if !sensitive_name(name) && name != "PASS" && !credential_reference_environment(name) {
                 return None;
             }
             Some((captures.get(0)?.range(), environment_default(&captures)?))

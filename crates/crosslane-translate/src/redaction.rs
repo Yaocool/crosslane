@@ -10,7 +10,7 @@ mod embedded_json;
 mod policy;
 mod shell;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -984,6 +984,7 @@ fn remember_literal_getters(session: Option<&RedactionSession>, discovered: &[St
 
 struct Redactor<'a> {
     known_secrets: &'a [&'a str],
+    known_values: HashSet<&'a str>,
     matcher: Option<AhoCorasick>,
     stats: RedactionStats,
     collecting: bool,
@@ -991,12 +992,14 @@ struct Redactor<'a> {
     session: Option<RedactionSession>,
     shell_commands: Vec<String>,
     decode_auth_literals: bool,
+    credential_context: bool,
 }
 
 impl<'a> Redactor<'a> {
     fn new(known_secrets: &'a [&'a str]) -> Self {
         Self {
             known_secrets,
+            known_values: known_secrets.iter().copied().collect(),
             matcher: {
                 let patterns: Vec<&str> = known_secrets
                     .iter()
@@ -1021,6 +1024,7 @@ impl<'a> Redactor<'a> {
             session: None,
             shell_commands: Vec::new(),
             decode_auth_literals: true,
+            credential_context: false,
         }
     }
 
@@ -1343,9 +1347,18 @@ impl<'a> Redactor<'a> {
                     .collect();
                 let original = std::mem::take(fields);
                 for (mut name, mut child) in original {
+                    let private_key =
+                        self.credential_context && auth::credential_reference_name(&name);
+                    let business_reference = !sensitive
+                        && !self.credential_context
+                        && child
+                            .as_str()
+                            .is_some_and(|value| policy::business_reference_value(&name, value));
                     let secret_field = !auth::public_field(&name, &child)
+                        && !business_reference
                         && !(fetch_options && name == "credentials")
                         && (sensitive
+                            || private_key
                             || sensitive_name(&name)
                             || oauth_fields.contains(&name)
                             || child
@@ -1356,12 +1369,19 @@ impl<'a> Redactor<'a> {
                             self.authentication_literal(password);
                         }
                     }
+                    let previous_context = self.credential_context;
+                    let child_context =
+                        previous_context || auth::credential_container_property(&name);
                     self.text(&mut name);
+                    self.credential_context = child_context;
                     if !secret_field && auth::challenge_header(&name) {
                         self.challenge(&mut child);
+                    } else if private_key && secret_field {
+                        self.authentication_literal(&mut child);
                     } else {
                         self.data(&mut child, secret_field);
                     }
+                    self.credential_context = previous_context;
                     if fields.contains_key(&name) {
                         let base = name;
                         let mut suffix = 2usize;
@@ -1420,7 +1440,7 @@ impl<'a> Redactor<'a> {
             Value::String(text)
                 if sensitive
                     && ((structured_reference(text)
-                        && !self.known_secrets.contains(&text.as_str()))
+                        && !self.known_values.contains(text.as_str()))
                         || marker_pattern().is_match(text)) =>
             {
                 let ranges = exclude_references(text, std::iter::once(0..text.len()).collect())
@@ -1447,6 +1467,22 @@ impl<'a> Redactor<'a> {
                 }
             }
             Value::String(text) if !sensitive => self.text(text),
+            Value::Number(number)
+                if !sensitive && !self.known_values.is_empty() && {
+                    let literal = number.to_string();
+                    reusable_secret(&literal) && self.known_values.contains(literal.as_str())
+                } =>
+            {
+                // Public identifier fields do not override an authoritative
+                // numeric credential. This traversal excludes protocol budgets
+                // and schema keywords; restoration retains the numeric type.
+                let marker = self.session.as_ref().map_or_else(
+                    || REDACTED.to_owned(),
+                    |session| session.marker(value.clone()),
+                );
+                *value = Value::String(marker);
+                self.stats.redacted_values += 1;
+            }
             _ if sensitive && self.collecting => {
                 if let Value::String(text) = value {
                     if reusable_secret(text) {
@@ -1550,6 +1586,26 @@ impl<'a> Redactor<'a> {
         sensitive_property: bool,
         property_name: Option<&str>,
     ) {
+        let previous_context = self.credential_context;
+        self.credential_context |= property_name.is_some_and(auth::credential_container_property);
+        self.credential_context |= property_name.is_some_and(sensitive_name)
+            && value.as_object().is_some_and(|schema| {
+                schema.contains_key("properties")
+                    || schema.contains_key("items")
+                    || schema
+                        .get("type")
+                        .is_some_and(|kind| kind == "object" || kind == "array")
+            });
+        self.schema_property_inner(value, sensitive_property, property_name);
+        self.credential_context = previous_context;
+    }
+
+    fn schema_property_inner(
+        &mut self,
+        value: &mut Value,
+        sensitive_property: bool,
+        property_name: Option<&str>,
+    ) {
         match value {
             Value::Object(fields) => {
                 for (name, child) in fields {
@@ -1566,9 +1622,8 @@ impl<'a> Redactor<'a> {
                                         schema,
                                         sensitive_property
                                             || (basic_auth && property == "pass")
-                                            || (property_name
-                                                .is_some_and(auth::authentication_property)
-                                                && property.eq_ignore_ascii_case("key"))
+                                            || (self.credential_context
+                                                && auth::credential_reference_name(property))
                                             || (sensitive_name(property)
                                                 && !auth::public_boolean_schema(property, schema)),
                                         Some(property),
@@ -1628,7 +1683,11 @@ impl<'a> Redactor<'a> {
             self.data(value, sensitive);
             return;
         };
-        let sensitive = (sensitive && !auth::public_field(name, value))
+        let business_reference = !self.credential_context
+            && value
+                .as_str()
+                .is_some_and(|value| policy::business_reference_value(name, value));
+        let sensitive = (sensitive && !auth::public_field(name, value) && !business_reference)
             || value
                 .as_str()
                 .is_some_and(|text| auth::credential_field(name, text));
@@ -2297,9 +2356,16 @@ fn secret_ranges_with_auth(
     }
     // Long opaque keys and Base64 data usually contain no assignment delimiter.
     // Avoid running the bounded identifier matcher at every byte in that case.
+    let public_cloud_references = policy::cloud_reference_ranges(text);
     for mut assignment in assignments(text) {
         let name = assignment.name;
         if auth.manages(assignment.start) {
+            continue;
+        }
+        // A Secrets Manager ARN contains `secret:...`, which is a resource
+        // component rather than an inline secret assignment. Known values and
+        // provider/JWT/private-key patterns were scanned independently above.
+        if inside(&public_cloud_references, assignment.start) {
             continue;
         }
         if policy::bearer_prose_assignment(name, &text[..assignment.start]) {
@@ -2310,7 +2376,7 @@ fn secret_ranges_with_auth(
             Some(policy::TypeAnnotation::Initializer(start)) => assignment.value_start = start,
             None => {}
         }
-        let credential_key = auth::credential_key_assignment(name, &text[..assignment.start]);
+        let credential_key = auth::credential_reference_assignment(name, &text[..assignment.start]);
         if sensitive_name(name) || credential_key {
             if let Some(range) = auth::environment_literal_at(text, assignment.value_start) {
                 literal_defaults.push(range);
@@ -2353,7 +2419,10 @@ fn secret_ranges_with_auth(
                 ValueContext::Json
             };
             if let Some(range) = value_range(text, assignment.value_start, context, name) {
-                if !auth::public_assignment(name, &text[range.clone()]) {
+                let business_reference =
+                    policy::business_reference_value(name, &text[range.clone()])
+                        && !auth::credential_object_prefix(prefix);
+                if !auth::public_assignment(name, &text[range.clone()]) && !business_reference {
                     if decode_auth_literals
                         && (text[assignment.value_start..].starts_with('\'')
                             || text[assignment.value_start..].starts_with("$'"))
@@ -2406,7 +2475,13 @@ fn secret_ranges_with_auth(
             {
                 let start = captures.get(0).expect("flag").end();
                 if let Some(range) = value_range(text, start, ValueContext::Shell, name.as_str())
-                    .filter(|range| !auth::public_assignment(name.as_str(), &text[range.clone()]))
+                    .filter(|range| {
+                        !auth::public_assignment(name.as_str(), &text[range.clone()])
+                            && !(policy::business_reference_value(
+                                name.as_str(),
+                                &text[range.clone()],
+                            ) && !auth::credential_object_prefix(&text[..name.start()]))
+                    })
                 {
                     if decode_auth_literals
                         && shell::literal_word_fragment(
@@ -2430,7 +2505,7 @@ fn secret_ranges_with_auth(
         .captures_iter(text)
         {
             let name = captures.name("name").expect("variable name").as_str();
-            if sensitive_name(name) || name == "KEY" {
+            if sensitive_name(name) || auth::credential_reference_environment(name) {
                 ranges.push(captures.name("secret").expect("fallback value").range());
             }
         }

@@ -249,7 +249,8 @@ async fn image_requests_with_public_documentation_only_warn_for_actual_credentia
         "interface Options { apiKey: string; password: string; }\n",
         "api_key=YOUR_OPENAI_API_KEY\nsecret={{API_SECRET}}\n",
         "curl --key ./certs/client.key https://example.invalid/\n",
-        "next_page_token=cursor-page-2\nshortcut_key=Ctrl+K"
+        "next_page_token=cursor-page-2\nshortcut_key=Ctrl+K\n",
+        "Response: {\"pdf_key\":\"PDF存储Key\",\"output_file_key\":\"objects/report.pdf\"}"
     );
     for has_secret in [false, true] {
         for stream in [false, true] {
@@ -265,11 +266,18 @@ async fn image_requests_with_public_documentation_only_warn_for_actual_credentia
                         "hotKey":{"type":"string","enum":["Enter","Escape"]},
                         "nextPageToken":{"type":"string","default":"cursor-page-2"},
                         "signature":{"type":"string","default":"fn inspect(input: &str) -> bool"},
-                        "private_key":{"type":"string","default":"./fixtures/id_ed25519"}
+                        "private_key":{"type":"string","default":"./fixtures/id_ed25519"},
+                        "pdf_key":{"type":"string","default":"PDF存储Key"},
+                        "documentKey":{"type":"string","default":"objects/report.pdf"}
                     }}
                 }],
-                "messages":[{"role":"user","content":[
-                    {"type":"text","text":if has_secret {format!("Describe the image.\napi_key={actual_secret}")} else {"Describe the image.".into()}},
+                "messages":[
+                    {"role":"user","content":"Read the documentation."},
+                    {"role":"assistant","content":[{"type":"tool_use","id":"read-docs","name":"Workflow","input":{"key":"perf"}}]},
+                    {"role":"user","content":[{"type":"tool_result","tool_use_id":"read-docs","content":if has_secret {format!("{documentation}\napi_key={actual_secret}")} else {documentation.into()}}]},
+                    {"role":"assistant","content":"Read the documentation."},
+                    {"role":"user","content":[
+                    {"type":"text","text":"Describe the image."},
                     {"type":"image","source":{"type":"base64","media_type":"image/png","data":image}}
                 ]}]
             });
@@ -299,6 +307,7 @@ async fn image_requests_with_public_documentation_only_warn_for_actual_credentia
             let text = wire.to_string();
             assert!(text.contains("perform a performance review"));
             assert!(text.contains("sk-proj-xxxxx"));
+            assert!(text.contains("PDF存储Key"));
             assert!(!text.contains(actual_secret));
             assert_eq!(text.contains("__CROSSLANE_SECRET_"), has_secret);
         }
