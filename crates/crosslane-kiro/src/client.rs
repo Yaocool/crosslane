@@ -248,14 +248,38 @@ pub struct KiroResponse {
     stream_slot_wait_ms: u64,
     thinking_enabled: bool,
     redaction_session: crosslane_translate::RedactionSession,
+    redaction_report: crosslane_translate::RedactionReport,
     #[cfg(feature = "crs")]
     prepared_payload: KiroPayload,
+}
+
+fn log_redaction_report(
+    kind: &'static str,
+    endpoint: &str,
+    report: &crosslane_translate::RedactionReport,
+) {
+    tracing::info!(
+        event = "proxy.upstream.redaction",
+        request_kind = kind,
+        endpoint,
+        redaction_enabled = report.enabled,
+        redaction_triggered = report.triggered,
+        redacted_values = report.redacted_values,
+        redaction_sources = %serde_json::json!(&report.sources),
+        redaction_sources_truncated = report.sources_truncated,
+        "outgoing request credential redaction inspected"
+    );
 }
 
 impl KiroResponse {
     /// Private request-local mapping; never serialize this into model context.
     pub fn redaction_session(&self) -> &crosslane_translate::RedactionSession {
         &self.redaction_session
+    }
+
+    /// Content-free evidence from this attempt's actual serialized payload.
+    pub fn redaction_report(&self) -> &crosslane_translate::RedactionReport {
+        &self.redaction_report
     }
 
     /// Thinking requested by this actual attempt, after model-specific preparation.
@@ -1228,6 +1252,8 @@ impl KiroClient {
                 })?;
             request["profileArn"] = serde_json::json!(profile);
         }
+        let redaction_report = redaction_session.outgoing_redaction_report(&request, 0);
+        log_redaction_report("web_search", "MCP web_search", &redaction_report);
         let response = self
             .mcp
             .post(url.clone())
@@ -1445,6 +1471,9 @@ impl KiroClient {
             }
         }
         let model_permit = self.admit_model(&payload).await?;
+        let redaction_report =
+            redaction_session.outgoing_redaction_report(&wire, payload.protected_history_len());
+        log_redaction_report("generation", endpoint.name, &redaction_report);
         let response = self
             .stream
             .post(&endpoint.url)
@@ -1475,6 +1504,7 @@ impl KiroClient {
                 stream_slot_wait_ms,
                 thinking_enabled: payload.thinking_enabled(),
                 redaction_session,
+                redaction_report,
                 #[cfg(feature = "crs")]
                 prepared_payload,
             });

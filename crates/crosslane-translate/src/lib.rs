@@ -26,7 +26,10 @@ pub use context::{
 };
 pub use error::{error_envelope, sanitize_error_message, ErrorFormat};
 pub use protocol::*;
-pub use redaction::{redact_kiro_payload, redact_text, RedactionSession, RedactionStats};
+pub use redaction::{
+    redact_kiro_payload, redact_text, RedactionReport, RedactionSession, RedactionSource,
+    RedactionStats,
+};
 pub use responses::{
     responses_to_openai, ResponsesRequest, ResponsesToolName, ResponsesTranslation,
 };

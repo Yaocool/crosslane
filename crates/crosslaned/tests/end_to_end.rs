@@ -151,6 +151,10 @@ impl Daemon {
     }
 
     async fn start_http(port: u16, upstream_url: &str) -> Self {
+        Self::start_http_with_log_level(port, upstream_url, "warn").await
+    }
+
+    async fn start_http_with_log_level(port: u16, upstream_url: &str, log_level: &str) -> Self {
         let home = tempfile::tempdir().expect("tempdir");
         let socket = home.path().join("admin.sock");
         let child = Command::new(env!("CARGO_BIN_EXE_crosslaned"))
@@ -166,7 +170,7 @@ impl Daemon {
                     .unwrap()
                     .as_str(),
             )
-            .env("RUST_LOG", "warn")
+            .env("RUST_LOG", log_level)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true)

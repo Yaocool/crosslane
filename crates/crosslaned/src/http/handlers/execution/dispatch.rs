@@ -548,6 +548,11 @@ async fn dispatch_upstream(
                     model_path = %model_path.join(" -> "),
                     mapping_rule = model_mapping_rule.as_deref().unwrap_or("none"),
                     endpoint = %response.endpoint.name,
+                    redaction_enabled = response.redaction_report().enabled,
+                    redaction_triggered = response.redaction_report().triggered,
+                    redacted_values = response.redaction_report().redacted_values,
+                    redaction_sources = %serde_json::json!(&response.redaction_report().sources),
+                    redaction_sources_truncated = response.redaction_report().sources_truncated,
                     "upstream response accepted"
                 );
                 pool.record_success(&account.id).await;

@@ -6,11 +6,12 @@
 //! reliably by text rules; callers must not treat this as a general DLP guarantee.
 
 mod auth;
+mod diagnostics;
 mod embedded_json;
 mod policy;
 mod shell;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -22,6 +23,8 @@ use serde_json::Value;
 use crate::{KiroPayload, KiroUserInputMessage};
 
 pub const REDACTED: &str = "[REDACTED]";
+
+pub use diagnostics::{RedactionReport, RedactionSource};
 
 /// Only counts are returned: original secrets are never retained in diagnostics.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +46,7 @@ struct SessionState {
     by_value: HashMap<String, String>,
     by_marker: HashMap<String, Value>,
     source_texts: HashMap<String, String>,
+    rules: HashMap<String, BTreeSet<&'static str>>,
     #[cfg(feature = "crs")]
     transmitted_redactions: bool,
 }
@@ -79,6 +83,7 @@ impl RedactionSession {
                 by_value: HashMap::new(),
                 by_marker: HashMap::new(),
                 source_texts: HashMap::new(),
+                rules: HashMap::new(),
                 #[cfg(feature = "crs")]
                 transmitted_redactions: false,
             })),
@@ -93,31 +98,15 @@ impl RedactionSession {
     /// inferring it from mappings discovered by an input-budget estimate.
     #[cfg(feature = "crs")]
     pub fn record_transmitted_payload(&self, payload: &Value) {
-        if !self.enabled {
+        if !self.enabled || self.has_transmitted_redactions() {
             return;
         }
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if state.transmitted_redactions || state.by_marker.is_empty() {
-            return;
+        if self.outgoing_redaction_report(payload, 0).triggered {
+            self.state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .transmitted_redactions = true;
         }
-        let prefix = format!("__CROSSLANE_SECRET_{}_", state.nonce);
-        fn contains(value: &Value, prefix: &str, state: &SessionState) -> bool {
-            let text_contains = |text: &str| {
-                text.contains(prefix)
-                    && marker_pattern()
-                        .find_iter(text)
-                        .any(|marker| state.by_marker.contains_key(marker.as_str()))
-            };
-            match value {
-                Value::String(text) => text_contains(text),
-                Value::Array(values) => values.iter().any(|value| contains(value, prefix, state)),
-                Value::Object(fields) => fields
-                    .iter()
-                    .any(|(key, value)| text_contains(key) || contains(value, prefix, state)),
-                _ => false,
-            }
-        }
-        state.transmitted_redactions = contains(payload, &prefix, &state);
     }
 
     /// Safe request-local evidence; neither credential values nor markers leave
@@ -1102,6 +1091,16 @@ impl<'a> Redactor<'a> {
     }
 
     fn text(&mut self, value: &mut String) {
+        let before = self.stats.redacted_values;
+        self.text_inner(value);
+        if !self.collecting && self.stats.redacted_values > before {
+            if let Some(session) = &self.session {
+                session.record_text_rule(value, "text_match");
+            }
+        }
+    }
+
+    fn text_inner(&mut self, value: &mut String) {
         let shell_source = self.shell_commands.iter().any(|source| source == value);
         if !self.collecting {
             if let Some(session) = self
@@ -1320,6 +1319,16 @@ impl<'a> Redactor<'a> {
     }
 
     fn data(&mut self, value: &mut Value, sensitive: bool) {
+        let before = self.stats.redacted_values;
+        self.data_inner(value, sensitive);
+        if sensitive && !self.collecting && self.stats.redacted_values > before {
+            if let Some(session) = &self.session {
+                session.record_value_rule(value, "credential_field");
+            }
+        }
+    }
+
+    fn data_inner(&mut self, value: &mut Value, sensitive: bool) {
         if let Value::String(text) = value {
             if self.collecting {
                 self.discovered.extend(checkpoint_secrets(text));
@@ -1482,6 +1491,9 @@ impl<'a> Redactor<'a> {
                 );
                 *value = Value::String(marker);
                 self.stats.redacted_values += 1;
+                if let Some(session) = &self.session {
+                    session.record_value_rule(value, "known_value");
+                }
             }
             _ if sensitive && self.collecting => {
                 if let Value::String(text) = value {

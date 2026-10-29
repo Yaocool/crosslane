@@ -237,8 +237,12 @@ async fn image_requests_with_public_documentation_only_warn_for_actual_credentia
         .mount(&mock)
         .await;
     let port = unused_tcp_port();
-    let daemon =
-        Daemon::start_http(port, &format!("{}/generateAssistantResponse", mock.uri())).await;
+    let daemon = Daemon::start_http_with_log_level(
+        port,
+        &format!("{}/generateAssistantResponse", mock.uri()),
+        "info",
+    )
+    .await;
     import_context_alignment_account(&daemon, 0.0).await;
     configure(&daemon, true, true).await;
     let image = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a04cAAAAASUVORK5CYII=";
@@ -312,6 +316,69 @@ async fn image_requests_with_public_documentation_only_warn_for_actual_credentia
             assert_eq!(text.contains("__CROSSLANE_SECRET_"), has_secret);
         }
     }
+    let mut records = Vec::new();
+    for _ in 0..60 {
+        records.clear();
+        let mut files = tokio::fs::read_dir(daemon.home().join("logs"))
+            .await
+            .unwrap();
+        while let Some(file) = files.next_entry().await.unwrap() {
+            if file.file_type().await.unwrap().is_file() {
+                let content = tokio::fs::read_to_string(file.path()).await.unwrap();
+                records.extend(
+                    content
+                        .lines()
+                        .filter_map(|line| serde_json::from_str::<Value>(line).ok()),
+                );
+            }
+        }
+        if records
+            .iter()
+            .filter(|row| row["fields"]["event"] == "upstream.response.accepted")
+            .count()
+            >= 4
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    for event in ["proxy.upstream.redaction", "upstream.response.accepted"] {
+        let entries = records
+            .iter()
+            .filter(|row| row["fields"]["event"] == event)
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 4);
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|row| row["fields"]["redaction_triggered"] == true)
+                .count(),
+            2
+        );
+        for row in entries {
+            let fields = &row["fields"];
+            assert_eq!(fields["redaction_enabled"], true);
+            let sources: Value =
+                serde_json::from_str(fields["redaction_sources"].as_str().unwrap()).unwrap();
+            if fields["redaction_triggered"] == true {
+                assert_eq!(fields["redacted_values"], 1);
+                assert!(sources
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|source| source["source"] == "tool_result"
+                        && source["path"].as_str().unwrap().contains("/history/")));
+            } else {
+                assert_eq!(sources, json!([]));
+            }
+            if event == "upstream.response.accepted" {
+                assert!(fields["trace_id"].as_str().unwrap().starts_with("trace_"));
+            }
+        }
+    }
+    let logs = serde_json::to_string(&records).unwrap();
+    assert!(!logs.contains(actual_secret));
+    assert!(!logs.contains("__CROSSLANE_SECRET_"));
     daemon.stop().await;
 }
 
