@@ -21,6 +21,7 @@ pub(super) async fn handle_capabilities(state: &Arc<AppState>) -> Handled {
         "provider_kinds": descriptors.iter().map(|provider| provider.kind.as_str()).collect::<BTreeSet<_>>(),
         "features": [
             "admin_rest_tokens",
+            "force_account_removal",
             "provider_registry",
             "provider_scoped_accounts",
             "provider_scoped_account_tags",
@@ -451,9 +452,19 @@ pub(super) async fn handle_account_remove(state: &Arc<AppState>, params: Value) 
     struct Params {
         provider: Option<String>,
         id: String,
+        #[serde(default)]
+        force: bool,
     }
     let params: Params = parse_params(params)?;
     let reference = resolve_account_ref(state, params.provider.as_deref(), &params.id).await?;
+    if params.force {
+        return super::removal::force_remove(
+            state,
+            reference.provider_id.as_str(),
+            &reference.account_id,
+        )
+        .await;
+    }
     if reference.provider_id.as_str() == "kiro" {
         return super::handle_account_remove(state, json!({"id":reference.account_id})).await;
     }

@@ -695,6 +695,9 @@ providers = ["kiro", "copilot"]
     }
 }
 
+
+
+
 #[tokio::test]
 async fn contradictory_provider_edits_and_multi_provider_tasks_fail_before_rpc() {
     for args in [
@@ -1616,6 +1619,7 @@ async fn destructive_account_command_supports_yes_and_json_cancellation() {
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].method, method::V2_ACCOUNT_REMOVE);
     assert_eq!(requests[0].params["id"], "acc_00000001");
+    assert_eq!(requests[0].params["force"], false);
 
     let (cancelled, requests) = run(&["account", "rm", "acc_00000001"], vec![]).await;
     assert_success(&cancelled);
@@ -1641,6 +1645,31 @@ async fn batch_account_remove_emits_one_json_document() {
     assert_eq!(output["results"].as_array().map(Vec::len), Some(2));
     assert_eq!(output["errors"].as_array().map(Vec::len), Some(0));
     assert_eq!(output["complete"], true);
+}
+
+#[tokio::test]
+async fn force_account_remove_reaches_every_account_and_still_requires_confirmation() {
+    for ids in [vec!["acc_00000001"], vec!["acc_00000001", "acc_00000002"]] {
+        let mut args = vec!["account", "rm"];
+        args.extend(ids.iter().copied());
+        args.extend(["--provider", "kiro", "--force", "--yes"]);
+        let (output, requests) =
+            run(&args, ids.iter().map(|id| json!({"removed":id})).collect()).await;
+        assert_success(&output);
+        assert_eq!(requests.len(), ids.len());
+        for (request, id) in requests.iter().zip(ids) {
+            assert_eq!(request.method, method::V2_ACCOUNT_REMOVE);
+            assert_eq!(
+                request.params,
+                json!({"id":id,"provider":"kiro","force":true})
+            );
+        }
+    }
+    let (output, requests) = run(&["account", "delete", "acc_00000001", "--force"], vec![]).await;
+    assert_success(&output);
+    assert!(requests.is_empty());
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["cancelled"], true);
 }
 
 #[tokio::test]

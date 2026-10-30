@@ -39,6 +39,7 @@ use crate::state::AppState;
 type Handled = Result<serde_json::Value, RpcError>;
 
 mod providers;
+mod removal;
 pub(super) mod rest;
 mod tokens;
 

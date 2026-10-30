@@ -613,6 +613,9 @@ pub(super) async fn handle_account_remove(
     params: serde_json::Value,
 ) -> Handled {
     let params: crosslane_ipc::protocol::AccountRemoveParams = parse_params(params)?;
+    if params.force {
+        return super::removal::force_remove(state, "kiro", &params.id).await;
+    }
     let id = params.id;
     let removed = commit_account_change(state, |store| {
         let account = store

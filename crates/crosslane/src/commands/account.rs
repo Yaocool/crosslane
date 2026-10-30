@@ -277,7 +277,7 @@ pub enum AccountCommand {
     /// 删除 Kiro/Copilot 账号；可按来源消歧。
     #[command(
         visible_alias = "delete",
-        long_about = "删除一个或多个 Kiro/Copilot 账号，整批执行前只需输入一次 y 或 yes 确认。同名账号用 --provider 或 provider/account_id 消歧。\n\n示例：\n  crosslane account rm acc_7f3a2b1c --provider kiro\n  crosslane account rm acc_8b2c --provider copilot"
+        long_about = "删除一个或多个 Kiro/Copilot 账号，整批执行前只需输入一次 y 或 yes 确认。同名账号用 --provider 或 provider/account_id 消歧。--force 自动从所有 service 解绑后删除账号；不传时保留绑定保护。\n\n示例：\n  crosslane account rm acc_7f3a2b1c --provider kiro\n  crosslane account rm acc_8b2c --provider copilot\n  crosslane account rm acc_7f3a2b1c acc_8b2c --provider kiro --force --yes"
     )]
     Rm {
         /// 一个或多个账号 ID/邮箱，以空格分隔。
@@ -286,6 +286,9 @@ pub enum AccountCommand {
         /// 提供源实例 ID；也可使用 provider/account_id。
         #[arg(long)]
         provider: Option<String>,
+        /// 自动从所有 service 解绑后删除；仍需确认，可配合 --yes。
+        #[arg(long)]
+        force: bool,
         /// 跳过交互确认，用于自动化。
         #[arg(short = 'y', long)]
         yes: bool,
@@ -1609,7 +1612,12 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
                 println!("已添加 {}（{}）", result.email, result.id);
             }
         }
-        AccountCommand::Rm { ids, provider, yes } => {
+        AccountCommand::Rm {
+            ids,
+            provider,
+            force,
+            yes,
+        } => {
             if !crate::commands::confirm_unless(yes, &remove_confirmation_prompt(&ids)).await? {
                 if json {
                     print_json(&serde_json::json!({
@@ -1622,7 +1630,7 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
                 }
                 return Ok(());
             }
-            remove_accounts(client, &ids, provider.as_deref(), json).await?;
+            remove_accounts(client, &ids, provider.as_deref(), force, json).await?;
         }
         AccountCommand::Enable { id, provider } => {
             set_enabled(client, &id, provider.as_deref(), true, json).await?
@@ -1992,13 +2000,14 @@ async fn remove_accounts(
     client: &mut AdminClient,
     ids: &[String],
     provider: Option<&str>,
+    force: bool,
     json: bool,
 ) -> Result<()> {
     if let [id] = ids {
         let result: serde_json::Value = client
             .call(
                 method::V2_ACCOUNT_REMOVE,
-                serde_json::json!({"id": id,"provider":provider}),
+                serde_json::json!({"id": id,"provider":provider,"force":force}),
             )
             .await?;
         if json {
@@ -2015,7 +2024,7 @@ async fn remove_accounts(
         match client
             .call::<serde_json::Value>(
                 method::V2_ACCOUNT_REMOVE,
-                serde_json::json!({"id": id,"provider":provider}),
+                serde_json::json!({"id": id,"provider":provider,"force":force}),
             )
             .await
         {
@@ -2172,30 +2181,7 @@ async fn read_batch_source(file: &str) -> Result<String> {
 }
 
 fn parse_csv_line(line: &str) -> Result<Vec<String>> {
-    let mut fields = vec![String::new()];
-    let mut quoted = false;
-    let mut chars = line.chars().peekable();
-    while let Some(character) = chars.next() {
-        match character {
-            '"' if quoted && chars.peek() == Some(&'"') => {
-                fields
-                    .last_mut()
-                    .ok_or_else(|| anyhow!("CSV 解析状态无效"))?
-                    .push('"');
-                chars.next();
-            }
-            '"' => quoted = !quoted,
-            ',' if !quoted => fields.push(String::new()),
-            other => fields
-                .last_mut()
-                .ok_or_else(|| anyhow!("CSV 解析状态无效"))?
-                .push(other),
-        }
-    }
-    if quoted {
-        return Err(anyhow!("未闭合的引号"));
-    }
-    Ok(fields)
+    crosslane_core::account_csv::parse_csv_line(line).map_err(Into::into)
 }
 
 fn print_account_services(result: &AccountServicesResult, json: bool) -> Result<()> {
@@ -2719,6 +2705,7 @@ mod tests {
             &mut client,
             &["missing@example.com".into(), "acc_00000002".into()],
             None,
+            false,
             false,
         )
         .await

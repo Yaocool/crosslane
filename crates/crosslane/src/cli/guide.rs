@@ -205,7 +205,7 @@ Copilot API 地址优先使用账号 token 返回的 endpoint；仅当缺失且�
         }
         "version" => "`crosslane version` 显示 CLI 版本、Rust MSRV 和默认 Kiro 上游端点；Copilot API 地址由各账号的 token 响应决定。",
         "account" => {
-            "统一用 `account add --provider <ID>` 添加账号：Kiro 的 --auth sso 搭配 --email/--password-stdin，--token-stdin 搭配 --email 导入 API key；Copilot 默认 Device Flow，--token-stdin 导入 GitHub token。旧 add-sso/add-api-key/import 保留。`list/show/rm/enable/disable/tag/export/refresh/probe/reset-health` 覆盖两者，可用 `--provider` 消歧；`refresh/probe/reset-health --all` 省略来源时覆盖全部来源。Kiro 的 `probe` 做真实推理，Copilot 的 `probe` 刷新凭证与模型目录；两种来源均支持标签筛选与 account services；`overage`、`regen-machine-id` 仅适用于 Kiro。详情见 `crosslane guide kiro` 和 `crosslane guide copilot`。"
+            "统一用 `account add --provider <ID>` 添加账号：Kiro 的 --auth sso 搭配 --email/--password-stdin，--token-stdin 搭配 --email 导入 API key；Copilot 默认 Device Flow，--token-stdin 导入 GitHub token。旧 add-sso/add-api-key/import 保留。`list/show/rm/enable/disable/tag/export/refresh/probe/reset-health` 覆盖两者，可用 `--provider` 消歧；`account rm <账号...> --force` 自动从所有 service 解绑再删除，跳过确认仍需 --yes；省略 --force 保留绑定保护。`refresh/probe/reset-health --all` 省略来源时覆盖全部来源。Kiro 的 `probe` 做真实推理，Copilot 的 `probe` 刷新凭证与模型目录；两种来源均支持标签筛选与 account services；`overage`、`regen-machine-id` 仅适用于 Kiro。详情见 `crosslane guide kiro` 和 `crosslane guide copilot`。"
         }
         "balance" => {
             "本评分仅用于 Kiro 账号池：score = active_ratio×weight_active + used_credit_ratio×weight_credit + recent_idle_penalty×weight_idle。\n分数越低越优先；随后加入小幅随机抖动。用 `crosslane pool --provider kiro --watch --explain` 查看实时评分。Copilot 的 `pool` 只显示账号认证与模型支持，不提供这组三因子评分。"

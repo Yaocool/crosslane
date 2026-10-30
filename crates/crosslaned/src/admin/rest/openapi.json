@@ -407,9 +407,18 @@
               "type": "string"
             },
             "description": "Provider-local account ID; IDs are preferred over login/email aliases."
+          },
+          {
+            "name": "force",
+            "in": "query",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            },
+            "description": "Automatically unbind this account from every service before deleting it."
           }
         ],
-        "description": "Returns 409 while any service uses this account. Unbind the account before deletion. In-flight requests are not cancelled."
+        "description": "Without force, returns 409 while any service uses this account. With force=true, unbinds every affected service (including disabled services and global/tag/manual pools), then deletes the account. Exclusions persist to protect against silent rejoining after re-import. Deletion failure restores bindings; rollback failures are reported. In-flight requests are not cancelled."
       }
     },
     "/accounts/{provider}/{account}/enabled": {

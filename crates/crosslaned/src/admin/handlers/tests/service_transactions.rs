@@ -164,6 +164,54 @@ fn automatic_service_ports_reserve_both_running_and_pending_status_ports() {
     );
 }
 
+#[tokio::test]
+async fn force_remove_uses_the_reloaded_copilot_and_unbinds_its_new_tags() {
+    let (_directory, state) = state_with_copilot().await;
+    for (name, tag) in [("global", None), ("moved", Some("moved"))] {
+        expect_ok(dispatch(&state, Request::new(1, method::SERVICE_CREATE,
+            serde_json::json!({"name":name,"host":"127.0.0.1","port":port(),"account_tag":tag,
+                "allowed_providers":["copilot"],"default_provider":"copilot"})
+        )).await);
+    }
+    let provider_id = crosslane_core::provider::ProviderId::parse("copilot").unwrap();
+    let old = state.providers.copilot(&provider_id).await.unwrap();
+    let mut disk = state.config.current().as_ref().clone();
+    disk.provider
+        .iter_mut()
+        .find(|provider| provider.id == "copilot")
+        .unwrap()
+        .pool
+        .max_concurrent_per_account += 1;
+    let file = state.paths.data_dir.join("providers/copilot/accounts.json");
+    let mut accounts: serde_json::Value =
+        serde_json::from_slice(&tokio::fs::read(&file).await.unwrap()).unwrap();
+    accounts[0]["tags"] = serde_json::json!(["moved"]);
+    tokio::fs::write(&file, accounts.to_string()).await.unwrap();
+    tokio::fs::write(&state.paths.config_file, toml::to_string(&disk).unwrap())
+        .await
+        .unwrap();
+    expect_ok(
+        dispatch(
+            &state,
+            Request::new(
+                2,
+                method::V2_ACCOUNT_REMOVE,
+                serde_json::json!({"provider":"copilot","id":"acc_b85b28b7","force":true}),
+            ),
+        )
+        .await,
+    );
+    let current = state.providers.copilot(&provider_id).await.unwrap();
+    assert!(!Arc::ptr_eq(&old, &current));
+    assert!(current.account("acc_b85b28b7").await.is_none());
+    for service in &state.config.current().proxy_service {
+        assert_eq!(service.excluded_account_ids, ["copilot/acc_b85b28b7"]);
+    }
+    let accounts: serde_json::Value =
+        serde_json::from_slice(&tokio::fs::read(&file).await.unwrap()).unwrap();
+    assert!(accounts["accounts"].as_array().unwrap().is_empty());
+    state.shutdown.cancel();
+}
 
 #[tokio::test]
 async fn copilot_local_mutations_use_the_generation_published_while_waiting_for_config_lock() {

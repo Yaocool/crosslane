@@ -10,6 +10,7 @@ use super::*;
 mod account_persistence;
 #[cfg(unix)]
 mod config_persistence;
+mod force_removal;
 mod identity_selection;
 mod service_transactions;
 

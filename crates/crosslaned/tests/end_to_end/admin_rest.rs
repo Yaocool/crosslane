@@ -259,6 +259,15 @@ async fn admin_rest_authentication_is_independent_rotatable_and_audited_without_
     assert!(schema.get("data").is_none());
     assert_eq!(schema["security"][0], json!({"AdminBearer":[]}));
     assert_eq!(schema["paths"].as_object().unwrap().len(), 25);
+    let removal = &schema["paths"]["/accounts/{provider}/{account}"]["delete"];
+    assert!(removal["parameters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|parameter| parameter["name"] == "force"
+            && parameter["in"] == "query"
+            && parameter["schema"]["default"] == false));
+
     fixture.edit_auth(true, "fixture-rotated-admin-token").await;
     assert_eq!(
         fixture
@@ -767,9 +776,223 @@ async fn admin_rest_copilot_import_stores_initial_tags_and_reports_native_quota(
         fixture.api(Method::GET, &account_path, None, 200).await["data"]["tags"],
         json!(["team-a", "test"])
     );
+    let accounts_file = fixture
+        .daemon
+        .home()
+        .join("providers/copilot-team/accounts.json");
+    let backup = accounts_file.with_extension("backup");
+    let config_file = fixture.daemon.home().join("config.toml");
+    let original_config = tokio::fs::read(&config_file).await.unwrap();
+    tokio::fs::rename(&accounts_file, &backup).await.unwrap();
+    tokio::fs::create_dir(&accounts_file).await.unwrap();
+    fixture
+        .api(
+            Method::DELETE,
+            &format!("{account_path}?force=true"),
+            None,
+            500,
+        )
+        .await;
+    tokio::fs::remove_dir(&accounts_file).await.unwrap();
+    tokio::fs::rename(&backup, &accounts_file).await.unwrap();
+    assert_eq!(
+        tokio::fs::read(&config_file).await.unwrap(),
+        original_config
+    );
+    let pool = fixture.api(Method::GET, &service_path, None, 200).await;
+    assert_eq!(pool["data"]["account_pool"]["total_accounts"], 1);
+    assert_eq!(
+        pool["data"]["account_pool"]["excluded_account_ids"],
+        json!([])
+    );
+    fixture
+        .api(
+            Method::DELETE,
+            &format!("{account_path}?force=false"),
+            None,
+            409,
+        )
+        .await;
+    let removed = fixture
+        .api(
+            Method::DELETE,
+            &format!("{account_path}?force=true"),
+            None,
+            200,
+        )
+        .await;
+    assert_eq!(
+        removed["data"],
+        json!({"removed":id,"provider_id":"copilot-team","reference":format!("copilot-team/{id}")})
+    );
+    let pool = fixture.api(Method::GET, &service_path, None, 200).await;
+    assert_eq!(pool["data"]["account_pool"]["total_accounts"], 0);
+    assert_eq!(
+        pool["data"]["account_pool"]["excluded_account_ids"],
+        json!([format!("copilot-team/{id}")])
+    );
+    assert_eq!(pool["data"]["service"]["running"], true);
+    fixture.restart().await;
+    let pool = fixture.api(Method::GET, &service_path, None, 200).await;
+    assert_eq!(pool["data"]["account_pool"]["total_accounts"], 0);
+    assert_eq!(
+        fixture
+            .api(Method::GET, "/accounts?provider=copilot-team", None, 200)
+            .await["data"]["total"],
+        0
+    );
     fixture.daemon.stop().await;
 }
 
+#[tokio::test]
+async fn admin_rest_force_remove_unbinds_all_kiro_services_and_persists_after_restart() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    let mut fixture = AdminFixture::start(false).await;
+    let mut ids = Vec::new();
+    for name in ["remove", "keep"] {
+        let account = fixture
+            .api(
+                Method::POST,
+                "/accounts",
+                Some(json!({
+                    "provider":"kiro","auth":"api-key","email":format!("{name}@example.invalid"),
+                    "token":format!("ksk_fixture_{name}"),"tags":["team-a"]
+                })),
+                201,
+            )
+            .await;
+        ids.push(account["data"]["id"].as_str().unwrap().to_owned());
+    }
+    let account_path = format!("/accounts/kiro/{}", ids[0]);
+    let aggregate_path = format!("/accounts/all/{}", ids[0]);
+    fixture
+        .api(
+            Method::POST,
+            &format!("{aggregate_path}/enabled"),
+            Some(json!({"enabled":false})),
+            400,
+        )
+        .await;
+    fixture
+        .api(
+            Method::POST,
+            &format!("{aggregate_path}/tags"),
+            Some(json!({"add":["must-not-change"]})),
+            400,
+        )
+        .await;
+    fixture
+        .api(
+            Method::DELETE,
+            &format!("{aggregate_path}?force=true"),
+            None,
+            400,
+        )
+        .await;
+    let unchanged = fixture.api(Method::GET, &account_path, None, 200).await;
+    assert_eq!(unchanged["data"]["enabled"], true);
+    assert_eq!(unchanged["data"]["tags"], json!(["team-a"]));
+    let mut services = Vec::new();
+    for (name, tag, remaining) in [
+        ("global", None, 1),
+        ("tagged", Some("team-a"), 1),
+        ("manual", Some("other"), 0),
+    ] {
+        let created = fixture
+            .api(
+                Method::POST,
+                "/services",
+                Some(json!({
+                    "name":name,"host":"127.0.0.1","port":unused_tcp_port(),"account_tag":tag
+                })),
+                201,
+            )
+            .await;
+        let path = format!(
+            "/services/{}",
+            created["data"]["service"]["id"].as_str().unwrap()
+        );
+        if name == "manual" {
+            fixture
+                .api(
+                    Method::POST,
+                    &format!("{path}/accounts"),
+                    Some(json!({"accounts":[format!("kiro/{}", ids[0])]})),
+                    200,
+                )
+                .await;
+        }
+        if name == "tagged" {
+            fixture
+                .api(Method::PATCH, &path, Some(json!({"enabled":false})), 200)
+                .await;
+        }
+        services.push((name, path, remaining));
+    }
+    fixture.api(Method::DELETE, &account_path, None, 409).await;
+    fixture
+        .api(
+            Method::DELETE,
+            &format!("{account_path}?force=false"),
+            None,
+            409,
+        )
+        .await;
+    fixture
+        .api(
+            Method::DELETE,
+            &format!("{account_path}?force=invalid"),
+            None,
+            400,
+        )
+        .await;
+    let denied = fixture
+        .request(
+            Method::DELETE,
+            &format!("{account_path}?force=true"),
+            Some(READ_TOKEN),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 403);
+    let removed = fixture
+        .api(
+            Method::DELETE,
+            &format!("{account_path}?force=true"),
+            None,
+            200,
+        )
+        .await;
+    assert_eq!(removed["data"]["removed"], ids[0]);
+    for restart in [false, true] {
+        if restart {
+            fixture.restart().await;
+        }
+        fixture.api(Method::GET, &account_path, None, 404).await;
+        let accounts = fixture
+            .api(Method::GET, "/accounts?provider=kiro", None, 200)
+            .await;
+        assert_eq!(accounts["data"]["total"], 1);
+        for (name, path, remaining) in &services {
+            let service = fixture.api(Method::GET, path, None, 200).await;
+            assert_eq!(
+                service["data"]["account_pool"]["total_accounts"],
+                *remaining
+            );
+            assert_eq!(service["data"]["service"]["running"], *name != "tagged");
+            assert_eq!(
+                service["data"]["account_pool"]["excluded_account_ids"],
+                json!([ids[0]])
+            );
+            assert_eq!(
+                service["data"]["account_pool"]["manual_account_ids"],
+                json!([])
+            );
+        }
+    }
+    fixture.daemon.stop().await;
+}
 
 impl AdminFixture {
     async fn batch_report(&self, id: &str) -> Value {

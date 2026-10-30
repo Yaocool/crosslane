@@ -473,14 +473,31 @@ pub(super) fn protect_error(mut error: ApiError, secrets: &[String]) -> ApiError
     error
 }
 
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoveQuery {
+    #[serde(default)]
+    force: bool,
+}
+
 pub(super) async fn remove(
     State(state): State<RestState>,
     Path((provider, account)): Path<(String, String)>,
+    request: Request,
 ) -> ApiResult<Response> {
+    let input: RemoveQuery = query(&request)?;
     let account = cached_lookup(&state.app, &provider, &account).await?;
-    rpc(&state.app, method::V2_ACCOUNT_REMOVE,
-        json!({"provider":provider,"id":account["id"]})).await?;
-    Ok(ok(json!({"removed":account["id"],"provider_id":account["provider_id"],"reference":account["reference"]})))
+    rpc(
+        &state.app,
+        method::V2_ACCOUNT_REMOVE,
+        json!({"provider":provider,"id":account["id"],"force":input.force}),
+    )
+    .await?;
+    // A provider's native removal result can contain raw quota errors and
+    // endpoint metadata. Return a stable acknowledgement for both drivers.
+    Ok(ok(
+        json!({"removed":account["id"],"provider_id":account["provider_id"],"reference":account["reference"]}),
+    ))
 }
 
 #[derive(Deserialize)]
