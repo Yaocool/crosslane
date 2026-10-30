@@ -446,9 +446,10 @@ async fn default_byte_limit_allows_compaction_of_history_larger_than_eight_mib()
         "OLD_FACT=cobalt-731\n{}\nLATEST_FACT=mango-482",
         format!("{}\n", " ".repeat(127)).repeat(66000)
     );
-    // Several full BPE/serialization passes over >8 MiB need scheduling slack
-    // on a busy runner; the production byte/window bounds remain unchanged.
-    let response = reqwest::Client::builder().timeout(Duration::from_secs(60)).build().unwrap()
+    assert!(history.len() > 8 * 1024 * 1024);
+    // Debug BPE/serialization passes over >8 MiB can exceed a minute even
+    // without competing tests. Keep the production byte/window bounds intact.
+    let response = reqwest::Client::builder().timeout(Duration::from_secs(180)).build().unwrap()
         .post(format!("http://127.0.0.1:{port}/v1/messages"))
         .header("x-api-key", daemon.api_key.as_deref().unwrap())
         .header("user-agent", "claude-cli/2.1.260 (external, e2e)")
