@@ -18,6 +18,7 @@ pub enum Topic {
     Service,
     #[value(name = "apikey")]
     ApiKey,
+    Admin,
     Pool,
     Balance,
     Diagnose,
@@ -45,6 +46,7 @@ impl Topic {
             Self::Sso => "sso",
             Self::Service => "service",
             Self::ApiKey => "apikey",
+            Self::Admin => "admin",
             Self::Pool => "pool",
             Self::Balance => "balance",
             Self::Diagnose => "diagnose",
@@ -72,6 +74,7 @@ const TOPICS: &[(&str, &str)] = &[
     ("sso", "Kiro IAM Identity Center SSO 单账号与批量导入"),
     ("service", "代理服务生命周期"),
     ("apikey", "API key、限额与用量"),
+    ("admin", "Admin REST 多令牌的创建、启停、轮换与撤销"),
     ("pool", "Kiro 评分与 Copilot 账号模型支持"),
     ("balance", "Kiro 账号池调度评分原理"),
     ("diagnose", "Kiro 网络和账号真实推理诊断"),
@@ -111,12 +114,31 @@ pub fn print(topic: Option<&str>, provider: Option<&str>) -> Result<()> {
         }
     }
     println!("{text}");
-    println!("\n--provider/-p 使用 `provider list` 中的实例 ID；--kind/--provider-kind 使用驱动类型。可用 `crosslane guide copilot -p <ID>` 按自定义 ID 生成接入示例。");
+    if topic != "admin" {
+        println!("\n--provider/-p 使用 `provider list` 中的实例 ID；--kind/--provider-kind 使用驱动类型。可用 `crosslane guide copilot -p <ID>` 按自定义 ID 生成接入示例。");
+    }
     Ok(())
 }
 
 fn topic_text(topic: &str) -> Result<&'static str> {
     let text = match topic {
+        "admin" => r#"Admin REST 令牌（全局，不接受 --provider）
+1. 在配置中开启 [status_http]，默认地址 127.0.0.1:7651；首次启用需要重启 daemon。
+2. 创建并启用管理访问：
+   crosslane admin token create --name ops --enable-rest
+   crosslane admin token create --name monitor --role read-only
+3. 查看元数据，不输出明文或摘要：
+   crosslane admin token list
+   crosslane admin token show ops
+4. 轮换、启停和撤销：
+   crosslane admin token rotate ops
+   crosslane admin token disable monitor
+   crosslane admin token enable monitor
+   crosslane admin token revoke monitor
+
+命令通过本机 Unix socket 执行，不需要已有 Bearer token。create/rotate 的明文只返回一次，--json 的 secret 字段可供自动化使用；配置仅保存 SHA256 摘要。请求头发送明文 Authorization: Bearer TOKEN。
+多把 admin/read-only 令牌可同时有效，read-only 只允许 GET/HEAD。启停、轮换、撤销立即影响后续请求，已受理的请求/批量任务不会被自动取消。rotate 保留 ID、名称、权限和启停状态。
+旧 token_sha256/read_token_sha256 配置继续兼容，在列表中显示为 legacy-admin/legacy-read-only，也可使用这些 ID 管理。最后一把令牌撤销后关闭 Admin REST，公开状态和业务 service 保持原配置。"#,
         "provider" => {
             r#"命令适用范围
   两者共用：provider、status、ready、account add/list/show/rm/enable/disable/tag/export/refresh/probe/reset-health/services、pool、models、model-map、service、apikey、stats、logs show/follow；--provider 可放在任意子命令前后，也可设置 CROSSLANE_PROVIDER；列表与 --all 操作默认聚合全部来源，单账号按 ID 自动识别；export 保持旧 Kiro 格式，需 --provider all 才导出全部。

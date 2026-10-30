@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 
 pub mod account;
+pub mod admin;
 pub mod runtime;
 
 /// Read an explicit confirmation for a destructive operation.

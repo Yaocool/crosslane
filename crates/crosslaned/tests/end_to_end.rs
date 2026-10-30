@@ -122,6 +122,8 @@ mod status_http;
 #[path = "end_to_end/admin_rest.rs"]
 mod admin_rest;
 
+#[path = "end_to_end/admin_tokens.rs"]
+mod admin_tokens;
 
 struct Daemon {
     child: Child,

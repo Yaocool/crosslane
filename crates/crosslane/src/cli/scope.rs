@@ -33,7 +33,7 @@ pub(super) fn for_path(path: &[&str]) -> Scope {
     }
     match path {
         [] | ["help" | "guide" | "completions", ..] => Scope::Navigation,
-        ["health" | "version" | "restart" | "stop" | "uninstall" | "config", ..]
+        ["health" | "version" | "restart" | "stop" | "uninstall" | "config" | "admin", ..]
         | ["logs", "trace" | "files" | "path"]
         | ["alert"]
         | ["alert", "config" | "events" | "platforms" | "list" | "logs"]

@@ -8,6 +8,8 @@ use tempfile::TempDir;
 use super::*;
 
 mod account_persistence;
+#[cfg(unix)]
+mod config_persistence;
 mod identity_selection;
 mod service_transactions;
 

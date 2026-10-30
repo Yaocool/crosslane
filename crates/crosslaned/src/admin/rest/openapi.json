@@ -1859,7 +1859,7 @@
       "AdminBearer": {
         "type": "http",
         "scheme": "bearer",
-        "description": "Plaintext Admin REST token matching a configured SHA256 digest. Send the plaintext value, never the stored digest."
+        "description": "Plaintext Admin REST token managed with crosslane admin token, or a token matching legacy digest fields. Multiple independently named admin/read-only tokens are supported. Send the plaintext value, never the stored SHA256 digest."
       }
     },
     "schemas": {

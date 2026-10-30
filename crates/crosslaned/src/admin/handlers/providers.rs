@@ -20,6 +20,7 @@ pub(super) async fn handle_capabilities(state: &Arc<AppState>) -> Handled {
         "rpc_versions": [1, 2],
         "provider_kinds": descriptors.iter().map(|provider| provider.kind.as_str()).collect::<BTreeSet<_>>(),
         "features": [
+            "admin_rest_tokens",
             "provider_registry",
             "provider_scoped_accounts",
             "provider_scoped_account_tags",

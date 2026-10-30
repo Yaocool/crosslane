@@ -52,6 +52,10 @@ pub(super) fn handle_nested_help(matches: &clap::ArgMatches) -> Result<bool> {
 
 pub fn empty_group_path(command: &Command) -> Option<&'static str> {
     match command {
+        Command::Admin { command: None } => Some("admin"),
+        Command::Admin {
+            command: Some(crate::commands::admin::AdminCommand::Token { command: None }),
+        } => Some("admin token"),
         Command::Provider { command: None }
         | Command::Config { command: None }
         | Command::Account { command: None }
@@ -107,14 +111,17 @@ pub fn print_all_commands(path: &[String]) -> Result<()> {
 }
 
 pub fn exit_missing_action(path: &str) -> ! {
-    let path = vec![path.to_owned()];
+    let path = path
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
     let mut command = command_at_path(&path).unwrap_or_else(super::command);
     let hint = match path[0].as_str() {
         "logs" => "请改用 `crosslane logs show`".to_owned(),
         "models" => "请改用 `crosslane models list`".to_owned(),
         "tasks" => "请改用 `crosslane tasks list`".to_owned(),
         "diagnose" => "请改用 `crosslane diagnose all`".to_owned(),
-        group => format!("请用 `crosslane help {group}` 查看可用操作"),
+        _ => format!("请用 `crosslane help {}` 查看可用操作", path.join(" ")),
     };
     command
         .error(

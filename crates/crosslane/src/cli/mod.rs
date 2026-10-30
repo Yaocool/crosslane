@@ -304,7 +304,12 @@ pub async fn handle_local(cli: &Cli) -> Result<bool> {
                 if cli.json {
                     help::exit_missing_action(path);
                 }
-                help::print_command_help(&[path.to_owned()])?;
+                help::print_command_help(
+                    &path
+                        .split_whitespace()
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>(),
+                )?;
                 return Ok(true);
             }
             if wrapper_local_only() {

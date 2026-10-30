@@ -40,11 +40,18 @@ type Handled = Result<serde_json::Value, RpcError>;
 
 mod providers;
 pub(super) mod rest;
+mod tokens;
 
 /// 分发一个 RPC 请求。
 pub async fn dispatch(state: &Arc<AppState>, request: Request) -> Response {
     let id = request.id;
     let outcome = match request.method.as_str() {
+        method::ADMIN_TOKEN_LIST => tokens::list(state),
+        method::ADMIN_TOKEN_SHOW => tokens::show(state, request.params),
+        method::ADMIN_TOKEN_CREATE => tokens::create(state, request.params).await,
+        method::ADMIN_TOKEN_ROTATE => tokens::rotate(state, request.params).await,
+        method::ADMIN_TOKEN_REVOKE => tokens::revoke(state, request.params).await,
+        method::ADMIN_TOKEN_SET_ENABLED => tokens::set_enabled(state, request.params).await,
         method::V2_CAPABILITIES => providers::handle_capabilities(state).await,
         method::V2_PROVIDER_LIST => providers::handle_provider_list(state, request.params).await,
         method::V2_PROVIDER_SHOW => providers::handle_provider_show(state, request.params).await,

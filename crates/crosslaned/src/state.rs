@@ -605,6 +605,18 @@ impl AppState {
         read_lock(&self.runtime_config).clone()
     }
 
+    /// Publish only authentication changes while the caller holds config_mutation.
+    /// Business listeners/providers and their rollback baseline stay untouched.
+    pub(crate) fn apply_admin_rest_auth_locked(
+        &self,
+        rest: crosslane_core::config::AdminRestConfig,
+    ) {
+        write_lock(&self.runtime_config).admin.rest = rest.clone();
+        let mut current = self.config.current().as_ref().clone();
+        current.admin.rest = rest;
+        self.config.replace(current);
+    }
+
     /// 管理面 socket 路径。
     pub fn admin_socket(&self) -> PathBuf {
         PathBuf::from(&self.config.current().admin.socket)
