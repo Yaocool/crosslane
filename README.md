@@ -87,6 +87,13 @@ crosslane ready
 `health` checks that the daemon responds; `ready` checks whether a configured
 service can accept work. A generation request is needed to verify upstream
 access. Never use an upstream credential as the client key.
+HTTP `/`, `/health`, and `/ready` use the [independent status listener](docs/startup-and-debugging.md#independent-status-http),
+enabled with `[status_http]`. Business service ports serve client-compatible endpoints.
+[Admin REST API](docs/admin-rest.md) on the independent port uses dedicated Bearer authentication
+for accounts, tags, services, grouped quotas and runtime management, with an optional read-only token.
+Bulk account creation accepts CLI-compatible SSO CSV for automatic login and persistence, with concurrency and per-row progress.
+Use `crosslane admin token create/list/show/rotate/disable/enable/revoke` to manage independent
+admin credentials; plaintext is returned only at creation/rotation, and only digests are stored.
 
 ## Connect a client
 

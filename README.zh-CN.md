@@ -76,6 +76,13 @@ crosslane ready
 
 `health` 检查 daemon 是否响应；`ready` 检查已配置服务是否具备接收请求的条件。
 还需实际发送生成请求才能验证上游可用。不要把上游凭证当作客户端 Key。
+HTTP 的 `/`、`/health`、`/ready` 通过[独立状态监听](docs/startup-and-debugging.zh-CN.md#独立状态-http)
+提供，需启用 `[status_http]`；业务服务端口只承载客户端兼容接口。
+独立端口上的 [Admin REST API](docs/admin-rest.zh-CN.md) 使用专用 Bearer 鉴权，提供账号、
+标签、服务、分组额度及常用运行管理接口，支持独立只读令牌。
+账号批量接口可直接上传与 CLI 相同的 SSO CSV，自动登录并入库，支持并发和逐条进度查询。
+通过 `crosslane admin token create/list/show/rotate/disable/enable/revoke` 管理多把独立
+管理令牌，明文只在创建或轮换时显示，配置仅保存摘要。
 
 ## 接入客户端
 

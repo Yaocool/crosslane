@@ -181,7 +181,56 @@ usage or remaining organization credits. An unlimited personal quota, including
 Business responses containing zero limits and `credits_used`, does not establish
 the organization's balance. Kiro credits and Copilot AIU remain separate.
 
+## Independent status HTTP
+
+Process status endpoints use a dedicated listener, independent of API proxy services and their
+TLS, client keys, and User-Agent policies. Add this section to the file shown by
+`crosslane config path`:
+
+```toml
+[status_http]
+enabled = true
+host = "127.0.0.1"
+port = 7651
+```
+
+The listener is disabled by default. When enabled, its default address is `127.0.0.1:7651`.
+Restart `crosslaned` after changing this section; `config reload` reports the restart requirement
+and retains the current listener. Change `host` to the appropriate listening address for remote
+probes. Docker host networking needs no additional port mapping.
+
+| Method and path | Purpose |
+| --- | --- |
+| `GET /` | Process name, version, and status |
+| `GET /health` | Liveness, untagged account counts, and each service's name, enabled flag, and listener running flag |
+| `GET /ready` | Required background tasks, metering recovery, and the listener and effective account pool of every enabled service; `200` when ready, `503` otherwise |
+
+```bash
+curl http://127.0.0.1:7651/health
+curl -i http://127.0.0.1:7651/ready
+```
+
+These endpoints read local snapshots without contacting upstreams or refreshing credentials, and
+require no client key or product-specific User-Agent. With no proxy services, `/health` still
+returns `200`, while `/ready` returns `503` with reasons. For both Kiro and Copilot, health counts
+include only accounts whose own `tags` array is empty, including disabled and unavailable accounts,
+with separate counts for each health state. Shared accounts are counted once. A service without
+`account_tag` uses the global pool and can still include tagged accounts; that is a different scope.
+Public health responses omit credits, service IDs, provider metadata, bindings, and raw errors.
+Each `services` entry contains only `name`, `enabled`, and `running`. Readiness still evaluates
+each service's actual provider scope, tags, manual bindings, and exclusions, so tagged service
+pools remain eligible even when health reports zero untagged accounts.
+
+After migration, `/`, `/health`, and `/ready` on business service ports return `404`; move existing
+HTTP probes to the dedicated status port. Automatic service port allocation skips the enabled
+status port. Model protocol endpoints, model discovery, and the client compatibility endpoint
+`/api/event_logging/batch` remain on business ports. CLI management continues over the Unix socket.
+
 ## Services and client access
+
+The independent listener can also expose `/admin/v1` with separate Bearer authentication
+for account/provider/tag management, service lifecycle, grouped pools and quotas.
+See [Admin REST API](admin-rest.md) for configuration and endpoints.
 
 A new installation has no business listener. Create one and save the client
 API key printed by the command:

@@ -153,7 +153,50 @@ AIU 从本机观察到的第一条计费响应开始累计，包含普通 JSON �
 全账号用量或组织剩余额度。个人额度不限，包括 Business 返回的零上限及
 `credits_used`，不能用来推断组织余额。Kiro credits 与 Copilot AIU 分别统计。
 
+## 独立状态 HTTP
+
+进程状态接口使用独立监听，不依赖任何 API 代理服务，也不使用业务端口的 TLS、客户端 Key
+或 User-Agent 策略。在 `crosslane config path` 显示的配置文件中设置：
+
+```toml
+[status_http]
+enabled = true
+host = "127.0.0.1"
+port = 7651
+```
+
+默认 `enabled = false`，启用后缺省监听 `127.0.0.1:7651`。修改这一节后需重启
+`crosslaned`；`config reload` 会提示需要重启，并保留当前监听。需要从其他机器探测时，
+将 `host` 改为对应的监听地址。Docker 的 host network 无需额外映射端口。
+
+| 方法与路径 | 含义 |
+| --- | --- |
+| `GET /` | 进程名称、版本和状态 |
+| `GET /health` | 存活检查，仅返回未打标签账号的数量，以及各服务的名称、启用状态和监听运行状态 |
+| `GET /ready` | 检查必要后台任务、计量恢复状态，以及每个启用服务的监听和有效账号池；就绪为 `200`，未就绪为 `503` |
+
+```bash
+curl http://127.0.0.1:7651/health
+curl -i http://127.0.0.1:7651/ready
+```
+
+这些接口只读取本地快照，不联系上游、不刷新凭证，也无需客户端 Key 或特定客户端
+User-Agent。没有业务服务时，`/health` 仍返回 `200`，`/ready` 返回 `503` 并说明原因。
+`/health` 对 Kiro 和 Copilot 都只统计账号自身 `tags` 为空的账号，包含其中停用或不可用
+的账号，并分别给出各健康状态的数量；账号被多个服务共用时不会重复计算。没有设置
+`account_tag` 的服务使用全局账号池，仍可能包含带标签的账号，这与 `/health` 的筛选条件不同。
+`/health` 的响应不包含 credits、service ID、来源信息、绑定关系或原始错误；`services` 每项仅包含
+`name`、`enabled`、`running`。`/ready` 继续按各服务真实的来源、标签、手工绑定和排除规则
+判断就绪，带标签的服务不会因 `/health` 只统计未打标签账号而被错误判断为不可用。
+
+迁移后，业务服务端口上的 `/`、`/health`、`/ready` 返回 `404`，已有 HTTP 探针需要改用
+独立状态端口。自动创建业务服务时会避开已启用的状态端口。模型协议接口、模型列表与
+客户端兼容端点 `/api/event_logging/batch` 继续使用业务端口；CLI 管理仍使用 Unix socket。
+
 ## 服务与客户端访问
+
+独立监听还可开启带独立 Bearer 鉴权的 `/admin/v1` 管理接口，支持按来源和标签管理账号、
+创建和启停服务、查询分组账号池及额度。配置与完整接口见 [Admin REST API](admin-rest.zh-CN.md)。
 
 新安装不会自动创建业务监听。创建服务并妥善保存命令输出的客户端 API Key：
 
