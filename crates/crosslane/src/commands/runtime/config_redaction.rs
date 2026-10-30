@@ -45,6 +45,8 @@ fn sensitive_key(key: &str, parent: Option<&str>) -> bool {
         return true;
     }
     key == "key"
+        || key == "token_sha256"
+        || key == "read_token_sha256"
         || (key == "api_key" && parent.is_some())
         || key == "token"
         || key == "authorization"
@@ -128,6 +130,14 @@ mod tests {
     fn masks_credentials_in_raw_and_effective_config_without_leaking_comments() {
         let raw = r#"
 # old token=comment-secret
+[admin.rest]
+enabled = true
+token_sha256 = "admin-write-digest"
+read_token_sha256 = "admin-read-digest"
+[[admin.rest.tokens]]
+id = "adm_0123456789abcdef"
+name = "ops"
+token_sha256 = "admin-named-digest"
 [[api_key]]
 id = "ak_public"
 key = "sk-secret"
@@ -145,6 +155,7 @@ personal_access = "unknown-secret"
             path: "/tmp/config.toml".into(),
             raw: raw.into(),
             effective_json: serde_json::json!({
+                "admin":{"rest":{"enabled":true,"token_sha256":"admin-write-digest","read_token_sha256":"admin-read-digest","tokens":[{"id":"adm_0123456789abcdef","name":"ops","token_sha256":"admin-named-digest"}]}},
                 "api_key":[{"id":"ak_public","key":"sk-secret"}],
                 "webhook":[{"url":"https://example.test/hook?access_token=url-secret"}],
                 "provider":[{"settings":{"client_id":"public-client-id","client_secret":"oauth-secret","personal_access":"unknown-secret"}}]
@@ -159,6 +170,9 @@ personal_access = "unknown-secret"
             "sign-secret",
             "oauth-secret",
             "unknown-secret",
+            "admin-write-digest",
+            "admin-read-digest",
+            "admin-named-digest",
         ] {
             assert!(!output.contains(secret), "{output}");
         }

@@ -170,6 +170,28 @@ impl Default for ServerConfig {
     }
 }
 
+/// Independent status HTTP listener, with optional authenticated admin REST routes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StatusHttpConfig {
+    /// Enable the dedicated status listener.
+    pub enabled: bool,
+    /// Listening host, independent of proxy services and their TLS settings.
+    pub host: String,
+    /// Listening port reserved from automatic proxy-service allocation when enabled.
+    pub port: u16,
+}
+
+impl Default for StatusHttpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: "127.0.0.1".into(),
+            port: 7651,
+        }
+    }
+}
+
 /// 双连接池配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -597,13 +619,206 @@ impl Default for LogConfig {
 pub struct AdminConfig {
     /// Unix socket 路径。
     pub socket: String,
+    /// Authenticated REST API on the independent status HTTP listener.
+    pub rest: AdminRestConfig,
 }
 
 impl Default for AdminConfig {
     fn default() -> Self {
         Self {
             socket: default_socket_path(),
+            rest: AdminRestConfig::default(),
         }
+    }
+}
+
+/// REST authentication is independent of model-client API keys.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AdminRestConfig {
+    /// Enable /admin/v1 on the status HTTP listener.
+    pub enabled: bool,
+    /// SHA-256 hexadecimal digest of the full-access Bearer token.
+    pub token_sha256: String,
+    /// Optional, distinct read-only Bearer token digest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_token_sha256: Option<String>,
+    /// Independently managed named tokens. Plaintext is never persisted.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tokens: Vec<AdminRestTokenConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminTokenRole {
+    #[default]
+    Admin,
+    ReadOnly,
+}
+
+impl AdminTokenRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Admin => "admin",
+            Self::ReadOnly => "read_only",
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct AdminRestTokenConfig {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub role: AdminTokenRole,
+    pub token_sha256: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<i64>,
+}
+
+impl std::fmt::Debug for AdminRestTokenConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminRestTokenConfig")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("role", &self.role)
+            .field("enabled", &self.enabled)
+            .field("created_at", &self.created_at)
+            .field("token_sha256", &"[redacted]")
+            .finish()
+    }
+}
+
+impl AdminRestConfig {
+    pub fn validate_tokens(&self) -> Result<(), ConfigError> {
+        let valid_digest =
+            |value: &str| value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit());
+        let mut ids = BTreeSet::new();
+        let mut names = BTreeMap::new();
+        let mut digests = BTreeSet::new();
+        for (id, digest) in [
+            (
+                "legacy-admin",
+                Some(self.token_sha256.as_str()).filter(|v| !v.is_empty()),
+            ),
+            ("legacy-read-only", self.read_token_sha256.as_deref()),
+        ] {
+            if let Some(digest) = digest {
+                if !valid_digest(digest) {
+                    return invalid_config(
+                        if id == "legacy-admin" {
+                            "admin.rest.token_sha256"
+                        } else {
+                            "admin.rest.read_token_sha256"
+                        },
+                        "must be a 64-character SHA-256 digest",
+                    );
+                }
+                if !digests.insert(digest.to_ascii_lowercase()) {
+                    return invalid_config(
+                        "admin.rest.read_token_sha256",
+                        "token digests must be distinct",
+                    );
+                }
+                ids.insert(id.to_owned());
+                names.insert(id.to_owned(), id.to_owned());
+            }
+        }
+        if self
+            .tokens
+            .iter()
+            .filter(|token| !matches!(token.id.as_str(), "legacy-admin" | "legacy-read-only"))
+            .count()
+            > 128
+        {
+            return invalid_config(
+                "admin.rest.tokens",
+                "at most 128 named tokens are supported",
+            );
+        }
+        for (index, token) in self.tokens.iter().enumerate() {
+            let field = format!("admin.rest.tokens[{index}]");
+            let legacy_role = match token.id.as_str() {
+                "legacy-admin" => Some(AdminTokenRole::Admin),
+                "legacy-read-only" => Some(AdminTokenRole::ReadOnly),
+                _ => None,
+            };
+            let valid_id = legacy_role.is_some()
+                || token
+                    .id
+                    .strip_prefix("adm_")
+                    .is_some_and(|id| id.len() == 16 && id.bytes().all(|b| b.is_ascii_hexdigit()));
+            if !valid_id || !ids.insert(token.id.clone()) {
+                return invalid_config(
+                    format!("{field}.id"),
+                    "must be a unique adm_<16 hex> ID or a migrated legacy token ID",
+                );
+            }
+            if legacy_role.is_some_and(|role| role != token.role) {
+                return invalid_config(
+                    format!("{field}.role"),
+                    "legacy token IDs must keep their original role",
+                );
+            }
+            if token.name.trim().is_empty()
+                || token.name != token.name.trim()
+                || token.name.chars().count() > 128
+                || token.name.chars().any(char::is_control)
+            {
+                return invalid_config(format!("{field}.name"),"must contain 1..128 characters without control characters or surrounding whitespace");
+            }
+            if names.insert(token.name.clone(), token.id.clone()).is_some() {
+                return invalid_config(format!("{field}.name"), "token names must be unique");
+            }
+            if !valid_digest(&token.token_sha256)
+                || !digests.insert(token.token_sha256.to_ascii_lowercase())
+            {
+                return invalid_config(
+                    format!("{field}.token_sha256"),
+                    "must be a valid SHA-256 digest distinct from every other token digest",
+                );
+            }
+            if matches!(token.name.as_str(), "legacy-admin" | "legacy-read-only")
+                && token.name != token.id
+            {
+                return invalid_config(
+                    format!("{field}.name"),
+                    "legacy token names are reserved for compatibility entries",
+                );
+            }
+        }
+        if names
+            .iter()
+            .any(|(name, id)| ids.contains(name) && name != id)
+        {
+            return invalid_config(
+                "admin.rest.tokens",
+                "token names must not collide with other token IDs",
+            );
+        }
+        if self.enabled && digests.is_empty() {
+            return invalid_config(
+                "admin.rest.token_sha256",
+                "requires at least one configured legacy or named token digest",
+            );
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for AdminRestConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminRestConfig")
+            .field("enabled", &self.enabled)
+            .field("token_sha256", &"[redacted]")
+            .field(
+                "read_token_sha256",
+                &self.read_token_sha256.as_ref().map(|_| "[redacted]"),
+            )
+            .field("tokens", &self.tokens)
+            .finish()
     }
 }
 
@@ -1125,6 +1340,8 @@ pub fn resolve_user_agent_check_policy(
 pub struct Config {
     /// API 代理服务共享参数和默认值。
     pub server: ServerConfig,
+    /// Independent process health/readiness listener.
+    pub status_http: StatusHttpConfig,
     /// 上游。
     pub upstream: UpstreamConfig,
     /// 账号池。
@@ -1256,6 +1473,21 @@ impl Config {
         if self.server.port < 1024 {
             return Err(ConfigError::InvalidPort(self.server.port));
         }
+        if self.status_http.host.trim().is_empty()
+            || self.status_http.host != self.status_http.host.trim()
+        {
+            return invalid_config(
+                "status_http.host",
+                "must be non-empty without surrounding whitespace",
+            );
+        }
+        if self.status_http.port < 1024 {
+            return invalid_config("status_http.port", "must be between 1024 and 65535");
+        }
+        if self.admin.rest.enabled && !self.status_http.enabled {
+            return invalid_config("admin.rest.enabled", "requires status_http.enabled = true");
+        }
+        self.admin.rest.validate_tokens()?;
         if self.server.keep_alive_timeout_ms == 0 {
             return invalid_config("server.keep_alive_timeout_ms", "must be greater than zero");
         }
@@ -1669,6 +1901,13 @@ impl Config {
             if service.port < 1024 {
                 return invalid_config(format!("{field}.port"), "must be between 1024 and 65535");
             }
+            if self.status_http.enabled && service.enabled && service.port == self.status_http.port
+            {
+                return invalid_config(
+                    format!("{field}.port"),
+                    "is reserved for the independent status HTTP listener",
+                );
+            }
             if service.enabled && !service_addresses.insert((service.host.as_str(), service.port)) {
                 return invalid_config(
                     format!("{field}.port"),
@@ -2019,7 +2258,7 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# =====================================
 #
 # 除特别说明外：
 # - `*_ms` 的单位是毫秒，`*_tokens` 的单位是 token，credits 支持小数。
-# - daemon 会监听文件并热重载；仅 `admin.socket` 和 TLS enabled 模式切换需重启。
+# - daemon 会监听文件并热重载；`admin.socket`、`status_http` 和 TLS enabled 模式切换需重启。
 # - 修改已有服务/API key/模型映射时，优先使用 `crosslane service`、
 #   `crosslane provider`、`crosslane apikey`、`crosslane model-map` 等命令，以免写错关联 ID。
 
@@ -2371,12 +2610,42 @@ retention_days = 3
 max_files_per_day = 3
 
 # ----------------------------------------------------------------------------
+# 独立状态 HTTP（与 API 代理服务的端口、TLS 和客户端 Key 无关）
+# ----------------------------------------------------------------------------
+[status_http]
+# 显式开启后，在独立端口提供 GET /、/health、/ready。默认不开启新的 TCP 监听。
+# 这三个路径不再由 API 代理服务端口提供；客户端协议与事件上报仍使用业务端口。
+# 修改本节任何字段后需要重启 daemon；不会通过热重载切换监听地址。
+enabled = false
+# 默认仅本机可访问；需从其他机器探测时改为对应的监听地址。
+host = "127.0.0.1"
+port = 7651
+
+# ----------------------------------------------------------------------------
 # 本机管理面
 # ----------------------------------------------------------------------------
 [admin]
 # CLI 与 daemon 通信的 Unix socket。首次生成时会按 CROSSLANE_HOME/XDG_RUNTIME_DIR 改写。
 # 修改后必须重启 daemon；容器 wrapper 会使用同一数据目录解析该路径。
 socket = "/run/crosslane/admin.sock"
+
+# 管理 REST 与公开状态接口共用 status_http 监听，通过独立 Bearer token 鉴权。
+# 此处只保存 token 的 SHA-256 摘要；模型客户端 Key 不获得管理权限。
+[admin.rest]
+enabled = false
+token_sha256 = ""
+# 可选只读 token 的摘要；与完整管理 token 必须不同。token 摘要可热重载轮换。
+# read_token_sha256 = "64-character SHA-256 hex digest"
+
+# 推荐通过 crosslane admin token create/list/rotate/revoke 管理多把独立令牌。
+# 明文只在 create/rotate 返回；以下是命名令牌的配置形状，通常无需手工编辑。
+# [[admin.rest.tokens]]
+# id = "adm_0123456789abcdef"
+# name = "ops"
+# role = "admin" # 或 read_only
+# enabled = true
+# token_sha256 = "64-character SHA-256 hex digest"
+# created_at = 1
 
 # ----------------------------------------------------------------------------
 # Kiro IAM Identity Center SSO（不适用于 Copilot 的 GitHub/Azure SSO）

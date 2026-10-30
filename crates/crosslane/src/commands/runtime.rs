@@ -2345,6 +2345,16 @@ impl ConfigModule {
 
 const CONFIG_MODULES: &[ConfigModule] = &[
     ConfigModule {
+        name: "status-http",
+        key: "status_http",
+        category: "通用",
+        scope: "global",
+        description: "独立状态 HTTP 监听；变更需重启 daemon",
+        preferred_command: "-",
+        aliases: &["status_http"],
+        is_array: false,
+    },
+    ConfigModule {
         name: "server",
         key: "server",
         category: "通用",
@@ -2449,7 +2459,7 @@ const CONFIG_MODULES: &[ConfigModule] = &[
         key: "admin",
         category: "通用",
         scope: "global",
-        description: "本地管理面 socket",
+        description: "本地管理 socket 与独立 HTTP 上的 REST 鉴权",
         preferred_command: "-",
         aliases: &[],
         is_array: false,

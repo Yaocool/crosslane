@@ -11,6 +11,13 @@ fn defaults_match_the_spec() {
     assert!(!config.server.adaptive.enabled);
     assert_eq!(config.server.adaptive.minimum_samples, 5);
     assert_eq!(config.server.adaptive.overload_error_rate, 0.05);
+    assert!(!config.status_http.enabled);
+    assert_eq!(config.status_http.host, "127.0.0.1");
+    assert_eq!(config.status_http.port, 7651);
+    assert!(!config.admin.rest.enabled);
+    assert!(config.admin.rest.token_sha256.is_empty());
+    assert!(config.admin.rest.read_token_sha256.is_none());
+    assert!(config.admin.rest.tokens.is_empty());
 
     assert_eq!(config.pool.max_concurrent_per_account, 50);
     assert_eq!(config.pool.max_queue_size, 10);
@@ -88,6 +95,116 @@ fn defaults_match_the_spec() {
     assert!(config.webhook.is_empty());
     assert!(config.api_key.is_empty());
     assert!(config.proxy_service.is_empty());
+}
+
+#[test]
+fn admin_rest_requires_a_listener_and_distinct_hashed_tokens() {
+    let mut config = Config::default();
+    config.admin.rest.enabled = true;
+    config.admin.rest.token_sha256 = "a".repeat(64);
+    assert!(config
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("status_http.enabled"));
+    config.status_http.enabled = true;
+    config.validate().unwrap();
+    for invalid in [
+        String::new(),
+        "plaintext-admin-secret".into(),
+        "g".repeat(64),
+    ] {
+        config.admin.rest.token_sha256 = invalid.clone();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("admin.rest.token_sha256"));
+        if !invalid.is_empty() {
+            assert!(!error.contains(&invalid));
+        }
+    }
+    config.admin.rest.token_sha256 = "a".repeat(64);
+    config.admin.rest.read_token_sha256 = Some("A".repeat(64));
+    assert!(config
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("distinct"));
+    config.admin.rest.read_token_sha256 = Some("b".repeat(64));
+    config.validate().unwrap();
+    let debug = format!("{:?}", config.admin);
+    assert!(!debug.contains(&"a".repeat(64)));
+    assert!(!debug.contains(&"b".repeat(64)));
+    let roundtrip: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+    assert_eq!(
+        roundtrip.admin.rest.token_sha256,
+        config.admin.rest.token_sha256
+    );
+    assert_eq!(
+        roundtrip.admin.rest.read_token_sha256,
+        config.admin.rest.read_token_sha256
+    );
+}
+
+#[test]
+fn admin_rest_named_tokens_validate_roles_uniqueness_and_redact_debug() {
+    let mut config = Config::default();
+    config.status_http.enabled = true;
+    config.admin.rest.enabled = true;
+    let make = |id: &str, name: &str, digest: &str, role| AdminRestTokenConfig {
+        id: id.into(),
+        name: name.into(),
+        role,
+        token_sha256: digest.into(),
+        enabled: true,
+        created_at: Some(123),
+    };
+    config.admin.rest.tokens = vec![
+        make(
+            "adm_0000000000000001",
+            "ops",
+            &"a".repeat(64),
+            AdminTokenRole::Admin,
+        ),
+        make(
+            "adm_0000000000000002",
+            "monitor",
+            &"b".repeat(64),
+            AdminTokenRole::ReadOnly,
+        ),
+    ];
+    config.validate().unwrap();
+    assert!(!format!("{:?}", config.admin).contains(&"a".repeat(64)));
+    assert!(!format!("{:?}", config.admin).contains(&"b".repeat(64)));
+    let valid = config.clone();
+    config.admin.rest.tokens[1].name = "ops".into();
+    assert!(config.validate().is_err());
+    config = valid.clone();
+    config.admin.rest.tokens[1].id = config.admin.rest.tokens[0].id.clone();
+    assert!(config.validate().is_err());
+    config = valid.clone();
+    config.admin.rest.tokens[1].token_sha256 = "A".repeat(64);
+    assert!(config
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("distinct"));
+    config = valid.clone();
+    config.admin.rest.read_token_sha256 = Some("b".repeat(64));
+    assert!(config.validate().is_err());
+    config = valid.clone();
+    config.admin.rest.tokens[1].name = "adm_0000000000000001".into();
+    assert!(config.validate().is_err());
+    config = valid.clone();
+    config.admin.rest.tokens[1].name = "line\nbreak".into();
+    assert!(config.validate().is_err());
+    config = valid;
+    config
+        .admin
+        .rest
+        .tokens
+        .retain(|token| token.role == AdminTokenRole::ReadOnly);
+    config.validate().unwrap();
+    config.admin.rest.tokens[0].enabled = false;
+    config.validate().unwrap(); // A deliberate deny-all state remains recoverable over UDS.
 }
 
 #[test]
@@ -345,6 +462,15 @@ fn uncomment_documented_settings() -> String {
 
 fn fully_populated_config() -> Config {
     let mut config = Config::default();
+    config.admin.rest.read_token_sha256 = Some("b".repeat(64));
+    config.admin.rest.tokens = vec![AdminRestTokenConfig {
+        id: "adm_0123456789abcdef".into(),
+        name: "ops".into(),
+        role: AdminTokenRole::Admin,
+        enabled: true,
+        token_sha256: "c".repeat(64),
+        created_at: Some(1),
+    }];
     config.models.disabled = vec!["claude-sonnet-4.6".into()];
     config.pool.max_overage_credits_per_account = Some(500.0);
     let mut provider = ProviderConfig {
@@ -703,6 +829,42 @@ fn rejects_port_below_privileged_range() {
     config.server.port = 80;
     let error = config.validate().expect_err("port 80 must be rejected");
     assert!(error.to_string().contains("port"), "{error}");
+}
+
+#[test]
+fn validates_independent_status_http_listener() {
+    let mut config = Config::default();
+    config.status_http.enabled = true;
+    config
+        .validate()
+        .expect("status listener needs no proxy service or client key");
+    config.status_http.port = 80;
+    assert!(config
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("status_http.port"));
+    config.status_http.port = 7651;
+    config.status_http.host = " ".into();
+    assert!(config
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("status_http.host"));
+    config.status_http.host = "127.0.0.1".into();
+    config.proxy_service.push(ProxyServiceConfig {
+        id: "svc_collision".into(),
+        name: "collision".into(),
+        host: "127.0.0.1".into(),
+        port: 7651,
+        enabled: true,
+        ..ProxyServiceConfig::default()
+    });
+    let error = config.validate().unwrap_err().to_string();
+    assert!(
+        error.contains("reserved for the independent status HTTP listener"),
+        "{error}"
+    );
 }
 
 #[test]

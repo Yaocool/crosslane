@@ -1,6 +1,26 @@
-//! 账号 ID 与设备标识生成。
+//! 稳定 ID 解析、账号 ID 与设备标识生成。
 
 use rand::RngCore;
+
+/// Resolve a stable ID before considering a display-name alias, regardless of
+/// entry order. Callers can use the index for reads, updates, or one-item removal.
+pub fn index_by_id_or_name<T>(
+    entries: &[T],
+    selector: &str,
+    identity: impl Fn(&T) -> (Option<&str>, Option<&str>),
+) -> Option<usize> {
+    let mut name_match = None;
+    for (index, entry) in entries.iter().enumerate() {
+        let (id, name) = identity(entry);
+        if id == Some(selector) {
+            return Some(index);
+        }
+        if name_match.is_none() && name == Some(selector) {
+            name_match = Some(index);
+        }
+    }
+    name_match
+}
 
 /// 生成账号 ID，格式 `acc_<8位小写hex>`。
 pub fn new_account_id() -> String {

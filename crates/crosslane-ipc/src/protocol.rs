@@ -6,6 +6,49 @@ use thiserror::Error;
 
 use crosslane_core::config::ServiceAccountTags;
 
+/// Safe Admin REST credential metadata; no digest or recoverable secret.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminTokenView {
+    pub id: String,
+    pub name: String,
+    pub role: crosslane_core::config::AdminTokenRole,
+    pub enabled: bool,
+    pub created_at: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AdminTokenListResult {
+    pub tokens: Vec<AdminTokenView>,
+    pub rest_enabled: bool,
+    pub listener_enabled: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AdminTokenResult {
+    pub token: AdminTokenView,
+    pub rest_enabled: bool,
+    pub listener_enabled: bool,
+}
+
+/// Plaintext is returned only by create/rotate. Debug must not disclose it.
+#[derive(Serialize, Deserialize)]
+pub struct CreatedAdminToken {
+    pub token: AdminTokenView,
+    pub secret: String,
+    pub rest_enabled: bool,
+    pub listener_enabled: bool,
+}
+impl std::fmt::Debug for CreatedAdminToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreatedAdminToken")
+            .field("token", &self.token)
+            .field("secret", &"<redacted>")
+            .field("rest_enabled", &self.rest_enabled)
+            .field("listener_enabled", &self.listener_enabled)
+            .finish()
+    }
+}
+
 /// Capability required before changing global model deny rules.
 pub const GLOBAL_MODEL_DISABLE_FEATURE: &str = "global_model_disable";
 
@@ -129,9 +172,21 @@ pub mod method {
     pub const WEBHOOK_TEST: &str = "webhook.test";
     /// Webhook 发送历史。
     pub const WEBHOOK_LOGS: &str = "webhook.logs";
+    pub const ADMIN_TOKEN_LIST: &str = "admin.token.list";
+    pub const ADMIN_TOKEN_SHOW: &str = "admin.token.show";
+    pub const ADMIN_TOKEN_CREATE: &str = "admin.token.create";
+    pub const ADMIN_TOKEN_ROTATE: &str = "admin.token.rotate";
+    pub const ADMIN_TOKEN_REVOKE: &str = "admin.token.revoke";
+    pub const ADMIN_TOKEN_SET_ENABLED: &str = "admin.token.setEnabled";
 
     /// 全部方法名。
     pub const ALL: &[&str] = &[
+        ADMIN_TOKEN_LIST,
+        ADMIN_TOKEN_SHOW,
+        ADMIN_TOKEN_CREATE,
+        ADMIN_TOKEN_ROTATE,
+        ADMIN_TOKEN_REVOKE,
+        ADMIN_TOKEN_SET_ENABLED,
         V2_CAPABILITIES,
         V2_PROVIDER_LIST,
         V2_PROVIDER_SHOW,
@@ -1016,7 +1071,7 @@ impl std::fmt::Debug for CopilotBrowserCredentials {
 pub struct AccountAddSsoParams {
     /// IAM Identity Center 登录邮箱。
     pub email: String,
-    /// 仅在管理 socket 上传输的登录密码。
+    /// 仅通过管理通道（Unix socket 或已鉴权 REST）传输的登录密码。
     pub password: String,
     /// IAM Identity Center start URL。
     pub start_url: String,
@@ -1054,6 +1109,15 @@ fn default_account_sso_region() -> String {
 pub struct AccountRefParams {
     /// 账号 ID 或邮箱。
     pub id: String,
+}
+
+/// `account.remove` 参数；默认保留服务绑定保护。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountRemoveParams {
+    pub id: String,
+    /// 自动解绑所有服务后删除账号。
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// `account.setEnabled` 参数。

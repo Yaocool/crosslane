@@ -79,18 +79,33 @@ pub fn diff_restart_required(old: &Config, new: &Config) -> Vec<&'static str> {
     if old.admin.socket != new.admin.socket {
         fields.push("admin.socket");
     }
+    if old.status_http.enabled != new.status_http.enabled {
+        fields.push("status_http.enabled");
+    }
+    if old.status_http.host != new.status_http.host {
+        fields.push("status_http.host");
+    }
+    if old.status_http.port != new.status_http.port {
+        fields.push("status_http.port");
+    }
     if old.server.tls.enabled != new.server.tls.enabled {
         fields.push("server.tls.enabled");
     }
     fields
 }
 
-/// 合并一次热重载：热更新字段取新值，管理 socket 与 TLS 监听模式保留运行值。
+/// 合并一次热重载：热更新字段取新值，管理 socket、状态监听与 TLS 监听模式保留运行值。
 ///
 /// 返回的字段列表提示调用方在下次进程重启后，磁盘中的新值才会生效。
 pub fn merge_hot_reload(old: &Config, mut new: Config) -> (Config, Vec<&'static str>) {
     let needs_restart = diff_restart_required(old, &new);
     new.admin.socket.clone_from(&old.admin.socket);
+    new.status_http.clone_from(&old.status_http);
+    if !new.status_http.enabled {
+        // Enabling the listener itself needs a restart; keep the REST feature
+        // inactive until that listener can actually serve requests.
+        new.admin.rest.enabled = false;
+    }
     if old.server.tls.enabled != new.server.tls.enabled {
         new.server.tls = old.server.tls.clone();
     }
@@ -316,6 +331,33 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn admin_rest_tokens_reload_but_wait_for_the_listener_to_be_started() {
+        let old = Config::default();
+        let mut edited = old.clone();
+        edited.status_http.enabled = true;
+        edited.admin.rest.enabled = true;
+        edited.admin.rest.token_sha256 = "a".repeat(64);
+        edited.validate().unwrap();
+        let (effective, restart) = merge_hot_reload(&old, edited.clone());
+        assert_eq!(restart, vec!["status_http.enabled"]);
+        assert!(!effective.admin.rest.enabled);
+        effective.validate().unwrap();
+
+        let mut rotated = edited.clone();
+        rotated.admin.rest.token_sha256 = "b".repeat(64);
+        rotated.admin.rest.read_token_sha256 = Some("c".repeat(64));
+        let (effective, restart) = merge_hot_reload(&edited, rotated);
+        assert!(restart.is_empty());
+        assert!(effective.admin.rest.enabled);
+        assert_eq!(effective.admin.rest.token_sha256, "b".repeat(64));
+        assert_eq!(effective.admin.rest.read_token_sha256, Some("c".repeat(64)));
+        effective.validate().unwrap();
+        let mut disabled = effective.clone();
+        disabled.admin.rest.enabled = false;
+        assert!(!merge_hot_reload(&effective, disabled).0.admin.rest.enabled);
+    }
+
     #[tokio::test]
     async fn missing_and_partial_configs_use_defaults() {
         let directory = tempdir().expect("tempdir");
@@ -372,6 +414,23 @@ mod tests {
         assert_eq!(merged.log.format, "pretty");
         assert!(merged.features.enable_prompt_cache);
         assert_eq!(restart, vec!["admin.socket"]);
+
+        let mut status = old.clone();
+        status.status_http.enabled = true;
+        status.status_http.host = "0.0.0.0".into();
+        status.status_http.port = 9000;
+        status.log.level = "debug".into();
+        let (status, restart) = merge_hot_reload(&old, status);
+        assert_eq!(status.status_http, old.status_http);
+        assert_eq!(status.log.level, "debug");
+        assert_eq!(
+            restart,
+            vec![
+                "status_http.enabled",
+                "status_http.host",
+                "status_http.port"
+            ]
+        );
 
         let mut certificate = Config::default();
         certificate.server.tls.cert = Some("new certificate".into());
