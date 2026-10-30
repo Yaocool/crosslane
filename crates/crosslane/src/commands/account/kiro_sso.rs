@@ -1,6 +1,6 @@
 //! Kiro IAM Identity Center login. CSV and stdin carry one login password.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use crosslane_ipc::protocol::{method, AccountAddSsoParams, AccountSummary};
 use futures::{stream, StreamExt};
 
@@ -104,48 +104,7 @@ pub(super) async fn run_batch(
 }
 
 pub(super) fn parse_csv(raw: &str) -> Result<Vec<(String, String)>> {
-    let mut rows = Vec::new();
-    let mut first_record = true;
-    for (index, line) in raw.trim_start_matches('\u{feff}').lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let fields = super::parse_csv_line(line.trim_start_matches('\u{feff}'))
-            .with_context(|| format!("CSV 第 {} 行无效", index + 1))?;
-        if first_record {
-            first_record = false;
-            if fields
-                .first()
-                .is_some_and(|field| field.trim().eq_ignore_ascii_case("email"))
-            {
-                if fields.len() != 2 || !fields[1].trim().eq_ignore_ascii_case("password") {
-                    return Err(anyhow!("Kiro CSV 表头必须为 email,password"));
-                }
-                continue;
-            }
-            if fields.first().is_some_and(|field| {
-                matches!(
-                    field.trim(),
-                    "github_username" | "username" | "sso_username"
-                )
-            }) {
-                return Err(anyhow!(
-                    "Kiro CSV 仅使用 email,password，不使用 Copilot 凭据列"
-                ));
-            }
-        }
-        if fields.len() != 2 || fields[0].trim().is_empty() || fields[1].is_empty() {
-            return Err(anyhow!(
-                "CSV 第 {} 行必须只有 email,password 两列",
-                index + 1
-            ));
-        }
-        rows.push((fields[0].trim().to_ascii_lowercase(), fields[1].clone()));
-    }
-    if rows.is_empty() {
-        return Err(anyhow!("CSV 中没有账号"));
-    }
-    Ok(rows)
+    crosslane_core::account_csv::parse_kiro_sso_csv(raw).map_err(Into::into)
 }
 
 #[cfg(test)]

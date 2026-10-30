@@ -1,6 +1,7 @@
 //! Authenticated REST facade for the existing Unix-socket control plane.
 
 mod accounts;
+mod batches;
 mod openapi;
 mod services;
 mod views;
@@ -30,6 +31,7 @@ pub(super) struct RestState {
     app: Arc<AppState>,
     requests: Arc<Semaphore>,
     account_creates: Arc<Semaphore>,
+    batches: Arc<batches::BatchRegistry>,
 }
 
 type ApiResult<T = Value> = Result<T, ApiError>;
@@ -39,10 +41,14 @@ pub(crate) fn router(app: Arc<AppState>) -> Router {
         app,
         requests: Arc::new(Semaphore::new(16)),
         account_creates: Arc::new(Semaphore::new(8)),
+        batches: Arc::new(batches::BatchRegistry::default()),
     };
     Router::new()
         .route("/openapi.json", get(openapi::schema))
         .route("/accounts", get(accounts::list).post(accounts::create))
+        .route("/account-batches", get(batches::list).post(batches::create))
+        .route("/account-batches/:batch", get(batches::show))
+        .route("/account-batches/:batch/cancel", post(batches::cancel))
         .route(
             "/accounts/:provider/:account",
             get(accounts::show).delete(accounts::remove),

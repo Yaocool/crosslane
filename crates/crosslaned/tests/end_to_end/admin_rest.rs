@@ -258,7 +258,7 @@ async fn admin_rest_authentication_is_independent_rotatable_and_audited_without_
     assert_eq!(schema["openapi"], "3.1.0");
     assert!(schema.get("data").is_none());
     assert_eq!(schema["security"][0], json!({"AdminBearer":[]}));
-    assert_eq!(schema["paths"].as_object().unwrap().len(), 22);
+    assert_eq!(schema["paths"].as_object().unwrap().len(), 25);
     fixture.edit_auth(true, "fixture-rotated-admin-token").await;
     assert_eq!(
         fixture
@@ -767,5 +767,200 @@ async fn admin_rest_copilot_import_stores_initial_tags_and_reports_native_quota(
         fixture.api(Method::GET, &account_path, None, 200).await["data"]["tags"],
         json!(["team-a", "test"])
     );
+    fixture.daemon.stop().await;
+}
+
+
+impl AdminFixture {
+    async fn batch_report(&self, id: &str) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let response = self
+                .request(
+                    Method::GET,
+                    &format!("/account-batches/{id}"),
+                    Some(READ_TOKEN),
+                )
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            let report: Value = response.json().await.unwrap();
+            if report["data"]["finished_at"].is_i64() {
+                return report["data"].clone();
+            }
+            assert!(Instant::now() < deadline, "batch did not finish: {report}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn admin_rest_batches_validate_before_creating_and_preserve_partial_success_after_restart() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    let mut fixture = AdminFixture::start(false).await;
+    for input in [
+        json!({"provider":"kiro","auth":"api-key","accounts":[{"email":"must-not-create@example.com","token":"ksk_fixture_batch_key"},{"email":"invalid","token":"ksk_fixture_invalid"}]}),
+        json!({"provider":"kiro","auth":"sso","csv":"email,password\nrow@example.com,password,extra"}),
+        json!({"provider":"kiro","auth":"api-key","accounts":[],"concurrency":9}),
+        json!({"provider":"kiro","auth":"sso","accounts":[],"csv":"email,password\nrow@example.com,password"}),
+    ] {
+        fixture
+            .api(Method::POST, "/account-batches", Some(input), 400)
+            .await;
+    }
+    for (bytes, expected) in [
+        (vec![0xff, 0xfe], 400),
+        (vec![b'x'; 2 * 1024 * 1024 + 1], 413),
+    ] {
+        let response = fixture
+            .request(
+                Method::POST,
+                "/account-batches?provider=kiro",
+                Some(WRITE_TOKEN),
+            )
+            .header("content-type", "text/csv")
+            .body(bytes)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"]["code"],
+            "invalid_request"
+        );
+    }
+    assert_eq!(
+        fixture.api(Method::GET, "/accounts", None, 200).await["data"]["total"],
+        0
+    );
+    assert_eq!(
+        fixture
+            .api(Method::GET, "/account-batches", None, 200)
+            .await["data"]["batches"],
+        json!([])
+    );
+    assert!(fixture
+        .upstream
+        .received_requests()
+        .await
+        .unwrap()
+        .is_empty());
+    for path in ["/account-batches", "/account-batches/missing/cancel"] {
+        assert_eq!(
+            fixture
+                .request(Method::POST, path, Some(READ_TOKEN))
+                .json(&json!({}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+    }
+    let request = json!({"provider":"kiro","auth":"api-key","tags":["team-a"],"accounts":[
+        {"email":"one@example.com","token":"ksk_fixture_first_batch","tag":"one"},
+        {"email":"one@example.com","token":"ksk_fixture_duplicate_batch"},
+        {"email":"two@example.com","token":"ksk_fixture_second_batch"}
+    ]});
+    let response = fixture
+        .request(Method::POST, "/account-batches", Some(WRITE_TOKEN))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202);
+    let location = response.headers()["location"].to_str().unwrap().to_owned();
+    let accepted: Value = response.json().await.unwrap();
+    let id = accepted["data"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(location, format!("/admin/v1/account-batches/{id}"));
+    let report = fixture.batch_report(&id).await;
+    assert_eq!(report["status"], "completed_with_errors");
+    assert_eq!(report["succeeded"], 2);
+    assert_eq!(report["failed"], 1);
+    assert_eq!(report["rows"][1]["error"]["code"], "conflict");
+    assert!(report["rows"][2]["reference"]
+        .as_str()
+        .unwrap()
+        .starts_with("kiro/acc_"));
+    for secret in [
+        "ksk_fixture_first_batch",
+        "ksk_fixture_duplicate_batch",
+        "ksk_fixture_second_batch",
+    ] {
+        assert!(!report.to_string().contains(secret));
+    }
+    let first_id = report["rows"][0]["account_id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        fixture
+            .api(
+                Method::GET,
+                &format!("/accounts/kiro/{first_id}"),
+                None,
+                200
+            )
+            .await["data"]["tags"],
+        json!(["one", "team-a"])
+    );
+    assert!(fixture
+        .api(Method::GET, "/account-batches", None, 200)
+        .await["data"]["batches"][0]
+        .get("rows")
+        .is_none());
+    fixture
+        .api(
+            Method::POST,
+            &format!("/account-batches/{id}/cancel"),
+            None,
+            200,
+        )
+        .await;
+    fixture.restart().await;
+    assert_eq!(
+        fixture.api(Method::GET, "/accounts", None, 200).await["data"]["total"],
+        2
+    );
+    fixture
+        .api(Method::GET, &format!("/account-batches/{id}"), None, 404)
+        .await;
+    fixture.daemon.stop().await;
+}
+
+#[cfg(feature = "sso")]
+#[tokio::test]
+async fn admin_rest_accepts_cli_sso_csv_and_uses_the_existing_sso_duplicate_guard() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    let fixture = AdminFixture::start(false).await;
+    for email in ["one@example.com", "two@example.com"] {
+        fixture.api(Method::POST,"/accounts",Some(json!({"provider":"kiro","auth":"api-key","email":email,"token":"ksk_fixture_existing"})),201).await;
+    }
+    let csv="\u{feff}email,password\r\n\"ONE@example.com\",\" fixture,\"\"private-password \"\r\ntwo@example.com,second-private-password\r\n";
+    let response=fixture.request(Method::POST,"/account-batches?provider=kiro&auth=sso&tag=team-a&concurrency=2&start_url=https%3A%2F%2Fexample.awsapps.com%2Fstart",Some(WRITE_TOKEN))
+        .header("content-type","text/csv; charset=utf-8").body(csv).send().await.unwrap();
+    assert_eq!(response.status(), 202);
+    let accepted: Value = response.json().await.unwrap();
+    let id = accepted["data"]["id"].as_str().unwrap();
+    let report = fixture.batch_report(id).await;
+    assert_eq!(report["failed"], 2);
+    assert_eq!(report["rows"][0]["display_name"], "one@example.com");
+    for row in report["rows"].as_array().unwrap() {
+        assert_eq!(row["error"]["code"], "conflict");
+        assert!(row["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("already exists"));
+    }
+    assert!(!report.to_string().contains("private-password"));
+    // The common SSO handler rejects existing accounts before launching Chromium.
+    assert!(fixture
+        .upstream
+        .received_requests()
+        .await
+        .unwrap()
+        .is_empty());
+    let log = tokio::fs::read_to_string(fixture.daemon.home().join("rest-test.log"))
+        .await
+        .unwrap();
+    assert!(!log.contains("private-password"));
     fixture.daemon.stop().await;
 }

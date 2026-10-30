@@ -192,7 +192,15 @@ pub(super) enum PreparedCreate {
 }
 
 impl PreparedCreate {
-
+    pub(super) fn identity(&self) -> (String, Option<String>) {
+        match self {
+            Self::Kiro(account) => ("kiro".into(), Some(account.email.clone())),
+            Self::Sso(params) => ("kiro".into(), Some(params.email.clone())),
+            Self::CopilotToken {
+                provider, label, ..
+            } => (provider.clone(), label.clone()),
+        }
+    }
     pub(super) fn secrets(&self) -> Vec<String> {
         match self {
             Self::Kiro(account) => [
@@ -211,6 +219,16 @@ impl PreparedCreate {
     }
 }
 
+pub(super) fn prepare_json(
+    app: &Arc<AppState>,
+    value: Value,
+    tags: &[String],
+) -> ApiResult<PreparedCreate> {
+    let mut input: Create =
+        serde_json::from_value(value).map_err(|_| ApiError::bad("invalid account fields"))?;
+    input.tags.extend_from_slice(tags);
+    prepare(app, input)
+}
 
 pub(super) async fn create(
     State(state): State<RestState>,
@@ -639,6 +657,7 @@ mod tests {
             app,
             requests: Arc::new(Semaphore::new(16)),
             account_creates: Arc::new(Semaphore::new(8)),
+            batches: Arc::new(super::super::batches::BatchRegistry::default()),
         };
         let occupied = state.account_creates.acquire_many(8).await.unwrap();
         let error = tokio::time::timeout(

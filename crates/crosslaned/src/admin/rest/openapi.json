@@ -3,7 +3,7 @@
   "info": {
     "title": "Crosslane Admin REST API",
     "version": "2.1.2",
-    "description": "Authenticated management on the independent status HTTP listener. Model-client keys are not admin credentials. GET/HEAD permit the optional read-only token; writes require the full-access token. JSON responses use {data:...}; the OpenAPI document itself is unwrapped. Credentials are accepted only in write bodies and never included in account responses. A newly created service returns its client key once. \nAccount control operations and service bindings resolve identities from local snapshots. Quota queries and explicit refresh/probe retain their usual upstream behavior. Service mutations preserve pending client-key edits and validate the persisted restart configuration. Service writes resolve selectors within the configuration transaction. Follow-up reads reject a changed service ID instead of returning another service's data. Configuration write errors verify or restore the previous file before returning; rollback verification failures are reported explicitly."
+    "description": "Authenticated management on the independent status HTTP listener. Model-client keys are not admin credentials. GET/HEAD permit the optional read-only token; writes require the full-access token. JSON responses use {data:...}; the OpenAPI document itself is unwrapped. Credentials are accepted only in write bodies and never included in account responses. A newly created service returns its client key once. Bulk creation accepts CLI-compatible Kiro SSO CSV and returns 202 with a task URI; progress and results never contain submitted credentials.\nAccount control operations and service bindings resolve identities from local snapshots. Quota queries and explicit refresh/probe retain their usual upstream behavior. Service mutations preserve pending client-key edits and validate the persisted restart configuration. Service writes resolve selectors within the configuration transaction. Follow-up reads reject a changed service ID instead of returning another service's data. Configuration write errors verify or restore the previous file before returning; rollback verification failures are reported explicitly."
   },
   "servers": [
     {
@@ -1849,6 +1849,305 @@
               "type": "string"
             },
             "description": "Client-key ID or name. An exact ID takes precedence over another key's name."
+          }
+        ]
+      }
+    },
+    "/account-batches": {
+      "get": {
+        "tags": [
+          "Accounts"
+        ],
+        "summary": "List retained account batch summaries",
+        "operationId": "accounts_list_batches",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "batches": {
+                          "type": "array",
+                          "items": {
+                            "$ref": "#/components/schemas/AccountBatch"
+                          }
+                        }
+                      },
+                      "required": [
+                        "batches"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "default": {
+            "$ref": "#/components/responses/ManagementError"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Accounts"
+        ],
+        "summary": "Submit bulk accounts or automatically log in a Kiro SSO CSV",
+        "operationId": "accounts_create_batch",
+        "responses": {
+          "202": {
+            "description": "Accepted",
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              },
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Relative URI for the accepted account batch."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/AccountBatch"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "default": {
+            "$ref": "#/components/responses/ManagementError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "For text/csv submissions; use the JSON body field for application/json."
+          },
+          {
+            "name": "auth",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "sso"
+              ],
+              "default": "sso"
+            },
+            "description": "For text/csv submissions; use the JSON body field for application/json."
+          },
+          {
+            "name": "start_url",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "uri",
+              "maxLength": 8192
+            },
+            "description": "For text/csv submissions; use the JSON body field for application/json."
+          },
+          {
+            "name": "region",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "maxLength": 64
+            },
+            "description": "For text/csv submissions; use the JSON body field for application/json."
+          },
+          {
+            "name": "tag",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "For text/csv submissions; use the JSON body field for application/json."
+          },
+          {
+            "name": "concurrency",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 8,
+              "default": 1
+            },
+            "description": "For text/csv submissions; use the JSON body field for application/json."
+          }
+        ],
+        "description": "Validate the complete input before starting any login. JSON accepts csv or accounts; text/csv accepts the uploaded file and requires provider in query parameters. SSO reuses account.addSso, including browser authorization, upstream identity/usage validation and durable insertion. Individual failures do not roll back successful accounts. Query task progress with Location.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateAccountBatch"
+              }
+            },
+            "text/csv": {
+              "schema": {
+                "type": "string",
+                "writeOnly": true
+              },
+              "example": "email,password\nuser@example.com,REPLACE_ME\n"
+            }
+          }
+        }
+      }
+    },
+    "/account-batches/{batch}": {
+      "get": {
+        "tags": [
+          "Accounts"
+        ],
+        "summary": "Read batch progress and sanitized per-account outcomes",
+        "operationId": "accounts_get_batch",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/AccountBatch"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "default": {
+            "$ref": "#/components/responses/ManagementError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "batch",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Batch ID returned when submitting."
+          }
+        ]
+      }
+    },
+    "/account-batches/{batch}/cancel": {
+      "post": {
+        "tags": [
+          "Accounts"
+        ],
+        "summary": "Stop queued rows and let started logins finish",
+        "operationId": "accounts_cancel_batch",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/AccountBatch"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "default": {
+            "$ref": "#/components/responses/ManagementError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "batch",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Batch ID returned when submitting."
           }
         ]
       }
