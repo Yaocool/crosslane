@@ -678,9 +678,10 @@ impl AccountPool {
         self.notify.notify_waiters();
     }
 
-    /// Count accounts using the same health and credit gates as scheduling.
+    /// Read account counts using the same health and credit gates as scheduling.
     ///
-    /// Credit protection is kept separate from true exhaustion.
+    /// Credit protection is kept separate from true exhaustion. Expired
+    /// cooldowns are projected as available without mutating scheduler state.
     pub async fn scheduling_counts(&self) -> AccountPoolCounts {
         self.scheduling_counts_in(None).await
     }
@@ -707,9 +708,6 @@ impl AccountPool {
         let config = self.config();
         let mut counts = AccountPoolCounts::default();
         for state in states {
-            if state.cooling_expired().await {
-                state.set_health(AccountHealth::Available);
-            }
             let account = state.account.read().await;
             if allowed_ids.is_some_and(|allowed| !allowed.contains(&account.id)) {
                 continue;
@@ -723,7 +721,13 @@ impl AccountPool {
             match account_credit_state(&account, &config) {
                 AccountCreditState::Protected => counts.protected += 1,
                 AccountCreditState::Exhausted => counts.exhausted += 1,
-                AccountCreditState::Available => match state.health() {
+                AccountCreditState::Available => match if state.cooling_expired().await {
+                    // Observability must not change scheduling state. The
+                    // scheduler itself reactivates expired cooling accounts.
+                    AccountHealth::Available
+                } else {
+                    state.health()
+                } {
                     AccountHealth::Available => counts.available += 1,
                     AccountHealth::Cooling => counts.cooling += 1,
                     AccountHealth::Exhausted => counts.exhausted += 1,
@@ -1263,6 +1267,40 @@ mod tests {
         let counts = pool.scheduling_counts_scoped(&allowed).await;
         assert_eq!(counts.total, 1);
         assert_eq!(counts.available, 1);
+    }
+
+    #[tokio::test]
+    async fn scheduling_counts_project_expired_cooling_without_changing_any_account() {
+        let pool = AccountPool::new(
+            vec![
+                account("included", 0.0, SubscriptionKind::Pro),
+                account("excluded", 0.0, SubscriptionKind::Pro),
+            ],
+            immediate_config(),
+        );
+        for id in ["included", "excluded"] {
+            pool.get(id).await.unwrap().cool_for(Duration::ZERO).await;
+        }
+        let allowed = HashSet::from(["included".to_owned()]);
+        let scoped = pool.scheduling_counts_scoped(&allowed).await;
+        assert_eq!((scoped.total, scoped.available, scoped.cooling), (1, 1, 0));
+        assert_eq!(pool.scheduling_counts().await.available, 2);
+        for id in ["included", "excluded"] {
+            assert_eq!(pool.get(id).await.unwrap().health(), AccountHealth::Cooling);
+        }
+        let lease = pool
+            .acquire_scoped_excluding("claude-sonnet", 0.0, &allowed, &HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(lease.account().await.id, "included");
+        assert_eq!(
+            pool.get("included").await.unwrap().health(),
+            AccountHealth::Available
+        );
+        assert_eq!(
+            pool.get("excluded").await.unwrap().health(),
+            AccountHealth::Cooling
+        );
     }
 
     #[tokio::test]

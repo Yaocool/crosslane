@@ -165,9 +165,6 @@ fn router_for_service(
     let keep_alive_state = router_state.clone();
     let trace_state = router_state.clone();
     Router::new()
-        .route("/", get(handlers::root))
-        .route("/health", get(handlers::health))
-        .route("/ready", get(handlers::readiness))
         .route(
             "/v1/messages",
             post(handlers::claude_messages).fallback(handlers::claude_method_not_allowed),
@@ -934,7 +931,7 @@ mod tests {
         for _ in 0..2 {
             let response = router(Arc::clone(&state))
                 .oneshot(
-                    Request::get("/health")
+                    Request::get("/v1/models")
                         .body(Body::empty())
                         .expect("request"),
                 )
@@ -1004,7 +1001,7 @@ mod tests {
         ]);
         let requests = [
             (
-                Request::get("/health").body(Body::empty()).unwrap(),
+                Request::get("/v1/models").body(Body::empty()).unwrap(),
                 StatusCode::OK,
             ),
             (
@@ -1356,7 +1353,7 @@ mod tests {
     #[tokio::test]
     async fn readiness_degrades_without_making_liveness_fail() {
         let (_directory, state) = test_state(Config::default()).await;
-        let app = router(Arc::clone(&state));
+        let app = crate::status_http::router(Arc::clone(&state));
         let health = app
             .clone()
             .oneshot(
@@ -1474,7 +1471,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_reports_total_accounts_and_aggregate_upstream_credits() {
+    async fn health_counts_only_untagged_accounts_and_limits_public_fields() {
         let (_directory, state) = test_state(Config::default()).await;
         let mut accounts = AccountStore::load(&state.paths.accounts_file)
             .await
@@ -1517,12 +1514,17 @@ mod tests {
                 None,
             ))
             .expect("account without usage");
+        for (id, enabled) in [("acc_tagged", true), ("acc_tagged_disabled", false)] {
+            let mut tagged = account_with_usage(id, &format!("{id}@example.com"), enabled, None);
+            tagged.tags = vec!["private-team".into()];
+            accounts.insert(tagged).expect("tagged account");
+        }
         state
             .apply_account_file_reload(accounts)
             .await
             .expect("reload accounts");
 
-        let response = router(state)
+        let response = crate::status_http::router(state)
             .oneshot(
                 Request::get("/health")
                     .body(Body::empty())
@@ -1533,8 +1535,22 @@ mod tests {
         let health = body_json(response).await;
 
         assert_eq!(health["total_accounts"], 3);
-        assert_eq!(health["used_credits"], 4.0);
-        assert_eq!(health["total_credits"], 30.0);
+        assert_eq!(health["available_accounts"], 2);
+        assert_eq!(health["disabled_accounts"], 1);
+        assert_eq!(health["services"], serde_json::json!([]));
+        for field in [
+            "used_credits",
+            "total_credits",
+            "service_id",
+            "provider_scope",
+            "provider_errors",
+            "uptime_secs",
+        ] {
+            assert!(
+                health.get(field).is_none(),
+                "private field exposed: {field}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3195,10 +3211,10 @@ mod tests {
         state.config.replace(config);
         let views = state.proxy_services.views(&state.config.current()).await;
         assert!(views[0].running);
-        let health = reqwest::get(format!("http://127.0.0.1:{port}/health"))
+        let models = reqwest::get(format!("http://127.0.0.1:{port}/v1/models"))
             .await
             .expect("restarted listener");
-        assert_eq!(health.status(), StatusCode::OK);
+        assert_eq!(models.status(), StatusCode::OK);
 
         state.shutdown.cancel();
         state

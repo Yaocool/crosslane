@@ -811,14 +811,10 @@ async fn creating_first_proxy_service_returns_a_scoped_api_key() {
         Some(created.api_key.key.as_str())
     );
 
-    let health: serde_json::Value = reqwest::get(format!("http://127.0.0.1:{port}/health"))
+    let health = reqwest::get(format!("http://127.0.0.1:{port}/health"))
         .await
-        .expect("health request")
-        .json()
-        .await
-        .expect("health JSON");
-    assert_eq!(health["status"], "ok");
-    assert_eq!(health["available_accounts"], 0);
+        .expect("business listener request");
+    assert_eq!(health.status().as_u16(), 404);
 
     let deleted: ProxyServiceDeleteResult = serde_json::from_value(expect_ok(
         dispatch(
@@ -2345,4 +2341,42 @@ async fn config_reload_rolls_back_when_proxy_listener_cannot_start() {
         .is_some_and(|error| error.contains("svc_reload")));
     assert!(state.config.current().proxy_service.is_empty());
     assert!(state.config.current().api_key.is_empty());
+}
+
+
+#[test]
+fn default_service_port_skips_the_enabled_status_http_port() {
+    let mut config = Config::default();
+    config.status_http.enabled = true;
+    config.status_http.port = config.server.port;
+    assert_eq!(
+        next_service_port_with_override(&config, None).unwrap(),
+        config.server.port + 1
+    );
+    assert_eq!(
+        next_service_port_with_override(&config, Some(config.server.port + 10)).unwrap(),
+        config.server.port + 1,
+        "the persisted port must also pass configuration validation"
+    );
+    config.status_http.port = config.server.port + 1;
+    assert_eq!(
+        next_service_port_with_override(&config, Some(config.status_http.port)).unwrap(),
+        config.server.port + 2,
+        "both the override and the reserved persisted port must be skipped"
+    );
+
+    config.status_http.port = config.server.port + 1;
+    config.proxy_service.push(ProxyServiceConfig {
+        port: config.server.port,
+        ..ProxyServiceConfig::default()
+    });
+    assert_eq!(
+        next_service_port_with_override(&config, None).unwrap(),
+        config.server.port + 2
+    );
+    config.status_http.enabled = false;
+    assert_eq!(
+        next_service_port_with_override(&config, None).unwrap(),
+        config.server.port + 1
+    );
 }

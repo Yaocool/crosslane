@@ -344,7 +344,7 @@ struct CompactionRequest<'a> {
 mod entrypoints;
 
 use entrypoints::{attempt_diagnostics, read_bounded_body, record_failed_request};
-pub use entrypoints::{claude_messages, health, openai_chat, readiness, root};
+pub use entrypoints::{claude_messages, openai_chat};
 
 mod chat;
 mod hosted_web;

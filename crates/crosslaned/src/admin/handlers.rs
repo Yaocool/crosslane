@@ -2018,19 +2018,42 @@ fn next_service_port_with_override(
     config: &Config,
     override_port: Option<u16>,
 ) -> Result<u16, RpcError> {
+    allocate_service_port(config, override_port, None)
+}
+
+fn allocate_service_port(
+    config: &Config,
+    override_port: Option<u16>,
+    pending_status_port: Option<u16>,
+) -> Result<u16, RpcError> {
     let existing = config
         .proxy_service
         .iter()
         .map(|service| crate::http::effective_port_with_override(config, service, override_port))
         .collect::<std::collections::HashSet<_>>();
-    if existing.is_empty() {
+    let mut reserved = config
+        .status_http
+        .enabled
+        .then_some(config.status_http.port)
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    reserved.extend(pending_status_port);
+    if existing.is_empty()
+        && !reserved.contains(&config.server.port)
+        && !reserved.contains(&override_port.unwrap_or(config.server.port))
+    {
         return Ok(config.server.port);
     }
-    let mut port = (*existing.iter().max().expect("nonempty ports")).max(1023);
+    let mut port = existing
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(config.server.port.saturating_sub(1))
+        .max(1023);
     loop {
         port = port.checked_add(1).ok_or_else(|| {
             RpcError::bad_params(
-                "无法自动分配服务端口：现有 service 最大端口已是 65535；请显式指定 --port",
+                "无法自动分配服务端口：已到达端口范围上限 65535；请显式指定 --port",
             )
         })?;
         let effective = if port == config.server.port {
@@ -2043,6 +2066,8 @@ fn next_service_port_with_override(
             port
         };
         if !existing.contains(&effective)
+            && !reserved.contains(&port)
+            && !reserved.contains(&effective)
             && !config
                 .proxy_service
                 .iter()

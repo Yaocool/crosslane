@@ -116,6 +116,11 @@ mod redaction_notice;
 #[path = "end_to_end/client_tool_search.rs"]
 mod client_tool_search;
 
+#[path = "end_to_end/status_http.rs"]
+mod status_http;
+
+
+
 struct Daemon {
     child: Child,
     socket: PathBuf,
@@ -199,6 +204,14 @@ impl Daemon {
     }
 
     async fn start_copilot(port: u16, github_base: &str) -> Self {
+        Self::start_copilot_with_status(port, github_base, None).await
+    }
+
+    async fn start_copilot_with_status(
+        port: u16,
+        github_base: &str,
+        status_port: Option<u16>,
+    ) -> Self {
         let home = tempfile::tempdir().expect("tempdir");
         let socket = home.path().join("admin.sock");
         let mut copilot = ProviderConfig {
@@ -219,6 +232,10 @@ impl Daemon {
             .insert("allow_insecure_http".into(), serde_json::Value::Bool(true));
         let mut config = Config::default();
         config.admin.socket = socket.to_string_lossy().into_owned();
+        if let Some(port) = status_port {
+            config.status_http.enabled = true;
+            config.status_http.port = port;
+        }
         config.provider = vec![copilot];
         config.api_key = vec![ApiKeyConfig {
             id: Some("ak_copilot_e2e".into()),
@@ -323,13 +340,12 @@ async fn wait_for_socket(socket: &Path) {
 
 async fn wait_for_http(port: u16) {
     let deadline = Instant::now() + Duration::from_secs(20);
-    let client = reqwest::Client::new();
     loop {
-        if client
-            .get(format!("http://127.0.0.1:{port}/health"))
-            .send()
+        // A business HTTP request can change request/error counters. Wait for
+        // the listener without consuming an API key or a metering record.
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
-            .is_ok_and(|response| response.status().is_success())
+            .is_ok()
         {
             return;
         }
@@ -778,7 +794,8 @@ async fn copilot_provider_routes_native_chat_models_mapping_and_usage_end_to_end
         .await;
 
     let port = unused_tcp_port();
-    let daemon = Daemon::start_copilot(port, &upstream.uri()).await;
+    let status_port = unused_tcp_port();
+    let daemon = Daemon::start_copilot_with_status(port, &upstream.uri(), Some(status_port)).await;
     let imported = expect_ok(
         daemon
             .call(
@@ -818,6 +835,17 @@ async fn copilot_provider_routes_native_chat_models_mapping_and_usage_end_to_end
     );
     assert_eq!(subscriptions["provider_id"], "copilot");
     assert_eq!(subscriptions["supported"], false);
+    let health: serde_json::Value = reqwest::get(format!("http://127.0.0.1:{status_port}/health"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    status_http::assert_health_contract(&health);
+    assert_eq!(
+        health["total_accounts"], 1,
+        "untagged Copilot account is included"
+    );
     let account_id = imported["id"].as_str().expect("imported account ID");
     let tagged = expect_ok(
         daemon
@@ -857,27 +885,28 @@ async fn copilot_provider_routes_native_chat_models_mapping_and_usage_end_to_end
 
     let client = reqwest::Client::new();
     let service_ready = client
-        .get(format!("http://127.0.0.1:{port}/ready"))
+        .get(format!("http://127.0.0.1:{status_port}/ready"))
         .send()
         .await
         .expect("service readiness request");
     assert_eq!(service_ready.status(), reqwest::StatusCode::OK);
     let service_ready: serde_json::Value = service_ready.json().await.expect("readiness JSON");
     assert_eq!(
-        service_ready["provider_scope"],
+        service_ready["services"][0]["provider_scope"],
         serde_json::json!(["copilot"])
     );
-    assert_eq!(service_ready["available_accounts"], 1);
+    assert_eq!(service_ready["services"][0]["available_accounts"], 1);
     let service_health: serde_json::Value = client
-        .get(format!("http://127.0.0.1:{port}/health"))
+        .get(format!("http://127.0.0.1:{status_port}/health"))
         .send()
         .await
         .expect("service health request")
         .json()
         .await
         .expect("health JSON");
-    assert_eq!(service_health["total_accounts"], 1);
-    assert_eq!(service_health["available_accounts"], 1);
+    status_http::assert_health_contract(&service_health);
+    assert_eq!(service_health["total_accounts"], 0);
+    assert_eq!(service_health["available_accounts"], 0);
     let catalog = client
         .get(format!("http://127.0.0.1:{port}/v1/models"))
         .bearer_auth(daemon.api_key.as_deref().expect("API key"))
@@ -1059,15 +1088,14 @@ async fn copilot_provider_routes_native_chat_models_mapping_and_usage_end_to_end
             .await,
     );
     assert_eq!(removed["provider_accounts"], serde_json::json!([]));
-    let health: serde_json::Value = client
-        .get(format!("http://127.0.0.1:{port}/health"))
+    let readiness = client
+        .get(format!("http://127.0.0.1:{status_port}/ready"))
         .send()
         .await
-        .unwrap()
-        .json()
-        .await
         .unwrap();
-    assert_eq!(health["total_accounts"], 0);
+    assert_eq!(readiness.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let readiness: serde_json::Value = readiness.json().await.unwrap();
+    assert_eq!(readiness["services"][0]["available_accounts"], 0);
     let blocked = client.post(format!("http://127.0.0.1:{port}/v1/messages"))
         .bearer_auth(daemon.api_key.as_deref().unwrap())
         .json(&serde_json::json!({"model":"gpt-test","messages":[{"role":"user","content":"excluded"}],"max_tokens":64}))
