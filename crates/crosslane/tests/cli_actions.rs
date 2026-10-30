@@ -695,8 +695,209 @@ providers = ["kiro", "copilot"]
     }
 }
 
+#[tokio::test]
+async fn management_id_collision_never_changes_or_removes_a_named_neighbor_in_cli() {
+    use crosslane_core::config::{ApiKeyConfig, Config, ProxyServiceConfig};
 
+    let initial = Config {
+        api_key: [
+            ("ak_shadow", "ak_target", 99.0),
+            ("ak_target", "target-key", 12.0),
+        ]
+        .map(|(id, name, limit)| ApiKeyConfig {
+            id: Some(id.into()),
+            name: name.into(),
+            key: format!("fixture-{id}"),
+            credits_limit: Some(limit),
+            ..ApiKeyConfig::default()
+        })
+        .to_vec(),
+        proxy_service: [
+            ("svc_shadow", "svc_target", 6201),
+            ("svc_target", "target-service", 6202),
+        ]
+        .map(|(id, name, port)| ProxyServiceConfig {
+            id: id.into(),
+            name: name.into(),
+            host: "127.0.0.1".into(),
+            port,
+            api_key_ids: vec!["ak_shadow".into()],
+            ..ProxyServiceConfig::default()
+        })
+        .to_vec(),
+        ..Config::default()
+    };
+    initial.validate().unwrap();
+    for (operation, args) in [
+        (
+            "service-edit",
+            vec![
+                "service",
+                "edit",
+                "svc_target",
+                "--skip-user-agent-check",
+                "true",
+            ],
+        ),
+        (
+            "key-edit",
+            vec![
+                "apikey",
+                "edit",
+                "ak_target",
+                "--skip-user-agent-check",
+                "true",
+            ],
+        ),
+        ("key-disable", vec!["apikey", "disable", "ak_target"]),
+        (
+            "key-limit",
+            vec!["apikey", "limit", "ak_target", "--credits", "7"],
+        ),
+        (
+            "key-clear-limit",
+            vec!["apikey", "limit", "ak_target", "--clear"],
+        ),
+        ("key-remove", vec!["apikey", "rm", "ak_target", "--yes"]),
+        (
+            "service-bind-key",
+            vec![
+                "service",
+                "edit",
+                "svc_target",
+                "--add-api-key",
+                "ak_target",
+            ],
+        ),
+    ] {
+        let workspace = tempfile::tempdir().unwrap();
+        let file = workspace.path().join("config.toml");
+        let mut before = initial.clone();
+        if operation == "key-remove" {
+            // Both keys are unbound, so validation cannot mask the old bug
+            // where one deletion removed the ID owner and its named neighbor.
+            before.proxy_service.clear();
+        }
+        fs::write(&file, toml::to_string(&before).unwrap()).unwrap();
+        let (output, requests) = run_in_workspace_mode(workspace.path(), &args, vec![
+            json!({"config_file":file,"accounts_file":"","daily_file":"","stats_file":"","admin_socket":""}),
+            json!({"applied":true,"needs_restart":[]}),
+        ], false).await;
+        assert_success(&output);
+        assert_eq!(requests.len(), 2);
+        let changed: Config = toml::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(changed.api_key[0].id.as_deref(), Some("ak_shadow"));
+        assert_eq!(changed.api_key[0].name, "ak_target");
+        assert!(changed.api_key[0].enabled && !changed.api_key[0].skip_user_agent_check);
+        assert_eq!(changed.api_key[0].credits_limit, Some(99.0));
+        assert_eq!(changed.proxy_service.len(), before.proxy_service.len());
+        if let Some(neighbor) = before.proxy_service.first() {
+            assert_eq!(&changed.proxy_service[0], neighbor);
+        }
+        match operation {
+            "service-edit" => assert!(changed.proxy_service[1].skip_user_agent_check),
+            "key-edit" => assert!(changed.api_key[1].skip_user_agent_check),
+            "key-disable" => assert!(!changed.api_key[1].enabled),
+            "key-limit" => assert_eq!(changed.api_key[1].credits_limit, Some(7.0)),
+            "key-clear-limit" => assert!(changed.api_key[1].credits_limit.is_none()),
+            "key-remove" => assert_eq!(
+                changed.api_key.len(),
+                1,
+                "deletion must remove exactly one selected key"
+            ),
+            _ => assert_eq!(
+                changed.proxy_service[1].api_key_ids,
+                ["ak_shadow", "ak_target"]
+            ),
+        }
+    }
+}
 
+#[tokio::test]
+async fn management_id_collision_keeps_cli_show_on_the_requested_id_and_preserves_name_aliases() {
+    let keys =
+        json!([{"id":"ak_shadow","name":"ak_target"},{"id":"ak_target","name":"target-key"}]);
+    let services = json!({"services":[
+        {"id":"svc_shadow","name":"svc_target","host":"127.0.0.1","port":6201,"enabled":true,"running":false,"created_at":0},
+        {"id":"svc_target","name":"target-service","host":"127.0.0.1","port":6202,"enabled":true,"running":false,"created_at":0}
+    ]});
+    for (args, result, expected) in [
+        (
+            vec!["apikey", "show", "ak_target"],
+            keys.clone(),
+            "ak_target",
+        ),
+        (vec!["apikey", "show", "target-key"], keys, "ak_target"),
+        (
+            vec!["service", "show", "svc_target"],
+            services.clone(),
+            "svc_target",
+        ),
+        (
+            vec!["service", "show", "target-service"],
+            services,
+            "svc_target",
+        ),
+    ] {
+        let (output, _) = run(&args, vec![result]).await;
+        assert_success(&output);
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["id"], expected);
+    }
+}
+
+#[tokio::test]
+async fn management_id_collision_service_rename_returns_the_selected_stable_id() {
+    use crosslane_core::config::{ApiKeyConfig, Config, ProxyServiceConfig};
+
+    let workspace = tempfile::tempdir().unwrap();
+    let file = workspace.path().join("config.toml");
+    let config = Config {
+        api_key: vec![ApiKeyConfig {
+            id: Some("ak_fixture".into()),
+            name: "fixture".into(),
+            key: "fixture-client-key".into(),
+            ..ApiKeyConfig::default()
+        }],
+        proxy_service: [
+            ("svc_shadow", "neighbor", 6201),
+            ("svc_target", "target", 6202),
+        ]
+        .map(|(id, name, port)| ProxyServiceConfig {
+            id: id.into(),
+            name: name.into(),
+            host: "127.0.0.1".into(),
+            port,
+            api_key_ids: vec!["ak_fixture".into()],
+            ..ProxyServiceConfig::default()
+        })
+        .to_vec(),
+        ..Config::default()
+    };
+    fs::write(&file, toml::to_string(&config).unwrap()).unwrap();
+    let (output, requests) = run_in_workspace(workspace.path(),
+        &["service", "edit", "target", "--rename", "svc_shadow"],
+        vec![
+            json!({"config_file":file,"accounts_file":"","daily_file":"","stats_file":"","admin_socket":""}),
+            json!({"applied":true,"needs_restart":[]}),
+            json!({"services":[
+                {"id":"svc_shadow","name":"neighbor","host":"127.0.0.1","port":6201,"enabled":true,"running":false,"created_at":0},
+                {"id":"svc_target","name":"svc_shadow","host":"127.0.0.1","port":6202,"enabled":true,"running":false,"created_at":0}
+            ]}),
+        ]
+    ).await;
+    assert_success(&output);
+    assert_eq!(requests.len(), 3);
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        result["id"], "svc_target",
+        "rename result must retain the edited service's stable ID"
+    );
+    assert_eq!(result["name"], "svc_shadow");
+    let saved: Config = toml::from_str(&fs::read_to_string(file).unwrap()).unwrap();
+    assert_eq!(saved.proxy_service[0].name, "neighbor");
+    assert_eq!(saved.proxy_service[1].name, "svc_shadow");
+}
 
 #[tokio::test]
 async fn contradictory_provider_edits_and_multi_provider_tasks_fail_before_rpc() {

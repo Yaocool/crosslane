@@ -3,6 +3,7 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Subcommand, ValueEnum};
 use crosslane_core::config::DEFAULT_COPILOT_OAUTH_CLIENT_ID;
+use crosslane_core::ids::index_by_id_or_name;
 use crosslane_core::paths::Paths;
 use crosslane_ipc::protocol::method;
 use crosslane_ipc::protocol::{
@@ -1215,6 +1216,7 @@ pub async fn run_service(
             }
             let account_tag = normalize_service_tags(&account_tag)?;
             let result_selector = rename.clone().unwrap_or_else(|| service.clone());
+            let mut result_id = String::new();
             mutate_config(client, |config| {
                 // Resolve names only after the config file lock has been
                 // acquired and the latest TOML snapshot has been read. This
@@ -1228,6 +1230,11 @@ pub async fn run_service(
                     .as_array_mut()
                     .ok_or_else(|| anyhow!("proxy_service must be an array of tables"))?;
                 let table = find_service_table_mut(array, &service)?;
+                result_id = table
+                    .get("id")
+                    .and_then(toml::Value::as_str)
+                    .context("proxy service has no stable ID")?
+                    .to_owned();
                 replace_optional_string(table, "name", rename.as_deref());
                 replace_optional_string(table, "host", host.as_deref());
                 if let Some(port) = port {
@@ -1266,7 +1273,7 @@ pub async fn run_service(
             })
             .await?;
             if json {
-                show_service(client, &result_selector, true).await
+                show_service(client, &result_id, true).await
             } else {
                 println!("已更新 API 代理服务 {result_selector}");
                 Ok(())
@@ -1546,11 +1553,11 @@ async fn show_service(client: &mut AdminClient, selector: &str, json: bool) -> R
     let result: ProxyServiceListResult = client
         .call(method::SERVICE_LIST, serde_json::json!({}))
         .await?;
-    let service = result
-        .services
-        .into_iter()
-        .find(|service| service.id == selector || service.name == selector)
-        .ok_or_else(|| anyhow!("proxy service not found: {selector}"))?;
+    let service = index_by_id_or_name(&result.services, selector, |service| {
+        (Some(service.id.as_str()), Some(service.name.as_str()))
+    })
+    .and_then(|index| result.services.get(index))
+    .ok_or_else(|| anyhow!("proxy service not found: {selector}"))?;
     if json {
         return print_json(&service);
     }
@@ -1622,7 +1629,7 @@ async fn show_service(client: &mut AdminClient, selector: &str, json: bool) -> R
             service.excluded_account_ids.join(",")
         }
     );
-    if let Some(error) = service.error.filter(|error| !error.is_empty()) {
+    if let Some(error) = service.error.as_deref().filter(|error| !error.is_empty()) {
         println!("错误      {error}");
     }
     Ok(())
@@ -1682,14 +1689,8 @@ fn find_service_table_mut<'a>(
     array: &'a mut [toml::Value],
     selector: &str,
 ) -> Result<&'a mut toml::map::Map<String, toml::Value>> {
-    array
-        .iter_mut()
-        .find(|value| {
-            value.as_table().is_some_and(|table| {
-                table.get("id").and_then(toml::Value::as_str) == Some(selector)
-                    || table.get("name").and_then(toml::Value::as_str) == Some(selector)
-            })
-        })
+    config_entry_index(array, selector)
+        .and_then(|index| array.get_mut(index))
         .and_then(toml::Value::as_table_mut)
         .ok_or_else(|| anyhow!("proxy service not found: {selector}"))
 }
@@ -1708,13 +1709,8 @@ fn resolve_api_key_ids(
         .unwrap_or_default();
     let mut ids = Vec::with_capacity(selectors.len());
     for selector in selectors {
-        let key = api_keys
-            .iter()
-            .filter_map(toml::Value::as_table)
-            .find(|key| {
-                key.get("id").and_then(toml::Value::as_str) == Some(selector)
-                    || key.get("name").and_then(toml::Value::as_str) == Some(selector)
-            })
+        let key = config_entry_index(api_keys, selector)
+            .and_then(|index| api_keys[index].as_table())
             .ok_or_else(|| anyhow!("API key not found: {selector}"))?;
         let id = key
             .get("id")
@@ -1745,10 +1741,10 @@ async fn show_keys(
         let entry = value
             .as_array_mut()
             .and_then(|array| {
-                array
-                    .iter()
-                    .position(|item| item["id"] == id || item["name"] == id)
-                    .map(|index| array.remove(index))
+                index_by_id_or_name(array, id, |item| {
+                    (item["id"].as_str(), item["name"].as_str())
+                })
+                .map(|index| array.remove(index))
             })
             .ok_or_else(|| anyhow!("API key not found: {id}"))?;
         value = if let Some(tail) = tail {
@@ -1776,9 +1772,8 @@ async fn mutate_key_and_reload(
     value: toml::Value,
 ) -> Result<()> {
     mutate_config_array(client, "api_key", |array| {
-        let table = array
-            .iter_mut()
-            .find(|item| matches_key(item, id))
+        let table = config_entry_index(array, id)
+            .and_then(|index| array.get_mut(index))
             .and_then(toml::Value::as_table_mut)
             .ok_or_else(|| anyhow!("API key not found: {id}"))?;
         table.insert(field.into(), value);
@@ -1789,9 +1784,8 @@ async fn mutate_key_and_reload(
 
 async fn clear_key_field_and_reload(client: &mut AdminClient, id: &str, field: &str) -> Result<()> {
     mutate_config_array(client, "api_key", |array| {
-        let table = array
-            .iter_mut()
-            .find(|item| matches_key(item, id))
+        let table = config_entry_index(array, id)
+            .and_then(|index| array.get_mut(index))
             .and_then(toml::Value::as_table_mut)
             .ok_or_else(|| anyhow!("API key not found: {id}"))?;
         table.remove(field);
@@ -2281,10 +2275,12 @@ fn remove_named_value(array: &mut Vec<toml::Value>, name: &str, kind: &str) -> R
     Ok(())
 }
 
-fn matches_key(value: &toml::Value, id: &str) -> bool {
-    value.as_table().is_some_and(|table| {
-        table.get("id").and_then(toml::Value::as_str) == Some(id)
-            || table.get("name").and_then(toml::Value::as_str) == Some(id)
+fn config_entry_index(values: &[toml::Value], selector: &str) -> Option<usize> {
+    index_by_id_or_name(values, selector, |value| {
+        (
+            value.get("id").and_then(toml::Value::as_str),
+            value.get("name").and_then(toml::Value::as_str),
+        )
     })
 }
 

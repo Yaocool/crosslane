@@ -1,5 +1,5 @@
 use super::{
-    anyhow, clear_key_field_and_reload, generate_key, key_id, matches_key, method,
+    anyhow, clear_key_field_and_reload, config_entry_index, generate_key, key_id, method,
     mutate_config_array, mutate_key_and_reload, print_json, render_table, show_keys, simple_rpc,
     AdminClient, ApiKeyCommand, Context, Deserialize, Result,
 };
@@ -108,9 +108,8 @@ pub async fn run_apikey(
                 return Err(anyhow!("没有指定修改项"));
             }
             mutate_config_array(client, "api_key", |array| {
-                let table = array
-                    .iter_mut()
-                    .find(|item| matches_key(item, &id))
+                let table = config_entry_index(array, &id)
+                    .and_then(|index| array.get_mut(index))
                     .and_then(toml::Value::as_table_mut)
                     .ok_or_else(|| anyhow!("API key not found: {id}"))?;
                 if let Some(skip) = skip_user_agent_check {
@@ -149,11 +148,10 @@ pub async fn run_apikey(
                 return Ok(());
             }
             mutate_config_array(client, "api_key", |array| {
-                let before = array.len();
-                array.retain(|value| !matches_key(value, &id));
-                (array.len() < before)
-                    .then_some(())
-                    .ok_or_else(|| anyhow!("API key not found: {id}"))
+                let index = config_entry_index(array, &id)
+                    .ok_or_else(|| anyhow!("API key not found: {id}"))?;
+                array.remove(index);
+                Ok(())
             })
             .await?;
             if json {
