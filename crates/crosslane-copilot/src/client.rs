@@ -427,9 +427,18 @@ impl AccountSlot {
     }
 }
 
-/// One configured Copilot provider instance with isolated accounts and token
-/// cache.
+/// Validated credentials awaiting a provider-generation-bound commit.
+/// Fields are private and intentionally have no Debug implementation.
+pub struct PreparedTokenImport {
+    generation: Uuid,
+    account: CopilotAccount,
+    exchanged: CachedApiToken,
+    models: Vec<ProviderModel>,
+}
+
+/// One configured Copilot provider instance with isolated accounts and token cache.
 pub struct CopilotProvider {
+    import_generation: Uuid,
     model_policy: Arc<crosslane_provider::ModelPolicy>,
     id: ProviderId,
     enabled: bool,
@@ -479,6 +488,7 @@ impl CopilotProvider {
             })
             .collect();
         Ok(Self {
+            import_generation: Uuid::new_v4(),
             model_policy: Arc::new(crosslane_provider::ModelPolicy::default()),
             tokenizer: std::sync::OnceLock::new(),
             id,
@@ -690,7 +700,42 @@ impl CopilotProvider {
         token: String,
         label: Option<String>,
     ) -> Result<CopilotAccountSummary, ProviderError> {
-        self.import_credentials(
+        self.import_token_with_tags(token, label, Vec::new()).await
+    }
+
+    /// Persist initial tags in the same transaction as the new account.
+    pub async fn import_token_with_tags(
+        &self,
+        token: String,
+        label: Option<String>,
+        tags: Vec<String>,
+    ) -> Result<CopilotAccountSummary, ProviderError> {
+        let prepared = self.prepare_token_import(token, label, tags).await?;
+        self.commit_token_import(prepared).await
+    }
+
+    /// Validate upstream credentials without changing the account store.
+    pub async fn prepare_token_import(
+        &self,
+        token: String,
+        label: Option<String>,
+        tags: Vec<String>,
+    ) -> Result<PreparedTokenImport, ProviderError> {
+        let mut normalized = Vec::new();
+        for tag in tags {
+            let tag = tag.trim();
+            if tag.is_empty() {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::InvalidRequest,
+                    StatusCode::BAD_REQUEST,
+                    "account tag must not be empty",
+                ));
+            }
+            normalized.push(tag.to_owned());
+        }
+        normalized.sort();
+        normalized.dedup();
+        self.prepare_credentials_import(
             CopilotCredentials {
                 github_access_token: token,
                 github_refresh_token: None,
@@ -700,6 +745,7 @@ impl CopilotProvider {
             },
             label,
             None,
+            normalized,
         )
         .await
     }
@@ -710,6 +756,30 @@ impl CopilotProvider {
         label: Option<String>,
         expected_login: Option<&str>,
     ) -> Result<CopilotAccountSummary, ProviderError> {
+        self.import_credentials_with_tags(credentials, label, expected_login, Vec::new())
+            .await
+    }
+
+    async fn import_credentials_with_tags(
+        &self,
+        credentials: CopilotCredentials,
+        label: Option<String>,
+        expected_login: Option<&str>,
+        tags: Vec<String>,
+    ) -> Result<CopilotAccountSummary, ProviderError> {
+        let prepared = self
+            .prepare_credentials_import(credentials, label, expected_login, tags)
+            .await?;
+        self.commit_token_import(prepared).await
+    }
+
+    async fn prepare_credentials_import(
+        &self,
+        credentials: CopilotCredentials,
+        label: Option<String>,
+        expected_login: Option<&str>,
+        tags: Vec<String>,
+    ) -> Result<PreparedTokenImport, ProviderError> {
         let user = self.github_user(&credentials.github_access_token).await?;
         if let Some(expected) = expected_login {
             let matches = if expected.contains('@') {
@@ -749,7 +819,7 @@ impl CopilotProvider {
             login: user.login,
             email: user.email,
             label,
-            tags: Vec::new(),
+            tags,
             enabled: true,
             credentials,
             created_at: now,
@@ -759,6 +829,33 @@ impl CopilotProvider {
             last_error: None,
             info,
         };
+        Ok(PreparedTokenImport {
+            generation: self.import_generation,
+            account,
+            exchanged,
+            models,
+        })
+    }
+
+    /// Commit only to the provider runtime that validated the credentials.
+    pub async fn commit_token_import(
+        &self,
+        prepared: PreparedTokenImport,
+    ) -> Result<CopilotAccountSummary, ProviderError> {
+        if prepared.generation != self.import_generation {
+            return Err(ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                StatusCode::CONFLICT,
+                "provider configuration changed during account validation; retry account creation",
+            ));
+        }
+        let PreparedTokenImport {
+            account,
+            exchanged,
+            models,
+            ..
+        } = prepared;
+        let now = account.created_at;
         let _mutation = self.mutation.lock().await;
         let mut accounts = self.accounts.write().await;
         let mut next = accounts.clone();

@@ -9,7 +9,7 @@ use crosslane_core::account::Account;
 use crosslane_core::config::{
     ApiKeyConfig, ApiKeyFormat, Config, PoolConfig, ProxyServiceConfig, ServiceAccountTags,
 };
-use crosslane_core::ids::{new_account_id, new_machine_id};
+use crosslane_core::ids::{index_by_id_or_name, new_account_id, new_machine_id};
 use crosslane_ipc::protocol::{
     method, AccountAddSsoParams, AccountDetail, AccountImportParams, AccountImportResult,
     AccountListParams, AccountListResult, AccountRefParams, AccountServiceBinding,
@@ -39,6 +39,7 @@ use crate::state::AppState;
 type Handled = Result<serde_json::Value, RpcError>;
 
 mod providers;
+pub(super) mod rest;
 
 /// 分发一个 RPC 请求。
 pub async fn dispatch(state: &Arc<AppState>, request: Request) -> Response {
@@ -1252,12 +1253,12 @@ async fn handle_model_resolve(state: &Arc<AppState>, params: serde_json::Value) 
         .api_key
         .as_deref()
         .map(|selector| {
-            config
-                .api_key
-                .iter()
-                .find(|key| key.id.as_deref() == Some(selector) || key.name == selector)
-                .and_then(|key| key.id.clone())
-                .ok_or_else(|| RpcError::bad_params(format!("API key not found: {selector}")))
+            index_by_id_or_name(&config.api_key, selector, |key| {
+                (key.id.as_deref(), Some(key.name.as_str()))
+            })
+            .and_then(|index| config.api_key.get(index))
+            .and_then(|key| key.id.clone())
+            .ok_or_else(|| RpcError::bad_params(format!("API key not found: {selector}")))
         })
         .transpose()?;
     let initial_route = crosslane_translate::model::map_model(
@@ -1537,11 +1538,11 @@ fn handle_service_apikeys(state: &Arc<AppState>, params: serde_json::Value) -> H
         return Err(RpcError::bad_params("service ID or name must not be empty"));
     }
     let config = state.config.current();
-    let service = config
-        .proxy_service
-        .iter()
-        .find(|service| service.id == selector || service.name == selector)
-        .ok_or_else(|| RpcError::bad_params(format!("proxy service not found: {selector}")))?;
+    let service = index_by_id_or_name(&config.proxy_service, selector, |service| {
+        (Some(service.id.as_str()), Some(service.name.as_str()))
+    })
+    .and_then(|index| config.proxy_service.get(index))
+    .ok_or_else(|| RpcError::bad_params(format!("proxy service not found: {selector}")))?;
     let mut api_keys = service
         .api_key_ids
         .iter()
@@ -1592,12 +1593,12 @@ async fn handle_service_accounts(state: &Arc<AppState>, params: serde_json::Valu
         return Err(RpcError::bad_params("service ID or name must not be empty"));
     }
     let config = state.config.current();
-    let service = config
-        .proxy_service
-        .iter()
-        .find(|service| service.id == selector || service.name == selector)
-        .ok_or_else(|| RpcError::bad_params(format!("proxy service not found: {selector}")))?;
-    let mut result = service_accounts_result(state, service).await?;
+    let service = index_by_id_or_name(&config.proxy_service, selector, |service| {
+        (Some(service.id.as_str()), Some(service.name.as_str()))
+    })
+    .and_then(|index| config.proxy_service.get(index))
+    .ok_or_else(|| RpcError::bad_params(format!("proxy service not found: {selector}")))?;
+    let mut result = service_accounts_result(state, service, true).await?;
     if let Some(provider) = params.provider.filter(|id| id != "all") {
         if !config
             .effective_providers()
@@ -1663,14 +1664,7 @@ async fn handle_service_account_change(
         }
         let resolved =
             providers::resolve_account_ref(state, params.provider.as_deref(), reference).await?;
-        let value = providers::handle_account_show(
-            state,
-            serde_json::json!({"id":resolved.account_id,"provider":resolved.provider_id}),
-        )
-        .await?;
-        let id = value["id"]
-            .as_str()
-            .ok_or_else(|| RpcError::internal("account has no id"))?;
+        let id = &resolved.account_id;
         let qualified = if resolved.provider_id.as_str() == "kiro" {
             id.to_owned()
         } else {
@@ -1681,13 +1675,12 @@ async fn handle_service_account_change(
         }
     }
 
-    let previous = state.config.current().as_ref().clone();
-    let mut next = previous.clone();
-    let service = next
-        .proxy_service
-        .iter_mut()
-        .find(|service| service.id == selector || service.name == selector)
-        .ok_or_else(|| RpcError::bad_params(format!("proxy service not found: {selector}")))?;
+    let (raw, mut next, _) = service_config_snapshot_locked(state).await?;
+    let service = index_by_id_or_name(&next.proxy_service, selector, |service| {
+        (Some(service.id.as_str()), Some(service.name.as_str()))
+    })
+    .and_then(|index| next.proxy_service.get_mut(index))
+    .ok_or_else(|| RpcError::bad_params(format!("proxy service not found: {selector}")))?;
     let original_service = service.clone();
     // Both forms are accepted for Kiro, but mutations persist the legacy form
     // so adding a qualified alias also clears an existing qualified exclusion.
@@ -1743,14 +1736,11 @@ async fn handle_service_account_change(
         drop(account_transaction);
         drop(config_mutation);
         drop(file_lock);
-        return service_accounts_result(state, &service).await;
+        return service_accounts_result(state, &service, false).await;
     }
 
     next.validate()
         .map_err(|error| RpcError::bad_params(error.to_string()))?;
-    let raw = tokio::fs::read_to_string(&state.paths.config_file)
-        .await
-        .map_err(|error| RpcError::internal(error.to_string()))?;
     persist_service_config_locked(state, &raw, &next).await?;
     let service = next
         .proxy_service
@@ -1761,10 +1751,14 @@ async fn handle_service_account_change(
     drop(account_transaction);
     drop(config_mutation);
     drop(file_lock);
-    service_accounts_result(state, &service).await
+    service_accounts_result(state, &service, false).await
 }
 
-async fn service_accounts_result(state: &Arc<AppState>, service: &ProxyServiceConfig) -> Handled {
+async fn service_accounts_result(
+    state: &Arc<AppState>,
+    service: &ProxyServiceConfig,
+    refresh: bool,
+) -> Handled {
     let source = state.with_accounts(|store| store.all().to_vec());
     let pool = state.pool();
     let pool_config = state.runtime_config_snapshot().pool;
@@ -1780,9 +1774,11 @@ async fn service_accounts_result(state: &Arc<AppState>, service: &ProxyServiceCo
     accounts.sort_by(|left, right| {
         compare_account_identity(&left.email, &left.id, &right.email, &right.id)
     });
-    let all: ProviderAccountListResult = serde_json::from_value(
-        providers::handle_account_list(state, serde_json::Value::Null).await?,
-    )
+    let all: ProviderAccountListResult = serde_json::from_value(if refresh {
+        providers::handle_account_list(state, serde_json::Value::Null).await?
+    } else {
+        providers::cached_account_list(state, serde_json::Value::Null).await?
+    })
     .map_err(|error| RpcError::internal(error.to_string()))?;
     let allowed = state
         .config
@@ -1820,19 +1816,81 @@ async fn service_accounts_result(state: &Arc<AppState>, service: &ProxyServiceCo
     })
 }
 
+async fn service_config_snapshot_locked(
+    state: &Arc<AppState>,
+) -> Result<(String, Config, Option<u16>), RpcError> {
+    let raw = tokio::fs::read_to_string(&state.paths.config_file)
+        .await
+        .map_err(|error| RpcError::internal(format!("read config: {error}")))?;
+    let disk: Config = toml::from_str(&raw)
+        .map_err(|_| RpcError::bad_params("could not parse current service configuration"))?;
+    let pending_status_port = disk.status_http.enabled.then_some(disk.status_http.port);
+    let (next, _) = merge_hot_reload(&state.config.current(), disk);
+    Ok((raw, next, pending_status_port))
+}
+
+/// Callers hold the configuration-file and runtime-mutation locks. An atomic
+/// rename can succeed before directory fsync reports an error, so a failed
+/// write must be reconciled before watchers can observe the file again.
+async fn write_config_update_locked(
+    state: &Arc<AppState>,
+    previous: &str,
+    updated: &str,
+) -> Result<(), RpcError> {
+    let Err(error) = crosslane_store::atomic::write_bytes_atomically(
+        &state.paths.config_file,
+        updated.as_bytes(),
+        Some(0o600),
+    )
+    .await
+    else {
+        return Ok(());
+    };
+    let unchanged = tokio::fs::read(&state.paths.config_file)
+        .await
+        .is_ok_and(|bytes| bytes == previous.as_bytes());
+    if unchanged {
+        warn!(event = "config.persistence_failed", error = %error, restored = true,
+            "configuration write failed before changing the previous generation");
+        return Err(RpcError::internal(
+            "could not persist configuration change; previous configuration unchanged",
+        ));
+    }
+
+    let rollback = crosslane_store::atomic::write_bytes_atomically(
+        &state.paths.config_file,
+        previous.as_bytes(),
+        Some(0o600),
+    )
+    .await;
+    // Rollback can itself replace the file before directory fsync fails.
+    // Inspect actual bytes instead of inferring the generation from the error.
+    let restored = tokio::fs::read(&state.paths.config_file)
+        .await
+        .is_ok_and(|bytes| bytes == previous.as_bytes());
+    warn!(event = "config.persistence_failed", error = %error, restored,
+        rollback_error = ?rollback.err(), "configuration write failed; disk rollback checked");
+    Err(RpcError::internal(if restored {
+        "could not persist configuration change; previous configuration restored"
+    } else {
+        "could not persist configuration change; restoring the previous configuration could not be verified"
+    }))
+}
+
 async fn persist_service_config_locked(
     state: &Arc<AppState>,
     raw: &str,
     next: &Config,
 ) -> Result<(), RpcError> {
     let output = render_service_config_update(raw, next)?;
-    crosslane_store::atomic::write_bytes_atomically(
-        &state.paths.config_file,
-        output.as_bytes(),
-        Some(0o600),
-    )
-    .await
-    .map_err(|error| RpcError::internal(error.to_string()))?;
+    // Restart-only fields remain unchanged on disk, so validate that
+    // generation as well as the effective, hot-reloaded configuration.
+    let persisted: Config = toml::from_str(&output)
+        .map_err(|_| RpcError::bad_params("updated service configuration is invalid"))?;
+    persisted
+        .validate()
+        .map_err(|error| RpcError::bad_params(error.to_string()))?;
+    write_config_update_locked(state, raw, &output).await?;
     if let Err(error) = state.apply_config_transaction_locked(next).await {
         crosslane_store::atomic::write_bytes_atomically(
             &state.paths.config_file,
@@ -1863,7 +1921,7 @@ async fn handle_service_create(state: &Arc<AppState>, params: serde_json::Value)
         .await
         .map_err(|error| RpcError::internal(format!("lock config: {error}")))?;
     let _mutation = state.lock_config_mutation().await;
-    let previous = state.config.current().as_ref().clone();
+    let (raw, previous, pending_status_port) = service_config_snapshot_locked(state).await?;
     if previous
         .proxy_service
         .iter()
@@ -1915,7 +1973,13 @@ async fn handle_service_create(state: &Arc<AppState>, params: serde_json::Value)
         .unwrap_or_else(|| "kiro".into());
     let port = match params.port {
         Some(port) => port,
-        None => next_service_port(&previous)?,
+        None => {
+            if let Some(port) = pending_status_port {
+                allocate_service_port(&previous, crate::http::http_port_override(), Some(port))?
+            } else {
+                next_service_port(&previous)?
+            }
+        }
     };
     let service = ProxyServiceConfig {
         web_search_provider: None,
@@ -1952,44 +2016,7 @@ async fn handle_service_create(state: &Arc<AppState>, params: serde_json::Value)
     next.validate()
         .map_err(|error| RpcError::bad_params(error.to_string()))?;
 
-    let raw = tokio::fs::read_to_string(&state.paths.config_file)
-        .await
-        .map_err(|error| RpcError::internal(error.to_string()))?;
-    let output = render_service_config_update(&raw, &next)?;
-    crosslane_store::atomic::write_bytes_atomically(
-        &state.paths.config_file,
-        output.as_bytes(),
-        Some(0o600),
-    )
-    .await
-    .map_err(|error| RpcError::internal(error.to_string()))?;
-
-    state.apply_runtime_config(&next).await;
-    state.config.replace(next.clone());
-    state.mark_config_reloaded(now_secs());
-    let failures = state.reconcile_proxy_services(&next).await;
-    if let Some((_, error)) = failures
-        .into_iter()
-        .find(|(service_id, _)| service_id == &service.id)
-    {
-        let rollback_write = crosslane_store::atomic::write_bytes_atomically(
-            &state.paths.config_file,
-            raw.as_bytes(),
-            Some(0o600),
-        )
-        .await;
-        state.apply_runtime_config(&previous).await;
-        state.config.replace(previous.clone());
-        let _rollback_failures = state.reconcile_proxy_services(&previous).await;
-        if let Err(rollback_error) = rollback_write {
-            return Err(RpcError::internal(format!(
-                "proxy service failed to start ({error}); config rollback failed: {rollback_error}"
-            )));
-        }
-        return Err(RpcError::bad_params(format!(
-            "proxy service failed to start: {error}"
-        )));
-    }
+    persist_service_config_locked(state, &raw, &next).await?;
 
     let view = state
         .proxy_services
@@ -2089,12 +2116,11 @@ async fn handle_service_delete(state: &Arc<AppState>, params: serde_json::Value)
         .await
         .map_err(|error| RpcError::internal(format!("lock config: {error}")))?;
     let _mutation = state.lock_config_mutation().await;
-    let previous = state.config.current().as_ref().clone();
-    let index = previous
-        .proxy_service
-        .iter()
-        .position(|service| service.id == selector || service.name == selector)
-        .ok_or_else(|| RpcError::bad_params(format!("proxy service not found: {selector}")))?;
+    let (raw, previous, _) = service_config_snapshot_locked(state).await?;
+    let index = index_by_id_or_name(&previous.proxy_service, selector, |service| {
+        (Some(service.id.as_str()), Some(service.name.as_str()))
+    })
+    .ok_or_else(|| RpcError::bad_params(format!("proxy service not found: {selector}")))?;
 
     let mut next = previous.clone();
     let removed = next.proxy_service.remove(index);
@@ -2102,25 +2128,7 @@ async fn handle_service_delete(state: &Arc<AppState>, params: serde_json::Value)
         remove_unshared_service_api_keys(&mut next, &removed);
     next.validate()
         .map_err(|error| RpcError::bad_params(error.to_string()))?;
-    let raw = tokio::fs::read_to_string(&state.paths.config_file)
-        .await
-        .map_err(|error| RpcError::internal(error.to_string()))?;
-    let output = render_service_config_update(&raw, &next)?;
-    crosslane_store::atomic::write_bytes_atomically(
-        &state.paths.config_file,
-        output.as_bytes(),
-        Some(0o600),
-    )
-    .await
-    .map_err(|error| RpcError::internal(error.to_string()))?;
-
-    state.apply_runtime_config(&next).await;
-    state.config.replace(next.clone());
-    state.mark_config_reloaded(now_secs());
-    let failures = state.reconcile_proxy_services(&next).await;
-    for (service_id, error) in failures {
-        warn!(%service_id, %error, "proxy service failed after service deletion");
-    }
+    persist_service_config_locked(state, &raw, &next).await?;
 
     to_value(ProxyServiceDeleteResult {
         service_id: removed.id,

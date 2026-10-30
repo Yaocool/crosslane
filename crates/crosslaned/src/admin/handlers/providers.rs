@@ -66,6 +66,14 @@ pub(super) async fn handle_provider_show(state: &Arc<AppState>, params: Value) -
 }
 
 pub(super) async fn handle_account_list(state: &Arc<AppState>, params: Value) -> Handled {
+    account_list(state, params, true).await
+}
+
+pub(super) async fn cached_account_list(state: &Arc<AppState>, params: Value) -> Handled {
+    account_list(state, params, false).await
+}
+
+async fn account_list(state: &Arc<AppState>, params: Value, refresh: bool) -> Handled {
     #[derive(Default, Deserialize)]
     struct Params {
         #[serde(flatten)]
@@ -88,7 +96,9 @@ pub(super) async fn handle_account_list(state: &Arc<AppState>, params: Value) ->
             "kiro" => accounts.extend(kiro_accounts(state, &descriptor).await),
             "copilot" => match state.providers.copilot(&descriptor.id).await {
                 Some(runtime) => {
-                    runtime.refresh_account_info(None, false).await;
+                    if refresh {
+                        runtime.refresh_account_info(None, false).await;
+                    }
                     accounts.extend(
                     runtime
                         .account_summaries()
@@ -190,8 +200,16 @@ pub(super) async fn handle_account_list(state: &Arc<AppState>, params: Value) ->
 }
 
 pub(super) async fn handle_account_show(state: &Arc<AppState>, params: Value) -> Handled {
+    account_show(state, params, true).await
+}
+
+pub(super) async fn cached_account_show(state: &Arc<AppState>, params: Value) -> Handled {
+    account_show(state, params, false).await
+}
+
+async fn account_show(state: &Arc<AppState>, params: Value, refresh: bool) -> Handled {
     let reference = parse_account_ref(state, params).await?;
-    let result = account_list_for_provider(state, &reference.provider_id).await?;
+    let result = account_list_for_provider(state, &reference.provider_id, refresh).await?;
     let account = result
         .accounts
         .into_iter()
@@ -259,14 +277,24 @@ pub(super) async fn handle_account_import_token(state: &Arc<AppState>, params: V
         provider: String,
         token: String,
         label: Option<String>,
+        #[serde(default)]
+        tags: Vec<String>,
     }
     let params: Params = parse_params(params)?;
     if params.token.trim().is_empty() {
         return Err(RpcError::bad_params("token must not be empty"));
     }
     let runtime = copilot_runtime(state, &params.provider).await?;
+    let prepared = runtime
+        .prepare_token_import(params.token, params.label, params.tags)
+        .await
+        .map_err(provider_rpc_error)?;
+    // Upstream validation runs outside the config lock. The short commit uses
+    // the registered runtime and rejects a generation changed during validation.
+    let _mutation = state.lock_config_mutation().await;
+    let runtime = copilot_runtime(state, &params.provider).await?;
     let result = runtime
-        .import_token(params.token, params.label)
+        .commit_token_import(prepared)
         .await
         .map_err(provider_rpc_error)?;
     to_value(result)
@@ -407,6 +435,7 @@ pub(super) async fn handle_account_set_enabled(state: &Arc<AppState>, params: Va
         )
         .await;
     }
+    let _mutation = state.lock_config_mutation().await;
     let runtime = copilot_runtime(state, reference.provider_id.as_str()).await?;
     to_value(
         runtime
@@ -427,8 +456,8 @@ pub(super) async fn handle_account_remove(state: &Arc<AppState>, params: Value) 
     if reference.provider_id.as_str() == "kiro" {
         return super::handle_account_remove(state, json!({"id":reference.account_id})).await;
     }
-    let runtime = copilot_runtime(state, reference.provider_id.as_str()).await?;
     let _mutation = state.lock_config_mutation().await;
+    let runtime = copilot_runtime(state, reference.provider_id.as_str()).await?;
     let account = runtime
         .account(&reference.account_id)
         .await
@@ -504,7 +533,7 @@ pub(super) async fn handle_account_tag(state: &Arc<AppState>, params: Value) -> 
     // Resolve and validate the entire batch before any provider is mutated.
     for id in &ids {
         let reference = resolve_account_ref(state, params.provider.as_deref(), id).await?;
-        let value = handle_account_show(
+        let value = cached_account_show(
             state,
             json!({"provider":reference.provider_id,"id":reference.account_id}),
         )
@@ -559,8 +588,8 @@ pub(super) async fn handle_account_tag(state: &Arc<AppState>, params: Value) -> 
                 results.insert((provider.clone(), account.id.clone()), json!(account));
             }
         } else {
-            let runtime = copilot_runtime(state, &provider).await?;
             let _mutation = state.lock_config_mutation().await;
+            let runtime = copilot_runtime(state, &provider).await?;
             for id in &ids {
                 let account = runtime
                     .account(id)
@@ -685,6 +714,7 @@ pub(super) async fn handle_account_reset_health(state: &Arc<AppState>, params: V
         )
         .await;
     }
+    let _mutation = state.lock_config_mutation().await;
     let runtime = copilot_runtime(state, reference.provider_id.as_str()).await?;
     let account = runtime
         .reset_account_health(&reference.account_id)
@@ -827,6 +857,7 @@ async fn kiro_accounts(
                     })
                 }),
                 "created_at":account.created_at,
+                "usage_updated_at":account.usage.as_ref().map(|usage| usage.updated_at),
                 "token_expires_at":account.credentials.expires_at,
                 "subscription":account.subscription.as_ref().map(|subscription| {
                     subscription.title.clone().unwrap_or_else(|| format!("{:?}", subscription.kind))
@@ -899,8 +930,9 @@ pub(super) fn unknown_provider(id: &str, descriptors: &[ProviderDescriptor]) -> 
 async fn account_list_for_provider(
     state: &Arc<AppState>,
     provider_id: &ProviderId,
+    refresh: bool,
 ) -> Result<ProviderAccountListResult, RpcError> {
-    let value = handle_account_list(state, json!({"provider":provider_id.as_str()})).await?;
+    let value = account_list(state, json!({"provider":provider_id.as_str()}), refresh).await?;
     serde_json::from_value(value).map_err(|error| RpcError::internal(error.to_string()))
 }
 
@@ -949,9 +981,9 @@ pub(super) async fn resolve_account_ref(
     }
     let list: ProviderAccountListResult =
         if let Some(provider) = explicit_provider.or(qualified_provider) {
-            account_list_for_provider(state, &parse_provider_id(provider)?).await?
+            account_list_for_provider(state, &parse_provider_id(provider)?, false).await?
         } else {
-            serde_json::from_value(handle_account_list(state, Value::Null).await?)
+            serde_json::from_value(cached_account_list(state, Value::Null).await?)
                 .map_err(|error| RpcError::internal(error.to_string()))?
         };
     if !list.complete {
@@ -985,7 +1017,7 @@ fn parse_provider_id(value: &str) -> Result<ProviderId, RpcError> {
     ProviderId::parse(value).map_err(|error| RpcError::bad_params(error.to_string()))
 }
 
-async fn copilot_runtime(
+pub(super) async fn copilot_runtime(
     state: &Arc<AppState>,
     provider: &str,
 ) -> Result<Arc<crosslane_copilot::CopilotProvider>, RpcError> {
@@ -1018,7 +1050,7 @@ fn parse_login_task(params: Value) -> Result<(String, String), RpcError> {
     Ok((params.provider, params.task_id))
 }
 
-fn provider_rpc_error(error: crosslane_provider::ProviderError) -> RpcError {
+pub(super) fn provider_rpc_error(error: crosslane_provider::ProviderError) -> RpcError {
     RpcError {
         code: i32::from(error.status.as_u16()),
         message: error.to_string(),

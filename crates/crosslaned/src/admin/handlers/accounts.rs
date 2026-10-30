@@ -194,7 +194,7 @@ pub(super) async fn handle_account_services(
     params: serde_json::Value,
 ) -> Handled {
     let account: crosslane_ipc::protocol::ProviderAccountSummary =
-        serde_json::from_value(super::providers::handle_account_show(state, params).await?)
+        serde_json::from_value(super::providers::cached_account_show(state, params).await?)
             .map_err(|error| RpcError::internal(error.to_string()))?;
     let config = state.config.current();
     let runtime = state
@@ -272,14 +272,13 @@ where
         .await
         .map_err(|error| RpcError::internal(error.to_string()))?;
     state.configure_account_store(&mut next);
+    let previous = next.clone();
     let result = mutate(&mut next)?;
     state
         .validate_or_restore_account_store(&next)
         .await
         .map_err(RpcError::bad_params)?;
-    next.save()
-        .await
-        .map_err(|error| RpcError::internal(error.to_string()))?;
+    save_account_store(state, &mut next, previous).await?;
     let pool_accounts = next.all().to_vec();
     state.replace_accounts(next);
     state.pool().replace_accounts(pool_accounts).await;
@@ -287,6 +286,63 @@ where
     state.request_model_refresh();
     crate::alerts::sync_quota_incidents(state).await;
     Ok(result)
+}
+
+/// Callers hold the configuration and account-storage transaction locks.
+pub(super) async fn save_account_store(
+    state: &Arc<AppState>,
+    next: &mut AccountStore,
+    mut previous: AccountStore,
+) -> Result<(), RpcError> {
+    let Err(error) = next.save().await else {
+        return Ok(());
+    };
+    // A base-file replacement may have committed before old delta cleanup
+    // failed. Report that committed generation truthfully instead of making
+    // a successful import appear to have failed.
+    if let Ok(mut actual) = AccountStore::load(&state.paths.accounts_file).await {
+        if same_account_generation(&actual, next)? {
+            state.configure_account_store(&mut actual);
+            *next = actual;
+            warn!(
+                event = "account.persistence_committed_after_error",
+                error = %error,
+                "account generation verified after a save error"
+            );
+            return Ok(());
+        }
+    }
+    // A multi-row incremental write can fail after writing some deltas. Replace
+    // the complete previous generation and verify that no partial write remains.
+    previous.set_incremental_write(false);
+    let rollback = previous.save().await;
+    let restored = match AccountStore::load(&state.paths.accounts_file).await {
+        Ok(actual) => same_account_generation(&actual, &previous)?,
+        Err(_) => false,
+    };
+    if !restored {
+        let detail = rollback
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "account file differs".into());
+        return Err(RpcError::internal(format!(
+            "save accounts: {error}; restoring the previous account generation could not be verified: {detail}"
+        )));
+    }
+    Err(RpcError::internal(format!(
+        "save accounts: {error}; previous account generation restored"
+    )))
+}
+
+fn same_account_generation(left: &AccountStore, right: &AccountStore) -> Result<bool, RpcError> {
+    let encode = |store: &AccountStore| {
+        // Delta replay can reorder accounts without changing their contents.
+        let mut accounts = store.all().iter().collect::<Vec<_>>();
+        accounts.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+        serde_json::to_value(accounts)
+            .map_err(|_| RpcError::internal("could not compare account generations"))
+    };
+    Ok(encode(left)? == encode(right)?)
 }
 
 pub(super) async fn handle_account_import(
@@ -556,7 +612,7 @@ pub(super) async fn handle_account_remove(
     state: &Arc<AppState>,
     params: serde_json::Value,
 ) -> Handled {
-    let params: AccountRefParams = parse_params(params)?;
+    let params: crosslane_ipc::protocol::AccountRemoveParams = parse_params(params)?;
     let id = params.id;
     let removed = commit_account_change(state, |store| {
         let account = store
@@ -570,17 +626,21 @@ pub(super) async fn handle_account_remove(
             .ok_or_else(|| RpcError::bad_params(format!("account not found: {id}")))
     })
     .await?;
-    state.kiro().endpoint_cache().clear_account(&removed);
+    account_removed(state, &removed);
+    to_value(serde_json::json!({"removed": removed}))
+}
+
+pub(super) fn account_removed(state: &Arc<AppState>, removed: &str) {
+    state.kiro().endpoint_cache().clear_account(removed);
     state.notifier().resolve_incident(
         crosslane_notify::WebhookEventKind::AccountQuotaExhausted,
-        Some(&removed),
+        Some(removed),
     );
     state.notifier().resolve_incident(
         crosslane_notify::WebhookEventKind::AccountCreditProtected,
-        Some(&removed),
+        Some(removed),
     );
-    crate::alerts::resolve_token_refresh_failure(state, &removed);
-    to_value(serde_json::json!({"removed": removed}))
+    crate::alerts::resolve_token_refresh_failure(state, removed);
 }
 
 pub(super) async fn handle_account_set_enabled(

@@ -1,0 +1,3164 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Crosslane Admin REST API",
+    "version": "2.1.2",
+    "description": "Authenticated management on the independent status HTTP listener. Model-client keys are not admin credentials. GET/HEAD permit the optional read-only token; writes require the full-access token. JSON responses use {data:...}; the OpenAPI document itself is unwrapped. Credentials are accepted only in write bodies and never included in account responses. A newly created service returns its client key once. \nAccount control operations and service bindings resolve identities from local snapshots. Quota queries and explicit refresh/probe retain their usual upstream behavior. Service mutations preserve pending client-key edits and validate the persisted restart configuration. Service writes resolve selectors within the configuration transaction. Follow-up reads reject a changed service ID instead of returning another service's data. Configuration write errors verify or restore the previous file before returning; rollback verification failures are reported explicitly."
+  },
+  "servers": [
+    {
+      "url": "/admin/v1"
+    }
+  ],
+  "security": [
+    {
+      "AdminBearer": []
+    }
+  ],
+  "tags": [
+    {
+      "name": "Accounts",
+      "description": "Provider-scoped account lifecycle and tags"
+    },
+    {
+      "name": "Services",
+      "description": "Listeners, effective account pools and client-key bindings"
+    },
+    {
+      "name": "Providers",
+      "description": "Configured upstream instances and models"
+    },
+    {
+      "name": "Operations",
+      "description": "Status, usage and supervised tasks"
+    },
+    {
+      "name": "APIKeys",
+      "description": "Client-key metadata and usage; no secret retrieval"
+    },
+    {
+      "name": "Documentation",
+      "description": "Authenticated API schema"
+    }
+  ],
+  "paths": {
+    "/openapi.json": {
+      "get": {
+        "tags": [
+          "Documentation"
+        ],
+        "summary": "Read this API schema",
+        "operationId": "documentation_get_openapi_json",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "default": {
+            "$ref": "#/components/responses/ManagementError"
+          }
+        }
+      }
+    },
+    "/accounts": {
+      "get": {
+        "tags": [
+          "Accounts"
+        ],
+        "summary": "List and group accounts",
+        "operationId": "accounts_get_accounts",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/AccountPage"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "default": {
+            "$ref": "#/components/responses/ManagementError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Configured instance ID; all or omitted aggregates instances."
+          },
+          {
+            "name": "tag",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": ""
+          },
+          {
+            "name": "untagged_only",
+            "in": "query",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            },
+            "description": ""
+          },
+          {
+            "name": "enabled_only",
+            "in": "query",
+            "schema": {
+              "type": "boolean"
+            },
+            "description": ""
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": ""
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "name",
+                "email",
+                "credit",
+                "id"
+              ]
+            },
+            "description": ""
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0
+            },
+            "description": ""
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000,
+              "default": 100
+            },
+            "description": ""
+          },
+          {
+            "name": "group_by",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "provider",
+                "tag"
+              ],
+              "default": "provider"
+            },
+            "description": "Tag groups repeat a multi-tag account once per tag. The total remains a unique account count. Untagged group tag is null."
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "Accounts"
+        ],
+        "summary": "Create a provider-scoped account with initial tags",
+        "operationId": "accounts_post_accounts",
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/Account"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "default": {
+            "$ref": "#/components/responses/ManagementError"
+          }
+        },
+        "description": "Tags are validated before upstream work and persisted with the new account. Kiro API-key/OAuth imports generate account and machine IDs. Kiro SSO uses the existing browser login and may take several minutes; it requires the sso build feature. Copilot tokens are verified against GitHub and Copilot before persistence, without holding the configuration lock. If hot reload replaces that provider during validation, returns 409 without saving the account; retry against the current configuration. Kiro storage errors trigger a durable-content check: a fully committed change succeeds despite stale-delta cleanup failure, while partial changes are rolled back and rollback verification failures are reported. Returns 503 immediately when all eight shared account-creation slots are occupied.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateAccount"
+              },
+              "example": {
+                "provider": "kiro",
+                "auth": "api-key",
+                "email": "ci@example.com",
+                "token": "ksk_REPLACE_ME",
+                "tags": [
+                  "prod"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "/accounts/{provider}/{account}": {
+      "get": {
+        "tags": [
+          "Accounts"
+        ],
+        "summary": "Read account and remaining quota",
+        "operationId": "accounts_get_accounts_provider_account",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/Account"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "default": {
+            "$ref": "#/components/responses/ManagementError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Configured provider instance ID, not driver kind. The all selector is not accepted in single-account paths."
+          },
+          {
+            "name": "account",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Provider-local account ID; IDs are preferred over login/email aliases."
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "Accounts"
+        ],
+        "summary": "Delete account, optionally unbinding all services first",
+        "operationId": "accounts_delete_accounts_provider_account",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/AccountRemoval"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "default": {
+            "$ref": "#/components/responses/ManagementError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Configured provider instance ID, not driver kind. The all selector is not accepted in single-account paths."
+          },
+          {
+            "name": "account",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Provider-local account ID; IDs are preferred over login/email aliases."
+          }
+        ],
+        "description": "Returns 409 while any service uses this account. Unbind the account before deletion. In-flight requests are not cancelled."
+      }
+    },
+    "/accounts/{provider}/{account}/enabled": {
+      "post": {
+        "tags": [
+          "Accounts"
+        ],
+        "summary": "Enable or disable account",
+        "operationId": "accounts_post_accounts_provider_account_enabled",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/Account"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "default": {
+            "$ref": "#/components/responses/ManagementError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Configured provider instance ID, not driver kind. The all selector is not accepted in single-account paths."
+          },
+          {
+            "name": "account",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Provider-local account ID; IDs are preferred over login/email aliases."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Enabled"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/accounts/{provider}/{account}/tags": {
+      "post": {
+        "tags": [
+          "Accounts"
+        ],
+        "summary": "Add or remove account tags",
+        "operationId": "accounts_post_accounts_provider_account_tags",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/Account"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "default": {
+            "$ref": "#/components/responses/ManagementError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Configured provider instance ID, not driver kind. The all selector is not accepted in single-account paths."
+          },
+          {
+            "name": "account",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Provider-local account ID; IDs are preferred over login/email aliases."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Tags"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/accounts/{provider}/{account}/refresh": {
+      "post": {
+        "tags": [
+          "Accounts"
+        ],
+        "summary": "Refresh account credentials/status",
+        "operationId": "accounts_post_accounts_provider_account_refresh",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/Account"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "default": {
+            "$ref": "#/components/responses/ManagementError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Configured provider instance ID, not driver kind. The all selector is not accepted in single-account paths."
+          },
+          {
+            "name": "account",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Provider-local account ID; IDs are preferred over login/email aliases."
+          }
+        ],
+        "description": "Refresh renewable credentials and usage. Kiro API keys only refresh usage. Failed actions return 502; successful projections include operation flags."
+      }
+    },
+    "/accounts/{provider}/{account}/probe": {
+      "post": {
+        "tags": [
+          "Accounts"
+        ],
+        "summary": "Probe authentication and model catalog",
+        "operationId": "accounts_post_accounts_provider_account_probe",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/Account"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "default": {
+            "$ref": "#/components/responses/ManagementError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Configured provider instance ID, not driver kind. The all selector is not accepted in single-account paths."
+          },
+          {
+            "name": "account",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Provider-local account ID; IDs are preferred over login/email aliases."
+          }
+        ]
+      }
+    },
+    "/accounts/{provider}/{account}/reset-health": {
+      "post": {
+        "tags": [
+          "Accounts"
+        ],
+        "summary": "Clear transient account health state",
+        "operationId": "accounts_post_accounts_provider_account_reset_health",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/Account"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "default": {
+            "$ref": "#/components/responses/ManagementError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Configured provider instance ID, not driver kind. The all selector is not accepted in single-account paths."
+          },
+          {
+            "name": "account",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Provider-local account ID; IDs are preferred over login/email aliases."
+          }
+        ]
+      }
+    },
+    "/accounts/{provider}/{account}/services": {
+      "get": {
+        "tags": [
+          "Accounts"
+        ],
+        "summary": "List effective service bindings and binding sources",
+        "operationId": "accounts_get_accounts_provider_account_services",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "default": {
+            "$ref": "#/components/responses/ManagementError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Configured provider instance ID, not driver kind. The all selector is not accepted in single-account paths."
+          },
+          {
+            "name": "account",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Provider-local account ID; IDs are preferred over login/email aliases."
+          }
+        ]
+      }
+    },
+    "/services": {
+      "get": {
+        "tags": [
+          "Services"
+        ],
+        "summary": "List services",
+        "operationId": "services_get_services",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/ServiceList"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "default": {
+            "$ref": "#/components/responses/ManagementError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Configured instance ID; all or omitted aggregates instances."
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "Services"
+        ],
+        "summary": "Create and start a service, returning its new client key once",
+        "operationId": "services_post_services",
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/CreatedService"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "default": {
+            "$ref": "#/components/responses/ManagementError"
+          }
+        },
+        "description": "Persistence and listener startup are transactional. Failed listener startup restores configuration and does not leave a generated key behind.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateService"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/services/{service}": {
+      "get": {
+        "tags": [
+          "Services"
+        ],
+        "summary": "Read service, grouped effective accounts, quotas and redacted key metadata",
+        "operationId": "services_get_services_service",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/ServiceDetail"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "default": {
+            "$ref": "#/components/responses/ManagementError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "service",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Service ID or name. An exact ID takes precedence over another service's name."
+          },
+          {
+            "name": "provider",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Configured instance ID; all or omitted aggregates instances."
+          },
+          {
+            "name": "group_by",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "provider",
+                "tag"
+              ],
+              "default": "provider"
+            },
+            "description": "Tag groups repeat a multi-tag account once per tag. The total remains a unique account count. Untagged group tag is null."
+          }
+        ]
+      },
+      "patch": {
+        "tags": [
+          "Services"
+        ],
+        "summary": "Start or stop a service",
+        "operationId": "services_patch_services_service",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/Service"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "default": {
+            "$ref": "#/components/responses/ManagementError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "service",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Service ID or name. An exact ID takes precedence over another service's name."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Enabled"
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Services"
+        ],
+        "summary": "Delete service and its unshared client keys",
+        "operationId": "services_delete_services_service",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "default": {
+            "$ref": "#/components/responses/ManagementError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "service",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Service ID or name. An exact ID takes precedence over another service's name."
+          }
+        ]
+      }
+    },
+    "/services/{service}/accounts": {
+      "get": {
+        "tags": [
+          "Services"
+        ],
+        "summary": "Read grouped effective account pool",
+        "operationId": "services_get_services_service_accounts",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/AccountPool"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "default": {
+            "$ref": "#/components/responses/ManagementError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "service",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Service ID or name. An exact ID takes precedence over another service's name."
+          },
+          {
+            "name": "provider",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Configured instance ID; all or omitted aggregates instances."
+          },
+          {
+            "name": "group_by",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "provider",
+                "tag"
+              ],
+              "default": "provider"
+            },
+            "description": "Tag groups repeat a multi-tag account once per tag. The total remains a unique account count. Untagged group tag is null."
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "Services"
+        ],
+        "summary": "Add provider-qualified manual account bindings",
+        "operationId": "services_post_services_service_accounts",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/AccountPool"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "default": {
+            "$ref": "#/components/responses/ManagementError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "service",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Service ID or name. An exact ID takes precedence over another service's name."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Binding"
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Services"
+        ],
+        "summary": "Exclude accounts from this service without deleting them",
+        "operationId": "services_delete_services_service_accounts",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/AccountPool"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "default": {
+            "$ref": "#/components/responses/ManagementError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "service",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Service ID or name. An exact ID takes precedence over another service's name."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Binding"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/services/{service}/api-keys": {
+      "get": {
+        "tags": [
+          "Services"
+        ],
+        "summary": "Read bound key metadata; never retrieve key secrets",
+        "operationId": "services_get_services_service_api_keys",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/ServiceKeys"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "default": {
+            "$ref": "#/components/responses/ManagementError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "service",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Service ID or name. An exact ID takes precedence over another service's name."
+          }
+        ]
+      }
+    },
+    "/providers": {
+      "get": {
+        "tags": [
+          "Providers"
+        ],
+        "summary": "List configured provider instances",
+        "operationId": "providers_get_providers",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "default": {
+            "$ref": "#/components/responses/ManagementError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Configured instance ID; all or omitted aggregates instances."
+          }
+        ]
+      }
+    },
+    "/providers/{provider}": {
+      "get": {
+        "tags": [
+          "Providers"
+        ],
+        "summary": "Read provider instance",
+        "operationId": "providers_get_providers_provider",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "default": {
+            "$ref": "#/components/responses/ManagementError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Configured provider instance ID, not driver kind."
+          }
+        ]
+      }
+    },
+    "/models": {
+      "get": {
+        "tags": [
+          "Providers"
+        ],
+        "summary": "Read aggregated provider model catalog",
+        "operationId": "providers_get_models",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "default": {
+            "$ref": "#/components/responses/ManagementError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Configured instance ID; all or omitted aggregates instances."
+          }
+        ]
+      }
+    },
+    "/runtime/status": {
+      "get": {
+        "tags": [
+          "Operations"
+        ],
+        "summary": "Read daemon and service operational status",
+        "operationId": "operations_get_runtime_status",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "default": {
+            "$ref": "#/components/responses/ManagementError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Configured instance ID; all or omitted aggregates instances."
+          }
+        ]
+      }
+    },
+    "/runtime/stats": {
+      "get": {
+        "tags": [
+          "Operations"
+        ],
+        "summary": "Read usage statistics",
+        "operationId": "operations_get_runtime_stats",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "default": {
+            "$ref": "#/components/responses/ManagementError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Configured instance ID; all or omitted aggregates instances."
+          },
+          {
+            "name": "since_secs",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "description": ""
+          },
+          {
+            "name": "start_secs",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            },
+            "description": ""
+          },
+          {
+            "name": "end_secs",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            },
+            "description": ""
+          },
+          {
+            "name": "detail",
+            "in": "query",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            },
+            "description": ""
+          }
+        ]
+      }
+    },
+    "/runtime/tasks": {
+      "get": {
+        "tags": [
+          "Operations"
+        ],
+        "summary": "Read supervised background tasks",
+        "operationId": "operations_get_runtime_tasks",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "default": {
+            "$ref": "#/components/responses/ManagementError"
+          }
+        }
+      }
+    },
+    "/runtime/tasks/{task}/run": {
+      "post": {
+        "tags": [
+          "Operations"
+        ],
+        "summary": "Run a supported operator task",
+        "operationId": "operations_post_runtime_tasks_task_run",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "default": {
+            "$ref": "#/components/responses/ManagementError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "task",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "provider",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Configured instance ID; all or omitted aggregates instances."
+          }
+        ]
+      }
+    },
+    "/api-keys": {
+      "get": {
+        "tags": [
+          "APIKeys"
+        ],
+        "summary": "Read client-key metadata and usage without secrets",
+        "operationId": "apikeys_get_api_keys",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "default": {
+            "$ref": "#/components/responses/ManagementError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Configured instance ID; all or omitted aggregates instances."
+          }
+        ]
+      }
+    },
+    "/api-keys/{key}/reset-usage": {
+      "post": {
+        "tags": [
+          "APIKeys"
+        ],
+        "summary": "Reset one client key usage counter",
+        "operationId": "apikeys_post_api_keys_key_reset_usage",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error403"
+          },
+          "default": {
+            "$ref": "#/components/responses/ManagementError"
+          }
+        },
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Client-key ID or name. An exact ID takes precedence over another key's name."
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "AdminBearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Plaintext Admin REST token matching a configured SHA256 digest. Send the plaintext value, never the stored digest."
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "code",
+              "message"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "additionalProperties": false
+      },
+      "Envelope": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {}
+        }
+      },
+      "CreateAccount": {
+        "type": "object",
+        "properties": {
+          "provider": {
+            "type": "string",
+            "description": "Required configured provider ID. kiro driver supports api-key/oauth/sso; copilot supports token."
+          },
+          "auth": {
+            "type": "string",
+            "enum": [
+              "api-key",
+              "oauth",
+              "sso",
+              "token"
+            ]
+          },
+          "tags": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          "tag": {
+            "type": "string"
+          },
+          "email": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string",
+            "maxLength": 256
+          },
+          "token": {
+            "type": "string",
+            "writeOnly": true
+          },
+          "credentials": {
+            "type": "object",
+            "writeOnly": true,
+            "required": [
+              "access_token",
+              "region",
+              "expires_at",
+              "auth_method"
+            ],
+            "properties": {
+              "access_token": {
+                "type": "string",
+                "writeOnly": true
+              },
+              "refresh_token": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "writeOnly": true
+              },
+              "client_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "client_secret": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "writeOnly": true
+              },
+              "region": {
+                "type": "string"
+              },
+              "expires_at": {
+                "type": "integer"
+              },
+              "auth_method": {
+                "type": "string",
+                "enum": [
+                  "idc",
+                  "social"
+                ]
+              }
+            }
+          },
+          "region": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "Maximum 64 UTF-8 bytes.",
+            "minLength": 1,
+            "pattern": "^\\S+$"
+          },
+          "profile_arn": {
+            "type": "string"
+          },
+          "machine_id": {
+            "type": "string",
+            "pattern": "^[0-9a-fA-F]{64}$"
+          },
+          "password": {
+            "type": "string",
+            "writeOnly": true
+          },
+          "start_url": {
+            "type": "string",
+            "format": "uri",
+            "description": "HTTPS IAM Identity Center start URL; SSO only. Maximum 8192 UTF-8 bytes.",
+            "maxLength": 8192
+          }
+        },
+        "required": [
+          "provider",
+          "auth"
+        ],
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "auth": {
+                  "const": "api-key"
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "email",
+                "token"
+              ]
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "auth": {
+                  "const": "oauth"
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "email",
+                "credentials"
+              ]
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "auth": {
+                  "const": "sso"
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "email",
+                "password"
+              ]
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "auth": {
+                  "const": "token"
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "token"
+              ]
+            }
+          }
+        ]
+      },
+      "CreateService": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "host": {
+            "type": "string"
+          },
+          "port": {
+            "type": "integer",
+            "minimum": 1024,
+            "maximum": 65535
+          },
+          "skip_user_agent_check": {
+            "type": "boolean",
+            "default": false
+          },
+          "account_tag": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            ]
+          },
+          "allowed_providers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "default_provider": {
+            "type": "string"
+          },
+          "api_key_name": {
+            "type": "string"
+          },
+          "api_key_format": {
+            "type": "string",
+            "enum": [
+              "sk",
+              "simple",
+              "token"
+            ]
+          },
+          "tags": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            ],
+            "description": "Alias of account_tag; send only one spelling."
+          },
+          "providers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Alias of allowed_providers; send only one spelling."
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "additionalProperties": false
+      },
+      "Enabled": {
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
+        "additionalProperties": false
+      },
+      "Tags": {
+        "type": "object",
+        "properties": {
+          "add": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "remove": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "Binding": {
+        "type": "object",
+        "properties": {
+          "accounts": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 1000,
+            "items": {
+              "type": "string"
+            }
+          },
+          "provider": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "accounts"
+        ],
+        "additionalProperties": false
+      },
+      "Quota": {
+        "type": "object",
+        "properties": {
+          "unit": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "kiro_credits",
+              "ai_credits",
+              "premium_requests",
+              null
+            ]
+          },
+          "used": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "total": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "remaining": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "source": {
+            "type": "string"
+          },
+          "cached": {
+            "type": "boolean"
+          },
+          "unlimited": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "scope": {
+            "type": "string"
+          },
+          "percent_remaining": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "minimum": 0
+          }
+        },
+        "description": "Unknown values remain null. Kiro totals include the configured effective overage cap. Copilot is a personal upstream quota; unlimited or zero placeholders do not establish an organization balance."
+      },
+      "Account": {
+        "type": "object",
+        "required": [
+          "id",
+          "provider_id",
+          "provider_kind",
+          "reference",
+          "tags",
+          "quota"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "provider_id": {
+            "type": "string"
+          },
+          "provider_kind": {
+            "type": "string"
+          },
+          "reference": {
+            "type": "string"
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "health": {
+            "type": "string"
+          },
+          "auth_state": {
+            "type": "string"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "supported_models": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "token_expires_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Renewable API token deadline; null if unknown or inapplicable."
+          },
+          "quota": {
+            "$ref": "#/components/schemas/Quota"
+          },
+          "local_aiu_usage": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/LocalAiuUsage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "operation": {
+            "type": "object",
+            "properties": {
+              "ok": {
+                "type": "boolean"
+              },
+              "refreshed": {
+                "type": "boolean"
+              },
+              "persisted": {
+                "type": "boolean"
+              },
+              "usage_refreshed": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "ok"
+            ]
+          }
+        }
+      },
+      "LocalAiuUsage": {
+        "type": "object",
+        "properties": {
+          "total_nano_aiu": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "billed_requests": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "first_recorded_at": {
+            "type": "integer"
+          },
+          "last_recorded_at": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total_nano_aiu",
+          "billed_requests",
+          "first_recorded_at",
+          "last_recorded_at"
+        ],
+        "description": "Locally observed account billing. Exact integer nano AIU; 1 AIU = 1,000,000,000 nano AIU. Independent of personal upstream quotas."
+      },
+      "AccountGroup": {
+        "type": "object",
+        "properties": {
+          "provider_id": {
+            "type": "string"
+          },
+          "tag": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "accounts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Account"
+            }
+          }
+        },
+        "required": [
+          "count",
+          "accounts"
+        ],
+        "description": "Provider grouping includes provider_id; tag grouping includes tag (null for untagged). Multi-tag accounts appear once per tag."
+      },
+      "AccountPage": {
+        "type": "object",
+        "properties": {
+          "total": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "has_more": {
+            "type": "boolean"
+          },
+          "groups": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AccountGroup"
+            }
+          },
+          "complete": {
+            "type": "boolean"
+          },
+          "errors": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "total",
+          "offset",
+          "limit",
+          "has_more",
+          "groups",
+          "complete",
+          "errors"
+        ]
+      },
+      "AccountPool": {
+        "type": "object",
+        "properties": {
+          "service_id": {
+            "type": "string"
+          },
+          "service_name": {
+            "type": "string"
+          },
+          "uses_global_pool": {
+            "type": "boolean"
+          },
+          "account_tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "manual_account_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "excluded_account_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "total_accounts": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "groups": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AccountGroup"
+            }
+          }
+        },
+        "required": [
+          "service_id",
+          "service_name",
+          "uses_global_pool",
+          "total_accounts",
+          "groups"
+        ]
+      },
+      "Service": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "host": {
+            "type": "string"
+          },
+          "default_provider": {
+            "type": "string"
+          },
+          "port": {
+            "type": "integer"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "running": {
+            "type": "boolean"
+          },
+          "skip_user_agent_check": {
+            "type": "boolean"
+          },
+          "api_key_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "account_tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "account_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "excluded_account_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "allowed_providers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "account_tag": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "integer"
+          },
+          "error": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "host",
+          "port",
+          "enabled",
+          "running"
+        ]
+      },
+      "ServiceList": {
+        "type": "object",
+        "properties": {
+          "services": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Service"
+            }
+          }
+        },
+        "required": [
+          "services"
+        ]
+      },
+      "ClientKeyMetadata": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "format": {
+            "type": "string"
+          },
+          "skip_user_agent_check": {
+            "type": "boolean"
+          },
+          "user_agent_check_enforced": {
+            "type": "boolean"
+          },
+          "user_agent_check_reason": {
+            "type": "string"
+          },
+          "credits_limit": {
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "enabled"
+        ]
+      },
+      "ServiceDetail": {
+        "type": "object",
+        "properties": {
+          "service": {
+            "$ref": "#/components/schemas/Service"
+          },
+          "account_pool": {
+            "$ref": "#/components/schemas/AccountPool"
+          },
+          "api_keys": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ClientKeyMetadata"
+            }
+          }
+        },
+        "required": [
+          "service",
+          "account_pool",
+          "api_keys"
+        ]
+      },
+      "ServiceKeys": {
+        "type": "object",
+        "properties": {
+          "service_id": {
+            "type": "string"
+          },
+          "service_name": {
+            "type": "string"
+          },
+          "api_keys": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ClientKeyMetadata"
+            }
+          }
+        },
+        "required": [
+          "service_id",
+          "service_name",
+          "api_keys"
+        ]
+      },
+      "CreatedServiceKey": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "key": {
+            "type": "string",
+            "readOnly": true
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "key"
+        ],
+        "description": "Plaintext model-client key is returned only by service creation. Not an admin credential."
+      },
+      "CreatedService": {
+        "type": "object",
+        "properties": {
+          "service": {
+            "$ref": "#/components/schemas/Service"
+          },
+          "api_key": {
+            "$ref": "#/components/schemas/CreatedServiceKey"
+          }
+        },
+        "required": [
+          "service",
+          "api_key"
+        ]
+      },
+      "BatchAccount": {
+        "type": "object",
+        "properties": {
+          "provider": {
+            "type": "string",
+            "description": "Required configured provider ID. kiro driver supports api-key/oauth/sso; copilot supports token."
+          },
+          "auth": {
+            "type": "string",
+            "enum": [
+              "api-key",
+              "oauth",
+              "sso",
+              "token"
+            ]
+          },
+          "tags": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          "tag": {
+            "type": "string"
+          },
+          "email": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string",
+            "maxLength": 256
+          },
+          "token": {
+            "type": "string",
+            "writeOnly": true
+          },
+          "credentials": {
+            "type": "object",
+            "writeOnly": true,
+            "required": [
+              "access_token",
+              "region",
+              "expires_at",
+              "auth_method"
+            ],
+            "properties": {
+              "access_token": {
+                "type": "string",
+                "writeOnly": true
+              },
+              "refresh_token": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "writeOnly": true
+              },
+              "client_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "client_secret": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "writeOnly": true
+              },
+              "region": {
+                "type": "string"
+              },
+              "expires_at": {
+                "type": "integer"
+              },
+              "auth_method": {
+                "type": "string",
+                "enum": [
+                  "idc",
+                  "social"
+                ]
+              }
+            }
+          },
+          "region": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "Maximum 64 UTF-8 bytes.",
+            "minLength": 1,
+            "pattern": "^\\S+$"
+          },
+          "profile_arn": {
+            "type": "string"
+          },
+          "machine_id": {
+            "type": "string",
+            "pattern": "^[0-9a-fA-F]{64}$"
+          },
+          "password": {
+            "type": "string",
+            "writeOnly": true
+          },
+          "start_url": {
+            "type": "string",
+            "format": "uri",
+            "description": "HTTPS IAM Identity Center start URL; SSO only. Maximum 8192 UTF-8 bytes.",
+            "maxLength": 8192
+          }
+        },
+        "required": [],
+        "additionalProperties": false,
+        "description": "One account. Omitted provider/auth/start_url/region inherit batch defaults; tags combine with batch tags. Required authentication fields are validated after defaults are applied."
+      },
+      "CreateAccountBatch": {
+        "type": "object",
+        "properties": {
+          "provider": {
+            "type": "string"
+          },
+          "auth": {
+            "type": "string",
+            "enum": [
+              "api-key",
+              "oauth",
+              "sso",
+              "token"
+            ]
+          },
+          "start_url": {
+            "type": "string",
+            "format": "uri",
+            "maxLength": 8192,
+            "description": "Maximum 8192 UTF-8 bytes."
+          },
+          "region": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "Maximum 64 UTF-8 bytes.",
+            "minLength": 1,
+            "pattern": "^\\S+$"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "maxItems": 64
+          },
+          "tag": {
+            "type": "string"
+          },
+          "csv": {
+            "type": "string",
+            "writeOnly": true,
+            "description": "The same email,password CSV accepted by account add --provider kiro --auth sso --batch; BOM, CRLF and quoted passwords supported."
+          },
+          "accounts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BatchAccount"
+            },
+            "minItems": 1,
+            "maxItems": 1000
+          },
+          "concurrency": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 8,
+            "default": 1
+          }
+        },
+        "required": [],
+        "additionalProperties": false,
+        "oneOf": [
+          {
+            "required": [
+              "csv"
+            ],
+            "not": {
+              "required": [
+                "accounts"
+              ]
+            }
+          },
+          {
+            "required": [
+              "accounts"
+            ],
+            "not": {
+              "required": [
+                "csv"
+              ]
+            }
+          }
+        ]
+      },
+      "BatchRow": {
+        "type": "object",
+        "properties": {
+          "index": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "provider": {
+            "type": "string"
+          },
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "running",
+              "succeeded",
+              "failed",
+              "cancelled"
+            ]
+          },
+          "account_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reference": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "code": {
+                    "type": "string"
+                  },
+                  "message": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code",
+                  "message"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "started_at": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "finished_at": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "index",
+          "provider",
+          "status"
+        ]
+      },
+      "AccountBatch": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "running",
+              "cancelling",
+              "completed",
+              "completed_with_errors",
+              "cancelled"
+            ]
+          },
+          "created_at": {
+            "type": "integer"
+          },
+          "started_at": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "finished_at": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "pending": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "running": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "succeeded": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "failed": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "cancelled": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "completed": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "complete": {
+            "type": "boolean",
+            "description": "True only after every row succeeds."
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BatchRow"
+            },
+            "description": "Input order. Present in create/show/cancel responses; omitted from list summaries."
+          }
+        },
+        "required": [
+          "id",
+          "status",
+          "created_at",
+          "total",
+          "completed",
+          "complete"
+        ],
+        "description": "Process-local task report. Up to four active batches, eight concurrent REST account creations globally, 32 retained reports, finished reports retained for at most one hour. Restart clears reports and pending credentials, but preserves successfully created accounts. Cancellation stops queued rows and drains already-started logins."
+      },
+      "AccountRemoval": {
+        "type": "object",
+        "properties": {
+          "removed": {
+            "type": "string",
+            "description": "Canonical provider-local account ID."
+          },
+          "provider_id": {
+            "type": "string"
+          },
+          "reference": {
+            "type": "string",
+            "description": "Provider-qualified account reference."
+          }
+        },
+        "required": [
+          "removed",
+          "provider_id",
+          "reference"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "responses": {
+      "Error401": {
+        "description": "Admin authentication required",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Error403": {
+        "description": "Read-only token attempted a write",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "ManagementError": {
+        "description": "Management error: 400 invalid input; 404 missing or disabled; 405 unsupported method; 409 conflict; 413 body limit; 500 internal error; 501 unsupported feature; 502 failed upstream action; 503 temporarily unavailable.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
+    },
+    "headers": {
+      "RequestId": {
+        "schema": {
+          "type": "string"
+        },
+        "description": "Audit correlation ID prefixed admin_."
+      },
+      "NoStore": {
+        "schema": {
+          "type": "string",
+          "const": "no-store"
+        }
+      }
+    }
+  }
+}

@@ -45,6 +45,7 @@ pub(crate) fn router(state: Arc<AppState>) -> Router {
         .route("/health", get(health))
         .route("/ready", get(readiness))
         .with_state(Arc::clone(&state))
+        .nest("/admin/v1", crate::admin::rest::router(state))
 }
 
 async fn root() -> Json<Value> {

@@ -36,13 +36,25 @@ const SCOPES: &[&str] = &[
     "codewhisperer:taskassist",
 ];
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SsoLoginRequest {
     pub email: String,
     pub password: String,
     pub start_url: String,
     pub region: String,
     pub headful: bool,
+}
+
+impl std::fmt::Debug for SsoLoginRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SsoLoginRequest")
+            .field("email", &self.email)
+            .field("password", &"<redacted>")
+            .field("start_url", &self.start_url)
+            .field("region", &self.region)
+            .field("headful", &self.headful)
+            .finish()
+    }
 }
 
 pub async fn login(request: SsoLoginRequest) -> Result<Credentials> {
@@ -340,6 +352,20 @@ fn now_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn login_request_debug_does_not_expose_the_password() {
+        let request = SsoLoginRequest {
+            email: "fixture@example.com".into(),
+            password: "fixture-private-login-password".into(),
+            start_url: "https://example.awsapps.com/start".into(),
+            region: "us-east-1".into(),
+            headful: false,
+        };
+        let debug = format!("{request:?}");
+        assert!(!debug.contains(&request.password));
+        assert!(debug.contains("<redacted>"));
+    }
 
     #[cfg(feature = "sso")]
     #[tokio::test]

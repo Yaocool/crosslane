@@ -11,4 +11,4 @@ pub use account::{
     CopilotQuotaSnapshot,
 };
 pub use auth::{DeviceLoginState, DeviceLoginStatus};
-pub use client::{CopilotProvider, CopilotSettings};
+pub use client::{CopilotProvider, CopilotSettings, PreparedTokenImport};

@@ -7,6 +7,10 @@ use tempfile::TempDir;
 
 use super::*;
 
+mod account_persistence;
+mod identity_selection;
+mod service_transactions;
+
 fn sample_account(id: &str, email: &str, enabled: bool) -> Account {
     Account {
         id: id.into(),
@@ -144,6 +148,9 @@ async fn state_with_copilot() -> (TempDir, Arc<AppState>) {
             ..ProviderConfig::default()
         },
     ];
+    tokio::fs::write(&state.paths.config_file, toml::to_string(&config).unwrap())
+        .await
+        .unwrap();
     state.config.replace(config.clone());
     state
         .providers
@@ -286,7 +293,9 @@ async fn copilot_service_pool_uses_tags_qualified_bindings_and_exclusions() {
     let mut config = state.config.current().as_ref().clone();
     config.proxy_service.push(service.clone());
     state.config.replace(config.clone());
-    let result = service_accounts_result(&state, &service).await.unwrap();
+    let result = service_accounts_result(&state, &service, false)
+        .await
+        .unwrap();
     assert_eq!(result["accounts"], serde_json::json!([]));
     assert_eq!(result["provider_accounts"][0]["provider_id"], "copilot");
     let bound = expect_ok(
@@ -330,7 +339,7 @@ async fn copilot_service_pool_uses_tags_qualified_bindings_and_exclusions() {
     ));
     config.proxy_service[0].excluded_account_ids = vec!["copilot/acc_b85b28b7".into()];
     state.config.replace(config.clone());
-    let result = service_accounts_result(&state, &config.proxy_service[0])
+    let result = service_accounts_result(&state, &config.proxy_service[0], false)
         .await
         .unwrap();
     assert_eq!(result["provider_accounts"], serde_json::json!([]));
@@ -348,7 +357,9 @@ async fn copilot_service_pool_uses_tags_qualified_bindings_and_exclusions() {
     let mut manual = service;
     manual.account_tag = Some(ServiceAccountTags::One("no-match".into()));
     manual.account_ids = vec!["copilot/acc_b85b28b7".into()];
-    let result = service_accounts_result(&state, &manual).await.unwrap();
+    let result = service_accounts_result(&state, &manual, false)
+        .await
+        .unwrap();
     assert_eq!(result["provider_accounts"].as_array().unwrap().len(), 1);
 }
 
@@ -883,6 +894,43 @@ fn default_service_port_follows_the_highest_configured_service() {
         ..ProxyServiceConfig::default()
     });
     assert!(next_service_port(&config).is_err());
+}
+
+#[test]
+fn default_service_port_skips_the_enabled_status_http_port() {
+    let mut config = Config::default();
+    config.status_http.enabled = true;
+    config.status_http.port = config.server.port;
+    assert_eq!(
+        next_service_port_with_override(&config, None).unwrap(),
+        config.server.port + 1
+    );
+    assert_eq!(
+        next_service_port_with_override(&config, Some(config.server.port + 10)).unwrap(),
+        config.server.port + 1,
+        "the persisted port must also pass configuration validation"
+    );
+    config.status_http.port = config.server.port + 1;
+    assert_eq!(
+        next_service_port_with_override(&config, Some(config.status_http.port)).unwrap(),
+        config.server.port + 2,
+        "both the override and the reserved persisted port must be skipped"
+    );
+
+    config.status_http.port = config.server.port + 1;
+    config.proxy_service.push(ProxyServiceConfig {
+        port: config.server.port,
+        ..ProxyServiceConfig::default()
+    });
+    assert_eq!(
+        next_service_port_with_override(&config, None).unwrap(),
+        config.server.port + 2
+    );
+    config.status_http.enabled = false;
+    assert_eq!(
+        next_service_port_with_override(&config, None).unwrap(),
+        config.server.port + 1
+    );
 }
 
 #[test]
@@ -2341,42 +2389,4 @@ async fn config_reload_rolls_back_when_proxy_listener_cannot_start() {
         .is_some_and(|error| error.contains("svc_reload")));
     assert!(state.config.current().proxy_service.is_empty());
     assert!(state.config.current().api_key.is_empty());
-}
-
-
-#[test]
-fn default_service_port_skips_the_enabled_status_http_port() {
-    let mut config = Config::default();
-    config.status_http.enabled = true;
-    config.status_http.port = config.server.port;
-    assert_eq!(
-        next_service_port_with_override(&config, None).unwrap(),
-        config.server.port + 1
-    );
-    assert_eq!(
-        next_service_port_with_override(&config, Some(config.server.port + 10)).unwrap(),
-        config.server.port + 1,
-        "the persisted port must also pass configuration validation"
-    );
-    config.status_http.port = config.server.port + 1;
-    assert_eq!(
-        next_service_port_with_override(&config, Some(config.status_http.port)).unwrap(),
-        config.server.port + 2,
-        "both the override and the reserved persisted port must be skipped"
-    );
-
-    config.status_http.port = config.server.port + 1;
-    config.proxy_service.push(ProxyServiceConfig {
-        port: config.server.port,
-        ..ProxyServiceConfig::default()
-    });
-    assert_eq!(
-        next_service_port_with_override(&config, None).unwrap(),
-        config.server.port + 2
-    );
-    config.status_http.enabled = false;
-    assert_eq!(
-        next_service_port_with_override(&config, None).unwrap(),
-        config.server.port + 1
-    );
 }

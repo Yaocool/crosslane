@@ -726,12 +726,16 @@ impl Meter {
     pub async fn reset_usage(self: &Arc<Self>, id_or_name: &str) -> Result<bool, MeterError> {
         {
             let mut keys = lock(&self.keys);
-            let Some(state) = keys
-                .values_mut()
-                .find(|state| state.id == id_or_name || state.config.name == id_or_name)
+            let Some(id) = keys
+                .get(id_or_name)
+                .or_else(|| keys.values().find(|state| state.config.name == id_or_name))
+                .map(|state| state.id.clone())
             else {
                 return Ok(false);
             };
+            let state = keys
+                .get_mut(&id)
+                .expect("selected key exists under the same lock");
             state.usage = ApiKeyUsage::default();
         }
         self.persist().await?;
@@ -924,7 +928,7 @@ fn legacy_key_id(key: &str) -> String {
     format!("ak_{:02x}{:02x}", digest[0], digest[1])
 }
 
-fn constant_time_eq(expected: &str, presented: &str) -> bool {
+pub(crate) fn constant_time_eq(expected: &str, presented: &str) -> bool {
     let expected = expected.as_bytes();
     let presented = presented.as_bytes();
     let mut difference = expected.len() ^ presented.len();
@@ -1099,6 +1103,39 @@ mod tests {
         ));
         drop(first);
         assert!(meter.reserve(Some("ak_test"), 6.0).is_ok());
+    }
+
+    #[tokio::test]
+    async fn management_id_collision_never_resets_the_named_neighbors_usage() {
+        let directory = tempfile::tempdir().unwrap();
+        let configs =
+            [("ak_first", "ak_second"), ("ak_second", "ak_first")].map(|(id, name)| ApiKeyConfig {
+                id: Some(id.into()),
+                name: name.into(),
+                key: format!("fixture-{id}"),
+                ..ApiKeyConfig::default()
+            });
+        let meter = Meter::load(&directory.path().join("daily.json"), &configs)
+            .await
+            .unwrap();
+        // Cyclic aliases force at least one incorrect selection with a combined
+        // ID/name search, independently of the HashMap's randomized order.
+        for target in ["ak_first", "ak_second"] {
+            {
+                for state in lock(&meter.keys).values_mut() {
+                    state.usage = ApiKeyUsage::default();
+                    state.usage.add(usage(2.5));
+                }
+            }
+            assert!(meter.reset_usage(target).await.unwrap());
+            for key in meter.list() {
+                assert_eq!(
+                    key.usage.total_requests,
+                    u64::from(key.id != target),
+                    "reset affected a name instead of the exact ID"
+                );
+            }
+        }
     }
 
     #[tokio::test]
