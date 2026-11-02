@@ -3,6 +3,7 @@
 pub mod catalog;
 pub mod client;
 pub mod endpoint;
+pub mod enterprise;
 pub mod event_stream;
 pub mod identity;
 mod response_redaction;
