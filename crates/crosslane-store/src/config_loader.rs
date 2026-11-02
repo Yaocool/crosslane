@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use crosslane_core::config::Config;
+use crosslane_core::config::{AdminRestConfig, Config};
 use notify::{RecursiveMode, Watcher};
 use notify_debouncer_full::{new_debouncer, Debouncer, FileIdMap};
 use tracing::{error, info, warn};
@@ -99,17 +99,26 @@ pub fn diff_restart_required(old: &Config, new: &Config) -> Vec<&'static str> {
 /// 返回的字段列表提示调用方在下次进程重启后，磁盘中的新值才会生效。
 pub fn merge_hot_reload(old: &Config, mut new: Config) -> (Config, Vec<&'static str>) {
     let needs_restart = diff_restart_required(old, &new);
+    new.admin.rest = merge_admin_rest_auth(old, &new);
     new.admin.socket.clone_from(&old.admin.socket);
     new.status_http.clone_from(&old.status_http);
-    if !new.status_http.enabled {
-        // Enabling the listener itself needs a restart; keep the REST feature
-        // inactive until that listener can actually serve requests.
-        new.admin.rest.enabled = false;
-    }
     if old.server.tls.enabled != new.server.tls.enabled {
         new.server.tls = old.server.tls.clone();
     }
     (new, needs_restart)
+}
+
+/// Apply credential changes immediately, while deferring a new REST activation
+/// until its configured listener is running. Already active REST can rotate
+/// credentials during a pending listener move without interrupting access.
+pub fn merge_admin_rest_auth(running: &Config, configured: &Config) -> AdminRestConfig {
+    let mut rest = configured.admin.rest.clone();
+    if !running.status_http.enabled
+        || (!running.admin.rest.enabled && running.status_http != configured.status_http)
+    {
+        rest.enabled = false;
+    }
+    rest
 }
 
 /// 文件监听句柄，drop 后停止监听。
@@ -356,6 +365,34 @@ mod tests {
         let mut disabled = effective.clone();
         disabled.admin.rest.enabled = false;
         assert!(!merge_hot_reload(&effective, disabled).0.admin.rest.enabled);
+    }
+
+    #[test]
+    fn admin_rest_activation_waits_for_listener_moves_but_existing_auth_can_rotate() {
+        let mut running = Config::default();
+        running.status_http.enabled = true;
+        running.admin.rest.token_sha256 = "a".repeat(64);
+        for host_change in [true, false] {
+            let mut pending = running.clone();
+            pending.admin.rest.enabled = true;
+            pending.admin.rest.token_sha256 = "b".repeat(64);
+            if host_change {
+                pending.status_http.host = "0.0.0.0".into();
+            } else {
+                pending.status_http.port += 1;
+            }
+            pending.validate().unwrap();
+            let (effective, restart) = merge_hot_reload(&running, pending.clone());
+            assert!(!restart.is_empty());
+            assert!(!effective.admin.rest.enabled);
+            assert_eq!(effective.status_http, running.status_http);
+            assert_eq!(effective.admin.rest.token_sha256, "b".repeat(64));
+            let mut already_active = running.clone();
+            already_active.admin.rest.enabled = true;
+            let (effective, _) = merge_hot_reload(&already_active, pending);
+            assert!(effective.admin.rest.enabled);
+            assert_eq!(effective.admin.rest.token_sha256, "b".repeat(64));
+        }
     }
 
     #[tokio::test]

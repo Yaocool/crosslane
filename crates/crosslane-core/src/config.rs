@@ -1485,7 +1485,10 @@ impl Config {
             return invalid_config("status_http.port", "must be between 1024 and 65535");
         }
         if self.admin.rest.enabled && !self.status_http.enabled {
-            return invalid_config("admin.rest.enabled", "requires status_http.enabled = true");
+            return invalid_config(
+                "admin.rest.enabled",
+                "requires status_http.enabled = true; edit both sections with `crosslane config edit admin`, then restart crosslaned for listener changes",
+            );
         }
         self.admin.rest.validate_tokens()?;
         if self.server.keep_alive_timeout_ms == 0 {
@@ -2627,17 +2630,21 @@ port = 7651
 [admin]
 # CLI 与 daemon 通信的 Unix socket。首次生成时会按 CROSSLANE_HOME/XDG_RUNTIME_DIR 改写。
 # 修改后必须重启 daemon；容器 wrapper 会使用同一数据目录解析该路径。
+# config reset admin/完整 reset 使用 daemon 的默认 socket；旧 daemon 未提供默认值时保留当前路径。
 socket = "/run/crosslane/admin.sock"
 
 # 管理 REST 与公开状态接口共用 status_http 监听，通过独立 Bearer token 鉴权。
 # 此处只保存 token 的 SHA-256 摘要；模型客户端 Key 不获得管理权限。
+# 首次启用：crosslane config edit admin 同时展示 admin/status_http，先设置 status_http.enabled=true。
+# 重启 daemon 后执行 crosslane admin token create --name ops --enable-rest；自动生成并保存摘要。
+# 手工开启本节 enabled 前，必须已开启 status_http 并配置至少一把令牌。
 [admin.rest]
 enabled = false
 token_sha256 = ""
 # 可选只读 token 的摘要；与完整管理 token 必须不同。token 摘要可热重载轮换。
 # read_token_sha256 = "64-character SHA-256 hex digest"
 
-# 推荐通过 crosslane admin token create/list/rotate/revoke 管理多把独立令牌。
+# 使用 crosslane admin token create/list/show/rotate/disable/enable/revoke 管理多把独立令牌。
 # 明文只在 create/rotate 返回；以下是命名令牌的配置形状，通常无需手工编辑。
 # [[admin.rest.tokens]]
 # id = "adm_0123456789abcdef"
@@ -2646,6 +2653,12 @@ token_sha256 = ""
 # enabled = true
 # token_sha256 = "64-character SHA-256 hex digest"
 # created_at = 1
+
+# Kiro 企业订阅管理只使用 crosslaned 环境变量，不在本文件中保存 AWS 管理员凭据：
+# 必填 CROSSLANE_KIRO_ADMIN_ACCESS_KEY_ID、CROSSLANE_KIRO_ADMIN_SECRET_ACCESS_KEY；
+# 临时 STS 凭据另需 CROSSLANE_KIRO_ADMIN_SESSION_TOKEN。
+# 可选 REGION（默认 us-east-1）、PROFILE_ARN、APPLICATION_ARN、IDENTITY_CENTER_REGION，
+# 变量名均带 CROSSLANE_KIRO_ADMIN_ 前缀；详见 docs/kiro-enterprise-admin.zh-CN.md。
 
 # ----------------------------------------------------------------------------
 # Kiro IAM Identity Center SSO（不适用于 Copilot 的 GitHub/Azure SSO）

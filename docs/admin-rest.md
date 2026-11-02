@@ -1,9 +1,15 @@
 # Admin REST API
 
+Kiro Console enterprise subscriptions are managed under `/admin/v1/kiro/enterprise`,
+separately from local account pools. List users, inspect direct/inherited subscriptions,
+activate, cancel, upgrade and downgrade using only the Admin Bearer token. AWS credentials
+come from the daemon environment. Activation never adds a separate Identity Center application
+assignment. See [Kiro Enterprise administration](kiro-enterprise-admin.md) for setup and callers.
+
 The API uses the independent HTTP listener, normally
 `http://127.0.0.1:7651/admin/v1`, alongside public `/health` and `/ready`.
 It remains available without any business service. Business ports do not serve administration.
-Resources are grouped as Accounts, Services, Providers, Operations, and APIKeys.
+Resources are grouped as Accounts, Services, Providers, Operations, APIKeys, and KiroEnterprise.
 `GET /admin/v1/openapi.json` provides an authenticated OpenAPI 3.1 document.
 
 ## Enable and authenticate
@@ -12,8 +18,16 @@ Use `crosslane admin token` to manage multiple independent credentials. Commands
 its existing Unix socket and do not require a pre-existing Bearer token. These credentials
 are separate from model-client keys managed by `crosslane apikey`.
 
-For initial setup, configure the independent listener in the file from `crosslane config path`
-and restart the daemon:
+New configurations disable both `[status_http]` and `[admin.rest]`; the default listener
+is `127.0.0.1:7651`. Upgrades preserve existing files. `crosslane config edit admin`
+(or `config edit status-http`) exposes both sections together and fills missing
+documented defaults in older configurations, then validates the combined update.
+Exiting without changing a setting preserves the original file and does not reload
+providers or services; pending restart fields are still reported. If the full-config
+editor exits unsuccessfully, the original file is restored.
+
+For initial setup, run `crosslane config edit admin`, enable the independent listener
+below, keep `[admin.rest] enabled = false`, then save and restart the daemon:
 
 ```toml
 [status_http]
@@ -21,6 +35,10 @@ enabled = true
 host = "127.0.0.1"
 port = 7651
 ```
+
+Docker wrapper installations can use `crosslane restart`; native installations must
+restart the `crosslaned` service. Listener enable/disable, host, and port changes require
+a restart; `config reload` reports the pending fields.
 
 Create the first token and enable administration using the explicit `--enable-rest` flag:
 
@@ -31,9 +49,30 @@ crosslane admin token list
 crosslane admin token show ops
 ```
 
-`--enable-rest` requires an already enabled/running status listener. It does not open a new
+`--enable-rest` requires an enabled listener whose running enable state, host, and port
+match the saved configuration. Pending listener changes reject creation until restart,
+so REST is not activated on the previous address. It does not open a new
 port or reconfigure business services. Without it, creation retains the current admin switch.
 Token changes apply to subsequent requests immediately, without restart or a separate reload.
+Initial REST activation from a config edit likewise waits for the intended listener;
+creating or rotating credentials during that wait cannot activate it at the old address.
+An already active REST interface can continue rotating credentials while a listener move is pending.
+
+If tokens already exist, enable `[status_http]` and `[admin.rest]` together using
+`crosslane config edit admin`, then restart if the listener is not running yet. There is no
+need to create another token. You can also create a token without `--enable-rest` while the
+listener is disabled, then enable both sections in the editor. Enabling REST without its
+listener or without any configured token remains invalid.
+
+Inspect the running configuration with `crosslane config show admin --effective` and
+`config show status-http --effective`; use `admin token list` for credential metadata and
+access state. When disabling the listener, disable REST in the same edit.
+`config reset status-http` disables REST too, preserving credentials and the socket.
+`config reset admin` removes all admin tokens and resets the socket, preserving the listener.
+Socket defaults come from the daemon's environment. With older daemons that do not report
+this default, the current socket is retained instead of using the CLI's `CROSSLANE_HOME`
+or `XDG_RUNTIME_DIR`. A full `config reset` also removes admin tokens and disables REST
+and the status listener; the original configuration is backed up before resetting.
 
 | Command | Purpose |
 | --- | --- |

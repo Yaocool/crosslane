@@ -170,14 +170,15 @@ async fn mutate(state: &Arc<AppState>, change: Change) -> Handled {
         RpcError::bad_params("configuration could not be parsed; run crosslane config validate")
     })?;
     let current = state.config.current();
+    let listener_ready = disk.status_http.enabled && disk.status_http == current.status_http;
     let rest = &mut disk.admin.rest;
     let mut plaintext = None;
     let event;
     let changed = match change {
         Change::Create(params) => {
-            if params.enable_rest && !current.status_http.enabled {
+            if params.enable_rest && !listener_ready {
                 return Err(RpcError::bad_params(
-                    "enable and restart status_http before using --enable-rest",
+                    "use `crosslane config edit admin` to set [status_http] enabled=true, then restart crosslaned before using --enable-rest",
                 ));
             }
             let name = params.name.trim().to_owned();
@@ -233,10 +234,7 @@ async fn mutate(state: &Arc<AppState>, change: Change) -> Handled {
     };
     disk.validate()
         .map_err(|error| RpcError::bad_params(error.to_string()))?;
-    let mut effective = disk.admin.rest.clone();
-    if !current.status_http.enabled {
-        effective.enabled = false;
-    }
+    let effective = crosslane_store::config_loader::merge_admin_rest_auth(&current, &disk);
     let output = render(&raw, &disk.admin.rest)?;
     write_config_update_locked(state, &raw, &output).await?;
     // No model/provider/listener reconfiguration is required for an auth change.

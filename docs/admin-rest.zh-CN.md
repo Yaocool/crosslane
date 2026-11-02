@@ -1,8 +1,13 @@
 # Admin REST API
 
+Kiro 官方企业订阅管理位于 `/admin/v1/kiro/enterprise`，与 Crosslane 本地账号池分开。
+支持列用户、查询直接/组继承订阅、开通、取消、升级和降级；AWS 管理员凭据只从
+`crosslaned` 环境变量读取，调用方仍只传 Admin token。开通不会额外分配 Identity Center
+应用访问权限。完整环境变量、接口和 curl 示例见 [Kiro 企业订阅管理](kiro-enterprise-admin.zh-CN.md)。
+
 管理接口使用独立 HTTP 监听，默认地址为 `http://127.0.0.1:7651/admin/v1`。
 它与 `/health`、`/ready` 共用进程监听，不依赖任何业务 service。业务端口不提供管理接口。
-接口按 Accounts、Services、Providers、Operations、APIKeys 分组；开启后可通过
+接口按 Accounts、Services、Providers、Operations、APIKeys、KiroEnterprise 分组；开启后可通过
 `GET /admin/v1/openapi.json` 获取带鉴权定义的 OpenAPI 3.1 文档。
 
 ## 启用与鉴权
@@ -10,7 +15,14 @@
 推荐通过 `crosslane admin token` 管理多把独立令牌。命令使用已有 Unix socket，
 不需要先有 Bearer Token；与 `crosslane apikey` 管理的业务客户端 Key 分开。
 
-首次启用时，在 `crosslane config path` 对应文件中配置独立监听，并重启 daemon：
+新配置的 `[status_http]` 和 `[admin.rest]` 默认均为关闭，监听默认 `127.0.0.1:7651`；
+升级不会覆盖已有配置。运行 `crosslane config edit admin`（或 `config edit status-http`）
+会同时展示两个模块，并补齐旧配置缺少的默认字段和说明，保存时一起校验。
+未改设置直接退出时，原文件保持不变，也不会重载 provider 或 service；仍会报告磁盘配置
+相对于当前运行状态需要重启的字段。完整配置编辑器异常退出时会恢复原文件。
+
+首次启用时，运行 `crosslane config edit admin`，先设置以下监听，保留
+`[admin.rest] enabled = false`，保存后重启 daemon：
 
 ```toml
 [status_http]
@@ -18,6 +30,9 @@ enabled = true
 host = "127.0.0.1"
 port = 7651
 ```
+
+Docker wrapper 部署可用 `crosslane restart`；原生部署需重启 `crosslaned` 服务。
+监听启用、关闭、地址或端口变化都需要重启，`config reload` 只会提示待重启字段。
 
 随后创建第一把令牌，使用 `--enable-rest` 同时开启管理 REST：
 
@@ -28,9 +43,25 @@ crosslane admin token list
 crosslane admin token show ops
 ```
 
-`--enable-rest` 要求状态监听已启用并重启生效，不修改业务 service，也不会自动开启新的
+`--enable-rest` 要求状态监听已启用，且运行中的启用状态、地址和端口与磁盘配置一致；
+有待重启的监听变更时会拒绝创建，避免在旧监听地址上提前开启 REST。该参数不修改业务 service，也不会自动开启新的
 监听端口。省略该参数时，仅创建令牌，保留当前管理开关。首次监听设置后，Token 变更
 立即对后续请求生效，无需重启或另行 `config reload`。
+直接在配置中首次开启 REST 时同样会等待目标监听生效；等待期间创建或轮换令牌不会
+提前开启旧地址上的 REST。已开启的 REST 可在监听等待重启期间继续轮换令牌。
+
+已有令牌时，无需再创建：在 `crosslane config edit admin` 中将 `[status_http] enabled = true`
+与 `[admin.rest] enabled = true` 一起保存，监听尚未运行时再重启 daemon。也可先在监听关闭时
+执行 `admin token create --name ops`（不带 `--enable-rest`），再按此方式一起开启。
+直接开启 REST 而未开启监听，或尚未配置任何令牌，仍会校验失败。
+
+`crosslane config show admin --effective` 与 `config show status-http --effective` 可分别查询
+当前运行配置；`crosslane admin token list` 查询令牌和访问状态，不显示令牌明文或摘要。
+关闭监听时在编辑器中同时关闭 REST。`config reset status-http` 会同时关闭 REST，并保留
+令牌和 socket；`config reset admin` 会清除全部管理令牌并重置 socket，保留状态监听。
+socket 默认值取自 daemon 的环境；连接未提供该默认值的旧 daemon 时保留当前 socket，
+避免使用 CLI 的 `CROSSLANE_HOME` 或 `XDG_RUNTIME_DIR` 将管理路径移到其他目录。
+不指定模块的 `config reset` 同样会清除管理令牌，并关闭 REST 和状态监听；操作前会备份原配置。
 
 | 命令 | 功能 |
 | --- | --- |

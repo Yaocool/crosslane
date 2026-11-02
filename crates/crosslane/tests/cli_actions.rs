@@ -502,6 +502,232 @@ async fn config_edit_json_emits_only_a_result_object() {
 }
 
 #[tokio::test]
+async fn admin_editor_noop_preserves_legacy_files_and_reports_pending_restarts() {
+    for (original, expected_restart) in [
+        ("", json!(["admin.socket"])),
+        ("[admin]\nsocket = '/tmp/running-admin.sock'\n", json!([])),
+        ("[admin]\nsocket = '/tmp/running-admin.sock'\n[status_http]\nenabled = true\n[admin.rest]\nenabled = true\ntoken_sha256 = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\n", json!(["status_http.enabled"])),
+    ] {
+        for module in ["admin", "status-http"] {
+            let workspace = tempfile::tempdir().unwrap();
+            let config_file = workspace.path().join("config.toml");
+            fs::write(&config_file, original).unwrap();
+            let socket = workspace.path().join("admin.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let mut effective = crosslane_core::config::Config::default();
+            effective.admin.socket = "/tmp/running-admin.sock".into();
+            let server_path = config_file.clone();
+            let server = tokio::spawn(async move {
+                for (expected_method, result) in [
+                    (method::CONFIG_PATH, json!({"config_file":server_path,"accounts_file":"","daily_file":"","stats_file":"","admin_socket":"/tmp/running-admin.sock","default_admin_socket":"/tmp/daemon-default.sock"})),
+                    (method::CONFIG_SHOW, json!({"path":server_path,"raw":original,"effective_json":effective})),
+                ] {
+                    let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
+                    let (read, mut write) = stream.into_split();
+                    let request: Request = decode_line(&BufReader::new(read).lines().next_line().await.unwrap().unwrap()).unwrap();
+                    assert_eq!(request.method, expected_method);
+                    write.write_all(encode_line(&Response::ok(request.id, result)).unwrap().as_bytes()).await.unwrap();
+                }
+            });
+            let output = Command::new(env!("CARGO_BIN_EXE_crosslane"))
+                .current_dir(workspace.path())
+                .args(["--json", "--socket"]).arg(&socket)
+                .args(["config", "edit", module])
+                .env("VISUAL", "/usr/bin/true")
+                .output().await.unwrap();
+            assert_success(&output);
+            let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(result["saved"], false);
+            assert_eq!(result["changed"], false);
+            assert_eq!(result["needs_restart"], expected_restart);
+            assert_eq!(fs::read_to_string(&config_file).unwrap(), original);
+            server.await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn admin_config_reset_uses_daemon_defaults_and_preserves_socket_with_older_daemons() {
+    for module in [Some("admin"), None] {
+        for default_socket in [Some("/tmp/daemon-default.sock"), None] {
+            let workspace = tempfile::tempdir().unwrap();
+            let config_file = workspace.path().join("config.toml");
+            fs::write(&config_file, "[admin]\nsocket = '/tmp/running-admin.sock'\n[admin.rest]\ntoken_sha256 = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\n").unwrap();
+            let mut paths = json!({"config_file":config_file,"accounts_file":"","daily_file":"","stats_file":"","admin_socket":"/tmp/running-admin.sock"});
+            if let Some(default_socket) = default_socket {
+                paths["default_admin_socket"] = json!(default_socket);
+            }
+            let mut args = vec!["config", "reset"];
+            args.extend(module);
+            args.push("--yes");
+            let (output, _) = run_in_workspace(
+                workspace.path(),
+                &args,
+                vec![paths, json!({"applied":true,"needs_restart":[]})],
+            )
+            .await;
+            assert_success(&output);
+            let config: crosslane_core::config::Config =
+                toml::from_str(&fs::read_to_string(&config_file).unwrap()).unwrap();
+            assert_eq!(
+                config.admin.socket,
+                default_socket.unwrap_or("/tmp/running-admin.sock")
+            );
+            assert!(config.admin.rest.token_sha256.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn failed_full_config_editor_restores_the_original_file() {
+    let workspace = tempfile::tempdir().unwrap();
+    let config_file = workspace.path().join("config.toml");
+    let original = "[admin]\nsocket = '/tmp/running-admin.sock'\n";
+    fs::write(&config_file, original).unwrap();
+    let editor = workspace.path().join("failing-editor.sh");
+    fs::write(
+        &editor,
+        "printf '%s\\n' '[admin.rest]' 'enabled = true' > \"$1\"\nexit 7\n",
+    )
+    .unwrap();
+    let socket = workspace.path().join("admin.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server_path = config_file.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read, mut write) = stream.into_split();
+        let request: Request = decode_line(
+            &BufReader::new(read)
+                .lines()
+                .next_line()
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(request.method, method::CONFIG_PATH);
+        write.write_all(encode_line(&Response::ok(request.id, json!({"config_file":server_path,"accounts_file":"","daily_file":"","stats_file":"","admin_socket":"/tmp/running-admin.sock"}))).unwrap().as_bytes()).await.unwrap();
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_crosslane"))
+        .current_dir(workspace.path())
+        .args(["--socket"])
+        .arg(&socket)
+        .args(["config", "edit"])
+        .env("VISUAL", format!("/bin/sh '{}'", editor.display()))
+        .output()
+        .await
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("编辑器"));
+    assert!(stderr(&output).contains("回滚"));
+    assert_eq!(fs::read_to_string(&config_file).unwrap(), original);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn status_http_reset_explains_its_effect_on_rest_in_the_success_message() {
+    let workspace = tempfile::tempdir().unwrap();
+    let config_file = workspace.path().join("config.toml");
+    fs::write(&config_file, "[admin.rest]\nenabled = true\ntoken_sha256 = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\n[status_http]\nenabled = true\n").unwrap();
+    let (output, _) = run_in_workspace_mode(workspace.path(), &["config", "reset", "status-http", "--yes"], vec![json!({"config_file":config_file,"accounts_file":"","daily_file":"","stats_file":"","admin_socket":"/tmp/running-admin.sock"}),json!({"applied":true,"needs_restart":["status_http.enabled"]})], false).await;
+    assert_success(&output);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Admin REST"));
+    assert!(stdout.contains("令牌"));
+    assert!(!stdout.contains("其他配置未改动"));
+}
+
+#[tokio::test]
+async fn config_admin_edit_saves_listener_and_authentication_together_and_reports_restart() {
+    for module in ["admin", "status-http"] {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_file = workspace.path().join("config.toml");
+        let original = r#"# business configuration
+[server]
+port = 6200
+[admin]
+socket = "/tmp/keep-admin.sock"
+[admin.rest]
+token_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+"#;
+        fs::write(&config_file, original).unwrap();
+        let editor = workspace.path().join("editor.sh");
+        fs::write(
+            &editor,
+            "exec /usr/bin/sed -i.bak 's/^enabled = false$/enabled = true/' \"$1\"\n",
+        )
+        .unwrap();
+        let socket = workspace.path().join("admin.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server_path = config_file.clone();
+        let server = tokio::spawn(async move {
+            for (expected_method, result) in [
+                (
+                    method::CONFIG_PATH,
+                    json!({"config_file":server_path,"accounts_file":"","daily_file":"","stats_file":"","admin_socket":""}),
+                ),
+                (
+                    method::CONFIG_RELOAD,
+                    json!({"applied":true,"needs_restart":["status_http.enabled"]}),
+                ),
+            ] {
+                let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let (read, mut write) = stream.into_split();
+                let line = BufReader::new(read)
+                    .lines()
+                    .next_line()
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let request: Request = decode_line(&line).unwrap();
+                assert_eq!(request.method, expected_method);
+                write
+                    .write_all(
+                        encode_line(&Response::ok(request.id, result))
+                            .unwrap()
+                            .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let output = tokio::time::timeout(
+            Duration::from_secs(10),
+            Command::new(env!("CARGO_BIN_EXE_crosslane"))
+                .current_dir(workspace.path())
+                .args(["--json", "--socket"])
+                .arg(&socket)
+                .args(["config", "edit", module])
+                .env("VISUAL", format!("/bin/sh '{}'", editor.display()))
+                .env_remove("CROSSLANE_PROVIDER")
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_success(&output);
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["saved"], true);
+        assert_eq!(result["changed"], true);
+        assert_eq!(result["module"], module);
+        assert_eq!(result["needs_restart"], json!(["status_http.enabled"]));
+        let raw = fs::read_to_string(&config_file).unwrap();
+        let config: crosslane_core::config::Config = toml::from_str(&raw).unwrap();
+        config.validate().unwrap();
+        assert!(config.status_http.enabled);
+        assert!(config.admin.rest.enabled);
+        assert_eq!(config.status_http.port, 7651);
+        assert_eq!(config.admin.socket, "/tmp/keep-admin.sock");
+        assert_eq!(config.server.port, 6200);
+        assert!(raw.contains("# business configuration"));
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn config_reload_reports_an_unapplied_result_as_failure() {
     for json_output in [true, false] {
         let workspace = tempfile::tempdir().unwrap();

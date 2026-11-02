@@ -180,3 +180,53 @@ fn nested_token_help_is_local_and_rejects_provider_scope() {
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("不接受 --provider"));
 }
+
+#[tokio::test]
+async fn disabled_admin_access_points_to_the_combined_config_editor() {
+    for listener_enabled in [false, true] {
+        let output = run(
+            &["admin", "token", "list"],
+            method::ADMIN_TOKEN_LIST,
+            Value::Null,
+            json!({"tokens":[metadata()],"rest_enabled":false,"listener_enabled":listener_enabled}),
+        )
+        .await;
+        let hint = String::from_utf8(output.stderr).unwrap();
+        assert!(hint.contains("crosslane config edit admin"));
+        if !listener_enabled {
+            assert!(hint.contains("[status_http] enabled=true"));
+        }
+        assert!(hint.contains("[admin.rest] enabled=true"));
+        assert!(hint.contains("已有令牌"));
+        assert!(hint.contains("待重启"));
+    }
+}
+
+#[test]
+fn admin_help_and_guides_explain_listener_dependencies_and_configuration_defaults() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join(".env"), "BROKEN='unterminated\n").unwrap();
+    for args in [
+        vec!["admin", "--help"],
+        vec!["admin", "token", "--help"],
+        vec!["admin", "token", "create", "--help"],
+        vec!["config", "edit", "--help"],
+        vec!["guide", "admin"],
+        vec!["guide", "config"],
+    ] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_crosslane"))
+            .current_dir(home.path())
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let help = String::from_utf8(output.stdout).unwrap();
+        assert!(help.contains("config edit admin"), "{args:?}: {help}");
+        assert!(help.contains("status_http"), "{args:?}: {help}");
+        assert!(help.contains("重启"), "{args:?}: {help}");
+    }
+}

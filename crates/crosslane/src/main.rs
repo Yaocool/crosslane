@@ -66,7 +66,7 @@ struct TimeRangeArgs {
 enum Command {
     /// 管理 Admin REST 的独立访问令牌；通过 Unix socket 执行。
     #[command(
-        after_help = "示例：\n  crosslane admin token create --name ops --enable-rest\n  crosslane admin token list\n  crosslane admin token rotate ops\n  crosslane admin token revoke ops"
+        after_help = "首次启用：crosslane config edit admin 同时编辑 [status_http] 和 [admin.rest]，先开启监听并重启 daemon，再创建 --enable-rest 令牌。\n\n示例：\n  crosslane admin token create --name ops --enable-rest\n  crosslane admin token list\n  crosslane admin token rotate ops\n  crosslane admin token revoke ops\n\n操作说明：crosslane guide admin"
     )]
     Admin {
         #[command(subcommand)]
@@ -910,15 +910,15 @@ enum ConfigCommand {
     Reload,
     /// 用 $VISUAL/$EDITOR 编辑完整配置或指定模块，保存后校验并重载。
     #[command(
-        after_help = "Kiro 上游与账号池使用 upstream/pool 等模块；请求凭证脱敏开关使用 features 模块。Copilot OAuth、endpoint、缓存优先用 provider edit <ID> 修改对应实例。不指定模块时编辑完整配置。\n\n示例：\n  crosslane config edit upstream\n  crosslane config edit pool\n  crosslane config edit features\n  crosslane provider edit copilot --setting 'api_endpoint_fallback=\"https://api.enterprise.githubcopilot.com\"'"
+        after_help = "admin 和 status-http 编辑入口会同时展示 [admin]/[status_http]，补齐旧配置缺少的默认字段；可以一起启停 REST 与监听。模块编辑未改设置退出时不写文件、不重载服务，仍提示待重启字段；完整配置编辑器异常退出时恢复原文件。首次开启监听或修改地址/端口需重启 daemon，首次开启 REST 会等待目标监听生效。令牌用 admin token 管理，详见 crosslane guide admin。\nKiro 上游与账号池使用 upstream/pool 等模块；请求凭证脱敏开关使用 features 模块。Copilot OAuth、endpoint、缓存优先用 provider edit <ID> 修改对应实例。不指定模块时编辑完整配置。\n\n示例：\n  crosslane config edit admin\n  crosslane config edit status-http\n  crosslane config edit upstream\n  crosslane config edit pool\n  crosslane config edit features\n  crosslane provider edit copilot --setting 'api_endpoint_fallback=\"https://api.enterprise.githubcopilot.com\"'"
     )]
     Edit {
-        /// 只编辑指定模块；使用 `crosslane config list` 查看模块名。
+        /// 编辑指定模块；admin/status-http 同时包含关联监听和鉴权配置。
         module: Option<String>,
     },
     /// 备份配置并重置指定模块或全部可重置的运行配置。
     #[command(
-        after_help = "指定模块时仅重置该模块；pool/features/sso 等属于 Kiro 专项，server/log 等为全局。provider、api-key、proxy-service 不可按模块重置；不指定模块时重置 Kiro 与全局运行参数，保留基础服务和告警配置，但清除模型映射。原配置自动备份。\n\n示例：\n  crosslane config reset pool\n  crosslane config reset sso\n  crosslane config reset"
+        after_help = "指定模块时仅重置该模块；status-http 会同时关闭 Admin REST 并保留令牌，监听关闭需重启 daemon。admin 重置会清除全部管理令牌和重置 socket，不关闭状态监听。socket 默认值取自 daemon；旧 daemon 未提供默认值时保留当前 socket。pool/features/sso 等属于 Kiro 专项，server/log 等为全局。provider、api-key、proxy-service 不可按模块重置；不指定模块时重置 Kiro 与全局运行参数、清除管理令牌和模型映射、关闭 REST/状态监听，同时保留基础服务和告警配置。原配置自动备份。\n\n示例：\n  crosslane config reset status-http\n  crosslane config reset pool\n  crosslane config reset sso\n  crosslane config reset"
     )]
     Reset {
         /// 只重置指定模块；使用 `crosslane config list` 查看模块名。
@@ -1201,10 +1201,18 @@ async fn main() -> Result<()> {
                     }))?;
                 } else {
                     if let Some(module) = result.module.as_deref() {
-                        println!("配置模块 {module} 已恢复为默认设置并重载；其他配置未改动");
+                        if module == "status-http" {
+                            println!("配置模块 status-http 已恢复默认并重载，Admin REST 已关闭；管理令牌和 socket 已保留");
+                        } else if module == "admin" {
+                            println!(
+                                "配置模块 admin 已恢复默认并重载，管理令牌已清除；状态监听已保留"
+                            );
+                        } else {
+                            println!("配置模块 {module} 已恢复为默认设置并重载；其他配置未改动");
+                        }
                     } else {
                         println!(
-                            "运行配置已恢复默认并重载；提供源、API key、代理服务和告警配置已保留，模型映射已清除"
+                            "运行配置已恢复默认并重载；管理令牌和模型映射已清除，REST 已关闭，状态监听已设置为关闭；提供源、API key、代理服务和告警配置已保留"
                         );
                     }
                     println!("原配置备份 {}", result.backup_file.display());

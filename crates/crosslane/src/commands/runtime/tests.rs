@@ -1,5 +1,13 @@
 use super::*;
 
+fn render_config_module_editor(raw: &str, module: &ConfigModule) -> Result<String> {
+    super::render_config_module_editor(
+        raw,
+        module,
+        &crosslane_core::config::Config::default().admin.socket,
+    )
+}
+
 #[test]
 fn pool_overage_update_sets_preserves_and_clears_the_per_account_limit() {
     let mut root = toml::map::Map::new();
@@ -390,7 +398,9 @@ api_key_ids = ["ak_keep"]
 created_at = 123
 "#;
 
-    let output = render_reset_config_preserving_resources_and_alerts(raw).expect("reset config");
+    let output =
+        render_reset_config_preserving_resources_and_alerts(raw, "/tmp/default-admin.sock")
+            .expect("reset config");
     let reset: crosslane_core::config::Config =
         toml::from_str(&output).expect("parse reset config");
     let defaults = crosslane_core::config::Config::default();
@@ -426,7 +436,9 @@ format = "token"
 enabled = true
 "#;
 
-    let output = render_reset_config_preserving_resources_and_alerts(raw).expect("reset config");
+    let output =
+        render_reset_config_preserving_resources_and_alerts(raw, "/tmp/default-admin.sock")
+            .expect("reset config");
     let reset: crosslane_core::config::Config =
         toml::from_str(&output).expect("parse reset config");
 
@@ -454,7 +466,9 @@ events = ["token-refresh-failed", "service-quota-exhausted"]
 dingtalk_sign = "SEC-keep-secret"
 "#;
 
-    let output = render_reset_config_preserving_resources_and_alerts(raw).expect("reset config");
+    let output =
+        render_reset_config_preserving_resources_and_alerts(raw, "/tmp/default-admin.sock")
+            .expect("reset config");
     let reset: crosslane_core::config::Config =
         toml::from_str(&output).expect("parse reset config");
     let defaults = crosslane_core::config::Config::default();
@@ -570,6 +584,180 @@ max_queue_size = 10
     );
     assert!(output.contains("# port explanation"));
     assert!(!output.contains("max_queue_size"));
+}
+
+#[test]
+fn admin_edit_exposes_listener_and_missing_defaults_without_overwriting_existing_values() {
+    let original = r#"# business listener
+[server]
+port = 6200
+
+[admin]
+# retain the control socket
+socket = "/tmp/crosslane-admin.sock"
+
+[admin.rest]
+token_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+"#;
+    for name in ["admin", "status-http"] {
+        let module = resolve_config_module(name).unwrap();
+        let editor = render_config_module_editor(original, module).unwrap();
+        let mut edited: toml::Value = editor.parse().unwrap();
+        assert_eq!(edited["status_http"]["enabled"].as_bool(), Some(false));
+        assert_eq!(edited["status_http"]["port"].as_integer(), Some(7651));
+        assert_eq!(edited["admin"]["rest"]["enabled"].as_bool(), Some(false));
+        assert_eq!(
+            edited["admin"]["socket"].as_str(),
+            Some("/tmp/crosslane-admin.sock")
+        );
+        assert!(editor.contains("# retain the control socket"));
+        assert!(!editor.contains("[server]"));
+        edited["status_http"]["enabled"] = toml::Value::Boolean(true);
+        edited["admin"]["rest"]["enabled"] = toml::Value::Boolean(true);
+        let output =
+            merge_edited_config_module(original, module, &toml::to_string(&edited).unwrap())
+                .unwrap();
+        let config: crosslane_core::config::Config = toml::from_str(&output).unwrap();
+        config.validate().unwrap();
+        assert!(config.status_http.enabled);
+        assert!(config.admin.rest.enabled);
+        assert_eq!(config.server.port, 6200);
+        assert_eq!(config.admin.socket, "/tmp/crosslane-admin.sock");
+        assert!(output.contains("# business listener"));
+        assert!(output.contains("# retain the control socket"));
+    }
+}
+
+#[test]
+fn admin_edit_can_disable_both_interfaces_without_losing_tokens_or_other_modules() {
+    let original = r#"[status_http]
+enabled = true
+host = "0.0.0.0"
+port = 8765
+[admin]
+socket = "/tmp/admin.sock"
+[admin.rest]
+enabled = true
+token_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+[pool]
+max_queue_size = 19
+"#;
+    for name in ["admin", "status-http"] {
+        let module = resolve_config_module(name).unwrap();
+        let mut edited: toml::Value = render_config_module_editor(original, module)
+            .unwrap()
+            .parse()
+            .unwrap();
+        edited["status_http"]["enabled"] = toml::Value::Boolean(false);
+        edited["admin"]["rest"]["enabled"] = toml::Value::Boolean(false);
+        let output =
+            merge_edited_config_module(original, module, &toml::to_string(&edited).unwrap())
+                .unwrap();
+        let config: crosslane_core::config::Config = toml::from_str(&output).unwrap();
+        assert!(!config.status_http.enabled);
+        assert!(!config.admin.rest.enabled);
+        assert_eq!(config.admin.rest.token_sha256, "a".repeat(64));
+        assert_eq!(config.status_http.host, "0.0.0.0");
+        assert_eq!(config.status_http.port, 8765);
+        assert_eq!(config.pool.max_queue_size, 19);
+        let invalid = format!(
+            "{}\n[server]\nport = 7652\n",
+            toml::to_string(&edited).unwrap()
+        );
+        assert!(merge_edited_config_module(original, module, &invalid).is_err());
+    }
+}
+
+#[test]
+fn admin_edit_keeps_dependency_and_authentication_validation() {
+    let admin = resolve_config_module("admin").unwrap();
+    for edited in [
+        "[admin.rest]\nenabled = true\ntoken_sha256 = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\n",
+        "[status_http]\nenabled = true\n[admin.rest]\nenabled = true\n",
+    ] {
+        assert!(merge_edited_config_module("", admin, edited).is_err());
+    }
+    let editor = render_config_module_editor("", admin).unwrap();
+    let config: crosslane_core::config::Config = toml::from_str(&editor).unwrap();
+    assert_eq!(
+        config.admin.socket,
+        crosslane_core::config::Config::default().admin.socket
+    );
+    assert!(!config.admin.rest.enabled);
+    assert!(!config.status_http.enabled);
+}
+
+#[test]
+fn admin_edit_preserves_inline_tables_named_tokens_and_read_only_credentials() {
+    for raw in [
+        "admin = { socket = '/tmp/inline.sock' }\nstatus_http = { port = 8765 }\n",
+        "[admin]\nsocket = '/tmp/inline.sock'\nrest = { read_token_sha256 = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', tokens = [{id = 'adm_0123456789abcdef', name = 'ops', enabled = false, token_sha256 = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'}] }\n[status_http]\nport = 8765\n",
+    ] {
+        let before: crosslane_core::config::Config = toml::from_str(raw).unwrap();
+        let admin = resolve_config_module("admin").unwrap();
+        let editor = render_config_module_editor(raw, admin).unwrap();
+        let output = merge_edited_config_module(raw, admin, &editor).unwrap();
+        let after: crosslane_core::config::Config = toml::from_str(&output).unwrap();
+        after.validate().unwrap();
+        assert_eq!(after.admin.socket, before.admin.socket);
+        assert_eq!(after.status_http.port, before.status_http.port);
+        assert_eq!(
+            serde_json::to_value(&after.admin.rest).unwrap(),
+            serde_json::to_value(&before.admin.rest).unwrap()
+        );
+    }
+}
+
+#[test]
+fn admin_editor_uses_the_connected_daemons_socket_when_the_field_is_omitted() {
+    for name in ["admin", "status-http"] {
+        let module = resolve_config_module(name).unwrap();
+        let editor =
+            super::render_config_module_editor("", module, "/tmp/other-daemon.sock").unwrap();
+        let config: crosslane_core::config::Config = toml::from_str(&editor).unwrap();
+        assert_eq!(config.admin.socket, "/tmp/other-daemon.sock");
+    }
+}
+
+#[test]
+fn status_http_reset_disables_rest_but_keeps_credentials_and_socket() {
+    let original = r#"[status_http]
+enabled = true
+port = 8765
+[admin]
+socket = "/tmp/keep-admin.sock"
+[admin.rest]
+enabled = true
+token_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+[[admin.rest.tokens]]
+id = "adm_0123456789abcdef"
+name = "monitor"
+role = "read_only"
+enabled = false
+token_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+"#;
+    let module = resolve_config_module("status-http").unwrap();
+    let output = render_config_module_reset(original, module, "/tmp/default-admin.sock").unwrap();
+    let config: crosslane_core::config::Config = toml::from_str(&output).unwrap();
+    assert!(!config.status_http.enabled);
+    assert!(!config.admin.rest.enabled);
+    assert_eq!(config.status_http.port, 7651);
+    assert_eq!(config.admin.socket, "/tmp/keep-admin.sock");
+    assert_eq!(config.admin.rest.token_sha256, "a".repeat(64));
+    assert_eq!(config.admin.rest.tokens.len(), 1);
+    assert_eq!(config.admin.rest.tokens[0].token_sha256, "b".repeat(64));
+    assert!(!config.admin.rest.tokens[0].enabled);
+    let reset_admin = render_config_module_reset(
+        original,
+        resolve_config_module("admin").unwrap(),
+        "/tmp/default-admin.sock",
+    )
+    .unwrap();
+    let reset_admin: crosslane_core::config::Config = toml::from_str(&reset_admin).unwrap();
+    assert!(reset_admin.status_http.enabled);
+    assert_eq!(reset_admin.status_http.port, 8765);
+    assert!(!reset_admin.admin.rest.enabled);
+    assert!(reset_admin.admin.rest.tokens.is_empty());
 }
 
 #[test]
@@ -710,7 +898,8 @@ fn config_module_reset_restores_only_the_selected_module() {
     );
     let pool = resolve_config_module("pool").expect("pool module");
 
-    let output = render_config_module_reset(&original, pool).expect("reset pool");
+    let output =
+        render_config_module_reset(&original, pool, "/tmp/default-admin.sock").expect("reset pool");
     let reset: crosslane_core::config::Config = toml::from_str(&output).expect("reset config");
     let defaults = crosslane_core::config::Config::default();
 
@@ -731,7 +920,8 @@ port = 6200
 "#;
     let thinking = resolve_config_module("thinking").expect("thinking module");
 
-    let output = render_config_module_reset(original, thinking).expect("reset thinking map");
+    let output = render_config_module_reset(original, thinking, "/tmp/default-admin.sock")
+        .expect("reset thinking map");
     let reset: crosslane_core::config::Config = toml::from_str(&output).expect("reset config");
 
     assert!(reset.model_thinking_mode.is_empty());
@@ -752,7 +942,8 @@ priority = 10
 "#;
     let mappings = resolve_config_module("model-map").expect("mapping module");
 
-    let output = render_config_module_reset(original, mappings).expect("reset mappings");
+    let output = render_config_module_reset(original, mappings, "/tmp/default-admin.sock")
+        .expect("reset mappings");
     let reset: crosslane_core::config::Config = toml::from_str(&output).expect("reset config");
 
     assert!(reset.model_mapping.is_empty());
@@ -764,7 +955,8 @@ fn config_module_reset_refuses_foundation_service_resources() {
     for name in ["api-key", "proxy-service"] {
         let module = resolve_config_module(name).expect("foundation module");
         assert!(!module.resettable());
-        let error = render_config_module_reset("", module).expect_err("reset must be refused");
+        let error = render_config_module_reset("", module, "/tmp/default-admin.sock")
+            .expect_err("reset must be refused");
         assert!(error.to_string().contains("基础服务资源"));
     }
 }
@@ -997,8 +1189,14 @@ fn timestamps_reject_ambiguous_or_invalid_values() {
 fn disabled_models_survive_config_resets() {
     let raw = "[models]\ndisabled = [\"gpt-test\"]\ncache_ttl_ms = 1000\n";
     for output in [
-        render_reset_config_preserving_resources_and_alerts(raw).unwrap(),
-        render_config_module_reset(raw, resolve_config_module("models").unwrap()).unwrap(),
+        render_reset_config_preserving_resources_and_alerts(raw, "/tmp/default-admin.sock")
+            .unwrap(),
+        render_config_module_reset(
+            raw,
+            resolve_config_module("models").unwrap(),
+            "/tmp/default-admin.sock",
+        )
+        .unwrap(),
     ] {
         let config: crosslane_core::config::Config = toml::from_str(&output).unwrap();
         assert_eq!(config.models.disabled, ["gpt-test"]);

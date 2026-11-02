@@ -846,6 +846,7 @@ fn handle_config_path(state: &Arc<AppState>) -> ConfigPathResult {
         daily_file: state.paths.daily_file.display().to_string(),
         stats_file: state.paths.stats_file.display().to_string(),
         admin_socket: state.admin_socket().display().to_string(),
+        default_admin_socket: Some(Config::default().admin.socket),
         log_base_path: log_base_path.display().to_string(),
         log_directory: log_directory.display().to_string(),
     }

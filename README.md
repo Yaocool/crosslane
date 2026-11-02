@@ -94,6 +94,9 @@ for accounts, tags, services, grouped quotas and runtime management, with an opt
 Bulk account creation accepts CLI-compatible SSO CSV for automatic login and persistence, with concurrency and per-row progress.
 Use `crosslane admin token create/list/show/rotate/disable/enable/revoke` to manage independent
 admin credentials; plaintext is returned only at creation/rotation, and only digests are stored.
+`crosslane config edit admin` edits authentication and its `[status_http]` listener together;
+see `crosslane guide admin` for initial setup and restart requirements. Kiro enterprise users
+and subscriptions use [dedicated admin endpoints](docs/kiro-enterprise-admin.md) with daemon-side AWS credentials.
 
 ## Connect a client
 

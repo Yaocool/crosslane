@@ -195,6 +195,8 @@ port = 7651
 ```
 
 The listener is disabled by default. When enabled, its default address is `127.0.0.1:7651`.
+Use `crosslane config edit status-http` or `config edit admin` to edit this listener and
+its optional REST authentication together; missing defaults are supplied for older files.
 Restart `crosslaned` after changing this section; `config reload` reports the restart requirement
 and retains the current listener. Change `host` to the appropriate listening address for remote
 probes. Docker host networking needs no additional port mapping.

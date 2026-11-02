@@ -2324,6 +2324,15 @@ struct ConfigModule {
 }
 
 impl ConfigModule {
+    /// The REST switch and its listener must be editable in one validated update.
+    fn editor_keys(&self) -> Vec<&'static str> {
+        match self.key {
+            "admin" => vec!["admin", "status_http"],
+            "status_http" => vec!["status_http", "admin"],
+            key => vec![key],
+        }
+    }
+
     fn resettable(&self) -> bool {
         !matches!(self.key, "provider" | "api_key" | "proxy_service")
     }
@@ -2345,7 +2354,7 @@ const CONFIG_MODULES: &[ConfigModule] = &[
         key: "status_http",
         category: "通用",
         scope: "global",
-        description: "独立状态 HTTP 监听；变更需重启 daemon",
+        description: "独立状态 HTTP 监听；编辑时包含 admin，变更需重启 daemon",
         preferred_command: "-",
         aliases: &["status_http"],
         is_array: false,
@@ -2455,8 +2464,8 @@ const CONFIG_MODULES: &[ConfigModule] = &[
         key: "admin",
         category: "通用",
         scope: "global",
-        description: "本地管理 socket 与独立 HTTP 上的 REST 鉴权",
-        preferred_command: "-",
+        description: "管理 socket 与 REST 鉴权；编辑时包含 status_http 监听",
+        preferred_command: "crosslane admin token",
         aliases: &[],
         is_array: false,
     },
@@ -2547,6 +2556,7 @@ pub fn list_config_modules(json: bool) -> Result<()> {
                         .then_some(module.preferred_command),
                     "aliases":module.aliases,
                     "resettable":module.resettable(),
+                    "editor_keys":module.editor_keys(),
                 })
             })
             .collect::<Vec<_>>();
@@ -2676,8 +2686,31 @@ fn render_config_module_document(raw: &str, module: &ConfigModule) -> Result<Str
     Ok(output.to_string())
 }
 
-fn render_config_module_editor(raw: &str, module: &ConfigModule) -> Result<String> {
+fn render_config_module_editor(
+    raw: &str,
+    module: &ConfigModule,
+    admin_socket: &str,
+) -> Result<String> {
     let mut body = render_config_module_document(raw, module)?;
+    let editor_keys = module.editor_keys();
+    if editor_keys.len() > 1 {
+        let source = raw.parse::<DocumentMut>().context("配置文件 TOML 无效")?;
+        let defaults = crosslane_store::bootstrap::render_default_config(admin_socket)
+            .parse::<DocumentMut>()
+            .context("默认配置 TOML 无效")?;
+        let mut document = DocumentMut::new();
+        for key in &editor_keys {
+            let default = &defaults[key];
+            let mut item = source
+                .as_table()
+                .get(key)
+                .cloned()
+                .unwrap_or_else(|| default.clone());
+            fill_config_editor_defaults(&mut item, default);
+            document.as_table_mut().insert(key, item);
+        }
+        body = document.to_string();
+    }
     if module.key == "features" {
         let mut document = body.parse::<DocumentMut>().context("配置模块 TOML 无效")?;
         let features = document[module.key]
@@ -2708,13 +2741,40 @@ fn render_config_module_editor(raw: &str, module: &ConfigModule) -> Result<Strin
         }
         body = document.to_string();
     }
+    let scope = if editor_keys.len() > 1 {
+        "# 可同时编辑 admin 和 status_http；其他顶层模块不允许修改。\n\
+         # 开启 admin.rest.enabled 前，须开启 status_http.enabled 并先用 admin token create 创建令牌。\n\
+         # 监听需重启时，首次开启 REST 会等待该监听生效；已启用接口的令牌可继续热轮换。\n\
+         # 未改设置直接退出时不写入补全的默认值；仍会提示已有的待重启字段。"
+    } else {
+        "# 只允许编辑本模块。"
+    };
     Ok(format!(
         "# Crosslane 配置模块：{}（TOML key: {}）\n\
-         # 只允许编辑本模块；保存后会合并回完整配置并进行整体校验。\n\
+         {scope}\n\
+         # 保存后会合并回完整配置并进行整体校验；未包含的关联模块保持原值。\n\
          # 删除整个模块不会保存；要恢复默认值，请保留模块 TOML key 并清空字段或数组。\n\n\
          {body}",
         module.name, module.key
     ))
+}
+
+fn fill_config_editor_defaults(item: &mut toml_edit::Item, default: &toml_edit::Item) {
+    // Documented key comments contain newlines, which TOML inline tables cannot
+    // contain. Expand only the editor copy before adding those defaults.
+    if let Some(inline) = item.as_inline_table() {
+        *item = toml_edit::Item::Table(inline.clone().into_table());
+    }
+    let (Some(table), Some(defaults)) = (item.as_table_like_mut(), default.as_table_like()) else {
+        return;
+    };
+    for (name, default) in defaults.iter() {
+        if let Some(current) = table.get_mut(name) {
+            fill_config_editor_defaults(current, default);
+        } else if let Some(key) = defaults.key(name) {
+            table.entry_format(key).or_insert(default.clone());
+        }
+    }
 }
 
 fn merge_edited_config_module(
@@ -2731,9 +2791,10 @@ fn merge_edited_config_module(
     let edited_table = edited
         .as_table()
         .ok_or_else(|| anyhow!("配置模块文件必须是 TOML table"))?;
+    let editor_keys = module.editor_keys();
     let extra = edited_table
         .keys()
-        .filter(|key| key.as_str() != module.key)
+        .filter(|key| !editor_keys.contains(&key.as_str()))
         .cloned()
         .collect::<Vec<_>>();
     if !extra.is_empty() {
@@ -2743,18 +2804,22 @@ fn merge_edited_config_module(
             extra.join(", ")
         ));
     }
-    let value = edited_table.get(module.key).cloned().ok_or_else(|| {
-        anyhow!(
+    if !edited_table.contains_key(module.key) {
+        return Err(anyhow!(
             "配置模块 {} 缺少 TOML key `{}`；请保留该 key",
             module.name,
             module.key
-        )
-    })?;
+        ));
+    }
     let mut after = before.clone();
-    after
+    let after_table = after
         .as_table_mut()
-        .ok_or_else(|| anyhow!("config root must be a TOML table"))?
-        .insert(module.key.into(), value);
+        .ok_or_else(|| anyhow!("config root must be a TOML table"))?;
+    for key in editor_keys {
+        if let Some(value) = edited_table.get(key) {
+            after_table.insert(key.into(), value.clone());
+        }
+    }
     let output = crosslane_store::config_update::render_update_preserving_comments(
         original, &before, &after,
     )
@@ -2836,7 +2901,12 @@ async fn edit_full_config(client: &mut AdminClient, json: bool) -> Result<()> {
     let original = tokio::fs::read(&path)
         .await
         .with_context(|| format!("读取 {} 失败", path.display()))?;
-    run_editor(&path, json).await?;
+    if let Err(error) = run_editor(&path, json).await {
+        crosslane_store::atomic::write_bytes_atomically(&path, &original, Some(0o600))
+            .await
+            .with_context(|| format!("编辑器失败且原配置回滚失败：{error}"))?;
+        return Err(error.context("编辑器失败，磁盘文件已回滚"));
+    }
     if let Err(error) = validate_config_path(&path, true).await {
         crosslane_store::atomic::write_bytes_atomically(&path, &original, Some(0o600)).await?;
         return Err(error.context("配置无效，磁盘文件已回滚"));
@@ -2865,14 +2935,15 @@ async fn edit_config_module(
     let paths: ConfigPathResult = client
         .call(method::CONFIG_PATH, serde_json::json!({}))
         .await?;
-    let path = PathBuf::from(paths.config_file);
+    let path = PathBuf::from(&paths.config_file);
     let _config_lock = crosslane_store::atomic::lock_file_exclusive(&path)
         .await
         .with_context(|| format!("锁定配置文件 {} 失败", path.display()))?;
     let original = tokio::fs::read_to_string(&path)
         .await
         .with_context(|| format!("读取 {} 失败", path.display()))?;
-    let editor_content = render_config_module_editor(&original, module)?;
+    let editor_content =
+        render_config_module_editor(&original, module, daemon_default_admin_socket(&paths))?;
     let mut temporary = tempfile::Builder::new()
         .prefix(&format!("crosslane-config-{}-", module.name))
         .suffix(".toml")
@@ -2886,18 +2957,28 @@ async fn edit_config_module(
     let edited = tokio::fs::read_to_string(temporary.path())
         .await
         .context("读取编辑后的配置模块失败")?;
-    let output = merge_edited_config_module(&original, module, &edited)?;
+    // The editor adds discoverable defaults to legacy files. Closing it without
+    // changing a setting must not materialize those defaults on disk.
+    let original_editor: toml::Value = editor_content.parse().context("配置模块模板 TOML 无效")?;
+    let edited_value: toml::Value = edited.parse().context("编辑后的配置模块 TOML 无效")?;
+    let output = if edited_value == original_editor {
+        original.clone()
+    } else {
+        merge_edited_config_module(&original, module, &edited)?
+    };
     if output == original {
+        let needs_restart = unchanged_config_restart_required(client, &original, &paths).await?;
         if json {
             print_json(&serde_json::json!({
                 "saved": false,
                 "changed": false,
                 "module": module.name,
                 "config_file": path,
-                "needs_restart": [],
+                "needs_restart": needs_restart,
             }))?;
         } else {
             println!("配置模块 {} 未修改", module.name);
+            print_restart_required(&needs_restart);
         }
         return Ok(());
     }
@@ -2917,6 +2998,42 @@ async fn edit_config_module(
         print_restart_required(&result.needs_restart);
     }
     Ok(())
+}
+
+fn daemon_default_admin_socket(paths: &ConfigPathResult) -> &str {
+    paths
+        .default_admin_socket
+        .as_deref()
+        .filter(|socket| !socket.is_empty())
+        .unwrap_or(&paths.admin_socket)
+}
+
+async fn unchanged_config_restart_required(
+    client: &mut AdminClient,
+    raw: &str,
+    paths: &ConfigPathResult,
+) -> Result<Vec<String>> {
+    // Inspect a snapshot instead of reloading unrelated providers and services.
+    let show: ConfigShowResult = client
+        .call(method::CONFIG_SHOW, serde_json::json!({}))
+        .await?;
+    let running = serde_json::from_value(show.effective_json).context("生效配置无法解析")?;
+    let mut configured: crosslane_core::config::Config =
+        toml::from_str(raw).context("磁盘配置无法解析")?;
+    let raw_value: toml::Value = raw.parse().context("磁盘配置 TOML 无效")?;
+    if raw_value
+        .get("admin")
+        .and_then(|admin| admin.get("socket"))
+        .is_none()
+    {
+        configured.admin.socket = daemon_default_admin_socket(paths).into();
+    }
+    Ok(
+        crosslane_store::config_loader::diff_restart_required(&running, &configured)
+            .into_iter()
+            .map(String::from)
+            .collect(),
+    )
 }
 
 async fn run_editor(path: &Path, json: bool) -> Result<()> {
@@ -3014,17 +3131,31 @@ pub async fn reset_config(
     let paths: ConfigPathResult = client
         .call(method::CONFIG_PATH, serde_json::json!({}))
         .await?;
-    let path = PathBuf::from(paths.config_file);
+    let path = PathBuf::from(&paths.config_file);
+    let socket_reset = if paths
+        .default_admin_socket
+        .as_deref()
+        .is_some_and(|socket| !socket.is_empty())
+    {
+        "socket 会恢复 daemon 默认值"
+    } else {
+        "旧 daemon 未提供默认 socket，将保留当前 socket"
+    };
     let prompt = module.map_or_else(
         || {
-            "确认将运行配置恢复为默认设置？Kiro 专项与全局参数会重置，提供源、API key、代理服务、模型禁用规则和告警配置会保留，模型映射会被清除"
-                .to_string()
+            format!("确认将运行配置恢复为默认设置？管理令牌会清除，REST 和状态监听会关闭，{socket_reset}；Kiro 专项与全局参数会重置，提供源、API key、代理服务、模型禁用规则和告警配置会保留，模型映射会被清除")
         },
         |module| {
-            format!(
-                "确认将配置模块 {} 恢复为默认设置？其他配置不会改动",
-                module.name
-            )
+            if module.key == "status_http" {
+                "确认重置 status-http 并关闭 Admin REST？管理令牌和 socket 配置会保留；监听关闭需重启 daemon".into()
+            } else if module.key == "admin" {
+                format!("确认重置 admin、清除全部管理令牌？{socket_reset}；状态监听会保留；socket 变更需重启 daemon")
+            } else {
+                format!(
+                    "确认将配置模块 {} 恢复为默认设置？其他配置不会改动",
+                    module.name
+                )
+            }
         },
     );
     if !crate::commands::confirm_unless(yes, &prompt).await? {
@@ -3039,8 +3170,13 @@ pub async fn reset_config(
         .with_context(|| format!("读取 {} 失败", path.display()))?;
     let raw = std::str::from_utf8(&original).context("当前配置不是有效的 UTF-8")?;
     let reset = match module {
-        Some(module) => render_config_module_reset(raw, module)?,
-        None => render_reset_config_preserving_resources_and_alerts(raw)?,
+        Some(module) => {
+            render_config_module_reset(raw, module, daemon_default_admin_socket(&paths))?
+        }
+        None => render_reset_config_preserving_resources_and_alerts(
+            raw,
+            daemon_default_admin_socket(&paths),
+        )?,
     };
 
     let backup_file = write_config_backup(&path, &original).await?;
@@ -3095,7 +3231,11 @@ pub async fn reset_config(
     ))
 }
 
-fn render_config_module_reset(raw: &str, module: &ConfigModule) -> Result<String> {
+fn render_config_module_reset(
+    raw: &str,
+    module: &ConfigModule,
+    admin_socket: &str,
+) -> Result<String> {
     if !module.resettable() {
         return Err(anyhow!(
             "配置模块 {} 属于基础服务资源，不能通过 config reset 清空",
@@ -3103,8 +3243,9 @@ fn render_config_module_reset(raw: &str, module: &ConfigModule) -> Result<String
         ));
     }
     let before = raw.parse::<toml::Value>().context("当前配置 TOML 无效")?;
-    let defaults = toml::Value::try_from(crosslane_core::config::Config::default())
-        .context("内置默认配置无法序列化")?;
+    let mut defaults = crosslane_core::config::Config::default();
+    defaults.admin.socket = admin_socket.into();
+    let defaults = toml::Value::try_from(defaults).context("内置默认配置无法序列化")?;
     let default_value = defaults
         .as_table()
         .and_then(|table| table.get(module.key))
@@ -3118,6 +3259,17 @@ fn render_config_module_reset(raw: &str, module: &ConfigModule) -> Result<String
     if module.key == "models" {
         preserve_model_denials(&before, &mut after);
     }
+    if module.key == "status_http" {
+        // A disabled listener cannot serve REST. Keep credentials so a later
+        // explicit enable can reuse them without minting new tokens.
+        if let Some(rest) = after
+            .get_mut("admin")
+            .and_then(|admin| admin.get_mut("rest"))
+            .and_then(toml::Value::as_table_mut)
+        {
+            rest.insert("enabled".into(), toml::Value::Boolean(false));
+        }
+    }
     let output =
         crosslane_store::config_update::render_update_preserving_comments(raw, &before, &after)
             .context("生成模块重置配置失败")?;
@@ -3128,7 +3280,10 @@ fn render_config_module_reset(raw: &str, module: &ConfigModule) -> Result<String
 }
 
 /// Renders defaults while retaining separately managed resources and alert settings.
-fn render_reset_config_preserving_resources_and_alerts(raw: &str) -> Result<String> {
+fn render_reset_config_preserving_resources_and_alerts(
+    raw: &str,
+    admin_socket: &str,
+) -> Result<String> {
     const PRESERVED_SECTIONS: [&str; 5] =
         ["notify", "webhook", "provider", "api_key", "proxy_service"];
 
@@ -3136,9 +3291,7 @@ fn render_reset_config_preserving_resources_and_alerts(raw: &str) -> Result<Stri
     let current_table = current
         .as_table()
         .ok_or_else(|| anyhow!("config root must be a TOML table"))?;
-    let defaults = crosslane_store::bootstrap::render_default_config(
-        &crosslane_core::config::Config::default().admin.socket,
-    );
+    let defaults = crosslane_store::bootstrap::render_default_config(admin_socket);
     let before = defaults
         .parse::<toml::Value>()
         .context("内置默认配置无法解析")?;

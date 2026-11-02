@@ -13,7 +13,7 @@ use crate::output::{format_timestamp, print_json, render_table};
 pub enum AdminCommand {
     /// 管理独立 REST 接口的令牌，与业务 apikey 分开。
     #[command(
-        after_help = "示例：\n  crosslane admin token create --name ops --enable-rest\n  crosslane admin token create --name monitor --role read-only\n  crosslane admin token list\n  crosslane admin token rotate ops\n  crosslane admin token revoke monitor\n\n命令通过 Unix socket 执行，不需要先有 Admin Bearer token。明文仅在 create/rotate 返回，配置只保存摘要。"
+        after_help = "首次启用：crosslane config edit admin，将 [status_http] enabled=true 后重启 daemon；再创建带 --enable-rest 的令牌。\n\n示例：\n  crosslane admin token create --name ops --enable-rest\n  crosslane admin token create --name monitor --role read-only\n  crosslane admin token list\n  crosslane admin token rotate ops\n  crosslane admin token revoke monitor\n\n命令通过 Unix socket 执行，不需要先有 Admin Bearer token。明文仅在 create/rotate 返回，配置只保存摘要。"
     )]
     Token {
         #[command(subcommand)]
@@ -26,7 +26,7 @@ pub enum AdminTokenCommand {
     /// 创建独立管理令牌；明文只返回一次。
     #[command(
         visible_alias = "add",
-        after_help = "示例：\n  crosslane admin token create --name ops --enable-rest\n  crosslane admin token create --name monitor --role read-only\n  crosslane --json admin token create --name ci"
+        after_help = "--enable-rest 只开启 REST 鉴权路由；需先用 crosslane config edit admin 开启 [status_http] 并重启 daemon。已有令牌时可直接在同一编辑器中开启 [admin.rest]，无需再建令牌。\n\n示例：\n  crosslane admin token create --name ops --enable-rest\n  crosslane admin token create --name monitor --role read-only\n  crosslane --json admin token create --name ci"
     )]
     Create {
         /// 令牌的唯一可读名称。
@@ -35,7 +35,7 @@ pub enum AdminTokenCommand {
         /// admin 为完整权限，read-only 只允许 GET / HEAD。
         #[arg(long,default_value="admin",value_parser=["admin","read-only","read_only"])]
         role: String,
-        /// 同时开启 Admin REST；要求独立状态监听已经启用并重启生效。
+        /// 同时开启 Admin REST；要求监听已启用，地址/端口等配置已重启生效。
         #[arg(long)]
         enable_rest: bool,
     },
@@ -105,10 +105,10 @@ fn print_tokens(tokens: &[AdminTokenView]) {
 }
 fn hint(rest: bool, listener: bool) {
     if !listener {
-        eprintln!("独立状态监听未启用：请配置 [status_http] enabled=true，并重启 daemon。");
+        eprintln!("独立状态监听未启用：运行 crosslane config edit admin，设置 [status_http] enabled=true，并重启 daemon。");
     }
     if !rest {
-        eprintln!("Admin REST 当前关闭；监听启用后可用 crosslane admin token create --name NAME --enable-rest，或配置 [admin.rest] enabled=true。");
+        eprintln!("Admin REST 当前关闭；已有令牌时运行 crosslane config edit admin，设置 [admin.rest] enabled=true；若磁盘已开启，按编辑命令的待重启提示应用监听变更。首次创建用 crosslane admin token create --name NAME --enable-rest，要求监听已启用并重启生效。");
     }
 }
 
@@ -142,6 +142,19 @@ pub async fn run(client: &mut AdminClient, command: AdminCommand, json: bool) ->
                 print_json(&result)?;
             } else {
                 print_tokens(&result.tokens);
+                println!(
+                    "Admin REST：{}；独立状态监听：{}",
+                    if result.rest_enabled {
+                        "启用"
+                    } else {
+                        "关闭"
+                    },
+                    if result.listener_enabled {
+                        "启用"
+                    } else {
+                        "关闭"
+                    },
+                );
                 hint(result.rest_enabled, result.listener_enabled);
             }
         }
