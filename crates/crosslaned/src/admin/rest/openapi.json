@@ -3,7 +3,7 @@
   "info": {
     "title": "Crosslane Admin REST API",
     "version": "2.1.2",
-    "description": "Authenticated management on the independent status HTTP listener. Model-client keys are not admin credentials. GET/HEAD permit the optional read-only token; writes require the full-access token. JSON responses use {data:...}; the OpenAPI document itself is unwrapped. Credentials are accepted only in write bodies and never included in account responses. A newly created service returns its client key once. Bulk creation accepts CLI-compatible Kiro SSO CSV and returns 202 with a task URI; progress and results never contain submitted credentials.\nAccount control operations and service bindings resolve identities from local snapshots. Quota queries and explicit refresh/probe retain their usual upstream behavior. Service mutations preserve pending client-key edits and validate the persisted restart configuration. Service writes resolve selectors within the configuration transaction. Follow-up reads reject a changed service ID instead of returning another service's data. Configuration write errors verify or restore the previous file before returning; rollback verification failures are reported explicitly."
+    "description": "Authenticated management on the independent status HTTP listener. Model-client keys are not admin credentials. GET/HEAD permit the optional read-only token; writes require the full-access token. JSON responses use {data:...}; the OpenAPI document itself is unwrapped. Local account credentials are accepted only in write bodies and never included in account responses. Kiro Enterprise administration uses dedicated CROSSLANE_KIRO_ADMIN_* AWS credentials from the daemon environment; callers send only the Admin Bearer token. It never creates/deletes Identity Center users or application assignments. Console control-plane protocols are not a versioned public SDK contract. Writes are submitted once and accepted responses do not prove effective access or billing. A newly created service returns its client key once. Bulk creation accepts CLI-compatible Kiro SSO CSV and returns 202 with a task URI; progress and results never contain submitted credentials.\nAccount control operations and service bindings resolve identities from local snapshots. Quota queries and explicit refresh/probe retain their usual upstream behavior. Service mutations preserve pending client-key edits and validate the persisted restart configuration. Service writes resolve selectors within the configuration transaction. Follow-up reads reject a changed service ID instead of returning another service's data. Configuration write errors verify or restore the previous file before returning; rollback verification failures are reported explicitly.\nKiro subscription mutations/previews have eight independent operation slots and reject overlapping changes to the same resolved user. Accepted operations survive an HTTP disconnect within their AWS deadline; no automatic replay occurs. Paginated AWS collections are limited to 100 pages, 10000 items and 16 MiB in aggregate. User and membership responses must match the discovered identity store. Empty optional daemon environment values are treated as unset; STS tokens remain mandatory for temporary credentials.\nSupported Identity Store user/group/store ARN references are normalized before identity checks; arbitrary resource tails are not accepted. Catchable background execution panics are reported as unknown and still produce completion audits after an HTTP disconnect."
   },
   "servers": [
     {
@@ -39,6 +39,10 @@
     {
       "name": "Documentation",
       "description": "Authenticated API schema"
+    },
+    {
+      "name": "KiroEnterprise",
+      "description": "Kiro Console subscriptions and read-only Identity Center discovery; separate from local account pools"
     }
   ],
   "paths": {
@@ -2160,6 +2164,1263 @@
           }
         ]
       }
+    },
+    "/kiro/enterprise/plans": {
+      "get": {
+        "tags": [
+          "KiroEnterprise"
+        ],
+        "summary": "List supported Kiro Enterprise plans",
+        "operationId": "kiro_enterprise_list_plans",
+        "description": "Static plan names; requires Admin authentication but no AWS configuration.",
+        "responses": {
+          "200": {
+            "description": "Success or validated dry-run preview",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data"
+                  ],
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "plan",
+                          "subscription_type"
+                        ],
+                        "properties": {
+                          "plan": {
+                            "$ref": "#/components/schemas/KiroEnterprisePlan"
+                          },
+                          "subscription_type": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "description": "Read-only Admin token cannot write, or AWS credentials lack permission",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Error"
+                    },
+                    {
+                      "$ref": "#/components/schemas/KiroEnterpriseError"
+                    }
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "default": {
+            "description": "Invalid request, ambiguous selection, AWS failure or unavailable daemon credentials. No raw AWS error body is exposed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Error"
+                    },
+                    {
+                      "$ref": "#/components/schemas/KiroEnterpriseError"
+                    }
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/kiro/enterprise/profiles": {
+      "get": {
+        "tags": [
+          "KiroEnterprise"
+        ],
+        "summary": "Discover Kiro profiles owned by the AWS caller",
+        "operationId": "kiro_enterprise_list_profiles",
+        "description": "Uses STS GetCallerIdentity then the Kiro Console ListProfiles protocol. AWS credentials come only from the dedicated daemon environment.",
+        "responses": {
+          "200": {
+            "description": "Success or validated dry-run preview",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data"
+                  ],
+                  "properties": {
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "account_id": {
+                          "type": "string"
+                        },
+                        "kiro_region": {
+                          "type": "string"
+                        },
+                        "profiles": {
+                          "type": "array",
+                          "items": {
+                            "$ref": "#/components/schemas/KiroEnterpriseProfile"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "description": "Read-only Admin token cannot write, or AWS credentials lack permission",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Error"
+                    },
+                    {
+                      "$ref": "#/components/schemas/KiroEnterpriseError"
+                    }
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "default": {
+            "description": "Invalid request, ambiguous selection, AWS failure or unavailable daemon credentials. No raw AWS error body is exposed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Error"
+                    },
+                    {
+                      "$ref": "#/components/schemas/KiroEnterpriseError"
+                    }
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/KiroRegion"
+          },
+          {
+            "$ref": "#/components/parameters/KiroLegacy"
+          }
+        ]
+      }
+    },
+    "/kiro/enterprise/scope": {
+      "get": {
+        "tags": [
+          "KiroEnterprise"
+        ],
+        "summary": "Resolve and validate the Kiro and Identity Center scope",
+        "operationId": "kiro_enterprise_get_scope",
+        "description": "Automatically selects only unambiguous profiles/applications and verifies the application's Identity Center instance. Does not mutate Identity Center.",
+        "responses": {
+          "200": {
+            "description": "Success or validated dry-run preview",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/KiroEnterpriseScope"
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "description": "Read-only Admin token cannot write, or AWS credentials lack permission",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Error"
+                    },
+                    {
+                      "$ref": "#/components/schemas/KiroEnterpriseError"
+                    }
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "default": {
+            "description": "Invalid request, ambiguous selection, AWS failure or unavailable daemon credentials. No raw AWS error body is exposed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Error"
+                    },
+                    {
+                      "$ref": "#/components/schemas/KiroEnterpriseError"
+                    }
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/KiroRegion"
+          },
+          {
+            "$ref": "#/components/parameters/KiroLegacy"
+          },
+          {
+            "$ref": "#/components/parameters/KiroProfileArn"
+          },
+          {
+            "$ref": "#/components/parameters/KiroApplicationArn"
+          },
+          {
+            "$ref": "#/components/parameters/KiroIdentityCenterRegion"
+          }
+        ]
+      }
+    },
+    "/kiro/enterprise/users": {
+      "get": {
+        "tags": [
+          "KiroEnterprise"
+        ],
+        "summary": "List Identity Center users and their direct Kiro subscriptions",
+        "operationId": "kiro_enterprise_list_users",
+        "description": "Separate from Crosslane local accounts. Includes all users in the discovered identity store. Application group claims are returned separately; individual user reads expand group membership. Pagination fails explicitly rather than returning partial data (100 pages / 10000 entries per collection). Aggregate upstream response data is limited to 16 MiB; partial results are not returned.",
+        "responses": {
+          "200": {
+            "description": "Success or validated dry-run preview",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/KiroUserList"
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "description": "Read-only Admin token cannot write, or AWS credentials lack permission",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Error"
+                    },
+                    {
+                      "$ref": "#/components/schemas/KiroEnterpriseError"
+                    }
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "default": {
+            "description": "Invalid request, ambiguous selection, AWS failure or unavailable daemon credentials. No raw AWS error body is exposed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Error"
+                    },
+                    {
+                      "$ref": "#/components/schemas/KiroEnterpriseError"
+                    }
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/KiroRegion"
+          },
+          {
+            "$ref": "#/components/parameters/KiroLegacy"
+          },
+          {
+            "$ref": "#/components/parameters/KiroProfileArn"
+          },
+          {
+            "$ref": "#/components/parameters/KiroApplicationArn"
+          },
+          {
+            "$ref": "#/components/parameters/KiroIdentityCenterRegion"
+          }
+        ]
+      }
+    },
+    "/kiro/enterprise/subscriptions": {
+      "get": {
+        "tags": [
+          "KiroEnterprise"
+        ],
+        "summary": "List direct USER and GROUP subscription claims",
+        "operationId": "kiro_enterprise_list_subscriptions",
+        "description": "Current and pending plans remain distinct. Unknown AWS plan values remain queryable. Aggregate upstream response data is limited to 16 MiB; partial results are not returned.",
+        "responses": {
+          "200": {
+            "description": "Success or validated dry-run preview",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data"
+                  ],
+                  "properties": {
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "scope": {
+                          "$ref": "#/components/schemas/KiroEnterpriseScope"
+                        },
+                        "subscriptions": {
+                          "type": "array",
+                          "items": {
+                            "$ref": "#/components/schemas/KiroSubscriptionClaim"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "description": "Read-only Admin token cannot write, or AWS credentials lack permission",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Error"
+                    },
+                    {
+                      "$ref": "#/components/schemas/KiroEnterpriseError"
+                    }
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "default": {
+            "description": "Invalid request, ambiguous selection, AWS failure or unavailable daemon credentials. No raw AWS error body is exposed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Error"
+                    },
+                    {
+                      "$ref": "#/components/schemas/KiroEnterpriseError"
+                    }
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/KiroRegion"
+          },
+          {
+            "$ref": "#/components/parameters/KiroLegacy"
+          },
+          {
+            "$ref": "#/components/parameters/KiroProfileArn"
+          },
+          {
+            "$ref": "#/components/parameters/KiroApplicationArn"
+          },
+          {
+            "$ref": "#/components/parameters/KiroIdentityCenterRegion"
+          }
+        ]
+      }
+    },
+    "/kiro/enterprise/users/{user}/subscription": {
+      "get": {
+        "tags": [
+          "KiroEnterprise"
+        ],
+        "summary": "Get a user's direct and group-inherited subscriptions",
+        "operationId": "kiro_enterprise_get_user_subscription",
+        "description": "",
+        "responses": {
+          "200": {
+            "description": "Success or validated dry-run preview",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/KiroUserSubscription"
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "description": "Read-only Admin token cannot write, or AWS credentials lack permission",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Error"
+                    },
+                    {
+                      "$ref": "#/components/schemas/KiroEnterpriseError"
+                    }
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "default": {
+            "description": "Invalid request, ambiguous selection, AWS failure or unavailable daemon credentials. No raw AWS error body is exposed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Error"
+                    },
+                    {
+                      "$ref": "#/components/schemas/KiroEnterpriseError"
+                    }
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/KiroRegion"
+          },
+          {
+            "$ref": "#/components/parameters/KiroLegacy"
+          },
+          {
+            "$ref": "#/components/parameters/KiroProfileArn"
+          },
+          {
+            "$ref": "#/components/parameters/KiroApplicationArn"
+          },
+          {
+            "$ref": "#/components/parameters/KiroIdentityCenterRegion"
+          },
+          {
+            "$ref": "#/components/parameters/KiroUser"
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "KiroEnterprise"
+        ],
+        "summary": "Activate a direct Kiro USER subscription",
+        "operationId": "kiro_enterprise_create_user_subscription",
+        "description": "Calls only KiroControlPlaneQDeveloperService.CreateAssignment after read-only discovery. Existing direct claims return 409. Never calls CreateApplicationAssignment or creates an Identity Center user. Overlapping operations for the same resolved user return 409; eight active operation slots are shared across Kiro writes/previews, with 503 on saturation. Disconnect does not cancel an already started operation. This is not an atomic compare-and-set against external AWS writers.",
+        "responses": {
+          "200": {
+            "description": "Success or validated dry-run preview",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/KiroMutationResult"
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "description": "Read-only Admin token cannot write, or AWS credentials lack permission",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Error"
+                    },
+                    {
+                      "$ref": "#/components/schemas/KiroEnterpriseError"
+                    }
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "default": {
+            "description": "Invalid request, ambiguous selection, AWS failure or unavailable daemon credentials. No raw AWS error body is exposed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Error"
+                    },
+                    {
+                      "$ref": "#/components/schemas/KiroEnterpriseError"
+                    }
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "202": {
+            "description": "AWS accepted a single subscription request. Query current state to verify its effect.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/KiroMutationResult"
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/KiroRegion"
+          },
+          {
+            "$ref": "#/components/parameters/KiroLegacy"
+          },
+          {
+            "$ref": "#/components/parameters/KiroProfileArn"
+          },
+          {
+            "$ref": "#/components/parameters/KiroApplicationArn"
+          },
+          {
+            "$ref": "#/components/parameters/KiroIdentityCenterRegion"
+          },
+          {
+            "$ref": "#/components/parameters/KiroUser"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KiroChangePlan"
+              },
+              "example": {
+                "plan": "pro-plus",
+                "dry_run": false
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "KiroEnterprise"
+        ],
+        "summary": "Cancel a direct Kiro USER subscription",
+        "operationId": "kiro_enterprise_cancel_user_subscription",
+        "description": "Calls DeleteAssignment once. Cancellation does not delete local accounts, Identity Center users, application assignments or group entitlements. Requires a unique direct USER claim. Overlapping operations for the same resolved user return 409; eight active operation slots are shared across Kiro writes/previews, with 503 on saturation. Disconnect does not cancel an already started operation. This is not an atomic compare-and-set against external AWS writers.",
+        "responses": {
+          "200": {
+            "description": "Success or validated dry-run preview",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/KiroMutationResult"
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "description": "Read-only Admin token cannot write, or AWS credentials lack permission",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Error"
+                    },
+                    {
+                      "$ref": "#/components/schemas/KiroEnterpriseError"
+                    }
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "default": {
+            "description": "Invalid request, ambiguous selection, AWS failure or unavailable daemon credentials. No raw AWS error body is exposed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Error"
+                    },
+                    {
+                      "$ref": "#/components/schemas/KiroEnterpriseError"
+                    }
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "202": {
+            "description": "AWS accepted cancellation; this is not proof of access revocation or billing completion.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/KiroMutationResult"
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/KiroRegion"
+          },
+          {
+            "$ref": "#/components/parameters/KiroLegacy"
+          },
+          {
+            "$ref": "#/components/parameters/KiroProfileArn"
+          },
+          {
+            "$ref": "#/components/parameters/KiroApplicationArn"
+          },
+          {
+            "$ref": "#/components/parameters/KiroIdentityCenterRegion"
+          },
+          {
+            "$ref": "#/components/parameters/KiroUser"
+          },
+          {
+            "$ref": "#/components/parameters/KiroDeletionMode"
+          },
+          {
+            "$ref": "#/components/parameters/KiroDryRun"
+          }
+        ]
+      }
+    },
+    "/kiro/enterprise/users/{user}/subscription/upgrade": {
+      "post": {
+        "tags": [
+          "KiroEnterprise"
+        ],
+        "summary": "Upgrade a direct Kiro USER subscription",
+        "operationId": "kiro_enterprise_upgrade_user_subscription",
+        "description": "Target tier must be strictly above the unique current direct USER plan. AWS normally applies upgrades immediately. Calls UpdateAssignment once and never changes application assignments. Unknown plans or ambiguous claims fail before any write. Overlapping operations for the same resolved user return 409; eight active operation slots are shared across Kiro writes/previews, with 503 on saturation. Disconnect does not cancel an already started operation. This is not an atomic compare-and-set against external AWS writers.",
+        "responses": {
+          "200": {
+            "description": "Success or validated dry-run preview",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/KiroMutationResult"
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "description": "Read-only Admin token cannot write, or AWS credentials lack permission",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Error"
+                    },
+                    {
+                      "$ref": "#/components/schemas/KiroEnterpriseError"
+                    }
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "default": {
+            "description": "Invalid request, ambiguous selection, AWS failure or unavailable daemon credentials. No raw AWS error body is exposed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Error"
+                    },
+                    {
+                      "$ref": "#/components/schemas/KiroEnterpriseError"
+                    }
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "202": {
+            "description": "AWS accepted a single subscription request. Query current state to verify its effect.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/KiroMutationResult"
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/KiroRegion"
+          },
+          {
+            "$ref": "#/components/parameters/KiroLegacy"
+          },
+          {
+            "$ref": "#/components/parameters/KiroProfileArn"
+          },
+          {
+            "$ref": "#/components/parameters/KiroApplicationArn"
+          },
+          {
+            "$ref": "#/components/parameters/KiroIdentityCenterRegion"
+          },
+          {
+            "$ref": "#/components/parameters/KiroUser"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KiroChangePlan"
+              },
+              "example": {
+                "plan": "pro-plus",
+                "dry_run": false
+              }
+            }
+          }
+        }
+      }
+    },
+    "/kiro/enterprise/users/{user}/subscription/downgrade": {
+      "post": {
+        "tags": [
+          "KiroEnterprise"
+        ],
+        "summary": "Downgrade a direct Kiro USER subscription",
+        "operationId": "kiro_enterprise_downgrade_user_subscription",
+        "description": "Target tier must be strictly below the unique current direct USER plan. AWS normally applies downgrades next month. Calls UpdateAssignment once and never changes application assignments. Unknown plans or ambiguous claims fail before any write. Overlapping operations for the same resolved user return 409; eight active operation slots are shared across Kiro writes/previews, with 503 on saturation. Disconnect does not cancel an already started operation. This is not an atomic compare-and-set against external AWS writers.",
+        "responses": {
+          "200": {
+            "description": "Success or validated dry-run preview",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/KiroMutationResult"
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error401"
+          },
+          "403": {
+            "description": "Read-only Admin token cannot write, or AWS credentials lack permission",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Error"
+                    },
+                    {
+                      "$ref": "#/components/schemas/KiroEnterpriseError"
+                    }
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "default": {
+            "description": "Invalid request, ambiguous selection, AWS failure or unavailable daemon credentials. No raw AWS error body is exposed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Error"
+                    },
+                    {
+                      "$ref": "#/components/schemas/KiroEnterpriseError"
+                    }
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          },
+          "202": {
+            "description": "AWS accepted a single subscription request. Query current state to verify its effect.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/KiroMutationResult"
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "x-request-id": {
+                "$ref": "#/components/headers/RequestId"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/KiroRegion"
+          },
+          {
+            "$ref": "#/components/parameters/KiroLegacy"
+          },
+          {
+            "$ref": "#/components/parameters/KiroProfileArn"
+          },
+          {
+            "$ref": "#/components/parameters/KiroApplicationArn"
+          },
+          {
+            "$ref": "#/components/parameters/KiroIdentityCenterRegion"
+          },
+          {
+            "$ref": "#/components/parameters/KiroUser"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KiroChangePlan"
+              },
+              "example": {
+                "plan": "pro-plus",
+                "dry_run": false
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -3420,6 +4681,405 @@
           "reference"
         ],
         "additionalProperties": false
+      },
+      "KiroEnterprisePlan": {
+        "type": "string",
+        "enum": [
+          "pro",
+          "pro-plus",
+          "pro-max",
+          "power"
+        ]
+      },
+      "KiroChangePlan": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "plan"
+        ],
+        "properties": {
+          "plan": {
+            "$ref": "#/components/schemas/KiroEnterprisePlan"
+          },
+          "dry_run": {
+            "type": "boolean",
+            "default": false,
+            "description": "Perform discovery and direction validation without submitting a subscription write. Still requires a full-access Admin token."
+          }
+        }
+      },
+      "KiroEnterpriseScope": {
+        "type": "object",
+        "required": [
+          "account_id",
+          "kiro_region",
+          "identity_center_region",
+          "identity_store_id",
+          "instance_arn",
+          "application_arn",
+          "profile_arn",
+          "legacy"
+        ],
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "kiro_region": {
+            "type": "string"
+          },
+          "identity_center_region": {
+            "type": "string"
+          },
+          "identity_store_id": {
+            "type": "string",
+            "description": "Canonical bare identity store ID. Equivalent ARN representations are accepted from upstream responses; foreign stores remain invalid."
+          },
+          "instance_arn": {
+            "type": "string"
+          },
+          "application_arn": {
+            "type": "string"
+          },
+          "profile_arn": {
+            "type": "string"
+          },
+          "legacy": {
+            "type": "boolean"
+          }
+        }
+      },
+      "KiroEnterpriseProfile": {
+        "type": "object",
+        "required": [
+          "arn",
+          "instance_arn",
+          "identity_center_region",
+          "application_arns"
+        ],
+        "properties": {
+          "arn": {
+            "type": "string"
+          },
+          "instance_arn": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "identity_center_region": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "application_arns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "KiroSubscriptionClaim": {
+        "type": "object",
+        "required": [
+          "principal_type",
+          "principal_id",
+          "subscription_type",
+          "plan",
+          "pending_subscription_type",
+          "pending_plan",
+          "status"
+        ],
+        "properties": {
+          "principal_type": {
+            "type": "string",
+            "enum": [
+              "USER",
+              "GROUP"
+            ]
+          },
+          "principal_id": {
+            "type": "string",
+            "description": "Canonical bare ID for recognized Identity Store user/group references. Opaque legacy group identifiers are preserved."
+          },
+          "subscription_type": {
+            "type": "string",
+            "description": "Raw AWS current plan name; an unknown plan remains queryable."
+          },
+          "plan": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/KiroEnterprisePlan"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "pending_subscription_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pending_plan": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/KiroEnterprisePlan"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "KiroEnterpriseUser": {
+        "type": "object",
+        "required": [
+          "user_id",
+          "user_name",
+          "display_name",
+          "emails",
+          "direct_subscriptions"
+        ],
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "description": "Canonical bare Identity Store UserId, even when the upstream returned an ARN."
+          },
+          "user_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "emails": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "direct_subscriptions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/KiroSubscriptionClaim"
+            }
+          }
+        }
+      },
+      "KiroUserList": {
+        "type": "object",
+        "required": [
+          "scope",
+          "users",
+          "group_subscriptions"
+        ],
+        "properties": {
+          "scope": {
+            "$ref": "#/components/schemas/KiroEnterpriseScope"
+          },
+          "users": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/KiroEnterpriseUser"
+            }
+          },
+          "group_subscriptions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/KiroSubscriptionClaim"
+            },
+            "description": "All application group claims. Memberships are expanded only by the individual user subscription endpoint."
+          }
+        }
+      },
+      "KiroUserSubscription": {
+        "type": "object",
+        "required": [
+          "scope",
+          "user",
+          "group_subscriptions"
+        ],
+        "properties": {
+          "scope": {
+            "$ref": "#/components/schemas/KiroEnterpriseScope"
+          },
+          "user": {
+            "$ref": "#/components/schemas/KiroEnterpriseUser"
+          },
+          "group_subscriptions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/KiroSubscriptionClaim"
+            },
+            "description": "Only claims inherited through this user's current group memberships."
+          }
+        }
+      },
+      "KiroMutationResult": {
+        "type": "object",
+        "required": [
+          "status",
+          "operation",
+          "scope",
+          "user_id",
+          "previous_plan",
+          "requested_plan",
+          "deletion_mode",
+          "expected_effect",
+          "upstream_request_id",
+          "application_assignment_requested"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "preview",
+              "api_accepted"
+            ]
+          },
+          "operation": {
+            "type": "string",
+            "enum": [
+              "CreateAssignment",
+              "UpdateAssignment",
+              "DeleteAssignment"
+            ]
+          },
+          "scope": {
+            "$ref": "#/components/schemas/KiroEnterpriseScope"
+          },
+          "user_id": {
+            "type": "string"
+          },
+          "previous_plan": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/KiroEnterprisePlan"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "requested_plan": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/KiroEnterprisePlan"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "deletion_mode": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "immediate",
+              "end_of_period",
+              null
+            ]
+          },
+          "expected_effect": {
+            "type": "string",
+            "description": "Expected AWS scheduling semantics, not proof that access, billing or the plan has taken effect."
+          },
+          "upstream_request_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "application_assignment_requested": {
+            "type": "boolean",
+            "const": false,
+            "description": "Crosslane never submits Identity Center application assignments."
+          }
+        }
+      },
+      "KiroEnterpriseError": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": [
+              "code",
+              "message",
+              "http_status",
+              "operation",
+              "upstream_status",
+              "upstream_code",
+              "upstream_request_id",
+              "write_outcome"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "http_status": {
+                "type": "integer"
+              },
+              "operation": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "upstream_status": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "upstream_code": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "upstream_request_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "write_outcome": {
+                "type": "string",
+                "enum": [
+                  "not_submitted",
+                  "rejected",
+                  "unknown"
+                ],
+                "description": "unknown means a write may already have taken effect; query state before retrying. No automatic replay is performed."
+              }
+            }
+          }
+        }
       }
     },
     "responses": {
@@ -3465,6 +5125,89 @@
         "schema": {
           "type": "string",
           "const": "no-store"
+        }
+      }
+    },
+    "parameters": {
+      "KiroRegion": {
+        "name": "region",
+        "in": "query",
+        "required": false,
+        "description": "Kiro Profile region; defaults to CROSSLANE_KIRO_ADMIN_REGION, otherwise us-east-1. Commercial AWS partitions only.",
+        "schema": {
+          "type": "string"
+        }
+      },
+      "KiroLegacy": {
+        "name": "legacy",
+        "in": "query",
+        "required": false,
+        "description": "Explicit old control plane; only us-east-1 is supported. End-of-period cancellation is unavailable in this mode.",
+        "schema": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "KiroProfileArn": {
+        "name": "profile_arn",
+        "in": "query",
+        "required": false,
+        "description": "Defaults to CROSSLANE_KIRO_ADMIN_PROFILE_ARN, otherwise the only discovered profile; ambiguous discovery returns 409.",
+        "schema": {
+          "type": "string"
+        }
+      },
+      "KiroApplicationArn": {
+        "name": "application_arn",
+        "in": "query",
+        "required": false,
+        "description": "Defaults to CROSSLANE_KIRO_ADMIN_APPLICATION_ARN, otherwise the only application associated with the selected profile.",
+        "schema": {
+          "type": "string"
+        }
+      },
+      "KiroIdentityCenterRegion": {
+        "name": "identity_center_region",
+        "in": "query",
+        "required": false,
+        "description": "Optional fallback via CROSSLANE_KIRO_ADMIN_IDENTITY_CENTER_REGION when the profile lacks ssoRegion. Cannot override a different region recorded in the profile.",
+        "schema": {
+          "type": "string"
+        }
+      },
+      "KiroUser": {
+        "name": "user",
+        "in": "path",
+        "required": true,
+        "description": "Exact Identity Center UserId (including identity-store-prefixed UUIDs), commercial AWS Identity Store user ARN, or userName. URL-encode ARN path parameters. Not a display-name search. At most 128 Unicode characters; whitespace/control characters and unsupported ARN resource types are invalid. User/store/group references are canonicalized to bare IDs before matching, and subscription writes use only bare UserIds.",
+        "schema": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      },
+      "KiroDeletionMode": {
+        "name": "mode",
+        "in": "query",
+        "required": false,
+        "description": "When to stop access. Subscription billing ends at month end in either mode; inherited group entitlements and Identity Center users/application assignments are unchanged by Crosslane.",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "immediate",
+            "end_of_period"
+          ],
+          "default": "end_of_period"
+        }
+      },
+      "KiroDryRun": {
+        "name": "dry_run",
+        "in": "query",
+        "required": false,
+        "description": "Validate cancellation without submitting a write.",
+        "schema": {
+          "type": "boolean",
+          "default": false
         }
       }
     }

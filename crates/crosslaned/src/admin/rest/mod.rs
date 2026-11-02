@@ -2,6 +2,7 @@
 
 mod accounts;
 mod batches;
+mod enterprise;
 mod openapi;
 mod services;
 mod views;
@@ -32,9 +33,17 @@ pub(super) struct RestState {
     requests: Arc<Semaphore>,
     account_creates: Arc<Semaphore>,
     batches: Arc<batches::BatchRegistry>,
+    enterprise: Arc<enterprise::Control>,
 }
 
 type ApiResult<T = Value> = Result<T, ApiError>;
+
+#[derive(Clone)]
+struct RequestAudit {
+    request_id: String,
+    token_id: String,
+    role: &'static str,
+}
 
 pub(crate) fn router(app: Arc<AppState>) -> Router {
     let state = RestState {
@@ -42,8 +51,10 @@ pub(crate) fn router(app: Arc<AppState>) -> Router {
         requests: Arc::new(Semaphore::new(16)),
         account_creates: Arc::new(Semaphore::new(8)),
         batches: Arc::new(batches::BatchRegistry::default()),
+        enterprise: Arc::new(enterprise::Control::default()),
     };
     Router::new()
+        .nest("/kiro/enterprise", enterprise::router())
         .route("/openapi.json", get(openapi::schema))
         .route("/accounts", get(accounts::list).post(accounts::create))
         .route("/account-batches", get(batches::list).post(batches::create))
@@ -134,7 +145,11 @@ fn token_identity(auth: &AdminRestConfig, token: &str) -> Option<TokenIdentity> 
         })
 }
 
-async fn authenticate(State(state): State<RestState>, request: Request, next: Next) -> Response {
+async fn authenticate(
+    State(state): State<RestState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
     let started = Instant::now();
     let request_id = format!("admin_{}", Uuid::new_v4().simple());
     let route = request
@@ -186,6 +201,13 @@ async fn authenticate(State(state): State<RestState>, request: Request, next: Ne
         )
         .into_response()
     } else if let Ok(_permit) = state.requests.clone().try_acquire_owned() {
+        if let Some(identity) = &identity {
+            request.extensions_mut().insert(RequestAudit {
+                request_id: request_id.clone(),
+                token_id: identity.id.clone(),
+                role: identity.role.as_str(),
+            });
+        }
         next.run(request).await
     } else {
         ApiError::new(

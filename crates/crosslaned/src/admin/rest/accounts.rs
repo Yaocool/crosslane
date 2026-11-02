@@ -675,6 +675,7 @@ mod tests {
             requests: Arc::new(Semaphore::new(16)),
             account_creates: Arc::new(Semaphore::new(8)),
             batches: Arc::new(super::super::batches::BatchRegistry::default()),
+            enterprise: Arc::new(super::super::enterprise::Control::default()),
         };
         let occupied = state.account_creates.acquire_many(8).await.unwrap();
         let error = tokio::time::timeout(

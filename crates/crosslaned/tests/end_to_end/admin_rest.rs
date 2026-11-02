@@ -81,6 +81,9 @@ impl AdminFixture {
             .open(home.join("rest-test.log"))
             .unwrap();
         Command::new(env!("CARGO_BIN_EXE_crosslaned"))
+            .env_remove("CROSSLANE_KIRO_ADMIN_ACCESS_KEY_ID")
+            .env_remove("CROSSLANE_KIRO_ADMIN_SECRET_ACCESS_KEY")
+            .env_remove("CROSSLANE_KIRO_ADMIN_SESSION_TOKEN")
             .env("CROSSLANE_HOME", home)
             .env("CROSSLANE_CODEWHISPERER_URL", upstream)
             .env("CROSSLANE_AMAZONQ_URL", upstream)
@@ -258,7 +261,7 @@ async fn admin_rest_authentication_is_independent_rotatable_and_audited_without_
     assert_eq!(schema["openapi"], "3.1.0");
     assert!(schema.get("data").is_none());
     assert_eq!(schema["security"][0], json!({"AdminBearer":[]}));
-    assert_eq!(schema["paths"].as_object().unwrap().len(), 25);
+    assert_eq!(schema["paths"].as_object().unwrap().len(), 33);
     let removal = &schema["paths"]["/accounts/{provider}/{account}"]["delete"];
     assert!(removal["parameters"]
         .as_array()
