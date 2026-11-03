@@ -1510,6 +1510,10 @@ pub(super) async fn nonstream_claude(
     web_tool_names: std::collections::HashMap<String, String>,
     #[cfg(feature = "crs")] redaction_notice: bool,
 ) -> Result<Response, ApiError> {
+    let prompt_cache_plan =
+        state
+            .prompt_cache
+            .plan(&lease.account_id(), &kiro_model, prompt_cache.as_ref());
     let tool_names = super::super::tool_names::ClientToolNames::claude(&web_tool_names);
     let tool_name_trace = super::super::tool_names::ToolNameTrace {
         trace_id: &trace_id,
@@ -1633,7 +1637,7 @@ pub(super) async fn nonstream_claude(
     let account_name = lease.account().await.display_name().to_owned();
     state
         .prompt_cache
-        .apply(&account_id, prompt_cache.as_ref(), &mut decoded.usage);
+        .commit(&account_id, &prompt_cache_plan, &mut decoded);
     let credits = credits(&state, &kiro_model, &decoded);
     lease.settle_credits(credits).await;
     reservation
@@ -1746,6 +1750,10 @@ pub(super) async fn nonstream_openai(
     openai_tools: std::collections::HashMap<String, OpenAiToolIdentity>,
     responses_options: Option<super::super::responses::ResponsesOptions>,
 ) -> Result<Response, ApiError> {
+    let prompt_cache_plan =
+        state
+            .prompt_cache
+            .plan(&lease.account_id(), &kiro_model, prompt_cache.as_ref());
     let tool_names = super::super::tool_names::ClientToolNames::openai(&openai_tools);
     let tool_name_trace = super::super::tool_names::ToolNameTrace {
         trace_id: &trace_id,
@@ -1792,7 +1800,7 @@ pub(super) async fn nonstream_openai(
     let account_name = lease.account().await.display_name().to_owned();
     state
         .prompt_cache
-        .apply(&account_id, prompt_cache.as_ref(), &mut decoded.usage);
+        .commit(&account_id, &prompt_cache_plan, &mut decoded);
     let credits = credits(&state, &kiro_model, &decoded);
     lease.settle_credits(credits).await;
     reservation
@@ -1930,12 +1938,7 @@ pub(super) fn usage_record(
         cache_read_tokens: Some(decoded.usage.cache_read_tokens),
         cache_write_tokens: Some(decoded.usage.cache_write_tokens),
         reasoning_tokens: Some(decoded.usage.reasoning_tokens),
-        token_usage_source: if decoded.usage.credits > 0.0 {
-            "server"
-        } else {
-            "estimated"
-        }
-        .into(),
+        token_usage_source: decoded.token_usage_source().into(),
         provider_billing: None,
         path: path.into(),
     }
@@ -1960,6 +1963,11 @@ pub(super) fn request_log(
     decoded: &DecodedResponse,
     credits: f64,
 ) -> RequestLog {
+    decoded.log_usage_accounting(trace_id);
+    diagnostics.token_usage_source = decoded.token_usage_source().into();
+    diagnostics.cache_usage_source = decoded.cache_usage_source().into();
+    diagnostics.cache_read_tokens = decoded.usage.cache_read_tokens;
+    diagnostics.cache_write_tokens = decoded.usage.cache_write_tokens;
     diagnostics.tool_search_rounds = decoded.tool_searches.len();
     diagnostics.tool_search_matches = decoded
         .tool_searches

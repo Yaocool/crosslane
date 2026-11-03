@@ -94,6 +94,15 @@ pub struct RequestDiagnostics {
     /// legacy records and requests that never reached generation.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub credits_source: String,
+    /// Token/cache accounting is independent of the source of credit charges.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub token_usage_source: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cache_usage_source: String,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_overflow: Option<ContextOverflowDiagnostics>,
 }

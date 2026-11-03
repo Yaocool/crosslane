@@ -336,18 +336,29 @@ Kiro overage 默认关闭。
 
 `features.enable_prompt_cache` 默认是 `false`。运行
 `crosslane config edit features`，将其改为 `true` 后保存，CLI 会校验并热重载。
-此开关把客户端有效的 `cache_control` 提示转换为 Kiro 原生 `cachePoint`，是否接受
-提示、是否命中缓存取决于上游；它不会开启模拟缓存计费，也不保证缓存一定生效。
+Kiro 通常只报告 credits，不报告 token 和缓存计数，因此 Crosslane 使用与输入、输出
+统计相同的 tokenizer 在本地模拟缓存用量。这些估算不代表 Kiro 后端真实命中或 credits
+折扣；上游实际报告的 credits 仍单独结算。
 
-Claude Code 和 `/v1/messages` 的 `cache_read_input_tokens` 表示从缓存读取的输入
-token，`cache_creation_input_tokens` 表示写入缓存的输入 token。两者均属于输入
-统计，`output_tokens` 才是生成的输出。无论是否开启提示转发，Crosslane 都会回传
-上游实际报告的缓存计数；上游缺失这些字段时保持为 0，不根据本地重复请求推算命中。
+Claude 请求需在内容块或请求根部提供 `cache_control: {"type":"ephemeral"}`。
+OpenAI Chat/Responses 会进行隐式前缀核算，无需这个 Anthropic 扩展；有效的显式
+标记也会转换为 Kiro `cachePoint`。本地记录按上游账号、实际模型及可选的 OpenAI
+`prompt_cache_key` 隔离，默认保留 5 分钟，显式 `ttl=1h` 则保留 1 小时，读取时续期；
+daemon 重启会清空记录。这是本地策略，不保证上游保留时长。
 
-流式响应会将首个内容事件前已收到的用量写入 `message_start`，最终的
-`message_delta.usage` 包含累计用量，也包含较晚到达的缓存统计。排查缓存计数为 0
-时要查看完整事件流；非流式响应在 `usage` 中返回相同的最终计数。Kiro 分多次上报
-的统计会合并，缓存输入不会重复计入总量。
+成功完成的首次请求计为缓存创建。后续请求在断点前最多回看 20 个块，读取最长的
+已记录前缀，仅将新增部分计为创建。缓存标记移动不会破坏已有前缀；前置工具定义、
+角色或内容变化则会影响匹配。失败、取消以及未产生输出的拒绝不会建立缓存记录。
+本地最小前缀长度为：Opus 5/5.5、Sonnet/Haiku 5.5 为 512 token；Opus 4.7 为
+2,048；Opus 4.5/4.6、Haiku 4.5 为 4,096；其他模型为 1,024。这些是 Crosslane 的
+本地核算规则。上游如有明确缓存计数（包括 0），优先保留上游值。
+
+Claude Code 和 `/v1/messages` 的 `cache_read_input_tokens`、
+`cache_creation_input_tokens` 都是输入的一部分，`input_tokens` 表示剩余未缓存输入，
+三者相加才是内部记录的完整输入。`output_tokens` 是生成输出，不是缓存写入量。
+流式 `message_start` 包含初始本地缓存计划，最终 `message_delta.usage` 与非流式
+`usage` 返回完成后的核算结果。请求诊断和 `proxy.usage.accounting` 日志会将 token、
+缓存来源标记为 `estimated`，与实际额度的 `credits_source=server` 分开记录。
 
 OpenAI Chat Completions 在 `usage.prompt_tokens_details` 中返回 `cached_tokens`（读）
 和 `cache_write_tokens`（写）；Responses 在 `usage.input_tokens_details` 中返回同样两个字段。
@@ -356,7 +367,7 @@ OpenAI Chat Completions 在 `usage.prompt_tokens_details` 中返回 `cached_toke
 在终止事件中返回用量，参见 [OpenAI 官方缓存用量说明](https://developers.openai.com/api/docs/guides/prompt-caching#monitor-cache-performance)。
 
 Kiro 路径下，两个 OpenAI 入口都支持使用 `prompt_cache_key` 提供稳定的亲和提示，
-该值会哈希为上游 conversation ID，但不会开启缓存提示或固定账号。Kiro 的缓存
+该值会哈希为上游 conversation ID，并隔离本地缓存核算，但不会固定账号。Kiro 的缓存
 断点仍通过上述 `cache_control` 扩展转换，不承诺 OpenAI 的保留时长或断点 TTL。
 Kiro 对显式 `prompt_cache_breakpoint`，以及要求预热、最短 `ttl` 或 `mode=explicit`
 的 `prompt_cache_options`，会在生成前返回 HTTP 400，不会把预热悄悄降级为普通生成。

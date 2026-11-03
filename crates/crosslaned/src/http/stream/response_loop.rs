@@ -127,9 +127,11 @@ pub fn response(
         let mut accumulated_usage = crosslane_kiro::UsageInfo::default();
         let mut prompt_cache_plan = context.state.prompt_cache.plan(
             &context.lease.account_id(),
+            &context.kiro_model,
             context.prompt_cache.as_ref(),
         );
         let mut claude = build_claude_state(&context);
+        claude.apply_prompt_cache_plan(&prompt_cache_plan);
         let mut accumulated_searches = std::mem::take(&mut context.resumed_tool_searches);
         let mut accumulated_web_searches = std::mem::take(&mut context.resumed_web_searches);
         let mut data_started = false;
@@ -1101,8 +1103,12 @@ pub fn response(
                         break (new_lease, account);
                     };
                     let next_input_tokens = *input_tokens;
+                    #[cfg(feature = "crs")]
+                    let next_cache_model = &candidate_kiro_model;
+                    #[cfg(not(feature = "crs"))]
+                    let next_cache_model = &context.kiro_model;
                     let next_prompt_cache_plan = context.state.prompt_cache.plan(
-                        &new_lease.account_id(),
+                        &new_lease.account_id(), next_cache_model,
                         context.prompt_cache.as_ref(),
                     );
                     #[cfg(not(feature = "crs"))]
@@ -1112,6 +1118,7 @@ pub fn response(
                     }
                     claude = build_claude_state(&context);
                     claude.input_tokens = next_input_tokens;
+                    claude.apply_prompt_cache_plan(&next_prompt_cache_plan);
                     pending_initial = if matches!(protocol, StreamProtocol::Claude) {
                         match claude_initial_events(
                             &mut claude,
@@ -2438,11 +2445,6 @@ pub fn response(
         accumulate_usage(&mut decoded.usage, &accumulated_usage);
         apply_stream_stop(&mut decoded, &stop_filter);
         let current_round_output_tokens = decoded.usage.output_tokens;
-        context.state.prompt_cache.commit(
-            &context.lease.account_id(),
-            &prompt_cache_plan,
-            &mut decoded.usage,
-        );
         context.prompt_cache = None;
         if failed.is_none()
             && matches!(protocol, StreamProtocol::Claude)
@@ -2530,6 +2532,9 @@ pub fn response(
                     yield Ok::<Bytes, Infallible>(Bytes::from(data));
                 }
             }
+            context.state.prompt_cache.commit(
+                &context.lease.account_id(), &prompt_cache_plan, &mut decoded,
+            );
             for data in stream_finish(
                 &protocol,
                 &mut claude,

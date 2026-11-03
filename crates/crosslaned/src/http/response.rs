@@ -42,6 +42,9 @@ pub struct DecodedResponse {
     pub usage: UsageInfo,
     pub upstream_input_tokens: Option<u64>,
     pub(super) upstream_usage: UpstreamUsage,
+    /// Kiro normally omits token/cache statistics. Local cache accounting uses
+    /// the same tokenizer basis as input/output estimates, separately from credits.
+    pub(super) cache_usage_estimated: bool,
     pub upstream_context_usage_percentage: Option<f64>,
     /// Explicit Claude stop reason for proxy-managed server loops (for example
     /// `pause_turn`). When absent the ordinary tool/max/end inference applies.
@@ -60,9 +63,58 @@ pub(super) struct UpstreamUsage {
     uncached_input_tokens: Option<u64>,
     total_tokens: Option<u64>,
     pub(super) output_tokens: Option<u64>,
+    cache_reported: bool,
 }
 
 impl DecodedResponse {
+    pub fn has_upstream_cache_usage(&self) -> bool {
+        self.upstream_usage.cache_reported
+            || (!self.cache_usage_estimated
+                && (self.usage.cache_read_tokens > 0 || self.usage.cache_write_tokens > 0))
+    }
+
+    pub fn has_generated_output(&self) -> bool {
+        !self.text.is_empty()
+            || !self.reasoning.is_empty()
+            || !self.tools.is_empty()
+            || self.usage.output_tokens > 0
+    }
+
+    pub fn token_usage_source(&self) -> &'static str {
+        if self.upstream_input_tokens.is_some()
+            && self.upstream_usage.output_tokens.is_some()
+            && !self.cache_usage_estimated
+        {
+            "server"
+        } else {
+            "estimated"
+        }
+    }
+
+    pub fn cache_usage_source(&self) -> &'static str {
+        if self.has_upstream_cache_usage() {
+            "server"
+        } else if self.cache_usage_estimated {
+            "estimated"
+        } else {
+            "unreported"
+        }
+    }
+
+    pub fn log_usage_accounting(&self, trace_id: &str) {
+        tracing::info!(
+            event = "proxy.usage.accounting",
+            trace_id,
+            token_usage_source = self.token_usage_source(),
+            cache_usage_source = self.cache_usage_source(),
+            input_tokens = self.usage.input_tokens,
+            output_tokens = self.usage.output_tokens,
+            cache_read_tokens = self.usage.cache_read_tokens,
+            cache_write_tokens = self.usage.cache_write_tokens,
+            "token and cache usage normalized independently of upstream credits"
+        );
+    }
+
     pub fn log_context_usage(&self, trace_id: &str, estimated_input_tokens: u64) {
         if self.upstream_input_tokens.is_some() || self.upstream_context_usage_percentage.is_some()
         {
@@ -1745,6 +1797,7 @@ fn merge_usage(output: &mut UsageInfo, upstream: &mut UpstreamUsage, value: &Val
     );
     output.cache_read_tokens = cache_read.unwrap_or(output.cache_read_tokens);
     output.cache_write_tokens = cache_write.unwrap_or(output.cache_write_tokens);
+    upstream.cache_reported |= cache_read.is_some() || cache_write.is_some();
     let cache_tokens = output
         .cache_read_tokens
         .saturating_add(output.cache_write_tokens);

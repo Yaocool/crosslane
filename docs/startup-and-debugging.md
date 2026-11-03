@@ -406,23 +406,39 @@ already in progress can still affect final usage.
 
 `features.enable_prompt_cache` defaults to `false`. Use
 `crosslane config edit features` to set it to `true`; saving validates and
-reloads the configuration. This forwards valid client `cache_control` hints as
-native Kiro `cachePoint` blocks. Acceptance and cache hits depend on the upstream;
-this switch does not enable simulated cache billing or guarantee caching.
+reloads the configuration. Kiro normally reports credits without token/cache
+counts, so Crosslane estimates cache usage locally with the tokenizer used for
+input and output usage. This is usage simulation, not a claim that Kiro reused
+its backend cache or discounted its credits. Actual reported credit charges
+remain independent of these token estimates.
 
-For Claude Code and `/v1/messages`, `cache_read_input_tokens` counts prompt
-tokens read from cache and `cache_creation_input_tokens` counts prompt tokens
-written to cache. These are both input counters; `output_tokens` counts generated
-tokens. Crosslane always forwards actual upstream cache counters, including when
-hint forwarding is disabled. Missing upstream cache counters remain zero rather
-than being inferred from repeated local requests.
+Claude requests require an explicit `cache_control: {"type":"ephemeral"}`
+breakpoint or the same control at the request root. OpenAI Chat/Responses use
+implicit prefix accounting without requiring this Anthropic extension. Valid
+explicit controls are also translated into native Kiro `cachePoint` blocks.
+Local entries are isolated by upstream account, resolved model and optional
+OpenAI `prompt_cache_key`. They expire after 5 minutes (or 1 hour for an explicit
+`ttl=1h` control), refresh on reuse and are lost when crosslaned restarts.
+Client TTL values are local policy, not an upstream retention guarantee.
 
-For streaming responses, usage known before the first content event is included
-in `message_start`. The final `message_delta.usage` carries cumulative usage,
-including cache counters reported later. Inspect the complete stream when
-diagnosing zero cache usage. Non-streaming responses contain the same final
-counters in `usage`. Separate Kiro metadata events are merged without counting
-cached input twice.
+A completed cold request records cache creation. A later request can read the
+longest matching prefix within 20 blocks of a breakpoint and creates only the
+new suffix. Moving cache markers does not invalidate unchanged content; changing
+preceding tools, roles or content does. Failed/cancelled generations and empty
+refusals do not seed entries. Prefixes below the local model threshold are
+ignored: 512 tokens for Opus 5/5.5 and Sonnet/Haiku 5.5; 2,048 for Opus 4.7;
+4,096 for Opus 4.5/4.6 and Haiku 4.5; 1,024 otherwise. These are Crosslane's local
+accounting rules. Explicit upstream cache counters, including zero, take
+precedence when present.
+
+For Claude Code and `/v1/messages`, `cache_read_input_tokens` and
+`cache_creation_input_tokens` are input subsets. `input_tokens` is the remaining
+uncached input; their sum equals the total input counted for accounting.
+`output_tokens` counts generated output and is not a cache-write counter.
+Streaming `message_start` includes the initial local cache plan; final
+`message_delta.usage` and non-streaming `usage` contain completed accounting.
+Request diagnostics and the `proxy.usage.accounting` log identify token/cache
+sources as `estimated`, separately from `credits_source=server`.
 
 For OpenAI Chat Completions, `usage.prompt_tokens_details` contains
 `cached_tokens` (reads) and `cache_write_tokens` (writes). Responses returns
@@ -432,8 +448,8 @@ chunk; Responses streaming includes usage in its terminal response event.
 See the [official OpenAI cache usage documentation](https://developers.openai.com/api/docs/guides/prompt-caching#monitor-cache-performance).
 
 On Kiro routes, `prompt_cache_key` gives both OpenAI endpoints a stable affinity
-hint, hashed into the upstream conversation ID. It does not enable cache hints
-or pin an account. Kiro cache points still use the `cache_control` extension
+hint, hashed into the upstream conversation ID, and scopes local cache accounting.
+It does not pin an account. Native Kiro cache points still use the `cache_control` extension
 described above, without OpenAI retention or breakpoint-lifetime guarantees.
 Kiro rejects explicit `prompt_cache_breakpoint` markers and
 `prompt_cache_options` that request prewarming, a minimum `ttl`, or `mode=explicit`

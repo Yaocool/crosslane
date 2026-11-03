@@ -35,8 +35,9 @@ pub use responses::{
     responses_to_openai, ResponsesRequest, ResponsesToolName, ResponsesTranslation,
 };
 pub use tokenizer::{
-    compaction_summary_payload, prepare_compaction_source_history, ContextCompactionStats,
-    ContextTokenBreakdown, KiroCompactionPlan, TokenCountCache, TokenCountStats,
+    compaction_summary_payload, estimated_binary_document_tokens, estimated_image_tokens,
+    prepare_compaction_source_history, ContextCompactionStats, ContextTokenBreakdown,
+    KiroCompactionPlan, TokenCountCache, TokenCountStats,
 };
 pub use tool_history::{
     sanitize_kiro_tool_history, validate_kiro_tool_history, KiroToolHistoryStats,

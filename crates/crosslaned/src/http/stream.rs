@@ -670,6 +670,7 @@ struct ClaudeState {
     openai_include_usage: bool,
     cache_creation_input_tokens: u64,
     cache_read_input_tokens: u64,
+    local_cache_plan: Option<super::prompt_cache::PromptCachePlan>,
     visible_text: String,
     #[cfg(feature = "crs")]
     text_block_offset: usize,
@@ -701,12 +702,20 @@ impl ClaudeState {
             openai_include_usage: false,
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
+            local_cache_plan: None,
             visible_text: String::new(),
             #[cfg(feature = "crs")]
             text_block_offset: 0,
             emitted_citation_links: HashSet::new(),
             web_search_replay,
         }
+    }
+
+    fn apply_prompt_cache_plan(&mut self, plan: &super::prompt_cache::PromptCachePlan) {
+        self.local_cache_plan = Some(plan.clone());
+        let (read, write) = plan.usage(self.input_tokens);
+        self.cache_read_input_tokens = read;
+        self.cache_creation_input_tokens = write;
     }
 
     fn observe_usage(&mut self, decoded: &DecodedResponse, pending_initial: &mut [String]) {
@@ -718,9 +727,17 @@ impl ClaudeState {
         }
         // Metadata may precede the first content event. Use it in message_start
         // when available; late metadata is carried by the final message_delta.
-        // Local cache plans are never evidence of an upstream cache hit/write.
-        self.cache_creation_input_tokens = decoded.usage.cache_write_tokens;
-        self.cache_read_input_tokens = decoded.usage.cache_read_tokens;
+        // Local plans initialize the start event. Only reported metadata or
+        // finalized local accounting replaces those provisional counters.
+        if decoded.has_upstream_cache_usage() || decoded.cache_usage_estimated {
+            self.cache_creation_input_tokens = decoded.usage.cache_write_tokens;
+            self.cache_read_input_tokens = decoded.usage.cache_read_tokens;
+        } else if let Some(plan) = &self.local_cache_plan {
+            let (read, write) =
+                plan.usage(decoded.upstream_input_tokens.unwrap_or(self.input_tokens));
+            self.cache_read_input_tokens = read;
+            self.cache_creation_input_tokens = write;
+        }
         self.input_tokens = decoded
             .upstream_input_tokens
             .unwrap_or(self.input_tokens)
@@ -1415,11 +1432,6 @@ async fn finish_accounting(
     }
     let produced_output = produced_output(&decoded);
     fill_missing_usage(&context.state, &mut decoded, payload).await;
-    context.state.prompt_cache.apply(
-        &context.lease.account_id(),
-        context.prompt_cache.as_ref(),
-        &mut decoded.usage,
-    );
     let credits = if failure.is_some() && !produced_output {
         0.0
     } else if decoded.usage.credits > 0.0 {
@@ -1433,6 +1445,11 @@ async fn finish_accounting(
         )
     };
     context.lease.settle_credits(credits).await;
+    decoded.log_usage_accounting(&context.trace_id);
+    context.diagnostics.token_usage_source = decoded.token_usage_source().into();
+    context.diagnostics.cache_usage_source = decoded.cache_usage_source().into();
+    context.diagnostics.cache_read_tokens = decoded.usage.cache_read_tokens;
+    context.diagnostics.cache_write_tokens = decoded.usage.cache_write_tokens;
     context.diagnostics.credits_source = if decoded.usage.credits > 0.0 {
         "server"
     } else {
@@ -1454,12 +1471,7 @@ async fn finish_accounting(
             cache_read_tokens: Some(decoded.usage.cache_read_tokens),
             cache_write_tokens: Some(decoded.usage.cache_write_tokens),
             reasoning_tokens: Some(decoded.usage.reasoning_tokens),
-            token_usage_source: if decoded.usage.credits > 0.0 {
-                "server"
-            } else {
-                "estimated"
-            }
-            .into(),
+            token_usage_source: decoded.token_usage_source().into(),
             provider_billing: None,
             path: context.path.clone(),
         })

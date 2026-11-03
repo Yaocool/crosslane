@@ -1304,10 +1304,23 @@ async fn handle_claude_route_inner(
         if compaction_summary.is_some() {
             state
                 .prompt_cache
-                .claude_compacted_profile(&state.tokenizer, &request, input_tokens)
+                .claude_compacted_profile(
+                    &state.tokenizer,
+                    &request,
+                    input_tokens,
+                    &execution.kiro_model,
+                )
                 .await
         } else {
-            state.prompt_cache.claude_profile(&request, input_tokens)
+            state
+                .prompt_cache
+                .claude_profile(
+                    &state.tokenizer,
+                    &request,
+                    input_tokens,
+                    &execution.kiro_model,
+                )
+                .await
         }
     } else {
         None
@@ -1947,11 +1960,25 @@ pub(super) async fn handle_openai_route(
         selected.payload = payload.clone();
         prepared = Some(selected);
     }
-    // A fallback may trim additional history after this point. Native cache
-    // usage remains authoritative; don't estimate it from the original input.
-    let prompt_cache = (config.features.enable_prompt_cache && !automatic_truncation)
-        .then(|| state.prompt_cache.openai_profile(&request, input_tokens))
-        .flatten();
+    // A truncated history cannot reuse cache breakpoints from the original
+    // request. A later model fallback is also checked by the cache planner.
+    let prompt_cache = if config.features.enable_prompt_cache && !automatic_truncation {
+        state
+            .prompt_cache
+            .openai_profile(
+                &state.tokenizer,
+                &request,
+                input_tokens,
+                &payload
+                    .conversation_state
+                    .current_message
+                    .user_input_message
+                    .model_id,
+            )
+            .await
+    } else {
+        None
+    };
     let tool_tokens = state
         .tokenizer
         .estimate_kiro_tools(&payload)

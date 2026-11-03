@@ -1263,6 +1263,23 @@ fn compact_excerpt(value: &str, maximum: usize) -> String {
     )
 }
 
+/// Shared input/cache image overhead. Binary data is never sent to the text tokenizer.
+pub fn estimated_image_tokens(encoded: &str) -> usize {
+    let encoded = encoded.split_once(',').map_or(encoded, |(_, bytes)| bytes);
+    let bytes = encoded.len().saturating_mul(3) / 4;
+    IMAGE_BASE_TOKENS
+        .saturating_add(((bytes as f64).sqrt() * 2.5).ceil() as usize)
+        .clamp(IMAGE_BASE_TOKENS, IMAGE_MAX_TOKENS)
+}
+
+/// Shared input/cache overhead for binary PDF/Office documents.
+pub fn estimated_binary_document_tokens(encoded: &str) -> usize {
+    let encoded = encoded.split_once(',').map_or(encoded, |(_, bytes)| bytes);
+    DOCUMENT_BASE_TOKENS.saturating_add(
+        (encoded.len().saturating_mul(3) / 4).div_ceil(DOCUMENT_BINARY_BYTES_PER_TOKEN),
+    )
+}
+
 fn collect_user_message(
     message: &KiroUserInputMessage,
     segments: &mut Vec<String>,
@@ -1271,19 +1288,7 @@ fn collect_user_message(
     *fixed = fixed.saturating_add(MESSAGE_OVERHEAD_TOKENS);
     segments.push(message.content.clone());
     for image in &message.images {
-        let encoded = image
-            .source
-            .bytes
-            .split_once(',')
-            .map_or(image.source.bytes.as_str(), |(_, bytes)| bytes);
-        let estimated_bytes = encoded.len().saturating_mul(3) / 4;
-        let image_tokens = IMAGE_BASE_TOKENS
-            // Kiro does not expose an image token-count endpoint. Use a
-            // deliberately conservative size proxy so compressed, high-detail
-            // images do not get treated like a few dozen text tokens.
-            .saturating_add(((estimated_bytes as f64).sqrt() * 2.5).ceil() as usize)
-            .clamp(IMAGE_BASE_TOKENS, IMAGE_MAX_TOKENS);
-        *fixed = fixed.saturating_add(image_tokens);
+        *fixed = fixed.saturating_add(estimated_image_tokens(&image.source.bytes));
     }
     for document in &message.documents {
         segments.push(document.name.clone());
@@ -1293,9 +1298,6 @@ fn collect_user_message(
             .bytes
             .split_once(',')
             .map_or(document.source.bytes.as_str(), |(_, bytes)| bytes);
-        let estimated_bytes = encoded.len().saturating_mul(3) / 4;
-        *fixed = fixed.saturating_add(DOCUMENT_BASE_TOKENS);
-
         // Text-like Kiro documents contain UTF-8 bytes, including documents
         // translated from Anthropic's `source.type = "text"`. Tokenize their
         // decoded contents instead of applying a size heuristic that can
@@ -1303,6 +1305,7 @@ fn collect_user_message(
         if is_text_document_format(&document.format) {
             if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) {
                 if let Ok(text) = String::from_utf8(decoded) {
+                    *fixed = fixed.saturating_add(DOCUMENT_BASE_TOKENS);
                     segments.push(text);
                     continue;
                 }
@@ -1313,7 +1316,7 @@ fn collect_user_message(
         // Keep opaque base64 out of the tokenizer, but use a linear byte proxy
         // without a low cap so larger native documents cannot look cheaper
         // than much smaller ones during context preflight and compaction.
-        *fixed = fixed.saturating_add(estimated_bytes.div_ceil(DOCUMENT_BINARY_BYTES_PER_TOKEN));
+        *fixed = fixed.saturating_add(estimated_binary_document_tokens(encoded));
     }
     if let Some(context) = &message.user_input_message_context {
         collect_tools(message, segments, fixed);
