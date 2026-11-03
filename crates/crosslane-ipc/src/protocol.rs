@@ -919,6 +919,9 @@ pub struct ConfigPathResult {
     /// daemon 环境中的默认管理 socket；旧 daemon 未返回时由调用方保留当前 socket。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_admin_socket: Option<String>,
+    /// Whether this daemon can reconfigure status HTTP without restarting.
+    #[serde(default)]
+    pub status_http_hot_reload: bool,
     /// daemon 日志基础路径；实际文件会附加日期、级别和分片号。
     #[serde(default)]
     pub log_base_path: String,

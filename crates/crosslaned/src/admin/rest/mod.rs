@@ -36,6 +36,26 @@ pub(super) struct RestState {
     enterprise: Arc<enterprise::Control>,
 }
 
+/// Shared across listener generations so rebinding retains jobs, limits and
+/// canonical-user exclusion for operations still running on retired sockets.
+pub(crate) struct SharedState {
+    requests: Arc<Semaphore>,
+    account_creates: Arc<Semaphore>,
+    batches: Arc<batches::BatchRegistry>,
+    enterprise: Arc<enterprise::Control>,
+}
+
+impl Default for SharedState {
+    fn default() -> Self {
+        Self {
+            requests: Arc::new(Semaphore::new(16)),
+            account_creates: Arc::new(Semaphore::new(8)),
+            batches: Arc::new(batches::BatchRegistry::default()),
+            enterprise: Arc::new(enterprise::Control::default()),
+        }
+    }
+}
+
 type ApiResult<T = Value> = Result<T, ApiError>;
 
 #[derive(Clone)]
@@ -47,11 +67,11 @@ struct RequestAudit {
 
 pub(crate) fn router(app: Arc<AppState>) -> Router {
     let state = RestState {
+        requests: Arc::clone(&app.admin_rest.requests),
+        account_creates: Arc::clone(&app.admin_rest.account_creates),
+        batches: Arc::clone(&app.admin_rest.batches),
+        enterprise: Arc::clone(&app.admin_rest.enterprise),
         app,
-        requests: Arc::new(Semaphore::new(16)),
-        account_creates: Arc::new(Semaphore::new(8)),
-        batches: Arc::new(batches::BatchRegistry::default()),
-        enterprise: Arc::new(enterprise::Control::default()),
     };
     Router::new()
         .nest("/kiro/enterprise", enterprise::router())
@@ -158,7 +178,11 @@ async fn authenticate(
         .map(|path| path.as_str().to_owned())
         .unwrap_or_else(|| "/admin/v1/*".into());
     let method = request.method().clone();
-    let config = state.app.config.current();
+    let config = request
+        .extensions()
+        .get::<crate::status_http::ListenerConfig>()
+        .map(|snapshot| Arc::clone(&snapshot.0))
+        .unwrap_or_else(|| state.app.config.current());
     let auth = &config.admin.rest;
     let identity = request
         .headers()

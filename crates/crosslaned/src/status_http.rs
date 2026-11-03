@@ -13,6 +13,9 @@ use crosslane_core::config::{ProxyServiceConfig, StatusHttpConfig};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
+mod listener;
+pub(crate) use listener::ListenerManager;
+
 use crate::state::AppState;
 
 pub(crate) async fn bind(config: &StatusHttpConfig) -> Result<Option<TcpListener>> {
@@ -26,17 +29,38 @@ pub(crate) async fn bind(config: &StatusHttpConfig) -> Result<Option<TcpListener
     Ok(Some(listener))
 }
 
-pub(crate) async fn serve(state: Arc<AppState>, listener: Option<TcpListener>) -> Result<()> {
-    let shutdown = state.shutdown.clone();
-    let Some(listener) = listener else {
-        shutdown.cancelled().await;
-        return Ok(());
-    };
-    tracing::info!(address = %listener.local_addr()?, "status HTTP listening");
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown.cancelled_owned())
-        .await
-        .context("serve status HTTP")
+/// Authentication uses the same snapshot that admitted this request, so a
+/// listener switch cannot publish new credentials on an old address mid-request.
+#[derive(Clone)]
+pub(crate) struct ListenerConfig(pub Arc<crosslane_core::config::Config>);
+
+fn router_for_listener(
+    state: Arc<AppState>,
+    config: StatusHttpConfig,
+    stopped: tokio_util::sync::CancellationToken,
+) -> Router {
+    router(Arc::clone(&state)).layer(axum::middleware::from_fn(
+        move |mut request: axum::extract::Request, next: axum::middleware::Next| {
+            let state = Arc::clone(&state);
+            let config = config.clone();
+            let stopped = stopped.clone();
+            async move {
+                use axum::response::IntoResponse;
+                // Accepted keep-alive connections on a retired address must not
+                // gain access through the newly published listener/auth settings.
+                let current = state.config.current();
+                if stopped.is_cancelled() || current.status_http != config {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        [(axum::http::header::CACHE_CONTROL, "no-store")],
+                    )
+                        .into_response();
+                }
+                request.extensions_mut().insert(ListenerConfig(current));
+                next.run(request).await
+            }
+        },
+    ))
 }
 
 pub(crate) fn router(state: Arc<AppState>) -> Router {

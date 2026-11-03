@@ -87,7 +87,7 @@ async fn main() -> Result<()> {
     let config_handle = ConfigHandle::new(config);
     let socket_path = config_handle.current().admin.socket.clone().into();
     let state = Arc::new(AppState::load(paths, config_handle, accounts).await?);
-    let status_listener = status_http::bind(&state.config.current().status_http).await?;
+    state.status_http.initialize(Arc::clone(&state)).await?;
     let reload_state = Arc::clone(&state);
     let reload_runtime = tokio::runtime::Handle::current();
     let _watcher = spawn_config_watcher_with_hook(
@@ -112,7 +112,7 @@ async fn main() -> Result<()> {
         warn!(%service_id, %error, "configured proxy service is not running");
     }
     let admin = admin::server::serve(Arc::clone(&state), socket_path, shutdown.clone());
-    let status = status_http::serve(Arc::clone(&state), status_listener);
+    let status = state.status_http.run(Arc::clone(&state));
     let result = tokio::try_join!(admin, status).map(|((), ())| ());
     shutdown.cancel();
     tasks::flush_before_shutdown(&state).await;

@@ -175,6 +175,8 @@ pub struct AppState {
     pub task_registry: TaskRegistry,
     /// Dynamically managed API proxy listeners.
     pub proxy_services: Arc<crate::http::ProxyServiceManager>,
+    pub(crate) status_http: crate::status_http::ListenerManager,
+    pub(crate) admin_rest: crate::admin::rest::SharedState,
     /// Shared graceful-shutdown token for process lifecycle events.
     pub shutdown: CancellationToken,
     /// 启动时刻。
@@ -333,6 +335,8 @@ impl AppState {
             response_client_contexts: crate::http::responses::ResponseClientContexts::default(),
             task_registry: TaskRegistry::default(),
             proxy_services: Arc::new(crate::http::ProxyServiceManager::default()),
+            status_http: crate::status_http::ListenerManager::default(),
+            admin_rest: crate::admin::rest::SharedState::default(),
             shutdown: CancellationToken::new(),
             started_at: Instant::now(),
             config_reloaded_at: AtomicI64::new(0),
@@ -554,7 +558,17 @@ impl AppState {
         validate_service_account_tag_transitions(&previous, next)?;
         let accounts = self.with_accounts(|store| store.all().to_vec());
         validate_service_account_references(next, &accounts, &self.paths.data_dir)?;
-        self.config.replace(next.clone());
+        let status_listener = self
+            .status_http
+            .prepare(&next.status_http)
+            .await
+            .map_err(|error| format!("status HTTP prepare failed: {error}"))?;
+        // Keep the old control plane usable until all fallible work succeeds.
+        // New authentication must never be published on the previous address.
+        let mut applying = next.clone();
+        applying.status_http = previous.status_http.clone();
+        applying.admin.rest = previous.admin.rest.clone();
+        self.config.replace(applying);
         self.apply_runtime_config(next).await;
         if let Err(error) = self.providers.reconcile(next, &self.paths.data_dir).await {
             self.config.replace(previous.clone());
@@ -572,12 +586,25 @@ impl AppState {
             });
         }
         let failures = self.reconcile_proxy_services(next).await;
-        if failures.is_empty() {
-            crate::alerts::sync_quota_incidents(self).await;
-            return Ok(());
-        }
-
-        let apply_error = format_service_failures(&failures);
+        let apply_error = if failures.is_empty() {
+            match self
+                .status_http
+                .commit(Arc::clone(self), status_listener)
+                .await
+            {
+                Ok(()) => {
+                    self.config.replace(next.clone());
+                    crate::alerts::sync_quota_incidents(self).await;
+                    return Ok(());
+                }
+                Err(error) => format!("status HTTP apply failed: {error}"),
+            }
+        } else {
+            format!(
+                "proxy service apply failed: {}",
+                format_service_failures(&failures)
+            )
+        };
         self.config.replace(previous.clone());
         self.apply_runtime_config(&previous).await;
         let provider_rollback_error = self
@@ -588,12 +615,10 @@ impl AppState {
         let rollback_failures = self.reconcile_proxy_services(&previous).await;
         crate::alerts::sync_quota_incidents(self).await;
         if rollback_failures.is_empty() && provider_rollback_error.is_none() {
-            Err(format!(
-                "proxy service apply failed; previous config restored: {apply_error}"
-            ))
+            Err(format!("{apply_error}; previous config restored"))
         } else {
             Err(format!(
-                "proxy service apply failed ({apply_error}); rollback also failed: services={}, providers={}",
+                "{apply_error}; rollback also failed: services={}, providers={}",
                 format_service_failures(&rollback_failures),
                 provider_rollback_error.unwrap_or_else(|| "ok".into())
             ))

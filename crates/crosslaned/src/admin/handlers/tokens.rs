@@ -178,7 +178,7 @@ async fn mutate(state: &Arc<AppState>, change: Change) -> Handled {
         Change::Create(params) => {
             if params.enable_rest && !listener_ready {
                 return Err(RpcError::bad_params(
-                    "use `crosslane config edit admin` to set [status_http] enabled=true, then restart crosslaned before using --enable-rest",
+                    "use `crosslane config edit admin` to enable [status_http] and apply its address/port with `crosslane config reload` before using --enable-rest",
                 ));
             }
             let name = params.name.trim().to_owned();

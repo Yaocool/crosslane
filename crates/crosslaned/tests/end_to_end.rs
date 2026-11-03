@@ -119,6 +119,9 @@ mod client_tool_search;
 #[path = "end_to_end/status_http.rs"]
 mod status_http;
 
+#[path = "end_to_end/status_http_reload.rs"]
+mod status_http_reload;
+
 #[path = "end_to_end/admin_rest.rs"]
 mod admin_rest;
 

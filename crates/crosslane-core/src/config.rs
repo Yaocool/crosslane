@@ -1487,7 +1487,7 @@ impl Config {
         if self.admin.rest.enabled && !self.status_http.enabled {
             return invalid_config(
                 "admin.rest.enabled",
-                "requires status_http.enabled = true; edit both sections with `crosslane config edit admin`, then restart crosslaned for listener changes",
+                "requires status_http.enabled = true; edit both sections with `crosslane config edit admin`, then reload the listener configuration",
             );
         }
         self.admin.rest.validate_tokens()?;
@@ -2261,7 +2261,7 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# =====================================
 #
 # 除特别说明外：
 # - `*_ms` 的单位是毫秒，`*_tokens` 的单位是 token，credits 支持小数。
-# - daemon 会监听文件并热重载；`admin.socket`、`status_http` 和 TLS enabled 模式切换需重启。
+# - daemon 会监听文件并热重载；`admin.socket` 和 TLS enabled 模式切换需重启；status_http 支持热重载。
 # - 修改已有服务/API key/模型映射时，优先使用 `crosslane service`、
 #   `crosslane provider`、`crosslane apikey`、`crosslane model-map` 等命令，以免写错关联 ID。
 
@@ -2618,7 +2618,7 @@ max_files_per_day = 3
 [status_http]
 # 显式开启后，在独立端口提供 GET /、/health、/ready。默认不开启新的 TCP 监听。
 # 这三个路径不再由 API 代理服务端口提供；客户端协议与事件上报仍使用业务端口。
-# 修改本节任何字段后需要重启 daemon；不会通过热重载切换监听地址。
+# 本节启停、host、port 保存后热重载；绑定新地址失败时保留原监听。
 enabled = false
 # 默认仅本机可访问；需从其他机器探测时改为对应的监听地址。
 host = "127.0.0.1"
@@ -2636,7 +2636,7 @@ socket = "/run/crosslane/admin.sock"
 # 管理 REST 与公开状态接口共用 status_http 监听，通过独立 Bearer token 鉴权。
 # 此处只保存 token 的 SHA-256 摘要；模型客户端 Key 不获得管理权限。
 # 首次启用：crosslane config edit admin 同时展示 admin/status_http，先设置 status_http.enabled=true。
-# 重启 daemon 后执行 crosslane admin token create --name ops --enable-rest；自动生成并保存摘要。
+# 保存并重载后执行 crosslane admin token create --name ops --enable-rest；自动生成并保存摘要。
 # 手工开启本节 enabled 前，必须已开启 status_http 并配置至少一把令牌。
 [admin.rest]
 enabled = false

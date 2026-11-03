@@ -83,7 +83,7 @@ HTTP 的 `/`、`/health`、`/ready` 通过[独立状态监听](docs/startup-and-
 账号批量接口可直接上传与 CLI 相同的 SSO CSV，自动登录并入库，支持并发和逐条进度查询。
 通过 `crosslane admin token create/list/show/rotate/disable/enable/revoke` 管理多把独立
 管理令牌，明文只在创建或轮换时显示，配置仅保存摘要。
-`crosslane config edit admin` 可一起编辑鉴权和 `[status_http]` 监听；首次启用及重启步骤见
+`crosslane config edit admin` 可一起编辑鉴权和 `[status_http]` 监听；首次启用及重载步骤见
 `crosslane guide admin`。Kiro 企业用户与套餐使用[独立管理接口](docs/kiro-enterprise-admin.zh-CN.md)，
 AWS 管理员凭据通过 daemon 环境配置。
 

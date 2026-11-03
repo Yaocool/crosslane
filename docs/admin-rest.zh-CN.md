@@ -22,7 +22,7 @@ Kiro 官方企业订阅管理位于 `/admin/v1/kiro/enterprise`，与 Crosslane 
 相对于当前运行状态需要重启的字段。完整配置编辑器异常退出时会恢复原文件。
 
 首次启用时，运行 `crosslane config edit admin`，先设置以下监听，保留
-`[admin.rest] enabled = false`，保存后重启 daemon：
+`[admin.rest] enabled = false`，保存后自动重载：
 
 ```toml
 [status_http]
@@ -31,8 +31,11 @@ host = "127.0.0.1"
 port = 7651
 ```
 
-Docker wrapper 部署可用 `crosslane restart`；原生部署需重启 `crosslaned` 服务。
-监听启用、关闭、地址或端口变化都需要重启，`config reload` 只会提示待重启字段。
+独立监听的启用、关闭、地址和端口支持热重载，无需重启 daemon；也可执行
+`crosslane config reload` 应用手工编辑的文件。新地址会先绑定，绑定失败则保留原监听和运行配置。
+同端口修改 host 时会短暂重绑，失败后恢复原监听。业务服务继续运行，管理批量任务进度、
+并发名额和 Kiro 操作锁跨监听切换保留，旧连接不能使用新监听的鉴权配置。
+旧 daemon 仍可能返回监听字段需重启；升级到支持热重载的 daemon 后，此限制解除。
 
 随后创建第一把令牌，使用 `--enable-rest` 同时开启管理 REST：
 
@@ -44,14 +47,14 @@ crosslane admin token show ops
 ```
 
 `--enable-rest` 要求状态监听已启用，且运行中的启用状态、地址和端口与磁盘配置一致；
-有待重启的监听变更时会拒绝创建，避免在旧监听地址上提前开启 REST。该参数不修改业务 service，也不会自动开启新的
+监听变更尚未成功重载时会拒绝创建，先用 `crosslane config reload` 检查并应用，避免在旧地址上提前开启 REST。该参数不修改业务 service，也不会自动开启新的
 监听端口。省略该参数时，仅创建令牌，保留当前管理开关。首次监听设置后，Token 变更
 立即对后续请求生效，无需重启或另行 `config reload`。
 直接在配置中首次开启 REST 时同样会等待目标监听生效；等待期间创建或轮换令牌不会
-提前开启旧地址上的 REST。已开启的 REST 可在监听等待重启期间继续轮换令牌。
+提前开启旧地址上的 REST。已开启的 REST 可在监听重载失败后继续轮换令牌。
 
 已有令牌时，无需再创建：在 `crosslane config edit admin` 中将 `[status_http] enabled = true`
-与 `[admin.rest] enabled = true` 一起保存，监听尚未运行时再重启 daemon。也可先在监听关闭时
+与 `[admin.rest] enabled = true` 一起保存并热重载。也可先在监听关闭时
 执行 `admin token create --name ops`（不带 `--enable-rest`），再按此方式一起开启。
 直接开启 REST 而未开启监听，或尚未配置任何令牌，仍会校验失败。
 
@@ -127,7 +130,7 @@ print("SHA256:", hashlib.sha256(token.encode()).hexdigest())
 PYTOKEN
 ```
 
-手工修改摘要后可执行 `crosslane config reload`；修改监听地址/端口仍需重启。
+手工修改摘要或监听地址/端口后均可执行 `crosslane config reload`；修改 `admin.socket` 仍需重启。
 完整命令帮助：`crosslane help admin token`，操作指南：`crosslane guide admin`。
 
 ## 账号管理
@@ -308,7 +311,7 @@ daemon 重启会清空任务和待处理输入，不自动重放；已成功增�
 ## Service 管理
 
 service 变更基于磁盘最新配置，保留尚未热重载的客户端 Key 修改，并同时校验当前运行
-配置和重启后读取的磁盘配置。自动端口分配同时避开正在使用及待重启的状态监听端口。
+配置和磁盘目标配置。自动端口分配同时避开正在使用及尚未成功重载的状态监听端口。
 
 | 方法与路径 | 功能 |
 | --- | --- |

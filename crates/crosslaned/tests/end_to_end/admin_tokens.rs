@@ -24,14 +24,16 @@ async fn rpc_error(fixture: &AdminFixture, name: &str, params: Value, code: i32)
 #[tokio::test]
 async fn admin_token_bootstrap_respects_configured_and_running_listener_state() {
     let _guard = HTTP_TEST_LOCK.lock().await;
-    let mut daemon = Daemon::start().await;
+    let daemon = Daemon::start().await;
+    let pid = daemon.child.id();
     let file = daemon.home().join("config.toml");
     let paths = expect_ok(daemon.call("config.path", Value::Null).await);
     assert_eq!(
         paths["default_admin_socket"],
         json!(daemon.home().join("admin.sock"))
     );
-    let reject_enable = async |daemon: &Daemon, expected_file: &str| {
+    assert_eq!(paths["status_http_hot_reload"], true);
+    let reject_enable = async |expected_file: &str| {
         let response = daemon
             .call(
                 "admin.token.create",
@@ -49,7 +51,7 @@ async fn admin_token_bootstrap_respects_configured_and_running_listener_state() 
         );
     };
     let raw = tokio::fs::read_to_string(&file).await.unwrap();
-    reject_enable(&daemon, &raw).await;
+    reject_enable(&raw).await;
     let token = expect_ok(
         daemon
             .call("admin.token.create", json!({"name":"bootstrap"}))
@@ -65,126 +67,122 @@ async fn admin_token_bootstrap_respects_configured_and_running_listener_state() 
     config.status_http.enabled = true;
     config.status_http.port = port;
     config.admin.rest.enabled = true;
-    config.validate().unwrap();
-    let updated = toml::to_string(&config).unwrap();
     {
         let _lock = crosslane_store::atomic::lock_file_exclusive(&file)
             .await
             .unwrap();
-        crosslane_store::atomic::write_bytes_atomically(&file, updated.as_bytes(), Some(0o600))
-            .await
-            .unwrap();
-    }
-    let reload = expect_ok(daemon.call("config.reload", json!({})).await);
-    assert_eq!(reload["applied"], true);
-    assert!(reload["needs_restart"]
-        .as_array()
-        .unwrap()
-        .contains(&json!("status_http.enabled")));
-    reject_enable(&daemon, &updated).await;
-    let listed = expect_ok(daemon.call("admin.token.list", Value::Null).await);
-    assert_eq!(listed["tokens"].as_array().unwrap().len(), 1);
-    assert_eq!(listed["rest_enabled"], false);
-    assert_eq!(listed["listener_enabled"], false);
-
-    daemon.child.kill().await.unwrap();
-    daemon.child.wait().await.unwrap();
-    daemon.child = Command::new(env!("CARGO_BIN_EXE_crosslaned"))
-        .env("CROSSLANE_HOME", daemon.home())
-        .env("CROSSLANE_DISABLE_HTTP", "1")
-        .env("RUST_LOG", "warn")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
-    wait_for_socket(&daemon.socket).await;
-    wait_for_http(port).await;
-    let response = reqwest::Client::new()
-        .get(format!("http://127.0.0.1:{port}/admin/v1/providers"))
-        .bearer_auth(secret)
-        .send()
+        crosslane_store::atomic::write_bytes_atomically(
+            &file,
+            toml::to_string(&config).unwrap().as_bytes(),
+            Some(0o600),
+        )
         .await
         .unwrap();
-    assert_eq!(response.status(), 200);
-
-    // Enabling REST must wait for the configured address, too: otherwise a
-    // pending move away from a public listener could expose it at the old host.
-    for (host, next_port) in [("127.0.0.1", unused_tcp_port()), ("0.0.0.0", port)] {
-        let mut pending = config.clone();
-        pending.status_http.host = host.into();
-        pending.status_http.port = next_port;
-        pending.admin.rest.enabled = false;
-        let pending_raw = toml::to_string(&pending).unwrap();
-        {
-            let _lock = crosslane_store::atomic::lock_file_exclusive(&file)
-                .await
-                .unwrap();
-            crosslane_store::atomic::write_bytes_atomically(
-                &file,
-                pending_raw.as_bytes(),
-                Some(0o600),
-            )
-            .await
-            .unwrap();
-        }
-        assert_eq!(
-            expect_ok(daemon.call("config.reload", json!({})).await)["applied"],
-            true
-        );
-        reject_enable(&daemon, &pending_raw).await;
-        pending.admin.rest.enabled = true;
-        {
-            let _lock = crosslane_store::atomic::lock_file_exclusive(&file)
-                .await
-                .unwrap();
-            crosslane_store::atomic::write_bytes_atomically(
-                &file,
-                toml::to_string(&pending).unwrap().as_bytes(),
-                Some(0o600),
-            )
-            .await
-            .unwrap();
-        }
-        assert_eq!(
-            expect_ok(daemon.call("config.reload", json!({})).await)["applied"],
-            true
-        );
-        let listed = expect_ok(daemon.call("admin.token.list", Value::Null).await);
-        assert_eq!(listed["rest_enabled"], false);
-        let rotated = expect_ok(
-            daemon
-                .call("admin.token.rotate", json!({"id":"bootstrap"}))
-                .await,
-        );
-        assert_eq!(rotated["rest_enabled"], false);
-        config.admin.rest =
-            toml::from_str::<Config>(&tokio::fs::read_to_string(&file).await.unwrap())
-                .unwrap()
-                .admin
-                .rest;
-        assert!(config.admin.rest.enabled);
     }
+    let reload = expect_ok(daemon.call("config.reload", json!({})).await);
+    assert_eq!(reload["applied"], true);
+    assert_eq!(reload["needs_restart"], json!([]));
+    wait_for_http(port).await;
+    let listed = expect_ok(daemon.call("admin.token.list", Value::Null).await);
+    assert_eq!(listed["rest_enabled"], true);
+    assert_eq!(listed["listener_enabled"], true);
+    assert_eq!(
+        reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/admin/v1/providers"))
+            .bearer_auth(secret)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
 
-    // The listener remains alive until restart, but a pending disable must not
-    // be silently undone by creating another token with --enable-rest.
-    config.status_http.enabled = false;
+    // Failed listener moves must not activate REST on the previous address.
     config.admin.rest.enabled = false;
-    let disabled = toml::to_string(&config).unwrap();
+    let occupied = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     {
         let _lock = crosslane_store::atomic::lock_file_exclusive(&file)
             .await
             .unwrap();
-        crosslane_store::atomic::write_bytes_atomically(&file, disabled.as_bytes(), Some(0o600))
+        crosslane_store::atomic::write_bytes_atomically(
+            &file,
+            toml::to_string(&config).unwrap().as_bytes(),
+            Some(0o600),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        expect_ok(daemon.call("config.reload", json!({})).await)["applied"],
+        true
+    );
+    config.status_http.port = occupied.local_addr().unwrap().port();
+    config.admin.rest.enabled = true;
+    let pending = toml::to_string(&config).unwrap();
+    {
+        let _lock = crosslane_store::atomic::lock_file_exclusive(&file)
+            .await
+            .unwrap();
+        crosslane_store::atomic::write_bytes_atomically(&file, pending.as_bytes(), Some(0o600))
             .await
             .unwrap();
     }
-    let reload = expect_ok(daemon.call("config.reload", json!({})).await);
-    assert_eq!(reload["applied"], true);
+    assert_eq!(
+        expect_ok(daemon.call("config.reload", json!({})).await)["applied"],
+        false
+    );
+    reject_enable(&pending).await;
+    let rotated = expect_ok(
+        daemon
+            .call("admin.token.rotate", json!({"id":"bootstrap"}))
+            .await,
+    );
+    assert_eq!(rotated["rest_enabled"], false);
+    let rotated_secret = rotated["secret"].as_str().unwrap();
+    drop(occupied);
+    assert_eq!(
+        expect_ok(daemon.call("config.reload", json!({})).await)["applied"],
+        true
+    );
+    wait_for_http(config.status_http.port).await;
+    assert_eq!(
+        reqwest::Client::new()
+            .get(format!(
+                "http://127.0.0.1:{}/admin/v1/providers",
+                config.status_http.port
+            ))
+            .bearer_auth(rotated_secret)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    config = toml::from_str(&tokio::fs::read_to_string(&file).await.unwrap()).unwrap();
+    config.status_http.enabled = false;
+    config.admin.rest.enabled = false;
+    {
+        let _lock = crosslane_store::atomic::lock_file_exclusive(&file)
+            .await
+            .unwrap();
+        crosslane_store::atomic::write_bytes_atomically(
+            &file,
+            toml::to_string(&config).unwrap().as_bytes(),
+            Some(0o600),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        expect_ok(daemon.call("config.reload", json!({})).await)["applied"],
+        true
+    );
     let listed = expect_ok(daemon.call("admin.token.list", Value::Null).await);
-    assert_eq!(listed["listener_enabled"], true);
     assert_eq!(listed["rest_enabled"], false);
-    reject_enable(&daemon, &disabled).await;
+    assert_eq!(listed["listener_enabled"], false);
+    assert_eq!(daemon.child.id(), pid);
     daemon.stop().await;
 }
 

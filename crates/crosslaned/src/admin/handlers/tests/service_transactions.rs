@@ -114,7 +114,7 @@ async fn service_mutations_preserve_pending_client_key_rotations() {
 }
 
 #[tokio::test]
-async fn service_writes_validate_the_persisted_restart_configuration() {
+async fn service_writes_validate_the_persisted_pending_configuration() {
     let (_directory, state) = state_with(vec![]).await;
     create(&state, "target").await;
     let mut disk = state.config.current().as_ref().clone();
@@ -126,7 +126,8 @@ async fn service_writes_validate_the_persisted_restart_configuration() {
     tokio::fs::write(&state.paths.config_file, &raw)
         .await
         .unwrap();
-    let (mut effective, _) = merge_hot_reload(&state.config.current(), disk);
+    // Model a disk edit whose listener has not yet been successfully applied.
+    let mut effective = state.config.current().as_ref().clone();
     assert!(!effective.status_http.enabled);
     effective.proxy_service[0].port = reserved;
     effective.validate().unwrap();

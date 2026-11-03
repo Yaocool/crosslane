@@ -2354,7 +2354,7 @@ const CONFIG_MODULES: &[ConfigModule] = &[
         key: "status_http",
         category: "通用",
         scope: "global",
-        description: "独立状态 HTTP 监听；编辑时包含 admin，变更需重启 daemon",
+        description: "独立状态 HTTP 监听；编辑时包含 admin，支持热启停和地址切换",
         preferred_command: "-",
         aliases: &["status_http"],
         is_array: false,
@@ -2744,7 +2744,7 @@ fn render_config_module_editor(
     let scope = if editor_keys.len() > 1 {
         "# 可同时编辑 admin 和 status_http；其他顶层模块不允许修改。\n\
          # 开启 admin.rest.enabled 前，须开启 status_http.enabled 并先用 admin token create 创建令牌。\n\
-         # 监听需重启时，首次开启 REST 会等待该监听生效；已启用接口的令牌可继续热轮换。\n\
+         # 监听启停、地址和端口支持热重载；已启用接口的令牌可继续热轮换。\n\
          # 未改设置直接退出时不写入补全的默认值；仍会提示已有的待重启字段。"
     } else {
         "# 只允许编辑本模块。"
@@ -3028,12 +3028,20 @@ async fn unchanged_config_restart_required(
     {
         configured.admin.socket = daemon_default_admin_socket(paths).into();
     }
-    Ok(
-        crosslane_store::config_loader::diff_restart_required(&running, &configured)
-            .into_iter()
-            .map(String::from)
-            .collect(),
-    )
+    let mut fields = crosslane_store::config_loader::diff_restart_required(&running, &configured);
+    // Preserve restart hints when a new CLI connects to an older daemon.
+    if !paths.status_http_hot_reload {
+        if running.status_http.enabled != configured.status_http.enabled {
+            fields.push("status_http.enabled");
+        }
+        if running.status_http.host != configured.status_http.host {
+            fields.push("status_http.host");
+        }
+        if running.status_http.port != configured.status_http.port {
+            fields.push("status_http.port");
+        }
+    }
+    Ok(fields.into_iter().map(String::from).collect())
 }
 
 async fn run_editor(path: &Path, json: bool) -> Result<()> {
@@ -3147,7 +3155,7 @@ pub async fn reset_config(
         },
         |module| {
             if module.key == "status_http" {
-                "确认重置 status-http 并关闭 Admin REST？管理令牌和 socket 配置会保留；监听关闭需重启 daemon".into()
+                "确认重置 status-http 并关闭 Admin REST？管理令牌和 socket 配置会保留；监听立即热关闭".into()
             } else if module.key == "admin" {
                 format!("确认重置 admin、清除全部管理令牌？{socket_reset}；状态监听会保留；socket 变更需重启 daemon")
             } else {

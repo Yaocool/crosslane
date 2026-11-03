@@ -198,7 +198,7 @@ async fn disabled_admin_access_points_to_the_combined_config_editor() {
         }
         assert!(hint.contains("[admin.rest] enabled=true"));
         assert!(hint.contains("已有令牌"));
-        assert!(hint.contains("待重启"));
+        assert!(hint.contains("config reload"));
     }
 }
 
@@ -227,6 +227,6 @@ fn admin_help_and_guides_explain_listener_dependencies_and_configuration_default
         let help = String::from_utf8(output.stdout).unwrap();
         assert!(help.contains("config edit admin"), "{args:?}: {help}");
         assert!(help.contains("status_http"), "{args:?}: {help}");
-        assert!(help.contains("重启"), "{args:?}: {help}");
+        assert!(help.contains("重载"), "{args:?}: {help}");
     }
 }

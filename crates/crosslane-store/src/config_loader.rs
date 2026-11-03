@@ -79,29 +79,18 @@ pub fn diff_restart_required(old: &Config, new: &Config) -> Vec<&'static str> {
     if old.admin.socket != new.admin.socket {
         fields.push("admin.socket");
     }
-    if old.status_http.enabled != new.status_http.enabled {
-        fields.push("status_http.enabled");
-    }
-    if old.status_http.host != new.status_http.host {
-        fields.push("status_http.host");
-    }
-    if old.status_http.port != new.status_http.port {
-        fields.push("status_http.port");
-    }
     if old.server.tls.enabled != new.server.tls.enabled {
         fields.push("server.tls.enabled");
     }
     fields
 }
 
-/// 合并一次热重载：热更新字段取新值，管理 socket、状态监听与 TLS 监听模式保留运行值。
+/// 合并一次热重载：热更新字段取新值，管理 socket 与 TLS 监听模式保留运行值。
 ///
 /// 返回的字段列表提示调用方在下次进程重启后，磁盘中的新值才会生效。
 pub fn merge_hot_reload(old: &Config, mut new: Config) -> (Config, Vec<&'static str>) {
     let needs_restart = diff_restart_required(old, &new);
-    new.admin.rest = merge_admin_rest_auth(old, &new);
     new.admin.socket.clone_from(&old.admin.socket);
-    new.status_http.clone_from(&old.status_http);
     if old.server.tls.enabled != new.server.tls.enabled {
         new.server.tls = old.server.tls.clone();
     }
@@ -341,7 +330,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn admin_rest_tokens_reload_but_wait_for_the_listener_to_be_started() {
+    fn admin_rest_tokens_and_listener_configuration_are_hot_reloadable() {
         let old = Config::default();
         let mut edited = old.clone();
         edited.status_http.enabled = true;
@@ -349,8 +338,9 @@ mod tests {
         edited.admin.rest.token_sha256 = "a".repeat(64);
         edited.validate().unwrap();
         let (effective, restart) = merge_hot_reload(&old, edited.clone());
-        assert_eq!(restart, vec!["status_http.enabled"]);
-        assert!(!effective.admin.rest.enabled);
+        assert!(restart.is_empty());
+        assert!(effective.admin.rest.enabled);
+        assert_eq!(effective.status_http, edited.status_http);
         effective.validate().unwrap();
 
         let mut rotated = edited.clone();
@@ -368,7 +358,7 @@ mod tests {
     }
 
     #[test]
-    fn admin_rest_activation_waits_for_listener_moves_but_existing_auth_can_rotate() {
+    fn auth_only_mutations_wait_for_listener_moves_but_existing_auth_can_rotate() {
         let mut running = Config::default();
         running.status_http.enabled = true;
         running.admin.rest.token_sha256 = "a".repeat(64);
@@ -382,16 +372,14 @@ mod tests {
                 pending.status_http.port += 1;
             }
             pending.validate().unwrap();
-            let (effective, restart) = merge_hot_reload(&running, pending.clone());
-            assert!(!restart.is_empty());
-            assert!(!effective.admin.rest.enabled);
-            assert_eq!(effective.status_http, running.status_http);
-            assert_eq!(effective.admin.rest.token_sha256, "b".repeat(64));
+            let effective = merge_admin_rest_auth(&running, &pending);
+            assert!(!effective.enabled);
+            assert_eq!(effective.token_sha256, "b".repeat(64));
             let mut already_active = running.clone();
             already_active.admin.rest.enabled = true;
-            let (effective, _) = merge_hot_reload(&already_active, pending);
-            assert!(effective.admin.rest.enabled);
-            assert_eq!(effective.admin.rest.token_sha256, "b".repeat(64));
+            let effective = merge_admin_rest_auth(&already_active, &pending);
+            assert!(effective.enabled);
+            assert_eq!(effective.token_sha256, "b".repeat(64));
         }
     }
 
@@ -458,16 +446,11 @@ mod tests {
         status.status_http.port = 9000;
         status.log.level = "debug".into();
         let (status, restart) = merge_hot_reload(&old, status);
-        assert_eq!(status.status_http, old.status_http);
+        assert!(status.status_http.enabled);
+        assert_eq!(status.status_http.host, "0.0.0.0");
+        assert_eq!(status.status_http.port, 9000);
         assert_eq!(status.log.level, "debug");
-        assert_eq!(
-            restart,
-            vec![
-                "status_http.enabled",
-                "status_http.host",
-                "status_http.port"
-            ]
-        );
+        assert!(restart.is_empty());
 
         let mut certificate = Config::default();
         certificate.server.tls.cert = Some("new certificate".into());

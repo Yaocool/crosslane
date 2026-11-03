@@ -125,7 +125,7 @@ fn topic_text(topic: &str) -> Result<&'static str> {
         "admin" => r#"Admin REST 令牌（全局，不接受 --provider）
 1. 运行 crosslane config edit admin（或 config edit status-http），同屏编辑 [admin] 与 [status_http]；旧配置会补齐缺少的默认字段。
    先设置 [status_http] enabled=true，保留 [admin.rest] enabled=false；默认地址 127.0.0.1:7651。
-   保存后重启 daemon，再执行第 2 步。Docker wrapper 用 crosslane restart；原生部署重启 crosslaned 服务。
+   保存后自动重载，再执行第 2 步；监听的启停、地址和端口均不需要重启 daemon。
 2. 创建并启用管理访问：
    crosslane admin token create --name ops --enable-rest
    crosslane admin token create --name monitor --role read-only
@@ -141,7 +141,7 @@ fn topic_text(topic: &str) -> Result<&'static str> {
 命令通过本机 Unix socket 执行，不需要已有 Bearer token。create/rotate 的明文只返回一次，--json 的 secret 字段可供自动化使用；配置仅保存 SHA256 摘要。请求头发送明文 Authorization: Bearer TOKEN。
 多把 admin/read-only 令牌可同时有效，read-only 只允许 GET/HEAD。启停、轮换、撤销立即影响后续请求，已受理的请求/批量任务不会被自动取消。rotate 保留 ID、名称、权限和启停状态。
 已有令牌时，可在 config edit admin 中直接设置 [admin.rest] enabled=true，无需重复创建。关闭状态监听时须同时关闭 REST；config reset status-http 会完成这两项，并保留令牌。config reset admin 会清除令牌和重置 socket，保留状态监听。
-编辑器未改设置直接退出时不写文件、不重载服务，仍提示待重启字段。--enable-rest 要求运行监听与磁盘配置的启用状态、地址和端口一致，有待重启的监听变更时会拒绝创建。socket 默认值取自 daemon；连接未提供默认值的旧 daemon 时保留当前 socket。完整 config reset 也会清除管理令牌并关闭 REST/状态监听，操作前自动备份。
+编辑器未改设置直接退出时不写文件、不重载服务，仍提示待重启字段。--enable-rest 要求运行监听与磁盘配置的启用状态、地址和端口一致，监听配置尚未应用时会拒绝创建，请先执行 crosslane config reload。socket 默认值取自 daemon；连接未提供默认值的旧 daemon 时保留当前 socket。完整 config reset 也会清除管理令牌并关闭 REST/状态监听，操作前自动备份。
 旧 token_sha256/read_token_sha256 配置继续兼容，在列表中显示为 legacy-admin/legacy-read-only，也可使用这些 ID 管理。最后一把令牌撤销后关闭 Admin REST，公开状态和业务 service 保持原配置。
 Kiro 企业用户与套餐通过 /admin/v1/kiro/enterprise 的 REST 接口管理；AWS 管理员凭据只配置在 crosslaned 的 CROSSLANE_KIRO_ADMIN_* 环境变量中，调用方仍只传 Admin token。接口说明：docs/admin-rest.zh-CN.md、docs/kiro-enterprise-admin.zh-CN.md。"#,
         "provider" => {
@@ -238,7 +238,7 @@ Copilot API 地址优先使用账号 token 返回的 endpoint；仅当缺失且�
 
   `config show` 默认脱敏且不显示原文件注释；只有显式使用 `--show-secrets` 才输出完整原文或生效配置。
 
-`crosslane config list` 显示每个模块的适用来源，`show <模块> --effective` 查看合并默认值后的配置。`config edit admin` 与 `config edit status-http` 同时展示管理鉴权及独立监听（默认 127.0.0.1:7651），可原子修改依赖设置；未改设置退出时不写文件、不重载服务，仍提示待重启字段；首次启用详见 `crosslane guide admin`。新建 Copilot 实例会在配置文件中写入默认 Client ID；用 `crosslane config path` 定位文件，或在组织要求自有 OAuth App 时用 `crosslane provider edit copilot --setting 'client_id="Iv1.your-app"'` 覆盖。Kiro SSO 用 `config edit sso`，不是 Copilot 的 Azure SSO URL。`config reset <模块>` 只重置所选模块，status-http 另会关闭 REST 并保留令牌，admin 重置会清除令牌；不指定模块会重置 Kiro 与全局运行参数、清除管理令牌和模型映射、关闭 REST/状态监听，同时保留提供源、API key、服务、模型禁用规则和告警。socket 默认值取自 daemon；旧 daemon 未提供默认值时保留当前 socket。server.host/port 仅是新建服务默认值，已有服务用 service edit 修改；admin.socket、status_http 和 TLS 模式切换需重启 daemon。"#
+`crosslane config list` 显示每个模块的适用来源，`show <模块> --effective` 查看合并默认值后的配置。`config edit admin` 与 `config edit status-http` 同时展示管理鉴权及独立监听（默认 127.0.0.1:7651），可原子修改依赖设置；未改设置退出时不写文件、不重载服务，仍提示待重启字段；首次启用详见 `crosslane guide admin`。新建 Copilot 实例会在配置文件中写入默认 Client ID；用 `crosslane config path` 定位文件，或在组织要求自有 OAuth App 时用 `crosslane provider edit copilot --setting 'client_id="Iv1.your-app"'` 覆盖。Kiro SSO 用 `config edit sso`，不是 Copilot 的 Azure SSO URL。`config reset <模块>` 只重置所选模块，status-http 另会关闭 REST 并保留令牌，admin 重置会清除令牌；不指定模块会重置 Kiro 与全局运行参数、清除管理令牌和模型映射、关闭 REST/状态监听，同时保留提供源、API key、服务、模型禁用规则和告警。socket 默认值取自 daemon；旧 daemon 未提供默认值时保留当前 socket。server.host/port 仅是新建服务默认值，已有服务用 service edit 修改；status_http 支持热重载；admin.socket 和 TLS 模式切换需重启 daemon。"#
         }
         "apikey" => {
             "API key 可用 `--provider kiro`、`--provider copilot` 限定允许来源；add 省略时保持 Kiro-only，重复传入可允许两者，并可用 `--model 'copilot/*'` 限制模型。service create 自动生成的 key 继承服务来源范围。`apikey list/usage/history --provider <ID>` 是查询过滤；`limit` 的累计 credits 上限跨该 key 的来源共用，`reset-usage` 清除全部来源累计用量，不单独按来源重置。`show/edit` 可查看或修改范围；删除需确认。"

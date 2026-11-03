@@ -508,7 +508,12 @@ async fn admin_editor_noop_preserves_legacy_files_and_reports_pending_restarts()
         ("[admin]\nsocket = '/tmp/running-admin.sock'\n", json!([])),
         ("[admin]\nsocket = '/tmp/running-admin.sock'\n[status_http]\nenabled = true\n[admin.rest]\nenabled = true\ntoken_sha256 = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\n", json!(["status_http.enabled"])),
     ] {
-        for module in ["admin", "status-http"] {
+        for (module, hot_reload) in [
+            ("admin", false),
+            ("admin", true),
+            ("status-http", false),
+            ("status-http", true),
+        ] {
             let workspace = tempfile::tempdir().unwrap();
             let config_file = workspace.path().join("config.toml");
             fs::write(&config_file, original).unwrap();
@@ -519,7 +524,7 @@ async fn admin_editor_noop_preserves_legacy_files_and_reports_pending_restarts()
             let server_path = config_file.clone();
             let server = tokio::spawn(async move {
                 for (expected_method, result) in [
-                    (method::CONFIG_PATH, json!({"config_file":server_path,"accounts_file":"","daily_file":"","stats_file":"","admin_socket":"/tmp/running-admin.sock","default_admin_socket":"/tmp/daemon-default.sock"})),
+                    (method::CONFIG_PATH, json!({"config_file":server_path,"accounts_file":"","daily_file":"","stats_file":"","admin_socket":"/tmp/running-admin.sock","default_admin_socket":"/tmp/daemon-default.sock","status_http_hot_reload":hot_reload})),
                     (method::CONFIG_SHOW, json!({"path":server_path,"raw":original,"effective_json":effective})),
                 ] {
                     let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
@@ -539,7 +544,20 @@ async fn admin_editor_noop_preserves_legacy_files_and_reports_pending_restarts()
             let result: Value = serde_json::from_slice(&output.stdout).unwrap();
             assert_eq!(result["saved"], false);
             assert_eq!(result["changed"], false);
-            assert_eq!(result["needs_restart"], expected_restart);
+            let expected = if hot_reload {
+                Value::Array(
+                    expected_restart
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|field| !field.as_str().unwrap().starts_with("status_http."))
+                        .cloned()
+                        .collect(),
+                )
+            } else {
+                expected_restart.clone()
+            };
+            assert_eq!(result["needs_restart"], expected);
             assert_eq!(fs::read_to_string(&config_file).unwrap(), original);
             server.await.unwrap();
         }

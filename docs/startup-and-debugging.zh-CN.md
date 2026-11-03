@@ -167,8 +167,8 @@ port = 7651
 
 默认 `enabled = false`，启用后缺省监听 `127.0.0.1:7651`。
 `crosslane config edit status-http` 与 `config edit admin` 都会同时展示该监听和
-关联的 REST 鉴权，并补齐旧配置缺少的默认字段。修改这一节后需重启
-`crosslaned`；`config reload` 会提示需要重启，并保留当前监听。需要从其他机器探测时，
+关联的 REST 鉴权，并补齐旧配置缺少的默认字段。本节变更支持热重载，无需重启
+`crosslaned`；手工编辑后可执行 `config reload`，绑定失败时保留当前监听和运行配置。需要从其他机器探测时，
 将 `host` 改为对应的监听地址。Docker 的 host network 无需额外映射端口。
 
 | 方法与路径 | 含义 |
