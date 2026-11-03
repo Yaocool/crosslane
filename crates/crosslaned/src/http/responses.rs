@@ -620,7 +620,10 @@ fn usage(chat: &Value) -> Value {
     let output = chat["completion_tokens"].as_u64().unwrap_or_default();
     json!({
         "input_tokens":input,"output_tokens":output,"total_tokens":input.saturating_add(output),
-        "input_tokens_details":{"cached_tokens":chat["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or_default()},
+        "input_tokens_details":{
+            "cached_tokens":chat["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or_default(),
+            "cache_write_tokens":chat["prompt_tokens_details"]["cache_write_tokens"].as_u64().unwrap_or_default()
+        },
         "output_tokens_details":{"reasoning_tokens":chat["completion_tokens_details"]["reasoning_tokens"].as_u64().unwrap_or_default()}
     })
 }

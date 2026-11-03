@@ -55,6 +55,58 @@ fn assistant_history_ephemeral_marker_does_not_block_generation() {
 }
 
 #[test]
+fn non_native_cache_strategies_are_rejected_instead_of_becoming_generation_requests() {
+    for options in [
+        json!({"prewarm":true}),
+        json!({"ttl":"30m"}),
+        json!({"ttl":"12h"}),
+        json!({"mode":"explicit"}),
+    ] {
+        let body = json!({"model":"test","messages":[{"role":"user","content":"hello"}],
+            "prompt_cache_options":options});
+        let result = crosslane_translate::parse_openai_request(body)
+            .and_then(|request| validate_openai(&request));
+        assert!(result.is_err(), "Kiro must not silently ignore {options}");
+        let request = serde_json::from_value(json!({"model":"test","input":"hello",
+            "prompt_cache_options":options}))
+        .unwrap();
+        assert!(
+            crosslane_translate::responses_to_openai(&request).is_err(),
+            "Responses ignored {options}"
+        );
+    }
+}
+
+#[test]
+fn nullable_default_cache_options_and_legacy_retention_remain_compatible() {
+    for options in [
+        Value::Null,
+        json!({}),
+        json!({"mode":"implicit","prewarm":false,"ttl":null}),
+    ] {
+        let request = crosslane_translate::parse_openai_request(json!({"model":"test",
+            "messages":[{"role":"user","content":"Business data: prompt_cache_options.prewarm=true"}],
+            "prompt_cache_options":options,"prompt_cache_retention":"24h"})).unwrap();
+        validate_openai(&request).unwrap();
+        let request = serde_json::from_value(json!({"model":"test","input":"hello",
+            "prompt_cache_options":options,"prompt_cache_retention":"in_memory"}))
+        .unwrap();
+        crosslane_translate::responses_to_openai(&request).unwrap();
+    }
+    for part in [
+        json!({"type":"text","text":"prefix","prompt_cache_breakpoint":{"mode":"explicit"}}),
+        json!({"type":"file","file":{"file_data":"not-decoded"},"prompt_cache_breakpoint":{"mode":"explicit"}}),
+    ] {
+        let result = crosslane_translate::parse_openai_request(json!({"model":"test",
+            "messages":[{"role":"user","content":[part]}]}));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("prompt_cache_breakpoint"));
+    }
+}
+
+#[test]
 fn absent_and_null_cache_controls_do_not_create_kiro_breakpoints() {
     for absent in [false, true] {
         let control = Value::Null;

@@ -402,6 +402,60 @@ per account, run `crosslane account overage enable --max-credits 500`; use
 `crosslane account overage disable` to turn it off. Upstream limits and requests
 already in progress can still affect final usage.
 
+## Kiro prompt cache usage
+
+`features.enable_prompt_cache` defaults to `false`. Use
+`crosslane config edit features` to set it to `true`; saving validates and
+reloads the configuration. This forwards valid client `cache_control` hints as
+native Kiro `cachePoint` blocks. Acceptance and cache hits depend on the upstream;
+this switch does not enable simulated cache billing or guarantee caching.
+
+For Claude Code and `/v1/messages`, `cache_read_input_tokens` counts prompt
+tokens read from cache and `cache_creation_input_tokens` counts prompt tokens
+written to cache. These are both input counters; `output_tokens` counts generated
+tokens. Crosslane always forwards actual upstream cache counters, including when
+hint forwarding is disabled. Missing upstream cache counters remain zero rather
+than being inferred from repeated local requests.
+
+For streaming responses, usage known before the first content event is included
+in `message_start`. The final `message_delta.usage` carries cumulative usage,
+including cache counters reported later. Inspect the complete stream when
+diagnosing zero cache usage. Non-streaming responses contain the same final
+counters in `usage`. Separate Kiro metadata events are merged without counting
+cached input twice.
+
+For OpenAI Chat Completions, `usage.prompt_tokens_details` contains
+`cached_tokens` (reads) and `cache_write_tokens` (writes). Responses returns
+the same two fields in `usage.input_tokens_details`. Both are subsets of the input total. Chat streaming
+requires `stream_options: {"include_usage": true}` to receive the final usage
+chunk; Responses streaming includes usage in its terminal response event.
+See the [official OpenAI cache usage documentation](https://developers.openai.com/api/docs/guides/prompt-caching#monitor-cache-performance).
+
+On Kiro routes, `prompt_cache_key` gives both OpenAI endpoints a stable affinity
+hint, hashed into the upstream conversation ID. It does not enable cache hints
+or pin an account. Kiro cache points still use the `cache_control` extension
+described above, without OpenAI retention or breakpoint-lifetime guarantees.
+Kiro rejects explicit `prompt_cache_breakpoint` markers and
+`prompt_cache_options` that request prewarming, a minimum `ttl`, or `mode=explicit`
+with HTTP 400 before generation. A prewarm is never downgraded to a normal
+generation. Null/default controls, `prewarm=false`, and legacy
+`prompt_cache_retention` hints remain accepted; retention is not guaranteed.
+Between native OpenAI Chat and Responses upstreams, protocol conversion preserves
+`prompt_cache_options`, `prompt_cache_retention`, and content-level
+`prompt_cache_breakpoint` markers when the target can represent them. Prewarming
+and a 12-hour minimum lifetime require native Responses and are rejected when
+the selected upstream only supports Chat or Messages.
+
+Copilot requests upstream usage for accounting even when the Chat caller omits
+or disables `stream_options.include_usage`. The HTTP boundary records those real
+tokens, cache counters, and supplier bills before suppressing usage-only chunks
+and billing metadata from that caller. Content, errors and `[DONE]` stay intact.
+Clients that explicitly request usage still receive it. Messages and Responses
+retain their normal usage events.
+Internal statistics normalize Messages input as ordinary input plus cache reads
+and writes. OpenAI input totals already include those subsets and are preserved.
+The public responses retain each protocol's own input-token semantics.
+
 ## Request latency controls
 
 ### Load Claude Code MCP tools on demand

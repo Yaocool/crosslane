@@ -40,6 +40,10 @@ impl Usage {
                     &usage["prompt_tokens_details"]["cached_tokens"],
                 );
                 assign(
+                    &mut self.cache_write,
+                    &usage["prompt_tokens_details"]["cache_write_tokens"],
+                );
+                assign(
                     &mut self.reasoning,
                     &usage["completion_tokens_details"]["reasoning_tokens"],
                 );
@@ -50,6 +54,10 @@ impl Usage {
                 assign(
                     &mut self.cached,
                     &usage["input_tokens_details"]["cached_tokens"],
+                );
+                assign(
+                    &mut self.cache_write,
+                    &usage["input_tokens_details"]["cache_write_tokens"],
                 );
                 assign(
                     &mut self.reasoning,
@@ -68,12 +76,12 @@ impl Usage {
             }),
             ProviderProtocol::OpenAiChat => json!({
                 "prompt_tokens":self.input,"completion_tokens":self.output,"total_tokens":self.input.saturating_add(self.output),
-                "prompt_tokens_details":{"cached_tokens":self.cached},
+                "prompt_tokens_details":{"cached_tokens":self.cached,"cache_write_tokens":self.cache_write},
                 "completion_tokens_details":{"reasoning_tokens":self.reasoning}
             }),
             ProviderProtocol::OpenAiResponses => json!({
                 "input_tokens":self.input,"output_tokens":self.output,"total_tokens":self.input.saturating_add(self.output),
-                "input_tokens_details":{"cached_tokens":self.cached},
+                "input_tokens_details":{"cached_tokens":self.cached,"cache_write_tokens":self.cache_write},
                 "output_tokens_details":{"reasoning_tokens":self.reasoning}
             }),
         }

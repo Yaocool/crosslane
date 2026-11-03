@@ -312,22 +312,133 @@ fn response(protocol: ProviderProtocol) -> Value {
         ProviderProtocol::ClaudeMessages => {
             json!({"id":"message_1","model":"test","type":"message","role":"assistant",
             "content":[{"type":"text","text":"你好"},{"type":"tool_use","id":"call_a","name":"lookup","input":{"q":"x"}}],
-            "stop_reason":"tool_use","usage":{"input_tokens":8,"output_tokens":5,"cache_read_input_tokens":12}})
+            "stop_reason":"tool_use","usage":{"input_tokens":8,"output_tokens":5,"cache_read_input_tokens":12,"cache_creation_input_tokens":3}})
         }
         ProviderProtocol::OpenAiChat => {
             json!({"id":"chat_1","model":"test","choices":[{"index":0,"message":{"role":"assistant","content":"你好",
             "tool_calls":[{"id":"call_a","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"x\"}"}}]},"finish_reason":"tool_calls"}],
-            "usage":{"prompt_tokens":20,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":12}}})
+            "usage":{"prompt_tokens":23,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":12,"cache_write_tokens":3}}})
         }
         ProviderProtocol::OpenAiResponses => {
             json!({"id":"response_1","model":"test","status":"completed","output":[
             {"type":"message","role":"assistant","content":[{"type":"output_text","text":"你好"}]},
             {"type":"function_call","call_id":"call_a","name":"lookup","arguments":"{\"q\":\"x\"}"}],
-            "usage":{"input_tokens":20,"output_tokens":5,"input_tokens_details":{"cached_tokens":12}}})
+            "usage":{"input_tokens":23,"output_tokens":5,"input_tokens_details":{"cached_tokens":12,"cache_write_tokens":3}}})
         }
     };
     value["copilot_usage"] = json!({"total_nano_aiu":12345,"opaque":{"new_field":true}});
     value
+}
+
+#[test]
+fn cache_prewarm_and_response_lifetimes_are_not_downgraded_across_protocols() {
+    for options in [json!({"prewarm":true}), json!({"ttl":"12h"})] {
+        let mut body = request(ProviderProtocol::OpenAiResponses);
+        body["prompt_cache_options"] = options.clone();
+        for to in [
+            ProviderProtocol::OpenAiChat,
+            ProviderProtocol::ClaudeMessages,
+        ] {
+            assert!(translate_request(&body, ProviderProtocol::OpenAiResponses, to, None).is_err());
+        }
+        assert_eq!(
+            translate_request(
+                &body,
+                ProviderProtocol::OpenAiResponses,
+                ProviderProtocol::OpenAiResponses,
+                None
+            )
+            .unwrap(),
+            body
+        );
+    }
+    let mut body = request(ProviderProtocol::OpenAiChat);
+    body["messages"][1]["content"][0]["prompt_cache_breakpoint"] =
+        json!({"mode":"explicit","ttl":"12h"});
+    assert!(validate_chat_cache_controls(&body).is_err());
+    assert!(translate_request(
+        &body,
+        ProviderProtocol::OpenAiChat,
+        ProviderProtocol::ClaudeMessages,
+        None
+    )
+    .is_err());
+    let converted = translate_request(
+        &body,
+        ProviderProtocol::OpenAiChat,
+        ProviderProtocol::OpenAiResponses,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        converted["input"][1]["content"][0]["prompt_cache_breakpoint"]["ttl"],
+        "12h"
+    );
+}
+
+#[test]
+fn openai_cache_affinity_preserves_legacy_conversation_priority_and_nullable_keys() {
+    for (conversation, cache, expected) in [
+        (Value::Null, json!("cache-key"), Some("cache-key")),
+        (json!("legacy-id"), json!("cache-key"), Some("legacy-id")),
+        (json!("  "), json!(" cache-key "), Some("cache-key")),
+        (Value::Null, Value::Null, None),
+    ] {
+        let request = crate::parse_openai_request(json!({"model":"test",
+            "messages":[{"role":"user","content":"hello"}],
+            "conversation_id":conversation,"prompt_cache_key":cache}))
+        .unwrap();
+        assert_eq!(request.conversation_hint(), expected);
+    }
+    assert!(crate::parse_openai_request(json!({"model":"test",
+        "messages":[{"role":"user","content":"hello"}],"prompt_cache_key":42}))
+    .is_err());
+}
+
+#[test]
+fn openai_request_conversion_preserves_cache_options_and_explicit_breakpoints() {
+    let breakpoint = json!({"mode":"explicit","ttl":"30m"});
+    for from in [
+        ProviderProtocol::OpenAiChat,
+        ProviderProtocol::OpenAiResponses,
+    ] {
+        let to = if from == ProviderProtocol::OpenAiChat {
+            ProviderProtocol::OpenAiResponses
+        } else {
+            ProviderProtocol::OpenAiChat
+        };
+        let content = if from == ProviderProtocol::OpenAiChat {
+            json!([{"type":"text","text":"cached prefix","prompt_cache_breakpoint":breakpoint},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,aGVsbG8="},"prompt_cache_breakpoint":breakpoint}])
+        } else {
+            json!([{"type":"input_text","text":"cached prefix","prompt_cache_breakpoint":breakpoint},
+                {"type":"input_image","image_url":"data:image/png;base64,aGVsbG8=","prompt_cache_breakpoint":breakpoint}])
+        };
+        let mut body = json!({"model":"test","stream":true,"prompt_cache_key":"cache-group",
+            "prompt_cache_retention":"24h","prompt_cache_options":{"mode":"explicit","ttl":"30m"}});
+        let field = if from == ProviderProtocol::OpenAiChat {
+            "messages"
+        } else {
+            "input"
+        };
+        body[field] = json!([{"role":"user","content":content}]);
+        let converted = translate_request(&body, from, to, None).unwrap();
+        for name in [
+            "prompt_cache_key",
+            "prompt_cache_options",
+            "prompt_cache_retention",
+        ] {
+            assert_eq!(converted[name], body[name], "{from:?}->{to:?}: {name}");
+        }
+        let field = if to == ProviderProtocol::OpenAiChat {
+            "messages"
+        } else {
+            "input"
+        };
+        for part in converted[field][0]["content"].as_array().unwrap() {
+            assert_eq!(part["prompt_cache_breakpoint"], breakpoint);
+        }
+    }
 }
 
 #[test]
@@ -369,17 +480,26 @@ fn all_six_responses_preserve_tools_usage_cache_and_raw_billing() {
                 ProviderProtocol::ClaudeMessages => {
                     assert_eq!(converted["usage"]["input_tokens"], 8);
                     assert_eq!(converted["usage"]["cache_read_input_tokens"], 12);
+                    assert_eq!(converted["usage"]["cache_creation_input_tokens"], 3);
                     assert_eq!(converted["stop_reason"], "tool_use");
                 }
                 ProviderProtocol::OpenAiChat => {
-                    assert_eq!(converted["usage"]["prompt_tokens"], 20);
+                    assert_eq!(converted["usage"]["prompt_tokens"], 23);
+                    assert_eq!(
+                        converted["usage"]["prompt_tokens_details"]["cache_write_tokens"],
+                        3
+                    );
                     assert_eq!(
                         converted["usage"]["prompt_tokens_details"]["cached_tokens"],
                         12
                     );
                 }
                 ProviderProtocol::OpenAiResponses => {
-                    assert_eq!(converted["usage"]["input_tokens"], 20);
+                    assert_eq!(converted["usage"]["input_tokens"], 23);
+                    assert_eq!(
+                        converted["usage"]["input_tokens_details"]["cache_write_tokens"],
+                        3
+                    );
                     assert_eq!(
                         converted["usage"]["input_tokens_details"]["cached_tokens"],
                         12
@@ -399,7 +519,7 @@ fn stream(protocol: ProviderProtocol) -> Vec<u8> {
             json!({"choices":[],"usage":response(protocol)["usage"],"copilot_usage":response(protocol)["copilot_usage"]}),
         ],
         ProviderProtocol::ClaudeMessages => vec![
-            json!({"type":"message_start","message":{"id":"message_1","model":"test","usage":{"input_tokens":8,"cache_read_input_tokens":12,"output_tokens":0}}}),
+            json!({"type":"message_start","message":{"id":"message_1","model":"test","usage":{"input_tokens":8,"cache_read_input_tokens":12,"cache_creation_input_tokens":3,"output_tokens":0}}}),
             json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
             json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"你好"}}),
             json!({"type":"content_block_stop","index":0}),
@@ -472,19 +592,28 @@ fn all_six_stream_directions_keep_utf8_tools_and_trailing_usage() {
                         .unwrap();
                     assert_eq!(end["usage"]["input_tokens"], 8);
                     assert_eq!(end["usage"]["cache_read_input_tokens"], 12);
+                    assert_eq!(end["usage"]["cache_creation_input_tokens"], 3);
                     assert_eq!(end["delta"]["stop_reason"], "tool_use");
                     assert_eq!(values.last().unwrap()["type"], "message_stop");
                 }
                 ProviderProtocol::OpenAiChat => {
                     assert!(raw.ends_with("data: [DONE]\n\n"));
                     let usage = values.iter().find(|v| v.get("usage").is_some()).unwrap();
-                    assert_eq!(usage["usage"]["prompt_tokens"], 20);
+                    assert_eq!(usage["usage"]["prompt_tokens"], 23);
+                    assert_eq!(
+                        usage["usage"]["prompt_tokens_details"]["cache_write_tokens"],
+                        3
+                    );
                     assert_eq!(usage["usage"]["completion_tokens"], 5);
                 }
                 ProviderProtocol::OpenAiResponses => {
                     let done = &values.last().unwrap()["response"];
                     assert_eq!(done["output"][1]["arguments"], "{\"q\":\"x\"}");
-                    assert_eq!(done["usage"]["input_tokens"], 20);
+                    assert_eq!(done["usage"]["input_tokens"], 23);
+                    assert_eq!(
+                        done["usage"]["input_tokens_details"]["cache_write_tokens"],
+                        3
+                    );
                     for (index, value) in values.iter().enumerate() {
                         assert_eq!(value["sequence_number"], index);
                     }

@@ -9,7 +9,7 @@ mod response;
 mod stream;
 mod tools;
 
-pub use request::translate_request;
+pub use request::{translate_request, validate_chat_cache_controls};
 pub use response::{translate_error, translate_response};
 pub use stream::StreamBridge;
 pub use tools::ToolNames;

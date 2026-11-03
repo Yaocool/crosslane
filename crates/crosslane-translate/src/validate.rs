@@ -1807,6 +1807,7 @@ fn validate_compact_edit(
 }
 
 pub fn validate_openai(request: &OpenAiRequest) -> Result<(), ValidationError> {
+    crate::cache_compatibility::validate_options(request.prompt_cache_options.as_ref())?;
     common(&request.model, request.messages.is_empty())?;
     if request.n.is_some_and(|n| !(1..=128).contains(&n)) {
         return invalid("n", "must be in 1..=128");
@@ -1871,6 +1872,10 @@ pub fn validate_openai(request: &OpenAiRequest) -> Result<(), ValidationError> {
             &format!("messages.{index}.cache_control"),
         )?);
         if let Some(content) = message.content.as_ref() {
+            crate::cache_compatibility::validate_content(
+                content,
+                &format!("messages.{index}.content"),
+            )?;
             document_count += count_claude_documents_in_content(content);
             cache_breakpoints = cache_breakpoints.saturating_add(validate_content_cache_controls(
                 content,

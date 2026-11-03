@@ -1,4 +1,226 @@
 use super::*;
+
+#[tokio::test]
+async fn protocols_report_real_cache_usage_from_split_metadata_before_or_after_content() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/ListAvailableModels"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"models":[{"modelId":"claude-opus-5"}]})),
+        )
+        .mount(&mock)
+        .await;
+    let conversations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = conversations.clone();
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(move |request: &wiremock::Request| {
+            let wire: Value = serde_json::from_slice(&request.body).unwrap();
+            let content = wire["conversationState"]["currentMessage"]["userInputMessage"]
+                ["content"]
+                .as_str()
+                .unwrap();
+            let metadata_first = content.contains("metadata-first");
+            assert!(!wire.to_string().contains("cache-key-fixture"));
+            if content.contains("openai-cache-probe") {
+                observed
+                    .lock()
+                    .unwrap()
+                    .push(wire["conversationState"]["conversationId"].clone());
+            }
+            let metadata = [
+                (
+                    "messageMetadataEvent",
+                    json!({"tokenUsage":{"inputTokens":1000,"outputTokens":20}}),
+                ),
+                (
+                    "usageEvent",
+                    json!({"tokenUsage":{"cacheReadInputTokens":600}}),
+                ),
+                (
+                    "messageMetadataEvent",
+                    json!({"tokenUsage":{"cacheWriteInputTokens":100}}),
+                ),
+            ]
+            .into_iter()
+            .flat_map(|(kind, body)| event_stream_frame(kind, body))
+            .collect::<Vec<_>>();
+            let text = event_stream_frame("assistantResponseEvent", json!({"content":"pong"}));
+            let body = if metadata_first {
+                [metadata, text].concat()
+            } else {
+                [text, metadata].concat()
+            };
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/vnd.amazon.eventstream")
+                .set_body_bytes(body)
+        })
+        .expect(16)
+        .mount(&mock)
+        .await;
+    let port = unused_tcp_port();
+    let daemon =
+        Daemon::start_http(port, &format!("{}/generateAssistantResponse", mock.uri())).await;
+    expect_ok(daemon.call("account.import", json!({"accounts":[{
+        "id":"acc_66666666","email":"cache-test@example.com","machine_id":"6".repeat(64),
+        "credentials":{"access_token":"synthetic-cache-test","region":"us-east-1",
+            "expires_at":4_000_000_000i64,"auth_method":"idc"},
+        "usage":{"current":0.0,"limit":100.0,"percent_used":0.0,"updated_at":1},"created_at":1
+    }]})).await);
+    expect_ok(daemon.call("models", json!({})).await);
+    let client = reqwest::Client::new();
+    // Keep enable_prompt_cache at its default false: reported upstream usage
+    // must be forwarded even when this proxy does not emit cache hints.
+    for route in ["v1/messages", "v1/chat/completions", "v1/responses"] {
+        let claude = route.ends_with("messages");
+        let chat = route.ends_with("completions");
+        for metadata_first in [true, false] {
+            for stream in [false, true] {
+                for include_usage in if chat {
+                    &[false, true][..]
+                } else {
+                    &[true][..]
+                } {
+                    // Vary the whole first message. The shared cache key must
+                    // retain affinity independently of message fingerprints.
+                    let content = format!(
+                        "{} {} {stream} {include_usage}",
+                        if metadata_first {
+                            "metadata-first"
+                        } else {
+                            "metadata-last"
+                        },
+                        if claude {
+                            "claude-cache-probe"
+                        } else {
+                            "openai-cache-probe"
+                        }
+                    );
+                    let mut request = if route.ends_with("responses") {
+                        json!({"model":"claude-opus-5","max_output_tokens":100,"stream":stream,"store":false,
+                            "input":[{"role":"user","content":content}],"prompt_cache_key":"cache-key-fixture"})
+                    } else {
+                        json!({"model":"claude-opus-5","max_tokens":100,"stream":stream,
+                            "messages":[{"role":"user","content":content}]})
+                    };
+                    if chat {
+                        request["prompt_cache_key"] = json!("cache-key-fixture");
+                        if stream && *include_usage {
+                            request["stream_options"] = json!({"include_usage":true});
+                        }
+                    }
+                    let response = client
+                        .post(format!("http://127.0.0.1:{port}/{route}"))
+                        .header("x-api-key", daemon.api_key.as_deref().unwrap())
+                        .bearer_auth(daemon.api_key.as_deref().unwrap())
+                        .header("anthropic-version", "2023-06-01")
+                        .header(
+                            "user-agent",
+                            if claude {
+                                "claude-cli/2.1.266 (external, cli)"
+                            } else {
+                                "codex_cli_rs/0.1.0"
+                            },
+                        )
+                        .json(&request)
+                        .send()
+                        .await
+                        .unwrap();
+                    let status = response.status();
+                    let body = response.text().await.unwrap();
+                    assert_eq!(status, reqwest::StatusCode::OK, "{route}: {body}");
+                    let usage = if stream {
+                        let events = body
+                            .lines()
+                            .filter_map(|line| line.strip_prefix("data: "))
+                            .filter(|data| *data != "[DONE]")
+                            .map(|data| serde_json::from_str::<Value>(data).unwrap())
+                            .collect::<Vec<_>>();
+                        if claude {
+                            let start = events
+                                .iter()
+                                .find(|event| event["type"] == "message_start")
+                                .unwrap();
+                            assert_eq!(
+                                start["message"]["usage"]["cache_read_input_tokens"],
+                                if metadata_first { 600 } else { 0 }
+                            );
+                            assert_eq!(
+                                start["message"]["usage"]["cache_creation_input_tokens"],
+                                if metadata_first { 100 } else { 0 }
+                            );
+                            if metadata_first {
+                                assert_eq!(start["message"]["usage"]["input_tokens"], 300);
+                            }
+                            events
+                                .iter()
+                                .find(|event| event["type"] == "message_delta")
+                                .unwrap()["usage"]
+                                .clone()
+                        } else if chat {
+                            assert!(body.contains("data: [DONE]"));
+                            if !include_usage {
+                                assert!(
+                                    events.iter().all(|event| event["usage"].is_null()),
+                                    "{body}"
+                                );
+                                continue;
+                            }
+                            let event = events
+                                .iter()
+                                .find(|event| event["usage"].is_object())
+                                .unwrap();
+                            assert_eq!(event["choices"], json!([]));
+                            event["usage"].clone()
+                        } else {
+                            events
+                                .iter()
+                                .find(|event| event["type"] == "response.completed")
+                                .unwrap()["response"]["usage"]
+                                .clone()
+                        }
+                    } else {
+                        serde_json::from_str::<Value>(&body).unwrap()["usage"].clone()
+                    };
+                    if claude {
+                        assert_eq!(usage["input_tokens"], 300, "{body}");
+                        assert_eq!(usage["cache_read_input_tokens"], 600, "{body}");
+                        assert_eq!(usage["cache_creation_input_tokens"], 100, "{body}");
+                    } else {
+                        let (input, details) = if chat {
+                            ("prompt_tokens", "prompt_tokens_details")
+                        } else {
+                            ("input_tokens", "input_tokens_details")
+                        };
+                        assert_eq!(usage[input], 1000, "{body}");
+                        assert_eq!(usage["total_tokens"], 1020, "{body}");
+                        assert_eq!(usage[details]["cached_tokens"], 600, "{body}");
+                        assert_eq!(usage[details]["cache_write_tokens"], 100, "{body}");
+                    }
+                    assert_eq!(
+                        usage[if chat {
+                            "completion_tokens"
+                        } else {
+                            "output_tokens"
+                        }],
+                        20,
+                        "{body}"
+                    );
+                }
+            }
+        }
+    }
+    let conversations = conversations.lock().unwrap();
+    assert_eq!(conversations.len(), 12);
+    assert!(conversations[0].is_string());
+    assert!(
+        conversations.iter().all(|id| id == &conversations[0]),
+        "cache affinity changed: {conversations:?}"
+    );
+}
+
 use serde_json::{json, Value};
 
 fn request() -> Value {

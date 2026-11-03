@@ -9,6 +9,9 @@ pub fn translate_request(
     max_output_tokens: Option<u64>,
 ) -> Result<Value, BridgeError> {
     if from == to {
+        if to == ProviderProtocol::OpenAiChat {
+            validate_chat_cache_controls(body)?;
+        }
         return Ok(body.clone());
     }
     if !body.is_object() {
@@ -23,10 +26,48 @@ pub fn translate_request(
         return Err(invalid("messages must be an array"));
     }
     match to {
-        ProviderProtocol::OpenAiChat => Ok(chat),
+        ProviderProtocol::OpenAiChat => {
+            validate_chat_cache_controls(&chat)?;
+            Ok(chat)
+        }
         ProviderProtocol::ClaudeMessages => chat_to_messages(&chat, max_output_tokens),
         ProviderProtocol::OpenAiResponses => chat_to_responses(&chat),
     }
+}
+
+/// Response-only cache strategies must not silently become a Chat generation.
+pub fn validate_chat_cache_controls(body: &Value) -> Result<(), BridgeError> {
+    if body
+        .pointer("/prompt_cache_options/prewarm")
+        .is_some_and(|value| !value.is_null() && value != &Value::Bool(false))
+    {
+        return Err(invalid(
+            "prompt_cache_options.prewarm requires native Responses support",
+        ));
+    }
+    if body
+        .pointer("/prompt_cache_options/ttl")
+        .and_then(Value::as_str)
+        == Some("12h")
+    {
+        return Err(invalid(
+            "prompt_cache_options.ttl=12h requires native Responses support",
+        ));
+    }
+    for message in array(&body["messages"]) {
+        for part in array(&message["content"]) {
+            if part
+                .pointer("/prompt_cache_breakpoint/ttl")
+                .and_then(Value::as_str)
+                == Some("12h")
+            {
+                return Err(invalid(
+                    "prompt_cache_breakpoint.ttl=12h requires native Responses support",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn copy_fields(from: &Value, to: &mut Value, fields: &[&str]) {
@@ -217,7 +258,7 @@ fn responses_content_to_chat(content: &Value) -> Result<Value, BridgeError> {
         return Err(invalid("Responses content must be a string or array"));
     }
     Ok(json!(array(content).iter().map(|part| {
-        Ok(match string(&part["type"]) {
+        let mut converted = match string(&part["type"]) {
             "input_text" | "output_text" | "text" => json!({"type":"text","text":part["text"]}),
             "input_image" => json!({"type":"image_url","image_url":{"url":part["image_url"],"detail":part["detail"].as_str().unwrap_or("auto")}}),
             "input_file" => {
@@ -226,7 +267,9 @@ fn responses_content_to_chat(content: &Value) -> Result<Value, BridgeError> {
             }
             "refusal" => json!({"type":"text","text":part["refusal"]}),
             _ => return Err(invalid(format!("cannot adapt Responses content {}", string(&part["type"])))),
-        })
+        };
+        copy_fields(part, &mut converted, &["prompt_cache_breakpoint"]);
+        Ok(converted)
     }).collect::<Result<Vec<Value>, BridgeError>>()?))
 }
 
@@ -319,6 +362,7 @@ fn responses_to_chat(body: &Value) -> Result<Value, BridgeError> {
             "parallel_tool_calls",
             "service_tier",
             "prompt_cache_key",
+            "prompt_cache_options",
             "prompt_cache_retention",
         ],
     );
@@ -400,6 +444,8 @@ fn responses_to_chat(body: &Value) -> Result<Value, BridgeError> {
 }
 
 fn chat_part_to_messages(part: &Value) -> Result<Value, BridgeError> {
+    crate::cache_compatibility::validate_part(part, "content")
+        .map_err(|error| invalid(error.to_string()))?;
     let mut output = match string(&part["type"]) {
         "text" => part.clone(),
         "image_url" => {
@@ -445,6 +491,8 @@ fn message_content(content: &Value) -> Result<Vec<Value>, BridgeError> {
 }
 
 fn chat_to_messages(body: &Value, max_output_tokens: Option<u64>) -> Result<Value, BridgeError> {
+    crate::cache_compatibility::validate_options(body.get("prompt_cache_options"))
+        .map_err(|error| invalid(error.to_string()))?;
     if body["n"].as_u64().is_some_and(|n| n > 1) {
         return Err(invalid("multiple choices require native Chat support"));
     }
@@ -626,12 +674,14 @@ fn chat_content_to_responses(content: &Value, role: &str) -> Result<Value, Bridg
         );
     }
     Ok(json!(array(content).iter().map(|part| {
-        Ok(match string(&part["type"]) {
+        let mut converted = match string(&part["type"]) {
             "text" => json!({"type":if role == "assistant" {"output_text"} else {"input_text"},"text":part["text"]}),
             "image_url" => json!({"type":"input_image","image_url":part["image_url"].as_str().map(Value::from).unwrap_or_else(||part["image_url"]["url"].clone()),"detail":part["image_url"]["detail"].as_str().unwrap_or("auto")}),
             "file" => json!({"type":"input_file","filename":part["file"]["filename"],"file_data":part["file"]["file_data"]}),
             _ => return Err(invalid(format!("cannot adapt Chat content {}", string(&part["type"])))),
-        })
+        };
+        copy_fields(part, &mut converted, &["prompt_cache_breakpoint"]);
+        Ok(converted)
     }).collect::<Result<Vec<Value>, BridgeError>>()?))
 }
 
@@ -685,6 +735,7 @@ fn chat_to_responses(body: &Value) -> Result<Value, BridgeError> {
             "parallel_tool_calls",
             "service_tier",
             "prompt_cache_key",
+            "prompt_cache_options",
             "prompt_cache_retention",
         ],
     );

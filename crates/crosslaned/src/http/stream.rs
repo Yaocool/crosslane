@@ -26,7 +26,7 @@ use crate::meter::{now_secs, CreditReservation, UsageRecord};
 use crate::state::AppState;
 use crate::stats::{RequestDiagnostics, RequestLog, UpstreamAttemptLog};
 
-use super::prompt_cache::{PromptCachePlan, PromptCacheProfile};
+use super::prompt_cache::PromptCacheProfile;
 use super::response::{
     custom_tool_input, kiro_citation_key, kiro_visible_references, repair_json,
     web_search_citations, CompactionIterationUsage, DecodedResponse, OpenAiToolIdentity,
@@ -196,7 +196,7 @@ fn prepend_pending_initial(pending: &mut Vec<String>, mut output: Vec<String>) -
     combined
 }
 
-fn build_claude_state(context: &StreamContext, prompt_cache: &PromptCachePlan) -> ClaudeState {
+fn build_claude_state(context: &StreamContext) -> ClaudeState {
     let mut claude = ClaudeState::new(
         context.request_id.clone(),
         context.model.clone(),
@@ -210,7 +210,6 @@ fn build_claude_state(context: &StreamContext, prompt_cache: &PromptCachePlan) -
     claude
         .context_edit_stats
         .clone_from(&context.context_edit_stats);
-    claude.set_prompt_cache_plan(prompt_cache);
     claude
 }
 
@@ -710,31 +709,54 @@ impl ClaudeState {
         }
     }
 
-    fn set_prompt_cache_plan(&mut self, _plan: &PromptCachePlan) {
-        // Streaming starts before Kiro reports usage. Do not publish the local
-        // cache estimate as fact; the final message_delta carries real counters.
-        self.cache_creation_input_tokens = 0;
-        self.cache_read_input_tokens = 0;
+    fn observe_usage(&mut self, decoded: &DecodedResponse, pending_initial: &mut [String]) {
+        let pending_start = pending_initial
+            .first_mut()
+            .filter(|event| event.starts_with("event: message_start\n"));
+        if self.message_started && pending_start.is_none() {
+            return;
+        }
+        // Metadata may precede the first content event. Use it in message_start
+        // when available; late metadata is carried by the final message_delta.
+        // Local cache plans are never evidence of an upstream cache hit/write.
+        self.cache_creation_input_tokens = decoded.usage.cache_write_tokens;
+        self.cache_read_input_tokens = decoded.usage.cache_read_tokens;
+        self.input_tokens = decoded
+            .upstream_input_tokens
+            .unwrap_or(self.input_tokens)
+            .max(
+                self.cache_creation_input_tokens
+                    .saturating_add(self.cache_read_input_tokens),
+            );
+        if let Some(start) = pending_start {
+            // A compaction/server-tool prelude may have created message_start
+            // locally without sending it yet. Refresh that queued event too.
+            *start = self.message_start();
+        }
+    }
+
+    fn message_start(&self) -> String {
+        let uncached_input_tokens = self
+            .input_tokens
+            .saturating_sub(self.cache_creation_input_tokens)
+            .saturating_sub(self.cache_read_input_tokens);
+        sse(&json!({
+            "type":"message_start","message":{
+                "id":self.request_id,"type":"message","role":"assistant","content":[],
+                "model":self.model,"stop_reason":Value::Null,"stop_sequence":Value::Null,
+                "usage":{
+                    "input_tokens":uncached_input_tokens,
+                    "output_tokens":0,
+                    "cache_creation_input_tokens":self.cache_creation_input_tokens,
+                    "cache_read_input_tokens":self.cache_read_input_tokens
+                }
+            }
+        }))
     }
 
     fn ensure_message(&mut self, output: &mut Vec<String>) {
         if !self.message_started {
-            let uncached_input_tokens = self
-                .input_tokens
-                .saturating_sub(self.cache_creation_input_tokens)
-                .saturating_sub(self.cache_read_input_tokens);
-            output.push(sse(&json!({
-                "type":"message_start","message":{
-                    "id":self.request_id,"type":"message","role":"assistant","content":[],
-                    "model":self.model,"stop_reason":Value::Null,"stop_sequence":Value::Null,
-                    "usage":{
-                        "input_tokens":uncached_input_tokens,
-                        "output_tokens":0,
-                        "cache_creation_input_tokens":self.cache_creation_input_tokens,
-                        "cache_read_input_tokens":self.cache_read_input_tokens
-                    }
-                }
-            })));
+            output.push(self.message_start());
             self.message_started = true;
         }
     }
@@ -1100,6 +1122,7 @@ fn stream_finish(
     match protocol {
         StreamProtocol::Claude => {
             let mut output = Vec::new();
+            claude.observe_usage(decoded, &mut []);
             claude.ensure_message(&mut output);
             #[cfg(feature = "crs")]
             if decoded.refusal_details.is_some() && claude.next_index == 0 {
@@ -1237,9 +1260,10 @@ fn stream_finish(
                         "created":created,"model":model,"choices":[],
                         "usage":{"prompt_tokens":decoded.usage.input_tokens,
                             "completion_tokens":decoded.usage.output_tokens,
-                            "total_tokens":decoded.usage.input_tokens+decoded.usage.output_tokens,
+                            "total_tokens":decoded.usage.input_tokens.saturating_add(decoded.usage.output_tokens),
                             "prompt_tokens_details":{
-                                "cached_tokens":decoded.usage.cache_read_tokens
+                                "cached_tokens":decoded.usage.cache_read_tokens,
+                                "cache_write_tokens":decoded.usage.cache_write_tokens
                             },
                             "completion_tokens_details":{
                                 "reasoning_tokens":decoded.usage.reasoning_tokens

@@ -53,6 +53,42 @@ fn stream_values(text: &str) -> Vec<Value> {
 }
 
 #[tokio::test]
+async fn unsupported_kiro_cache_strategies_never_start_generation() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock)
+        .await;
+    let (daemon, port) = start(&mock).await;
+    for route in ["v1/chat/completions", "v1/responses"] {
+        for streaming in [false, true] {
+            for options in [
+                json!({"prewarm":true}),
+                json!({"ttl":"30m"}),
+                json!({"mode":"explicit"}),
+            ] {
+                let mut body = json!({"model":"claude-haiku-4.5","stream":streaming,"prompt_cache_options":options});
+                if route.ends_with("responses") {
+                    body["input"] = json!("prefix to cache");
+                } else {
+                    body["messages"] = json!([{"role":"user","content":"prefix to cache"}]);
+                }
+                let response = post(&daemon, port, route, body).await;
+                assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+                let error = response.text().await.unwrap();
+                assert!(
+                    error.contains("prompt_cache_options") && error.contains("native OpenAI"),
+                    "{error}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn chat_stop_candidates_and_completion_limit_apply_to_json_and_sse() {
     let _guard = HTTP_TEST_LOCK.lock().await;
     let mock = MockServer::start().await;

@@ -16,6 +16,10 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
     super::common::log_ignored_controls(
         "openai",
         &[
+            (
+                "prompt_cache_retention",
+                request.prompt_cache_retention.is_some(),
+            ),
             ("response_format", request.response_format.is_some()),
             (
                 "tools.strict",

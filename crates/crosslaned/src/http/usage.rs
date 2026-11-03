@@ -55,13 +55,20 @@ pub async fn fill_missing_usage(
         // cancelling a tool must not cancel its accounting evidence.
         return;
     }
-    if decoded.usage.input_tokens == 0 {
-        match state.tokenizer.estimate_kiro_payload(payload).await {
-            Ok(tokens) => decoded.usage.input_tokens = tokens as u64,
+    if decoded.upstream_input_tokens.is_none() && decoded.usage.input_tokens == 0 {
+        let estimated = match state.tokenizer.estimate_kiro_payload(payload).await {
+            Ok(tokens) => tokens as u64,
             Err(error) => {
-                tracing::warn!(%error, "failed to estimate missing upstream input usage")
+                tracing::warn!(%error, "failed to estimate missing upstream input usage");
+                0
             }
-        }
+        };
+        decoded.usage.input_tokens = estimated.max(
+            decoded
+                .usage
+                .cache_read_tokens
+                .saturating_add(decoded.usage.cache_write_tokens),
+        );
     }
     if decoded.usage.reasoning_tokens == 0 && !decoded.reasoning.is_empty() {
         let fallback_tokens = (decoded.reasoning.chars().count() as u64 / 4).max(1);
@@ -74,7 +81,10 @@ pub async fn fill_missing_usage(
                 }
             };
     }
-    if decoded.usage.output_tokens == 0 && produced_output(decoded) {
+    if decoded.upstream_usage.output_tokens.is_none()
+        && decoded.usage.output_tokens == 0
+        && produced_output(decoded)
+    {
         #[cfg(feature = "crs")]
         if decoded.text.is_empty()
             && decoded.reasoning.is_empty()
@@ -145,8 +155,7 @@ pub fn fallback_credits(state: &Arc<AppState>, model: &str, input: u64, output: 
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn output_fallback_counts_structured_tool_arguments() {
+    async fn fixture() -> (tempfile::TempDir, Arc<AppState>, KiroPayload) {
         let directory = tempfile::tempdir().expect("tempdir");
         let paths = crosslane_core::paths::Paths::from_env_values(
             Some(directory.path().to_str().expect("utf8")),
@@ -172,6 +181,63 @@ mod tests {
                 "currentMessage":{"userInputMessage":{"content":"hello","modelId":"model","origin":"CLI","images":[]}}}
         }))
         .expect("payload");
+        (directory, state, payload)
+    }
+
+    #[tokio::test]
+    async fn cache_only_metadata_still_estimates_the_complete_input() {
+        let (_directory, state, payload) = fixture().await;
+        let expected = state
+            .tokenizer
+            .estimate_kiro_payload(&payload)
+            .await
+            .unwrap() as u64;
+        assert!(expected > 2);
+        let mut decoded = DecodedResponse::default();
+        decoded
+            .push(crosslane_kiro::KiroEvent::Usage {
+                usage: json!({"cacheReadInputTokens":1,"cacheWriteInputTokens":1}),
+            })
+            .unwrap();
+        fill_missing_usage(&state, &mut decoded, &payload).await;
+        assert_eq!(decoded.usage.input_tokens, expected);
+        assert_eq!(decoded.upstream_input_tokens, None);
+        assert_eq!(decoded.usage.cache_read_tokens, 1);
+        assert_eq!(decoded.usage.cache_write_tokens, 1);
+
+        let mut decoded = DecodedResponse::default();
+        decoded
+            .push(crosslane_kiro::KiroEvent::Usage {
+                usage: json!({"cacheReadInputTokens":expected+100}),
+            })
+            .unwrap();
+        fill_missing_usage(&state, &mut decoded, &payload).await;
+        assert_eq!(decoded.usage.input_tokens, expected + 100);
+        assert_eq!(decoded.upstream_input_tokens, None);
+    }
+
+    #[tokio::test]
+    async fn explicit_zero_usage_is_not_replaced_by_estimates() {
+        let (_directory, state, payload) = fixture().await;
+        let mut decoded = DecodedResponse {
+            text: "upstream explicitly reported zero".into(),
+            ..DecodedResponse::default()
+        };
+        decoded
+            .push(crosslane_kiro::KiroEvent::Usage {
+                usage: json!({"inputTokens":0,"outputTokens":0}),
+            })
+            .unwrap();
+        fill_missing_usage(&state, &mut decoded, &payload).await;
+        assert_eq!(decoded.usage.input_tokens, 0);
+        assert_eq!(decoded.usage.output_tokens, 0);
+        assert_eq!(decoded.usage.cache_read_tokens, 0);
+        assert_eq!(decoded.usage.cache_write_tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn output_fallback_counts_structured_tool_arguments() {
+        let (_directory, state, payload) = fixture().await;
         let mut decoded = DecodedResponse {
             reasoning: "reasoning trace ".repeat(100),
             ..DecodedResponse::default()

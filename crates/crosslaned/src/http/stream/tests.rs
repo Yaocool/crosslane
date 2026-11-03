@@ -758,6 +758,50 @@ fn stream_finish_honors_pause_turn_override() {
 }
 
 #[test]
+fn queued_compaction_message_start_uses_real_cache_usage_without_duplicate_starts() {
+    let mut state = ClaudeState::new("msg_cache".into(), "model".into(), 100, replay_codec());
+    let mut pending = state.compaction("summary");
+    let pending_count = pending.len();
+    let mut decoded = DecodedResponse::default();
+    decoded
+        .push(KiroEvent::MessageMetadata {
+            usage: json!({"tokenUsage":{
+                "inputTokens":100,"cacheReadInputTokens":60,"cacheWriteInputTokens":10
+            }}),
+        })
+        .expect("usage");
+    state.observe_usage(&decoded, &mut pending);
+    assert_eq!(pending.len(), pending_count);
+    let text = state.event(&KiroEvent::AssistantResponse {
+        content: "pong".into(),
+    });
+    let events = streamed_values(&prepend_pending_initial(&mut pending, text));
+    let starts = events
+        .iter()
+        .filter(|event| event["type"] == "message_start")
+        .collect::<Vec<_>>();
+    assert_eq!(starts.len(), 1);
+    assert_eq!(starts[0]["message"]["usage"]["input_tokens"], 30);
+    assert_eq!(starts[0]["message"]["usage"]["cache_read_input_tokens"], 60);
+    assert_eq!(
+        starts[0]["message"]["usage"]["cache_creation_input_tokens"],
+        10
+    );
+    assert!(pending.is_empty());
+
+    decoded
+        .push(KiroEvent::Usage {
+            usage: json!({"cacheReadInputTokens":20}),
+        })
+        .expect("late usage");
+    state.observe_usage(&decoded, &mut pending);
+    assert_eq!(
+        state.cache_read_input_tokens, 60,
+        "an already emitted start is immutable"
+    );
+}
+
+#[test]
 fn claude_stream_reports_stop_sequences_and_cache_usage() {
     let mut state = ClaudeState::new("msg_stop".into(), "model".into(), 100, replay_codec());
     state.cache_creation_input_tokens = 5;

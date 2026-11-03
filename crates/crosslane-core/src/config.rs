@@ -390,7 +390,7 @@ pub struct FeaturesConfig {
     pub disable_tools: bool,
     /// 上游限流或模型暂时不可用时是否启用同族模型降级。
     pub enable_model_fallback: bool,
-    /// 是否模拟 prompt cache。
+    /// 是否将客户端有效的 cache_control 转换为 Kiro 原生 cachePoint；用量以实际上游统计为准。
     pub enable_prompt_cache: bool,
     /// 是否注入增强 system prompt。
     pub enhance_system_prompt: bool,
@@ -2500,7 +2500,8 @@ web_search_max_rounds = 20
 disable_tools = false
 # 遇到上游限流或模型暂时不可用时是否自动选择同族可用模型降级。
 enable_model_fallback = true
-# 是否模拟 prompt cache 计费字段；不代表 Kiro 提供真实 Anthropic cache。
+# 是否将有效的 cache_control 转换为 Kiro 原生 cachePoint；默认关闭。
+# 缓存读写用量仅回传上游实际统计，不模拟命中或计费，也不保证上游接受提示或命中缓存。
 enable_prompt_cache = false
 # 是否向上游 system prompt 注入协议兼容和工具使用说明。
 enhance_system_prompt = true

@@ -1842,7 +1842,7 @@ pub(super) async fn handle_openai_route(
             key_id.as_deref(),
             client_context,
             &headers,
-            request.conversation_id.as_deref(),
+            request.conversation_hint(),
             super::metadata_conversation_hint(request.metadata.as_ref())
                 .or_else(|| {
                     responses_options

@@ -6,7 +6,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use crosslane_core::config::{Config, ProxyServiceConfig};
 use crosslane_core::provider::{ProviderId, ProviderModel, ProviderProtocol};
-use crosslane_provider::{ProviderError, ProviderRequest, ProviderResponseBody};
+use crosslane_provider::{ProviderError, ProviderErrorKind, ProviderRequest, ProviderResponseBody};
 use crosslane_translate::model::{
     map_model_for_provider, resolve_model_with_family_fallback, ModelMappingContext, ModelRoute,
 };
@@ -473,6 +473,8 @@ pub(super) async fn execute_provider(
     client_context: crosslane_core::client_context::ClientContext,
 ) -> Result<Response, ApiError> {
     let started = Instant::now();
+    let omit_chat_usage = protocol == ProviderProtocol::OpenAiChat
+        && super::super::chat_usage::requested_omission(&route.body);
     let api_key_id = authenticated_key.as_ref().map(|key| key.id.clone());
     let user_agent = super::logged_user_agent(&headers);
     let error_provider = route.provider_id.to_string();
@@ -657,7 +659,7 @@ pub(super) async fn execute_provider(
             // supplier bill. Settle the already buffered observation before
             // failover rejects this candidate's client-request accounting.
             if let ProviderResponseBody::Full(bytes) = &response.body {
-                let usage = ProviderUsage::from_bytes(bytes);
+                let usage = ProviderUsage::from_bytes_for_protocol(bytes, protocol);
                 if usage.reported || usage.billing.is_some() {
                     record_provider_request(
                         &state,
@@ -673,6 +675,12 @@ pub(super) async fn execute_provider(
         return Err(error);
     }
     let status = response.status;
+    let is_sse = response
+        .headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/event-stream"));
+    let omit_chat_usage = omit_chat_usage && is_sse;
     #[cfg(feature = "crs")]
     let observe_claude = protocol == ProviderProtocol::ClaudeMessages
         && status.is_success()
@@ -683,6 +691,9 @@ pub(super) async fn execute_provider(
             .is_some_and(|value| value.starts_with("text/event-stream"));
     let mut builder = Response::builder().status(status);
     for (name, value) in &response.headers {
+        if omit_chat_usage && name == axum::http::header::CONTENT_LENGTH {
+            continue;
+        }
         builder = builder.header(name, value);
     }
     if let Ok(value) = HeaderValue::from_str(&metadata.request_id) {
@@ -690,8 +701,34 @@ pub(super) async fn execute_provider(
     }
     let body = match response.body {
         ProviderResponseBody::Full(bytes) => {
-            let usage = ProviderUsage::from_bytes(&bytes);
-            record_provider_request(&state, &metadata, usage, None, reservation).await;
+            let usage = if is_sse {
+                let mut scanner = ProviderUsageScanner::for_protocol(protocol);
+                scanner.push(&bytes);
+                scanner.finish()
+            } else {
+                ProviderUsage::from_bytes_for_protocol(&bytes, protocol)
+            };
+            let filtered = if omit_chat_usage {
+                let mut filter = super::super::chat_usage::ChatUsageFilter::default();
+                filter.push(&bytes).map(|mut output| {
+                    output.extend(filter.finish());
+                    Bytes::from(output)
+                })
+            } else {
+                Ok(bytes)
+            };
+            record_provider_request(
+                &state,
+                &metadata,
+                usage,
+                filtered.as_ref().err().map(|message| (*message).to_owned()),
+                reservation,
+            )
+            .await;
+            let bytes = filtered.map_err(|message| {
+                ApiError::new(StatusCode::BAD_GATEWAY, message, format)
+                    .with_provider_id(&error_provider)
+            })?;
             drop((connection_guard, admission_guard));
             Body::from(bytes)
         }
@@ -700,7 +737,7 @@ pub(super) async fn execute_provider(
             let mut finalizer = ProviderStreamFinalizer {
                 state: Arc::clone(&state),
                 metadata: metadata.clone(),
-                usage: ProviderUsageScanner::default(),
+                usage: ProviderUsageScanner::for_protocol(protocol),
                 claude: observe_claude.then(super::super::crs::ClaudeStreamState::default),
                 reservation: Some(reservation),
                 failure: None,
@@ -710,8 +747,9 @@ pub(super) async fn execute_provider(
                 let _connection_guard = connection_guard;
                 let _admission_guard = admission_guard;
                 let mut stream_error = None;
+                let mut chat_usage_filter = omit_chat_usage.then(super::super::chat_usage::ChatUsageFilter::default);
                 #[cfg(not(feature = "crs"))]
-                let mut usage = ProviderUsageScanner::default();
+                let mut usage = ProviderUsageScanner::for_protocol(protocol);
                 while let Some(chunk) = upstream.next().await {
                     match chunk {
                         Ok(bytes) => {
@@ -724,7 +762,19 @@ pub(super) async fn execute_provider(
                             remember_provider_client_context(&state, &metadata, &mut usage.usage, metadata.status);
                             #[cfg(feature = "crs")]
                             if let Some(claude) = finalizer.claude.as_mut() { claude.push(&bytes); }
-                            yield Ok::<_, ProviderError>(bytes)
+                            let bytes = if let Some(filter) = chat_usage_filter.as_mut() {
+                                match filter.push(&bytes) {
+                                    Ok(output) => Bytes::from(output),
+                                    Err(message) => {
+                                        stream_error = Some(message.to_owned());
+                                        #[cfg(feature = "crs")]
+                                        { finalizer.failure = stream_error.clone(); }
+                                        yield Err(ProviderError::new(ProviderErrorKind::Upstream, StatusCode::BAD_GATEWAY, message));
+                                        break;
+                                    }
+                                }
+                            } else { bytes };
+                            if !bytes.is_empty() { yield Ok::<_, ProviderError>(bytes); }
                         },
                         Err(error) => {
                             stream_error = Some(error.to_string());
@@ -733,6 +783,12 @@ pub(super) async fn execute_provider(
                             yield Err(error);
                             break;
                         }
+                    }
+                }
+                if stream_error.is_none() {
+                    if let Some(filter) = chat_usage_filter.as_mut() {
+                        let output = filter.finish();
+                        if !output.is_empty() { yield Ok::<_, ProviderError>(Bytes::from(output)); }
                     }
                 }
                 #[cfg(feature = "crs")]
@@ -865,6 +921,7 @@ struct ProviderUsage {
     output_tokens: u64,
     cache_read_tokens: u64,
     cache_write_tokens: u64,
+    uncached_input_tokens: Option<u64>,
     reasoning_tokens: u64,
     billing: Option<ProviderBilling>,
     error: Option<String>,
@@ -879,6 +936,18 @@ impl ProviderUsage {
     }
 
     fn from_value(value: &Value) -> Self {
+        Self::from_value_for_protocol(value, None)
+    }
+
+    fn from_bytes_for_protocol(bytes: &[u8], protocol: ProviderProtocol) -> Self {
+        serde_json::from_slice::<Value>(bytes)
+            .ok()
+            .map_or_else(Self::default, |value| {
+                Self::from_value_for_protocol(&value, Some(protocol))
+            })
+    }
+
+    fn from_value_for_protocol(value: &Value, protocol: Option<ProviderProtocol>) -> Self {
         // Local token estimates are returned to the caller, but are not
         // provider-reported generation usage.
         if value.get("estimated").and_then(Value::as_bool) == Some(true) {
@@ -901,7 +970,8 @@ impl ProviderUsage {
         {
             return usage;
         }
-        usage.merge_object(value);
+        let uncached_input = protocol == Some(ProviderProtocol::ClaudeMessages);
+        usage.merge_object(value, uncached_input);
         for candidate in [
             value.get("usage"),
             value.pointer("/message/usage"),
@@ -912,12 +982,17 @@ impl ProviderUsage {
         .filter(|candidate| candidate.is_object())
         {
             usage.reported = true;
-            usage.merge_object(candidate);
+            usage.merge_object(candidate, uncached_input);
         }
         usage
     }
 
-    fn merge_object(&mut self, value: &Value) {
+    fn merge_object(&mut self, value: &Value, uncached_input: bool) {
+        if uncached_input {
+            if let Some(tokens) = value.get("input_tokens").and_then(Value::as_u64) {
+                self.uncached_input_tokens = Some(tokens);
+            }
+        }
         let number = |names: &[&str]| {
             names
                 .iter()
@@ -947,13 +1022,21 @@ impl ProviderUsage {
             self.reported = true;
             self.reasoning_tokens = self.reasoning_tokens.max(tokens);
         }
-        if let Some(details) = value
-            .get("input_tokens_details")
-            .or_else(|| value.get("prompt_tokens_details"))
+        for details in [
+            value.get("input_tokens_details"),
+            value.get("prompt_tokens_details"),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|details| details.is_object())
         {
             if let Some(tokens) = details.get("cached_tokens").and_then(Value::as_u64) {
                 self.reported = true;
                 self.cache_read_tokens = self.cache_read_tokens.max(tokens);
+            }
+            if let Some(tokens) = details.get("cache_write_tokens").and_then(Value::as_u64) {
+                self.reported = true;
+                self.cache_write_tokens = self.cache_write_tokens.max(tokens);
             }
         }
         if let Some(details) = value
@@ -965,6 +1048,7 @@ impl ProviderUsage {
                 self.reasoning_tokens = self.reasoning_tokens.max(tokens);
             }
         }
+        self.normalize_input();
     }
 
     fn merge(&mut self, other: Self) {
@@ -973,6 +1057,11 @@ impl ProviderUsage {
         self.output_tokens = self.output_tokens.max(other.output_tokens);
         self.cache_read_tokens = self.cache_read_tokens.max(other.cache_read_tokens);
         self.cache_write_tokens = self.cache_write_tokens.max(other.cache_write_tokens);
+        if let Some(tokens) = other.uncached_input_tokens {
+            self.uncached_input_tokens =
+                Some(self.uncached_input_tokens.unwrap_or_default().max(tokens));
+        }
+        self.normalize_input();
         self.reasoning_tokens = self.reasoning_tokens.max(other.reasoning_tokens);
         if other.billing.is_some() {
             self.billing = other.billing;
@@ -982,6 +1071,16 @@ impl ProviderUsage {
         }
         if other.completed_response_id.is_some() {
             self.completed_response_id = other.completed_response_id;
+        }
+    }
+
+    fn normalize_input(&mut self) {
+        if let Some(uncached) = self.uncached_input_tokens {
+            self.input_tokens = self.input_tokens.max(
+                uncached
+                    .saturating_add(self.cache_read_tokens)
+                    .saturating_add(self.cache_write_tokens),
+            );
         }
     }
 }
@@ -1047,10 +1146,15 @@ fn copilot_billing(value: &Value) -> Option<ProviderBilling> {
 
 #[derive(Default)]
 pub(super) struct ProviderUsageScanner {
+    protocol: Option<ProviderProtocol>,
     pending: Vec<u8>,
     event_data: Vec<u8>,
     line_overflowed: bool,
     event_overflowed: bool,
+    skip_lf: bool,
+    json_body: Vec<u8>,
+    json_overflowed: bool,
+    is_sse: bool,
     usage: ProviderUsage,
 }
 
@@ -1058,29 +1162,57 @@ impl ProviderUsageScanner {
     const MAX_LINE_BYTES: usize = 128 * 1024;
     const MAX_EVENT_BYTES: usize = 128 * 1024;
 
+    fn for_protocol(protocol: ProviderProtocol) -> Self {
+        Self {
+            protocol: Some(protocol),
+            ..Self::default()
+        }
+    }
+
     pub(super) fn push(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            if self.pending.len() < Self::MAX_LINE_BYTES {
-                self.pending.push(*byte);
+        if !self.is_sse && !self.json_overflowed {
+            if self.json_body.len().saturating_add(bytes.len()) <= Self::MAX_EVENT_BYTES {
+                self.json_body.extend_from_slice(bytes);
             } else {
-                self.line_overflowed = true;
+                self.json_body.clear();
+                self.json_overflowed = true;
             }
-            if *byte == b'\n' {
+        }
+        for byte in bytes {
+            if self.skip_lf {
+                self.skip_lf = false;
+                if *byte == b'\n' {
+                    continue;
+                }
+            }
+            if matches!(byte, b'\r' | b'\n') {
+                self.skip_lf = *byte == b'\r';
                 if !self.line_overflowed {
                     let line = std::mem::take(&mut self.pending);
-                    self.consume_line(&line[..line.len().saturating_sub(1)]);
+                    self.consume_line(&line);
                 } else {
                     self.pending.clear();
                     self.event_data.clear();
                     self.event_overflowed = true;
                 }
                 self.line_overflowed = false;
+            } else if self.pending.len() < Self::MAX_LINE_BYTES {
+                self.pending.push(*byte);
+            } else {
+                self.line_overflowed = true;
             }
         }
     }
 
     fn consume_line(&mut self, line: &[u8]) {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if [b"data:".as_slice(), b"event:", b"id:", b"retry:", b":"]
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
+        {
+            self.is_sse = true;
+            self.json_body.clear();
+        }
         if line.is_empty() {
             self.consume_event();
             return;
@@ -1115,13 +1247,9 @@ impl ProviderUsageScanner {
                 self.event_data.push(b'\n');
             }
             self.event_data.extend_from_slice(payload);
-            return;
         }
-        // Non-SSE JSON responses are also streamed by reqwest; observe a
-        // complete line without rewriting the body sent to the client.
-        if let Ok(value) = serde_json::from_slice::<Value>(line) {
-            self.usage.merge(ProviderUsage::from_value(&value));
-        }
+        // JSON bodies are observed as complete envelopes in finish(). A
+        // compact nested tool/business object on its own line is not usage.
     }
 
     fn consume_event(&mut self) {
@@ -1135,7 +1263,10 @@ impl ProviderUsageScanner {
             return;
         }
         if let Ok(value) = serde_json::from_slice::<Value>(&self.event_data) {
-            self.usage.merge(ProviderUsage::from_value(&value));
+            self.usage.merge(ProviderUsage::from_value_for_protocol(
+                &value,
+                self.protocol,
+            ));
         }
         self.event_data.clear();
     }
@@ -1146,6 +1277,14 @@ impl ProviderUsageScanner {
             self.consume_line(&pending);
         }
         self.consume_event();
+        if !self.is_sse && !self.json_overflowed {
+            if let Ok(value) = serde_json::from_slice::<Value>(&self.json_body) {
+                self.usage.merge(ProviderUsage::from_value_for_protocol(
+                    &value,
+                    self.protocol,
+                ));
+            }
+        }
         self.usage
     }
 
@@ -1827,6 +1966,101 @@ mod tests {
         assert_eq!(route.upstream_model, "claude-sonnet-test");
         assert!(!route.lock_kiro_mapping);
         assert!(route.mapping_rule.is_none());
+    }
+
+    #[test]
+    fn json_business_objects_cannot_override_the_envelope_usage() {
+        let body = br#"{
+            "content": [{"type":"tool_use","input":{"records":[
+                {"usage":{"input_tokens":999999,"cache_read_input_tokens":888888}}
+            ]}}],
+            "usage":{"input_tokens":300,"output_tokens":20,"cache_read_input_tokens":600,"cache_creation_input_tokens":100}
+        }"#;
+        let mut scanner = ProviderUsageScanner::for_protocol(ProviderProtocol::ClaudeMessages);
+        for byte in body {
+            scanner.push(&[*byte]);
+        }
+        let usage = scanner.finish();
+        assert_eq!(usage.input_tokens, 1000);
+        assert_eq!(usage.cache_read_tokens, 600);
+        assert_eq!(usage.cache_write_tokens, 100);
+    }
+
+    #[test]
+    fn messages_accounting_includes_cache_once_across_split_and_repeated_events() {
+        let value = serde_json::json!({"usage":{"input_tokens":300,"output_tokens":20,
+            "cache_read_input_tokens":600,"cache_creation_input_tokens":100}});
+        let full = ProviderUsage::from_bytes_for_protocol(
+            &serde_json::to_vec(&value).unwrap(),
+            ProviderProtocol::ClaudeMessages,
+        );
+        assert_eq!(full.input_tokens, 1000);
+        let mut scanner = ProviderUsageScanner::for_protocol(ProviderProtocol::ClaudeMessages);
+        let events = [
+            serde_json::json!({"input_tokens":300}),
+            serde_json::json!({"cache_read_input_tokens":600}),
+            serde_json::json!({"cache_creation_input_tokens":100}),
+            serde_json::json!({"output_tokens":20}),
+        ];
+        for event in events.iter().chain(events.iter()) {
+            scanner.push(format!("data: {}\n\n", serde_json::json!({"usage":event})).as_bytes());
+        }
+        let usage = scanner.finish();
+        assert_eq!(usage.input_tokens, 1000);
+        assert_eq!(usage.output_tokens, 20);
+        assert_eq!(usage.cache_read_tokens, 600);
+        assert_eq!(usage.cache_write_tokens, 100);
+
+        let value = serde_json::json!({"usage":{"input_tokens":1000,"output_tokens":20,
+            "input_tokens_details":{"cached_tokens":600,"cache_write_tokens":100}}});
+        let full = ProviderUsage::from_bytes_for_protocol(
+            &serde_json::to_vec(&value).unwrap(),
+            ProviderProtocol::OpenAiResponses,
+        );
+        assert_eq!(
+            full.input_tokens, 1000,
+            "OpenAI input already includes caches"
+        );
+    }
+
+    #[test]
+    fn usage_scanner_handles_cr_only_events_and_pretty_json_bodies() {
+        let expected = serde_json::json!({"usage":{"input_tokens":100,"output_tokens":20,
+            "input_tokens_details":{"cached_tokens":60,"cache_write_tokens":10}}});
+        for body in [
+            format!("data: {expected}\r\rdata: [DONE]\r\r"),
+            serde_json::to_string_pretty(&expected).unwrap(),
+        ] {
+            let mut scanner = ProviderUsageScanner::default();
+            for byte in body.bytes() {
+                scanner.push(&[byte]);
+            }
+            let usage = scanner.finish();
+            assert!(usage.reported);
+            assert_eq!(usage.input_tokens, 100);
+            assert_eq!(usage.output_tokens, 20);
+            assert_eq!(usage.cache_read_tokens, 60);
+            assert_eq!(usage.cache_write_tokens, 10);
+        }
+    }
+
+    #[test]
+    fn usage_scanner_keeps_nested_openai_cache_reads_and_writes() {
+        for details_field in ["prompt_tokens_details", "input_tokens_details"] {
+            let mut usage = serde_json::json!({"input_tokens":100,"output_tokens":20,"input_tokens_details":null});
+            usage[details_field] = serde_json::json!({"cached_tokens":60,"cache_write_tokens":10});
+            let mut scanner = ProviderUsageScanner::default();
+            let frame = format!("data: {}\n\n", serde_json::json!({"usage":usage}));
+            for byte in frame.bytes() {
+                scanner.push(&[byte]);
+            }
+            let usage = scanner.finish();
+            assert!(usage.reported);
+            assert_eq!(usage.input_tokens, 100);
+            assert_eq!(usage.output_tokens, 20);
+            assert_eq!(usage.cache_read_tokens, 60);
+            assert_eq!(usage.cache_write_tokens, 10);
+        }
     }
 
     #[test]

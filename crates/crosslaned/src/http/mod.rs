@@ -1,5 +1,6 @@
 //! Public business HTTP plane.
 
+mod chat_usage;
 pub(crate) mod client_context;
 #[cfg(test)]
 mod client_context_tests;

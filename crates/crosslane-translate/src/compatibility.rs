@@ -14,6 +14,19 @@ fn invalid(field: impl Into<String>, message: impl Into<String>) -> ValidationEr
 }
 
 pub fn parse_openai_request(mut value: Value) -> Result<OpenAiRequest, ValidationError> {
+    crate::cache_compatibility::validate_options(value.get("prompt_cache_options"))?;
+    for (index, message) in value["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        // Validate before file normalization can replace the original block.
+        crate::cache_compatibility::validate_content(
+            &message["content"],
+            &format!("messages.{index}.content"),
+        )?;
+    }
     let object = value
         .as_object_mut()
         .ok_or_else(|| invalid("request", "expected an object"))?;

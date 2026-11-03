@@ -2524,6 +2524,24 @@ fn prepare_provider_request(
 ) -> Result<PreparedProviderRequest, ProviderError> {
     let mut value: Value = serde_json::from_slice(&request.body)
         .map_err(|error| internal_error(format!("decode routed provider request: {error}")))?;
+    if request.protocol == ProviderProtocol::OpenAiChat {
+        crosslane_translate::bridge::validate_chat_cache_controls(&value).map_err(|error| {
+            ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                StatusCode::BAD_REQUEST,
+                error.to_string(),
+            )
+        })?;
+        // False is an explicit no-op, and Chat has no prewarm parameter.
+        if let Some(options) = value
+            .get_mut("prompt_cache_options")
+            .and_then(Value::as_object_mut)
+        {
+            if options.get("prewarm") == Some(&Value::Bool(false)) {
+                options.remove("prewarm");
+            }
+        }
+    }
     let object = value
         .as_object_mut()
         .ok_or_else(|| internal_error("routed provider request must be a JSON object"))?;
@@ -2582,9 +2600,29 @@ fn prepare_provider_request(
         let stream_options = object
             .entry("stream_options")
             .or_insert_with(|| serde_json::json!({}));
-        if let Some(options) = stream_options.as_object_mut() {
-            options.entry("include_usage").or_insert(Value::Bool(true));
+        if stream_options.is_null() {
+            *stream_options = serde_json::json!({});
         }
+        let options = stream_options.as_object_mut().ok_or_else(|| {
+            ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                StatusCode::BAD_REQUEST,
+                "stream_options must be an object",
+            )
+        })?;
+        if options
+            .get("include_usage")
+            .is_some_and(|value| !value.is_null() && !value.is_boolean())
+        {
+            return Err(ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                StatusCode::BAD_REQUEST,
+                "stream_options.include_usage must be a boolean",
+            ));
+        }
+        // Always observe upstream tokens and cache counters for settlement.
+        // The HTTP boundary applies the caller's opt-in after metering.
+        options.insert("include_usage".into(), Value::Bool(true));
     }
     let body = serde_json::to_vec(&value)
         .map(bytes::Bytes::from)
@@ -3117,6 +3155,59 @@ mod tests {
     use super::*;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn chat_metering_requests_usage_even_when_the_client_opts_out() {
+        for options in [
+            Value::Null,
+            serde_json::json!({"include_usage":false}),
+            serde_json::json!({"include_usage":true}),
+        ] {
+            let body = serde_json::json!({"model":"test","messages":[{"role":"user","content":"hello"}],
+                "stream":true,"stream_options":options});
+            let mut request = ProviderRequest {
+                original_model: None,
+                protocol: ProviderProtocol::OpenAiChat,
+                model: "test".into(),
+                path: "/chat/completions".into(),
+                headers: HeaderMap::new(),
+                body: bytes::Bytes::from(body.to_string()),
+                trace_id: "cache-test".into(),
+                service_id: "test".into(),
+                account_pool: None,
+                api_key_id: None,
+                client_context: Default::default(),
+            };
+            let prepared = prepare_provider_request(&request).unwrap();
+            let wire: Value = serde_json::from_slice(&prepared.body).unwrap();
+            assert_eq!(wire["stream_options"]["include_usage"], true);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&request.body).unwrap(),
+                body
+            );
+            request.body = bytes::Bytes::from(
+                serde_json::json!({"stream":true,
+                "stream_options":{"include_usage":"invalid"}})
+                .to_string(),
+            );
+            assert_eq!(
+                prepare_provider_request(&request).err().unwrap().status,
+                StatusCode::BAD_REQUEST
+            );
+            for options in [
+                serde_json::json!({"prewarm":true}),
+                serde_json::json!({"ttl":"12h"}),
+            ] {
+                request.body = bytes::Bytes::from(
+                    serde_json::json!({"prompt_cache_options":options}).to_string(),
+                );
+                assert!(prepare_provider_request(&request).is_err());
+                request.protocol = ProviderProtocol::OpenAiResponses;
+                assert!(prepare_provider_request(&request).is_ok());
+                request.protocol = ProviderProtocol::OpenAiChat;
+            }
+        }
+    }
 
     #[test]
     fn claude_native_requests_preserve_schema_constraints_and_thinking() {

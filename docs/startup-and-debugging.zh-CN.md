@@ -332,6 +332,48 @@ Kiro overage 默认关闭。
 `crosslane account overage enable --max-credits 500`；关闭时运行
 `crosslane account overage disable`。上游限制和已在处理中的请求仍可能影响最终用量。
 
+## Kiro prompt cache 用量
+
+`features.enable_prompt_cache` 默认是 `false`。运行
+`crosslane config edit features`，将其改为 `true` 后保存，CLI 会校验并热重载。
+此开关把客户端有效的 `cache_control` 提示转换为 Kiro 原生 `cachePoint`，是否接受
+提示、是否命中缓存取决于上游；它不会开启模拟缓存计费，也不保证缓存一定生效。
+
+Claude Code 和 `/v1/messages` 的 `cache_read_input_tokens` 表示从缓存读取的输入
+token，`cache_creation_input_tokens` 表示写入缓存的输入 token。两者均属于输入
+统计，`output_tokens` 才是生成的输出。无论是否开启提示转发，Crosslane 都会回传
+上游实际报告的缓存计数；上游缺失这些字段时保持为 0，不根据本地重复请求推算命中。
+
+流式响应会将首个内容事件前已收到的用量写入 `message_start`，最终的
+`message_delta.usage` 包含累计用量，也包含较晚到达的缓存统计。排查缓存计数为 0
+时要查看完整事件流；非流式响应在 `usage` 中返回相同的最终计数。Kiro 分多次上报
+的统计会合并，缓存输入不会重复计入总量。
+
+OpenAI Chat Completions 在 `usage.prompt_tokens_details` 中返回 `cached_tokens`（读）
+和 `cache_write_tokens`（写）；Responses 在 `usage.input_tokens_details` 中返回同样两个字段。
+两者都已包含在输入总量中。Chat 流式请求需设置
+`stream_options: {"include_usage": true}` 才会收到最终用量块；Responses 流式响应
+在终止事件中返回用量，参见 [OpenAI 官方缓存用量说明](https://developers.openai.com/api/docs/guides/prompt-caching#monitor-cache-performance)。
+
+Kiro 路径下，两个 OpenAI 入口都支持使用 `prompt_cache_key` 提供稳定的亲和提示，
+该值会哈希为上游 conversation ID，但不会开启缓存提示或固定账号。Kiro 的缓存
+断点仍通过上述 `cache_control` 扩展转换，不承诺 OpenAI 的保留时长或断点 TTL。
+Kiro 对显式 `prompt_cache_breakpoint`，以及要求预热、最短 `ttl` 或 `mode=explicit`
+的 `prompt_cache_options`，会在生成前返回 HTTP 400，不会把预热悄悄降级为普通生成。
+空值、默认控制、`prewarm=false` 和旧版 `prompt_cache_retention` 提示仍可接受，
+但不承诺旧版提示中的保留时长。
+原生 OpenAI Chat 与 Responses 上游之间转换协议时，会保留
+目标协议能表达的 `prompt_cache_options`、`prompt_cache_retention` 及内容块的
+`prompt_cache_breakpoint`。预热和 12 小时最短保留时长要求原生 Responses；
+目标仅支持 Chat 或 Messages 时明确拒绝。
+
+即使 Chat 客户端省略或关闭 `stream_options.include_usage`，Copilot 仍会向上游请求
+用量用于内部记账。HTTP 层先记录真实 token、缓存计数及供应商账单，再移除该客户端
+未请求的用量块和账单元数据；正文、错误和 `[DONE]` 保留。明确请求 usage 的客户端
+仍会收到完整统计，Messages 和 Responses 保持各自正常的用量事件。
+内部统计将 Messages 的普通输入、缓存读取和写入相加作为输入总量；OpenAI 的输入
+总量本就包含缓存部分，直接保留。对外响应仍遵循各自协议的输入 token 语义。
+
 ## 请求延迟控制
 
 ### Claude Code 的 MCP 工具按需加载

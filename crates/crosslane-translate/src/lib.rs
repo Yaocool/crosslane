@@ -1,6 +1,7 @@
 //! Claude/OpenAI 与 Kiro 协议之间的纯转换层。
 
 pub mod bridge;
+mod cache_compatibility;
 pub mod compatibility;
 pub mod context;
 pub mod error;

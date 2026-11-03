@@ -187,6 +187,13 @@ pub struct OpenAiRequest {
     pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub conversation_id: Option<String>,
+    /// OpenAI cache affinity hint; scoped and hashed by the HTTP layer for Kiro.
+    #[serde(default)]
+    pub prompt_cache_key: Option<String>,
+    #[serde(default)]
+    pub prompt_cache_options: Option<Value>,
+    #[serde(default)]
+    pub prompt_cache_retention: Option<String>,
     #[serde(default)]
     pub metadata: Option<Value>,
     #[serde(default)]
@@ -194,6 +201,19 @@ pub struct OpenAiRequest {
 }
 
 impl OpenAiRequest {
+    pub fn conversation_hint(&self) -> Option<&str> {
+        self.conversation_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|hint| !hint.is_empty())
+            .or_else(|| {
+                self.prompt_cache_key
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|hint| !hint.is_empty())
+            })
+    }
+
     /// Prefer the current API's limit, retaining max_tokens as a legacy alias.
     pub fn output_token_limit(&self) -> Option<u32> {
         self.max_completion_tokens.or(self.max_tokens)

@@ -41,6 +41,7 @@ pub struct DecodedResponse {
     pub automatic_compaction: Option<crosslane_translate::ContextCompactionStats>,
     pub usage: UsageInfo,
     pub upstream_input_tokens: Option<u64>,
+    pub(super) upstream_usage: UpstreamUsage,
     pub upstream_context_usage_percentage: Option<f64>,
     /// Explicit Claude stop reason for proxy-managed server loops (for example
     /// `pause_turn`). When absent the ordinary tool/max/end inference applies.
@@ -49,6 +50,16 @@ pub struct DecodedResponse {
     pub refusal_details: Option<Value>,
     /// Custom Claude stop sequence matched by the proxy response filter.
     pub stop_sequence: Option<String>,
+}
+
+/// Metadata events can report different parts of one cumulative usage snapshot.
+/// Keep the original input basis so later cache counters cannot replace it.
+#[derive(Debug, Default)]
+pub(super) struct UpstreamUsage {
+    input_tokens: Option<u64>,
+    uncached_input_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+    pub(super) output_tokens: Option<u64>,
 }
 
 impl DecodedResponse {
@@ -1228,10 +1239,8 @@ impl DecodedResponse {
                     // run and must never be published or executed as results.
                     self.refused_tools.append(&mut self.tools);
                 }
-                merge_usage(&mut self.usage, &usage);
-                if self.usage.input_tokens > 0 {
-                    self.upstream_input_tokens = Some(self.usage.input_tokens);
-                }
+                self.upstream_input_tokens =
+                    merge_usage(&mut self.usage, &mut self.upstream_usage, &usage);
             }
             KiroEvent::Error { message, .. } => return Err(message),
             KiroEvent::Other {
@@ -1522,8 +1531,11 @@ impl DecodedResponse {
             "usage":{
                 "prompt_tokens":self.usage.input_tokens,
                 "completion_tokens":self.usage.output_tokens,
-                "total_tokens":self.usage.input_tokens+self.usage.output_tokens,
-                "prompt_tokens_details":{"cached_tokens":self.usage.cache_read_tokens},
+                "total_tokens":self.usage.input_tokens.saturating_add(self.usage.output_tokens),
+                "prompt_tokens_details":{
+                    "cached_tokens":self.usage.cache_read_tokens,
+                    "cache_write_tokens":self.usage.cache_write_tokens
+                },
                 "completion_tokens_details":{"reasoning_tokens":self.usage.reasoning_tokens}
             }
         })
@@ -1703,9 +1715,16 @@ fn format_visible_references(citations: &[&KiroCitation]) -> String {
     output
 }
 
-fn merge_usage(output: &mut UsageInfo, value: &Value) {
-    let uncached = find_number(value, &["uncachedInputTokens"]);
-    let total_input = find_number(value, &["inputTokens", "input_tokens"]);
+fn merge_usage(output: &mut UsageInfo, upstream: &mut UpstreamUsage, value: &Value) -> Option<u64> {
+    if let Some(uncached) = find_number(value, &["uncachedInputTokens"]) {
+        upstream.uncached_input_tokens = Some(uncached);
+    }
+    if let Some(input) = find_number(value, &["inputTokens", "input_tokens"]) {
+        upstream.input_tokens = Some(input);
+    }
+    if let Some(total) = find_number(value, &["totalTokens", "total_tokens"]) {
+        upstream.total_tokens = Some(total);
+    }
     let cache_read = find_number(
         value,
         &[
@@ -1724,27 +1743,31 @@ fn merge_usage(output: &mut UsageInfo, value: &Value) {
             "cache_write_tokens",
         ],
     );
-    let cache_tokens = cache_read
-        .unwrap_or_default()
-        .saturating_add(cache_write.unwrap_or_default());
-    if let Some(uncached) = uncached {
-        output.input_tokens = uncached.saturating_add(cache_tokens);
-    } else if let Some(input) = total_input {
-        // Kiro's generic inputTokens field is the total prompt size. Cache
-        // counters describe subsets of it and must not be added again.
-        output.input_tokens = input.max(cache_tokens);
-    } else if cache_tokens > 0 {
-        output.input_tokens = cache_tokens;
-    }
-    output.output_tokens =
-        find_number(value, &["outputTokens", "output_tokens"]).unwrap_or(output.output_tokens);
-    if output.input_tokens == 0 {
-        if let Some(total) = find_number(value, &["totalTokens", "total_tokens"]) {
-            output.input_tokens = total.saturating_sub(output.output_tokens);
-        }
-    }
     output.cache_read_tokens = cache_read.unwrap_or(output.cache_read_tokens);
     output.cache_write_tokens = cache_write.unwrap_or(output.cache_write_tokens);
+    let cache_tokens = output
+        .cache_read_tokens
+        .saturating_add(output.cache_write_tokens);
+    if let Some(tokens) = find_number(value, &["outputTokens", "output_tokens"]) {
+        upstream.output_tokens = Some(tokens);
+        output.output_tokens = tokens;
+    }
+    // Generic Kiro inputTokens includes the cached subsets. Only the explicit
+    // uncachedInputTokens basis needs cache reads/writes added to it.
+    let input = upstream
+        .uncached_input_tokens
+        .map(|uncached| uncached.saturating_add(cache_tokens))
+        .or(upstream.input_tokens)
+        .or_else(|| {
+            upstream
+                .total_tokens
+                .zip(upstream.output_tokens)
+                .map(|(total, output)| total.saturating_sub(output))
+        })
+        .map(|input| input.max(cache_tokens));
+    // Cache-only metadata does not report the whole prompt. Leave it missing
+    // so the shared fallback can estimate the remainder from the exact payload.
+    output.input_tokens = input.unwrap_or_default();
     output.reasoning_tokens = find_number(value, &["reasoningTokens", "reasoning_tokens"])
         .unwrap_or(output.reasoning_tokens);
     if output.credits <= 0.0 {
@@ -1766,45 +1789,55 @@ fn merge_usage(output: &mut UsageInfo, value: &Value) {
         .filter(|credits| *credits > 0.0)
         .unwrap_or(output.credits);
     }
+    input
 }
 
 fn find_number(value: &Value, keys: &[&str]) -> Option<u64> {
-    find_numeric_value(value, keys).and_then(|value| match value {
-        Value::Number(number) => number.as_u64().or_else(|| {
-            number
-                .as_f64()
-                .filter(|value| value.is_finite() && *value >= 0.0)
-                .map(|value| value as u64)
-        }),
-        Value::String(value) => value
-            .parse::<f64>()
-            .ok()
-            .and_then(|value| (value.is_finite() && value >= 0.0).then_some(value as u64)),
-        _ => None,
+    find_valid_number(value, keys, |value| {
+        let float = match value {
+            Value::Number(number) => {
+                if let Some(integer) = number.as_u64() {
+                    return Some(integer);
+                }
+                number.as_f64()?
+            }
+            Value::String(text) => {
+                if let Ok(integer) = text.parse::<u64>() {
+                    return Some(integer);
+                }
+                text.parse::<f64>().ok()?
+            }
+            _ => return None,
+        };
+        (float.is_finite() && float >= 0.0 && float < u64::MAX as f64 && float.fract() == 0.0)
+            .then_some(float as u64)
     })
 }
 
 fn find_float(value: &Value, keys: &[&str]) -> Option<f64> {
-    find_numeric_value(value, keys).and_then(|value| match value {
-        Value::Number(number) => number.as_f64(),
-        Value::String(value) => value.parse().ok(),
-        _ => None,
+    find_valid_number(value, keys, |value| {
+        match value {
+            Value::Number(number) => number.as_f64(),
+            Value::String(value) => value.parse().ok(),
+            _ => None,
+        }
+        .filter(|number| number.is_finite() && *number >= 0.0)
     })
 }
 
-fn find_numeric_value<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Value> {
+fn find_valid_number<T>(value: &Value, keys: &[&str], parse: fn(&Value) -> Option<T>) -> Option<T> {
     match value {
         Value::Object(map) => keys
             .iter()
             .filter_map(|key| map.get(*key))
-            .find(|candidate| candidate.is_number() || candidate.is_string())
+            .find_map(parse)
             .or_else(|| {
                 map.values()
-                    .find_map(|child| find_numeric_value(child, keys))
+                    .find_map(|child| find_valid_number(child, keys, parse))
             }),
         Value::Array(array) => array
             .iter()
-            .find_map(|child| find_numeric_value(child, keys)),
+            .find_map(|child| find_valid_number(child, keys, parse)),
         _ => None,
     }
 }
@@ -2965,6 +2998,155 @@ mod tests {
                 "text"
             ]
         );
+    }
+
+    #[test]
+    fn usage_is_independent_of_metadata_event_order_and_duplicate_snapshots() {
+        for input in [
+            json!({"inputTokens":100}),
+            json!({"uncachedInputTokens":30}),
+            json!({"totalTokens":120}),
+        ] {
+            let events = [
+                input,
+                json!({"cacheReadInputTokens":60}),
+                json!({"cacheWriteInputTokens":10}),
+                json!({"outputTokens":20}),
+            ];
+            for a in 0..4 {
+                for b in 0..4 {
+                    for c in 0..4 {
+                        for d in 0..4 {
+                            let order = [a, b, c, d];
+                            if order.iter().copied().collect::<HashSet<_>>().len() != 4 {
+                                continue;
+                            }
+                            let mut decoded = DecodedResponse::default();
+                            for index in order.into_iter().chain(order) {
+                                decoded
+                                    .push(KiroEvent::Usage {
+                                        usage: events[index].clone(),
+                                    })
+                                    .expect("usage");
+                            }
+                            assert_eq!(decoded.usage.input_tokens, 100, "{events:?} {order:?}");
+                            assert_eq!(decoded.upstream_input_tokens, Some(100));
+                            assert_eq!(decoded.usage.output_tokens, 20);
+                            assert_eq!(decoded.usage.cache_read_tokens, 60);
+                            assert_eq!(decoded.usage.cache_write_tokens, 10);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn usage_ignores_invalid_aliases_without_hiding_valid_counters() {
+        let mut decoded = DecodedResponse::default();
+        decoded
+            .push(KiroEvent::Usage {
+                usage: json!({
+                    "inputTokens":"unavailable",
+                    "cacheReadInputTokens":"NaN",
+                    "cacheWriteInputTokens":1.5,
+                    "creditsConsumed":"NaN",
+                    "tokenUsage":{
+                        "input_tokens":"100",
+                        "cache_read_input_tokens":"60.0",
+                        "cache_creation_input_tokens":10,
+                        "outputTokens":20,
+                        "creditsConsumed":"1.25"
+                    }
+                }),
+            })
+            .expect("usage");
+        decoded
+            .push(KiroEvent::Usage {
+                usage: json!({
+                    "cacheReadInputTokens":-1,
+                    "cacheWriteInputTokens":"18446744073709551616",
+                    "inputTokens":"inf"
+                }),
+            })
+            .expect("invalid counters are ignored");
+        assert_eq!(decoded.usage.input_tokens, 100);
+        assert_eq!(decoded.usage.output_tokens, 20);
+        assert_eq!(decoded.usage.cache_read_tokens, 60);
+        assert_eq!(decoded.usage.cache_write_tokens, 10);
+        assert_eq!(decoded.usage.credits, 1.25);
+    }
+
+    #[test]
+    fn usage_preserves_exact_integer_strings_and_explicit_cache_zeroes() {
+        let mut decoded = DecodedResponse::default();
+        decoded
+            .push(KiroEvent::Usage {
+                usage: json!({
+                    "inputTokens":"9007199254740993","cacheReadInputTokens":60,
+                    "cacheWriteInputTokens":10
+                }),
+            })
+            .expect("large integer");
+        assert_eq!(decoded.usage.input_tokens, 9_007_199_254_740_993);
+        decoded
+            .push(KiroEvent::Usage {
+                usage: json!({
+                    "inputTokens":0,"cacheReadInputTokens":0,"cacheWriteInputTokens":0,
+                    "outputTokens":0
+                }),
+            })
+            .expect("explicit zero");
+        assert_eq!(decoded.upstream_input_tokens, Some(0));
+        assert_eq!(decoded.usage.input_tokens, 0);
+        assert_eq!(decoded.usage.cache_read_tokens, 0);
+        assert_eq!(decoded.usage.cache_write_tokens, 0);
+    }
+
+    #[test]
+    fn usage_preserves_total_input_across_separate_cache_events() {
+        let mut decoded = DecodedResponse::default();
+        for usage in [
+            json!({"inputTokens":100,"outputTokens":20}),
+            json!({"cacheReadInputTokens":60}),
+            json!({"cacheWriteInputTokens":10}),
+        ] {
+            decoded.push(KiroEvent::Usage { usage }).expect("usage");
+        }
+        assert_eq!(decoded.usage.input_tokens, 100);
+        assert_eq!(decoded.upstream_input_tokens, Some(100));
+        assert_eq!(decoded.usage.cache_read_tokens, 60);
+        assert_eq!(decoded.usage.cache_write_tokens, 10);
+    }
+
+    #[test]
+    fn usage_recombines_uncached_input_and_later_cache_events() {
+        let mut decoded = DecodedResponse::default();
+        for usage in [
+            json!({"uncachedInputTokens":30}),
+            json!({"cacheReadInputTokens":60}),
+            json!({"cacheWriteInputTokens":10}),
+            json!({"outputTokens":20}),
+        ] {
+            decoded.push(KiroEvent::Usage { usage }).expect("usage");
+        }
+        assert_eq!(decoded.usage.input_tokens, 100);
+        assert_eq!(decoded.upstream_input_tokens, Some(100));
+        let response = decoded.claude_json("msg", "model", 100, 20, None, &replay_codec());
+        assert_eq!(response["usage"]["input_tokens"], 30);
+    }
+
+    #[test]
+    fn cache_only_usage_does_not_claim_a_reported_input_total() {
+        let mut decoded = DecodedResponse::default();
+        decoded
+            .push(KiroEvent::Usage {
+                usage: json!({"cacheReadInputTokens":60,"cacheWriteInputTokens":10}),
+            })
+            .expect("usage");
+        assert_eq!(decoded.upstream_input_tokens, None);
+        assert_eq!(decoded.usage.cache_read_tokens, 60);
+        assert_eq!(decoded.usage.cache_write_tokens, 10);
     }
 
     #[test]

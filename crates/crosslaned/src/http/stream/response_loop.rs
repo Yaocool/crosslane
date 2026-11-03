@@ -129,7 +129,7 @@ pub fn response(
             &context.lease.account_id(),
             context.prompt_cache.as_ref(),
         );
-        let mut claude = build_claude_state(&context, &prompt_cache_plan);
+        let mut claude = build_claude_state(&context);
         let mut accumulated_searches = std::mem::take(&mut context.resumed_tool_searches);
         let mut accumulated_web_searches = std::mem::take(&mut context.resumed_web_searches);
         let mut data_started = false;
@@ -433,6 +433,7 @@ pub fn response(
                                                 failed = Some(error);
                                                 break;
                                             }
+                                            claude.observe_usage(&decoded, &mut pending_initial);
                                             if stop_filter.matched().is_some() {
                                                 break;
                                             }
@@ -593,6 +594,7 @@ pub fn response(
                         failed = Some(error);
                         break;
                     }
+                    claude.observe_usage(&decoded, &mut pending_initial);
                     if stop_filter.matched().is_some() {
                         break;
                     }
@@ -1108,7 +1110,7 @@ pub fn response(
                         context.lease = new_lease;
                         prompt_cache_plan = next_prompt_cache_plan.clone();
                     }
-                    claude = build_claude_state(&context, &next_prompt_cache_plan);
+                    claude = build_claude_state(&context);
                     claude.input_tokens = next_input_tokens;
                     pending_initial = if matches!(protocol, StreamProtocol::Claude) {
                         match claude_initial_events(

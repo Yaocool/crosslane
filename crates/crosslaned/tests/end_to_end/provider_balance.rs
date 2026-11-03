@@ -23,6 +23,10 @@ struct Mixed {
 
 impl Mixed {
     async fn start() -> Self {
+        Self::start_with_protocols(&["/v1/messages", "/chat/completions", "/responses"]).await
+    }
+
+    async fn start_with_protocols(protocols: &[&str]) -> Self {
         let kiro = MockServer::start().await;
         let copilot = MockServer::start().await;
         Mock::given(method("POST"))
@@ -42,7 +46,7 @@ impl Mixed {
             ),
             (
                 "/models",
-                json!({"data":[{"id":"claude-sonnet-4-6","capabilities":{"supported_endpoints":["/v1/messages","/chat/completions","/responses"]}}]}),
+                json!({"data":[{"id":"claude-sonnet-4-6","capabilities":{"supported_endpoints":protocols}}]}),
             ),
         ] {
             Mock::given(method("GET"))
@@ -940,4 +944,178 @@ async fn native_none_with_inert_web_tools_stays_on_the_authorized_provider() {
         );
     }
     mixed.daemon.stop().await;
+}
+
+#[tokio::test]
+async fn chat_usage_opt_in_preserves_private_metering_for_every_upstream_protocol() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    for endpoint in ["/chat/completions", "/v1/messages", "/responses"] {
+        let mixed = Mixed::start_with_protocols(&[endpoint]).await;
+        let billing = json!({"total_nano_aiu":12345});
+        let usage = json!({"input_tokens":1000,"output_tokens":20,
+            "input_tokens_details":{"cached_tokens":600,"cache_write_tokens":100}});
+        let frames = match endpoint {
+            "/chat/completions" => vec![
+                json!({"id":"chat-cache","object":"chat.completion.chunk","model":"claude-sonnet-4-6",
+                    "choices":[{"index":0,"delta":{"content":"cached reply"},"finish_reason":"stop"}],"usage":null}),
+                json!({"id":"chat-cache","choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":20,
+                    "prompt_tokens_details":{"cached_tokens":600,"cache_write_tokens":100}},"copilot_usage":billing}),
+            ],
+            "/v1/messages" => vec![
+                json!({"type":"message_start","message":{"id":"msg-cache","model":"claude-sonnet-4-6","type":"message","role":"assistant","content":[],"stop_reason":null,"stop_sequence":null,
+                    "usage":{"input_tokens":300,"output_tokens":0,"cache_read_input_tokens":600,"cache_creation_input_tokens":100}}}),
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"cached reply"}}),
+                json!({"type":"content_block_stop","index":0}),
+                json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":20},"copilot_usage":billing}),
+                json!({"type":"message_stop"}),
+            ],
+            _ => vec![
+                json!({"type":"response.created","response":{"id":"resp-cache","model":"claude-sonnet-4-6"}}),
+                json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"cached reply"}),
+                json!({"type":"response.completed","response":{"id":"resp-cache","status":"completed","model":"claude-sonnet-4-6",
+                    "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"cached reply"}]}],
+                    "usage":usage,"copilot_usage":billing}}),
+            ],
+        };
+        let mut data = frames
+            .into_iter()
+            .map(|frame| format!("data: {frame}\n\n"))
+            .collect::<String>();
+        if endpoint == "/chat/completions" {
+            data.push_str("data: [DONE]\n\n");
+        }
+        let expected_requests = if endpoint == "/v1/messages" {
+            4u64
+        } else {
+            3u64
+        };
+        Mock::given(method("POST"))
+            .and(path(endpoint))
+            .respond_with(move |request: &wiremock::Request| {
+                if endpoint == "/chat/completions" {
+                    let body: Value = serde_json::from_slice(&request.body).unwrap();
+                    assert_eq!(body["stream_options"]["include_usage"], true);
+                }
+                ResponseTemplate::new(200).set_body_raw(data.clone(), "text/event-stream")
+            })
+            .with_priority(1)
+            .expect(expected_requests)
+            .mount(&mixed._copilot)
+            .await;
+        for flag in [None, Some(false), Some(true)] {
+            let mut body = json!({"model":"copilot/claude-sonnet-4.6","stream":true,
+                "messages":[{"role":"user","content":"hello"}]});
+            if let Some(flag) = flag {
+                body["stream_options"] = json!({"include_usage":flag});
+            }
+            let response = reqwest::Client::new()
+                .post(format!(
+                    "http://127.0.0.1:{}/v1/chat/completions",
+                    mixed.port
+                ))
+                .bearer_auth(mixed.daemon.api_key.as_deref().unwrap())
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            assert!(response
+                .headers()
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("text/event-stream"));
+            let text = response.text().await.unwrap();
+            assert_eq!(
+                status,
+                reqwest::StatusCode::OK,
+                "{endpoint} {flag:?}: {text}"
+            );
+            assert!(
+                text.contains("cached reply") && text.contains("[DONE]"),
+                "{text}"
+            );
+            let events = text
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+                .collect::<Vec<_>>();
+            let usage = events.iter().find(|event| event["usage"].is_object());
+            if flag == Some(true) {
+                let usage = &usage.expect("requested usage")["usage"];
+                assert_eq!(usage["prompt_tokens"], 1000);
+                assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 600);
+                assert_eq!(usage["prompt_tokens_details"]["cache_write_tokens"], 100);
+            } else {
+                assert!(usage.is_none(), "{text}");
+                assert!(events
+                    .iter()
+                    .all(|event| event.get("usage").is_none()
+                        && event.get("copilot_usage").is_none()));
+            }
+        }
+        if endpoint == "/v1/messages" {
+            let response = reqwest::Client::new()
+                .post(format!("http://127.0.0.1:{}/v1/messages", mixed.port))
+                .bearer_auth(mixed.daemon.api_key.as_deref().unwrap())
+                .header("anthropic-version", "2023-06-01")
+                .json(
+                    &json!({"model":"copilot/claude-sonnet-4.6","max_tokens":100,"stream":true,
+                    "messages":[{"role":"user","content":"hello"}]}),
+                )
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let text = response.text().await.unwrap();
+            assert_eq!(status, reqwest::StatusCode::OK, "{text}");
+            let events = text
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+                .collect::<Vec<_>>();
+            let usage = &events
+                .iter()
+                .find(|event| event["type"] == "message_start")
+                .unwrap()["message"]["usage"];
+            assert_eq!(
+                usage["input_tokens"], 300,
+                "public Messages input excludes caches"
+            );
+            assert_eq!(usage["cache_read_input_tokens"], 600);
+            assert_eq!(usage["cache_creation_input_tokens"], 100);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let stats = expect_ok(mixed.daemon.call("stats", json!({"detail":true})).await);
+            if stats["stats"]["total"]["requests"] == expected_requests {
+                assert_eq!(
+                    stats["stats"]["total"]["input_tokens"],
+                    expected_requests * 1000,
+                    "{stats}"
+                );
+                assert_eq!(
+                    stats["stats"]["total"]["output_tokens"],
+                    expected_requests * 20,
+                    "{stats}"
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline, "{stats}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let accounts = expect_ok(
+            mixed
+                .daemon
+                .call("v2.account.list", json!({"provider":"copilot"}))
+                .await,
+        );
+        assert_eq!(
+            accounts["accounts"][0]["details"]["local_aiu_usage"]["billed_requests"],
+            expected_requests,
+            "{accounts}"
+        );
+    }
 }

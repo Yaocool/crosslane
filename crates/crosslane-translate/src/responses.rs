@@ -54,6 +54,7 @@ pub struct ResponsesRequest {
     pub max_tool_calls: Option<u32>,
     pub context_management: Option<Value>,
     pub prompt_cache_key: Option<String>,
+    pub prompt_cache_options: Option<Value>,
     pub prompt_cache_retention: Option<String>,
     pub safety_identifier: Option<String>,
     pub user: Option<String>,
@@ -455,6 +456,9 @@ pub fn responses_to_openai(
         // Kiro's conversation ID is also its prompt-cache affinity key. The
         // HTTP layer hashes this client hint into an API-key-scoped UUID.
         conversation_id: request.prompt_cache_key.clone(),
+        prompt_cache_key: request.prompt_cache_key.clone(),
+        prompt_cache_options: request.prompt_cache_options.clone(),
+        prompt_cache_retention: request.prompt_cache_retention.clone(),
         metadata: request.metadata.clone(),
         response_format: request.text.as_ref().and_then(|text| text.format.clone()),
     };
@@ -513,6 +517,7 @@ fn declared_tools(request: &ResponsesRequest) -> Result<Vec<DeclaredTool<'_>>, V
 }
 
 fn validate_controls(request: &ResponsesRequest) -> Result<(), ValidationError> {
+    crate::cache_compatibility::validate_options(request.prompt_cache_options.as_ref())?;
     for (field, unsupported) in [
         ("background", request.background == Some(true)),
         ("conversation", request.conversation.is_some()),
@@ -737,6 +742,7 @@ fn content(value: Option<&Value>, field: &str, images: bool) -> Result<Value, Va
             .enumerate()
             .map(|(index, part)| {
                 let field = format!("{field}.{index}");
+                crate::cache_compatibility::validate_part(part, &field)?;
                 match part.get("type").and_then(Value::as_str) {
                     Some("input_text" | "output_text") => {
                         Ok(json!({"type":"text","text":string(part, "text", &field)?}))
