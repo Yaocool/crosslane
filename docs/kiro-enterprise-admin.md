@@ -9,6 +9,79 @@ These resources represent AWS/Kiro enterprise subscriptions. Local Crosslane acc
 
 ## Daemon credentials
 
+### CLI configuration and hot updates (recommended)
+
+Configure through the owner-only daemon Unix socket; no existing Admin token is required:
+
+```bash
+crosslane admin kiro configure
+crosslane admin kiro show
+crosslane --json admin kiro show
+```
+
+`configure` hides AK, SK and optional STS SessionToken input, then asks for the region
+(default `us-east-1`) and optional Profile ARN, Application ARN and Identity Center region.
+It replaces the complete credential/scope set; omitted scope fields revert to defaults.
+Temporary `ASIA` keys require a SessionToken. For automation, use
+`crosslane admin kiro configure --stdin < /secure/kiro-admin-input.json` with a `0600` input file,
+or pipe JSON directly from your credential manager:
+
+```json
+{
+  "access_key_id": "<AccessKeyId>",
+  "secret_access_key": "<SecretAccessKey>",
+  "region": "us-east-1"
+}
+```
+
+Optional fields: `session_token`, `profile_arn`, `application_arn`, `identity_center_region`.
+Secrets are not accepted in argv, printed, or included in input error diagnostics. Results contain
+only configuration status, source, region, scope and token presence. Configured status means local
+syntax checks passed; use `GET /profiles` to verify AWS identity/permissions. `GET /plans` is static.
+
+Profile ARNs validate the CodeWhisperer service, region, account and profile resource structure;
+Application ARNs validate the IAM Identity Center application structure. The resource types cannot
+be interchanged. See the [AWS Profile ARN definition](https://docs.aws.amazon.com/service-authorization/latest/reference/list_codewhisperer.html)
+and [AWS Application ARN definition](https://docs.aws.amazon.com/singlesignon/latest/APIReference/API_DescribeApplication.html).
+
+Write responses describe the submitted snapshot; use `show` for current state after concurrent changes.
+A `persistence_warning` means the change is already live but directory sync failed, so crash durability
+is unconfirmed. Terminal output displays it and JSON retains the field. Fix storage and retry the
+requested operation; do not assume the change was rejected. Ordinary `show` is not a durability check.
+
+Subsequent Kiro management requests use saved credentials immediately, without `config reload`,
+a restart or container recreation. Accepted AWS operations retain their original credential snapshot.
+Business services, account pools and REST tokens are unaffected.
+
+Credentials are AES-256-GCM encrypted in `.secrets/kiro-admin.enc` under the **daemon data directory**;
+a random local encryption key is stored alongside it as `kiro-admin.key`. The directory uses `0700`
+and files `0600`; ownership is checked and symbolic/hard links or permissive modes are rejected.
+macOS extended ACLs are also checked: additional ALLOW entries are rejected even when mode bits look
+private, while restrictive DENY entries remain supported. Inspect and remove inherited extra grants
+before configuring credentials; the CLI does not overwrite existing ACLs or parent-directory policies.
+Corruption fails closed without reverting to environment credentials. These credentials are outside
+`config.toml`, ordinary configuration/account exports, REST responses and logs; `config reset` does
+not modify them. Native defaults use `~/.local/share/crosslane/.secrets` (respecting `XDG_DATA_HOME`)
+or `$CROSSLANE_HOME/.secrets`. Docker stores them in its persistent volume at
+`/var/lib/crosslane/.secrets`; the calling CLI does not keep a local copy.
+
+Protect backups of both the encrypted file and local key: possession of both permits decryption.
+Restore a lost local key or fully replace the credentials with `configure`.
+
+```bash
+crosslane admin kiro clear    # Remove credentials and persist a disabled override
+crosslane admin kiro use-env  # Explicitly restore the daemon's inherited environment
+```
+
+The file takes precedence as a complete set; keys, token and scope are never mixed with environment
+values. `clear` prevents old environment credentials from returning, including after restart.
+`use-env` persists explicit environment selection; invalid/incomplete environment credentials reject the switch.
+
+### Legacy environment configuration
+
+The following remains compatible when no private credentials are configured or `use-env` was explicitly selected. Leave these fields empty
+when using CLI-managed credentials.
+
 Inject credentials into the **crosslaned process**, then start/restart it. For containers, inject
 the container environment; exporting variables in a CLI shell does not modify a running daemon.
 
@@ -93,7 +166,7 @@ Malformed pagination or exhausted bounds fail instead of returning incomplete re
 has a 120-second AWS budget, with at most 40 seconds per HTTP submission.
 
 Optional `region`, `profile_arn`, `application_arn`, and `identity_center_region` query parameters
-override environment defaults. Discovery selects only a unique candidate; ambiguity returns 409.
+override the active private credential or legacy environment defaults. Discovery selects only a unique candidate; ambiguity returns 409.
 Profiles must match the STS caller's account and requested region. Applications must be associated
 with the selected Profile and its Identity Center instance. Commercial AWS partitions only; China
 and GovCloud are unsupported. Explicit `legacy=true` supports only us-east-1 and immediate

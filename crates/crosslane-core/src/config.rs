@@ -2634,6 +2634,7 @@ port = 7651
 socket = "/run/crosslane/admin.sock"
 
 # 管理 REST 与公开状态接口共用 status_http 监听，通过独立 Bearer token 鉴权。
+# Kiro 官方管理 AK/SK 用 crosslane admin kiro configure 独立加密保存并热生效，不写本文件。
 # 此处只保存 token 的 SHA-256 摘要；模型客户端 Key 不获得管理权限。
 # 首次启用：crosslane config edit admin 同时展示 admin/status_http，先设置 status_http.enabled=true。
 # 保存并重载后执行 crosslane admin token create --name ops --enable-rest；自动生成并保存摘要。

@@ -21,6 +21,8 @@ tracing.workspace = true
 notify.workspace = true
 notify-debouncer-full.workspace = true
 rand.workspace = true
+ring.workspace = true
+zeroize.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

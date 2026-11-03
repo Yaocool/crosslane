@@ -554,6 +554,7 @@ dependencies = [
  "tokio",
  "toml",
  "toml_edit",
+ "zeroize",
 ]
 
 [[package]]
@@ -590,6 +591,7 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.63",
  "toml",
+ "zeroize",
 ]
 
 [[package]]
@@ -709,6 +711,7 @@ dependencies = [
  "notify",
  "notify-debouncer-full",
  "rand 0.8.5",
+ "ring",
  "serde",
  "serde_json",
  "tempfile",
@@ -717,6 +720,7 @@ dependencies = [
  "toml_edit",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

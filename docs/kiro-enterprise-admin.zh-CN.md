@@ -9,6 +9,77 @@
 
 ## 配置 AWS 管理员凭据
 
+### CLI 配置与热生效（推荐）
+
+通过 daemon 的 Unix socket 配置，无需已有 Admin token：
+
+```bash
+crosslane admin kiro configure
+crosslane admin kiro show
+crosslane --json admin kiro show
+```
+
+`configure` 隐藏输入 AK、SK 和可选 STS SessionToken，再填写区域（默认 `us-east-1`）
+与可选的 Profile ARN、Application ARN、Identity Center 区域。它会完整替换之前的凭证
+和范围，省略的范围字段恢复默认。临时 `ASIA` 凭证必须同时提供 SessionToken。
+
+自动化可使用 `crosslane admin kiro configure --stdin < /secure/kiro-admin-input.json`。
+输入文件应限制为 `0600`，也可从凭证管理工具直接管道输入，不需要保存明文文件。JSON 格式：
+
+```json
+{
+  "access_key_id": "<AccessKeyId>",
+  "secret_access_key": "<SecretAccessKey>",
+  "region": "us-east-1"
+}
+```
+
+可选字段为 `session_token`、`profile_arn`、`application_arn`、`identity_center_region`。
+不接受 AK/SK 命令行参数，避免进入 shell 历史和进程列表；错误信息不回显输入值。
+`show` 和设置结果只返回是否配置、来源、区域、范围及 SessionToken 是否存在，不返回任何密钥。
+“已配置”只代表本地格式检查通过，AWS 身份与权限需使用 `GET /profiles` 验证；`GET /plans`
+是静态清单，不能验证凭证。
+Profile ARN 会校验 CodeWhisperer 服务、区域、账号和 profile 资源结构；Application ARN
+会校验 IAM Identity Center 的 application 结构，两者不能互换。格式参考
+[AWS Profile ARN](https://docs.aws.amazon.com/service-authorization/latest/reference/list_codewhisperer.html)
+和 [AWS Application ARN](https://docs.aws.amazon.com/singlesignon/latest/APIReference/API_DescribeApplication.html)。
+
+写入结果是本次提交的配置快照；并发修改时，使用 `show` 查询最新状态。
+若结果包含 `persistence_warning`，表示修改已经热生效，但目录同步失败，崩溃或断电后的
+持久性无法确认。CLI 会显示提醒，JSON 模式保留该字段；应检查存储后重试原操作，
+不能把它当成“修改未生效”。普通 `show` 只查询状态，不确认此前写入的持久性。
+
+保存成功后，后续 Kiro 管理请求立即读取新凭证，不需要 `config reload`、重启 daemon 或重建
+容器；已受理的 AWS 操作继续使用其原凭证快照。业务服务、账号池与 REST token 保持原状态。
+
+凭证存放在 **daemon 数据目录**的 `.secrets/kiro-admin.enc`，使用 AES-256-GCM 加密；
+同目录的 `kiro-admin.key` 保存随机本机加密密钥。目录权限 `0700`、文件权限 `0600`，校验
+属主并拒绝符号链接、硬链接及宽松权限。macOS 还会检查扩展 ACL，拒绝额外 ALLOW
+授权（即使 mode 显示为 0700/0600），仅限制权限的 DENY 条目可保留。若目录继承了额外授权，
+需要先检查并移除这些授权；CLI 不会自动覆盖已有 ACL 或修改父目录的访问策略。文件损坏或权限异常时拒绝管理操作，不回落旧环境变量。
+这些文件不写入 `config.toml`、普通配置导出、账号导出、REST 响应或日志，也不受 `config reset`
+修改。原生默认目录为 `~/.local/share/crosslane/.secrets`（遵循 `XDG_DATA_HOME`）；设置
+`CROSSLANE_HOME` 后位于其 `.secrets` 子目录。Docker 默认在持久卷 `/var/lib/crosslane/.secrets`，
+CLI 通过 socket 修改容器中的文件，不会在调用端保存副本。
+
+备份时须同样保护加密文件和本机密钥，同时持有两者即可解密。密钥丢失时不能解密旧凭证，
+需恢复本机密钥或重新执行 `configure` 完整设置。
+
+```bash
+# 移除当前凭证并持久化停用，阻止旧环境变量重新生效
+crosslane admin kiro clear
+
+# 明确恢复 daemon 启动环境中的旧配置；存在无效环境凭证时拒绝切换
+crosslane admin kiro use-env
+```
+
+文件凭证优先于环境变量，整组选择，不混用 AK、SK、SessionToken 或范围。`clear` 保留加密
+停用标记，重启后仍停用；`use-env` 写入显式环境来源标记，再使用该进程继承的环境变量。
+
+### 兼容环境变量配置
+
+以下方式继续兼容，仅在未设置文件凭证或显式选择 use-env 时生效。CLI 管理凭证时可将 `.env` 中这些字段留空。
+
 把以下变量注入 **crosslaned 进程**，然后启动或重启该进程。容器部署时必须注入容器环境，
 仅在宿主机 CLI 的 shell 中 export 不会改变已经运行的守护进程。
 
@@ -23,7 +94,7 @@ export CROSSLANE_KIRO_ADMIN_SESSION_TOKEN='替换为临时SessionToken'
 crosslaned
 ```
 
-凭据不写入 Crosslane 的 TOML、账号库或 REST 响应；不会读取默认 AWS profile、
+环境凭据不写入 Crosslane 的 TOML、账号库或 REST 响应；不会读取默认 AWS profile、
 `AWS_ACCESS_KEY_ID`、SSO 缓存或 EC2/ECS 凭据链。请求不接收 AK/SK，调用方只携带 Admin token。
 AWS 凭据缺失、不完整或环境变量编码无效时，远程查询/写入返回 `503 kiro_admin_not_configured`；
 `GET /plans` 不需要 AWS 凭据。修改部署环境后应重启守护进程；`config reload` 不会更新进程环境。
@@ -89,7 +160,7 @@ services:
 不会把不完整清单作为成功返回。每个请求的 AWS 处理预算为 120 秒，每次 HTTP 请求最多 40 秒。
 
 可选查询参数 `region`、`profile_arn`、`application_arn`、`identity_center_region` 覆盖对应
-环境变量的默认选择。只在唯一候选时自动选择；有多个候选返回 409，不任取第一个。
+凭证文件或环境变量中的默认选择。只在唯一候选时自动选择；有多个候选返回 409，不任取第一个。
 传入的应用必须属于选中 Profile，返回的应用实例必须匹配 Profile 的 Identity Center 实例。
 Profile 的区域及所属 AWS 账号必须与当前请求和 STS 调用身份一致。
 

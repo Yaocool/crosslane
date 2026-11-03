@@ -52,6 +52,9 @@ pub(super) fn handle_nested_help(matches: &clap::ArgMatches) -> Result<bool> {
 
 pub fn empty_group_path(command: &Command) -> Option<&'static str> {
     match command {
+        Command::Admin {
+            command: Some(crate::commands::admin::AdminCommand::Kiro { command: None }),
+        } => Some("admin kiro"),
         Command::Admin { command: None } => Some("admin"),
         Command::Admin {
             command: Some(crate::commands::admin::AdminCommand::Token { command: None }),

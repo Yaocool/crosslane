@@ -3,6 +3,7 @@
 **/*.rs.bk
 *.pdb
 .crosslane-dev/
+.secrets/
 # Keep legacy credential directories ignored.
 .kproxy-dev/
 

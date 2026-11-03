@@ -7,6 +7,7 @@ pub mod account_csv;
 pub mod client_context;
 pub mod config;
 pub mod ids;
+pub mod kiro_admin;
 pub mod model_policy;
 pub mod paths;
 pub mod provider;

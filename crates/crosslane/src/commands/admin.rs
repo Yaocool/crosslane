@@ -1,4 +1,4 @@
-//! Admin REST credentials use the trusted control socket, not a Bearer token.
+//! REST tokens and Kiro AWS credentials use the trusted control socket.
 
 use anyhow::Result;
 use clap::Subcommand;
@@ -9,8 +9,18 @@ use crosslane_ipc::protocol::{
 use crate::client::AdminClient;
 use crate::output::{format_timestamp, print_json, render_table};
 
+mod kiro;
+
 #[derive(Debug, Subcommand)]
 pub enum AdminCommand {
+    /// 配置 Kiro 官方管理凭证；独立加密保存并热生效，不写 config.toml。
+    #[command(
+        after_help = "凭证通过 Unix socket 写入 daemon 数据目录的 .secrets/kiro-admin.enc；目录 0700、文件 0600。\nconfigure 隐藏输入 AK/SK/SessionToken，--stdin 支持 JSON；不接受密钥命令行参数。保存后后续 Kiro 管理请求立即使用新凭证，不重启 daemon。\nshow 只返回状态；clear 停用凭证且阻止回落旧环境变量；use-env 显式恢复环境变量来源。\n\n示例：\n  crosslane admin kiro configure\n  crosslane admin kiro configure --stdin < /secure/kiro-admin-input.json\n  crosslane admin kiro show\n  crosslane admin kiro clear\n  crosslane admin kiro use-env"
+    )]
+    Kiro {
+        #[command(subcommand)]
+        command: Option<kiro::KiroAdminCommand>,
+    },
     /// 管理独立 REST 接口的令牌，与业务 apikey 分开。
     #[command(
         after_help = "首次启用：crosslane config edit admin，将 [status_http] enabled=true 后保存重载；再创建带 --enable-rest 的令牌。\n\n示例：\n  crosslane admin token create --name ops --enable-rest\n  crosslane admin token create --name monitor --role read-only\n  crosslane admin token list\n  crosslane admin token rotate ops\n  crosslane admin token revoke monitor\n\n命令通过 Unix socket 执行，不需要先有 Admin Bearer token。明文仅在 create/rotate 返回，配置只保存摘要。"
@@ -113,6 +123,12 @@ fn hint(rest: bool, listener: bool) {
 }
 
 pub async fn run(client: &mut AdminClient, command: AdminCommand, json: bool) -> Result<()> {
+    let command = match command {
+        AdminCommand::Kiro {
+            command: Some(command),
+        } => return kiro::run(client, command, json).await,
+        other => other,
+    };
     let AdminCommand::Token {
         command: Some(command),
     } = command

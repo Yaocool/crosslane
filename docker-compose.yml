@@ -25,7 +25,8 @@ services:
       - crosslane-data:/var/lib/crosslane
     environment:
       RUST_LOG: info
-      # Optional Kiro enterprise administration; credentials stay on the daemon.
+      # Legacy Kiro enterprise environment fallback. Prefer admin kiro configure:
+      # encrypted credentials persist in crosslane-data and hot-apply without recreation.
       CROSSLANE_KIRO_ADMIN_ACCESS_KEY_ID: ${CROSSLANE_KIRO_ADMIN_ACCESS_KEY_ID:-}
       CROSSLANE_KIRO_ADMIN_SECRET_ACCESS_KEY: ${CROSSLANE_KIRO_ADMIN_SECRET_ACCESS_KEY:-}
       CROSSLANE_KIRO_ADMIN_SESSION_TOKEN: ${CROSSLANE_KIRO_ADMIN_SESSION_TOKEN:-}

@@ -367,7 +367,8 @@ impl EnterpriseError {
     }
 }
 
-pub(super) fn validate_region(region: &str) -> Result<(), EnterpriseError> {
+/// Validate a supported commercial region without constructing an HTTP client.
+pub fn validate_region(region: &str) -> Result<(), EnterpriseError> {
     let segments: Vec<_> = region.split('-').collect();
     if region.len() > 32
         || segments.len() < 3

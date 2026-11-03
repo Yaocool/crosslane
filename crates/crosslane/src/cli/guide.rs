@@ -74,7 +74,7 @@ const TOPICS: &[(&str, &str)] = &[
     ("sso", "Kiro IAM Identity Center SSO 单账号与批量导入"),
     ("service", "代理服务生命周期"),
     ("apikey", "API key、限额与用量"),
-    ("admin", "Admin REST 多令牌的创建、启停、轮换与撤销"),
+    ("admin", "Admin REST 多令牌与 Kiro 管理凭证的安全配置"),
     ("pool", "Kiro 评分与 Copilot 账号模型支持"),
     ("balance", "Kiro 账号池调度评分原理"),
     ("diagnose", "Kiro 网络和账号真实推理诊断"),
@@ -122,7 +122,7 @@ pub fn print(topic: Option<&str>, provider: Option<&str>) -> Result<()> {
 
 fn topic_text(topic: &str) -> Result<&'static str> {
     let text = match topic {
-        "admin" => r#"Admin REST 令牌（全局，不接受 --provider）
+        "admin" => r#"Admin REST 令牌与 Kiro 管理凭证（全局，不接受 --provider）
 1. 运行 crosslane config edit admin（或 config edit status-http），同屏编辑 [admin] 与 [status_http]；旧配置会补齐缺少的默认字段。
    先设置 [status_http] enabled=true，保留 [admin.rest] enabled=false；默认地址 127.0.0.1:7651。
    保存后自动重载，再执行第 2 步；监听的启停、地址和端口均不需要重启 daemon。
@@ -143,7 +143,16 @@ fn topic_text(topic: &str) -> Result<&'static str> {
 已有令牌时，可在 config edit admin 中直接设置 [admin.rest] enabled=true，无需重复创建。关闭状态监听时须同时关闭 REST；config reset status-http 会完成这两项，并保留令牌。config reset admin 会清除令牌和重置 socket，保留状态监听。
 编辑器未改设置直接退出时不写文件、不重载服务，仍提示待重启字段。--enable-rest 要求运行监听与磁盘配置的启用状态、地址和端口一致，监听配置尚未应用时会拒绝创建，请先执行 crosslane config reload。socket 默认值取自 daemon；连接未提供默认值的旧 daemon 时保留当前 socket。完整 config reset 也会清除管理令牌并关闭 REST/状态监听，操作前自动备份。
 旧 token_sha256/read_token_sha256 配置继续兼容，在列表中显示为 legacy-admin/legacy-read-only，也可使用这些 ID 管理。最后一把令牌撤销后关闭 Admin REST，公开状态和业务 service 保持原配置。
-Kiro 企业用户与套餐通过 /admin/v1/kiro/enterprise 的 REST 接口管理；AWS 管理员凭据只配置在 crosslaned 的 CROSSLANE_KIRO_ADMIN_* 环境变量中，调用方仍只传 Admin token。接口说明：docs/admin-rest.zh-CN.md、docs/kiro-enterprise-admin.zh-CN.md。"#,
+Kiro 企业用户与套餐通过 /admin/v1/kiro/enterprise 管理，调用方只传 Admin token。
+AWS 管理员凭证使用以下命令，不写 config.toml：
+  crosslane admin kiro configure
+  crosslane admin kiro configure --stdin < /secure/kiro-admin-input.json
+  crosslane admin kiro show
+  crosslane admin kiro clear
+  crosslane admin kiro use-env
+configure 完整替换凭证及区域/范围，隐藏输入 AK/SK/SessionToken；--stdin 读取完整 JSON，不接受密钥 argv 参数。daemon 将其 AES-256-GCM 加密保存到数据目录的 .secrets/kiro-admin.enc，同目录 kiro-admin.key 保存本机加密密钥；目录 0700、文件 0600，拒绝链接和不安全权限。修改对后续管理请求热生效，不重启 daemon，也不影响已受理操作。
+写入结果为本次提交快照；并发修改后的最新状态用 show 查询。若返回 persistence_warning，修改已热生效，但崩溃后的持久性未确认，检查存储后重试原操作。show 只显示状态和来源。clear 删除当前凭证并持久化停用标记，不会回落旧环境变量；use-env 写入显式环境来源标记，恢复 daemon 启动环境中的 CROSSLANE_KIRO_ADMIN_* 来源。文件错误时拒绝远程管理，不自动回落；仅环境变量模式的更新仍需重启/重建进程。
+这些凭证不属于 config reset；使用 admin kiro clear 停用。API、日志和普通配置导出不返回 AK/SK/SessionToken。保护加密文件及本机密钥的备份，两者齐全可解密。接口说明：docs/admin-rest.zh-CN.md、docs/kiro-enterprise-admin.zh-CN.md。"#,
         "provider" => {
             r#"命令适用范围
   两者共用：provider、status、ready、account add/list/show/rm/enable/disable/tag/export/refresh/probe/reset-health/services、pool、models、model-map、service、apikey、stats、logs show/follow；--provider 可放在任意子命令前后，也可设置 CROSSLANE_PROVIDER；列表与 --all 操作默认聚合全部来源，单账号按 ID 自动识别；export 保持旧 Kiro 格式，需 --provider all 才导出全部。

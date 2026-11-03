@@ -30,6 +30,23 @@ pub struct AdminTokenResult {
     pub listener_enabled: bool,
 }
 
+/// Kiro credential status only; no AWS key, token, or encrypted contents.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct KiroAdminCredentialsView {
+    pub configured: bool,
+    pub source: String,
+    pub credentials_file: String,
+    pub region: Option<String>,
+    pub has_session_token: bool,
+    pub profile_arn: Option<String>,
+    pub application_arn: Option<String>,
+    pub identity_center_region: Option<String>,
+    /// Present only on a write whose live publication succeeded but crash
+    /// durability could not be confirmed. Never contains credential values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistence_warning: Option<String>,
+}
+
 /// Plaintext is returned only by create/rotate. Debug must not disclose it.
 #[derive(Serialize, Deserialize)]
 pub struct CreatedAdminToken {
@@ -178,6 +195,10 @@ pub mod method {
     pub const ADMIN_TOKEN_ROTATE: &str = "admin.token.rotate";
     pub const ADMIN_TOKEN_REVOKE: &str = "admin.token.revoke";
     pub const ADMIN_TOKEN_SET_ENABLED: &str = "admin.token.setEnabled";
+    pub const ADMIN_KIRO_CREDENTIALS_SHOW: &str = "admin.kiro.credentials.show";
+    pub const ADMIN_KIRO_CREDENTIALS_CONFIGURE: &str = "admin.kiro.credentials.configure";
+    pub const ADMIN_KIRO_CREDENTIALS_CLEAR: &str = "admin.kiro.credentials.clear";
+    pub const ADMIN_KIRO_CREDENTIALS_USE_ENV: &str = "admin.kiro.credentials.useEnvironment";
 
     /// 全部方法名。
     pub const ALL: &[&str] = &[
@@ -187,6 +208,10 @@ pub mod method {
         ADMIN_TOKEN_ROTATE,
         ADMIN_TOKEN_REVOKE,
         ADMIN_TOKEN_SET_ENABLED,
+        ADMIN_KIRO_CREDENTIALS_SHOW,
+        ADMIN_KIRO_CREDENTIALS_CONFIGURE,
+        ADMIN_KIRO_CREDENTIALS_CLEAR,
+        ADMIN_KIRO_CREDENTIALS_USE_ENV,
         V2_CAPABILITIES,
         V2_PROVIDER_LIST,
         V2_PROVIDER_SHOW,

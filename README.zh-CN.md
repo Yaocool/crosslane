@@ -85,7 +85,7 @@ HTTP 的 `/`、`/health`、`/ready` 通过[独立状态监听](docs/startup-and-
 管理令牌，明文只在创建或轮换时显示，配置仅保存摘要。
 `crosslane config edit admin` 可一起编辑鉴权和 `[status_http]` 监听；首次启用及重载步骤见
 `crosslane guide admin`。Kiro 企业用户与套餐使用[独立管理接口](docs/kiro-enterprise-admin.zh-CN.md)，
-AWS 管理员凭据通过 daemon 环境配置。
+AWS 管理员凭据通过 `crosslane admin kiro configure` 独立加密保存并热生效，兼容旧环境变量配置。
 
 ## 接入客户端
 

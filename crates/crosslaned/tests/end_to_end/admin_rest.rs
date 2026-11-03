@@ -75,15 +75,25 @@ impl AdminFixture {
     }
 
     fn spawn(home: &Path, upstream: &str) -> Child {
+        Self::spawn_with_environment(home, upstream, &[])
+    }
+
+    fn spawn_with_environment(home: &Path, upstream: &str, environment: &[(&str, &str)]) -> Child {
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(home.join("rest-test.log"))
             .unwrap();
         Command::new(env!("CARGO_BIN_EXE_crosslaned"))
+            .current_dir(home)
             .env_remove("CROSSLANE_KIRO_ADMIN_ACCESS_KEY_ID")
             .env_remove("CROSSLANE_KIRO_ADMIN_SECRET_ACCESS_KEY")
             .env_remove("CROSSLANE_KIRO_ADMIN_SESSION_TOKEN")
+            .env_remove("CROSSLANE_KIRO_ADMIN_REGION")
+            .env_remove("CROSSLANE_KIRO_ADMIN_PROFILE_ARN")
+            .env_remove("CROSSLANE_KIRO_ADMIN_APPLICATION_ARN")
+            .env_remove("CROSSLANE_KIRO_ADMIN_IDENTITY_CENTER_REGION")
+            .envs(environment.iter().copied())
             .env("CROSSLANE_HOME", home)
             .env("CROSSLANE_CODEWHISPERER_URL", upstream)
             .env("CROSSLANE_AMAZONQ_URL", upstream)
@@ -154,9 +164,14 @@ impl AdminFixture {
     }
 
     pub(super) async fn restart(&mut self) {
+        self.restart_with_environment(&[]).await;
+    }
+
+    pub(super) async fn restart_with_environment(&mut self, environment: &[(&str, &str)]) {
         self.daemon.child.kill().await.unwrap();
         self.daemon.child.wait().await.unwrap();
-        self.daemon.child = Self::spawn(self.daemon.home(), &self.upstream.uri());
+        self.daemon.child =
+            Self::spawn_with_environment(self.daemon.home(), &self.upstream.uri(), environment);
         wait_for_socket(&self.daemon.socket).await;
         wait_for_http(self.port).await;
     }

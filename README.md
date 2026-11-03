@@ -96,7 +96,7 @@ Use `crosslane admin token create/list/show/rotate/disable/enable/revoke` to man
 admin credentials; plaintext is returned only at creation/rotation, and only digests are stored.
 `crosslane config edit admin` edits authentication and its `[status_http]` listener together;
 see `crosslane guide admin` for initial setup and reload behavior. Kiro enterprise users
-and subscriptions use [dedicated admin endpoints](docs/kiro-enterprise-admin.md) with daemon-side AWS credentials.
+and subscriptions use [dedicated admin endpoints](docs/kiro-enterprise-admin.md) with daemon-side AWS credentials; `crosslane admin kiro configure` stores them separately, encrypted, and applies changes without a restart.
 
 ## Connect a client
 

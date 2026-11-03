@@ -4,6 +4,7 @@ pub mod completions;
 pub mod guide;
 pub mod help;
 pub(crate) mod scope;
+pub(crate) mod secret_input;
 
 use anyhow::Result;
 use clap::{CommandFactory, FromArgMatches};

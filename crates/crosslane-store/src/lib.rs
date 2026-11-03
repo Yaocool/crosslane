@@ -6,3 +6,4 @@ pub mod bootstrap;
 pub mod config_loader;
 pub mod config_update;
 pub mod environment;
+pub mod kiro_admin;

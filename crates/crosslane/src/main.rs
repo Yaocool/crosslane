@@ -64,9 +64,9 @@ struct TimeRangeArgs {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// 管理 Admin REST 的独立访问令牌；通过 Unix socket 执行。
+    /// 管理 Admin REST 令牌与 Kiro 官方管理凭证；通过 Unix socket 执行。
     #[command(
-        after_help = "首次启用：crosslane config edit admin 同时编辑 [status_http] 和 [admin.rest]，先开启监听并保存重载，再创建 --enable-rest 令牌。\n\n示例：\n  crosslane admin token create --name ops --enable-rest\n  crosslane admin token list\n  crosslane admin token rotate ops\n  crosslane admin token revoke ops\n\n操作说明：crosslane guide admin"
+        after_help = "首次启用：crosslane config edit admin 同时编辑 [status_http] 和 [admin.rest]，先开启监听并保存重载，再创建 --enable-rest 令牌。\n\n示例：\n  crosslane admin token create --name ops --enable-rest\n  crosslane admin token list\n  crosslane admin token rotate ops\n  crosslane admin token revoke ops\n  crosslane admin kiro configure\n  crosslane admin kiro show\n\nKiro AK/SK 独立加密保存，CLI 修改后热生效，不写 config.toml。操作说明：crosslane guide admin"
     )]
     Admin {
         #[command(subcommand)]

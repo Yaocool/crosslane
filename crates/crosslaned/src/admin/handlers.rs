@@ -38,6 +38,7 @@ use crate::state::AppState;
 
 type Handled = Result<serde_json::Value, RpcError>;
 
+pub(super) mod kiro_credentials;
 mod providers;
 mod removal;
 pub(super) mod rest;
@@ -47,6 +48,12 @@ mod tokens;
 pub async fn dispatch(state: &Arc<AppState>, request: Request) -> Response {
     let id = request.id;
     let outcome = match request.method.as_str() {
+        method::ADMIN_KIRO_CREDENTIALS_SHOW => kiro_credentials::show(state).await,
+        method::ADMIN_KIRO_CREDENTIALS_CONFIGURE => {
+            kiro_credentials::configure(state, request.params).await
+        }
+        method::ADMIN_KIRO_CREDENTIALS_CLEAR => kiro_credentials::clear(state).await,
+        method::ADMIN_KIRO_CREDENTIALS_USE_ENV => kiro_credentials::use_environment(state).await,
         method::ADMIN_TOKEN_LIST => tokens::list(state),
         method::ADMIN_TOKEN_SHOW => tokens::show(state, request.params),
         method::ADMIN_TOKEN_CREATE => tokens::create(state, request.params).await,

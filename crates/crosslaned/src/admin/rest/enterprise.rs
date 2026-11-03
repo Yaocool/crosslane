@@ -1,5 +1,5 @@
-//! AWS administrator credentials come only from crosslaned's environment,
-//! independently of the Admin Bearer token and stored OAuth account pools.
+//! AWS credentials come from private daemon storage, with legacy environment
+//! fallback, independently of Admin Bearer tokens and OAuth account pools.
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -10,8 +10,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use crosslane_kiro::enterprise::{
-    AwsCredentials, DeletionMode, EnterpriseClient, EnterpriseError, Mutation, MutationCoordinator,
-    MutationResult, Plan, ScopeSelector, WriteOutcome,
+    DeletionMode, EnterpriseClient, EnterpriseError, Mutation, MutationCoordinator, MutationResult,
+    Plan, ScopeSelector, WriteOutcome,
 };
 use futures::FutureExt;
 use serde::Deserialize;
@@ -205,51 +205,60 @@ impl ScopeQuery {
 }
 
 fn configuration_error() -> RestError {
-    ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "kiro_admin_not_configured", "set valid CROSSLANE_KIRO_ADMIN_ACCESS_KEY_ID, CROSSLANE_KIRO_ADMIN_SECRET_ACCESS_KEY and, for STS credentials, CROSSLANE_KIRO_ADMIN_SESSION_TOKEN in the crosslaned environment").into()
+    ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "kiro_admin_not_configured", "configure valid Kiro AWS credentials with crosslane admin kiro configure; check private credential permissions or legacy CROSSLANE_KIRO_ADMIN_* environment settings").into()
 }
 
-fn context(input: &ScopeQuery) -> Result<(EnterpriseClient, ScopeSelector)> {
-    context_with(input, &|name| match std::env::var(name) {
-        Ok(value) => Ok(Some(value)),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => Err(configuration_error()),
-    })
+async fn context(
+    state: &RestState,
+    input: &ScopeQuery,
+) -> Result<(EnterpriseClient, ScopeSelector)> {
+    let (settings, _) = crate::admin::handlers::kiro_credentials::effective(&state.app.paths)
+        .await
+        .map_err(|_| configuration_error())?;
+    context_from_settings(input, &settings.ok_or_else(configuration_error)?)
 }
 
-// Keep environment loading injectable: tests never mutate the process-global
-// credential environment or accidentally fall back to real AWS credentials.
+#[cfg(test)]
 fn context_with(
     input: &ScopeQuery,
     read: &impl Fn(&str) -> Result<Option<String>>,
 ) -> Result<(EnterpriseClient, ScopeSelector)> {
-    let optional = |name: &str| -> Result<Option<String>> {
-        Ok(read(name)?.filter(|value| !value.is_empty()))
-    };
-    let credentials = AwsCredentials::new(
-        read("CROSSLANE_KIRO_ADMIN_ACCESS_KEY_ID")?.unwrap_or_default(),
-        read("CROSSLANE_KIRO_ADMIN_SECRET_ACCESS_KEY")?.unwrap_or_default(),
-        optional("CROSSLANE_KIRO_ADMIN_SESSION_TOKEN")?,
-    )
+    let settings = crate::admin::handlers::kiro_credentials::environment_with(&|name| {
+        read(name).map_err(|_| anyhow::anyhow!("invalid credential environment"))
+    })
     .map_err(|_| configuration_error())?;
-    let fallback = |value: &Option<String>, name: &str| match value {
-        Some(value) => Ok(Some(value.clone())),
-        None => optional(name),
-    };
-    let region = fallback(&input.region, "CROSSLANE_KIRO_ADMIN_REGION")?
-        .unwrap_or_else(|| "us-east-1".into());
+    context_from_settings(input, &settings)
+}
+
+fn context_from_settings(
+    input: &ScopeQuery,
+    settings: &crosslane_core::kiro_admin::KiroAdminCredentials,
+) -> Result<(EnterpriseClient, ScopeSelector)> {
+    let credentials = crate::admin::handlers::kiro_credentials::aws_credentials(settings)
+        .map_err(|_| configuration_error())?;
     let selector = ScopeSelector {
-        profile_arn: fallback(&input.profile_arn, "CROSSLANE_KIRO_ADMIN_PROFILE_ARN")?,
-        application_arn: fallback(
-            &input.application_arn,
-            "CROSSLANE_KIRO_ADMIN_APPLICATION_ARN",
-        )?,
-        identity_center_region: fallback(
-            &input.identity_center_region,
-            "CROSSLANE_KIRO_ADMIN_IDENTITY_CENTER_REGION",
-        )?,
+        profile_arn: input
+            .profile_arn
+            .clone()
+            .or_else(|| settings.profile_arn.clone()),
+        application_arn: input
+            .application_arn
+            .clone()
+            .or_else(|| settings.application_arn.clone()),
+        identity_center_region: input
+            .identity_center_region
+            .clone()
+            .or_else(|| settings.identity_center_region.clone()),
     };
     Ok((
-        EnterpriseClient::new(credentials, region, input.legacy)?,
+        EnterpriseClient::new(
+            credentials,
+            input
+                .region
+                .clone()
+                .unwrap_or_else(|| settings.region.clone()),
+            input.legacy,
+        )?,
         selector,
     ))
 }
@@ -258,7 +267,7 @@ async fn plans() -> Response {
     ok(Plan::ALL.map(|plan| json!({"plan":plan,"subscription_type":plan.aws_type()})))
 }
 
-async fn profiles(request: Request) -> Result {
+async fn profiles(State(state): State<RestState>, request: Request) -> Result {
     let input = ScopeQuery::for_non_delete(&request)?;
     if input.profile_arn.is_some()
         || input.application_arn.is_some()
@@ -269,31 +278,35 @@ async fn profiles(request: Request) -> Result {
         )
         .into());
     }
-    Ok(ok(context(&input)?.0.profiles().await?))
+    Ok(ok(context(&state, &input).await?.0.profiles().await?))
 }
 
-async fn scope(request: Request) -> Result {
+async fn scope(State(state): State<RestState>, request: Request) -> Result {
     let input = ScopeQuery::for_non_delete(&request)?;
-    let (client, selector) = context(&input)?;
+    let (client, selector) = context(&state, &input).await?;
     Ok(ok(client.scope(&selector).await?))
 }
 
-async fn users(request: Request) -> Result {
+async fn users(State(state): State<RestState>, request: Request) -> Result {
     let input = ScopeQuery::for_non_delete(&request)?;
-    let (client, selector) = context(&input)?;
+    let (client, selector) = context(&state, &input).await?;
     Ok(ok(client.users(&selector).await?))
 }
 
-async fn subscriptions(request: Request) -> Result {
+async fn subscriptions(State(state): State<RestState>, request: Request) -> Result {
     let input = ScopeQuery::for_non_delete(&request)?;
-    let (client, selector) = context(&input)?;
+    let (client, selector) = context(&state, &input).await?;
     let (scope, subscriptions) = client.subscriptions(&selector).await?;
     Ok(ok(json!({"scope":scope,"subscriptions":subscriptions})))
 }
 
-async fn user_subscription(Path(user): Path<String>, request: Request) -> Result {
+async fn user_subscription(
+    State(state): State<RestState>,
+    Path(user): Path<String>,
+    request: Request,
+) -> Result {
     let input = ScopeQuery::for_non_delete(&request)?;
-    let (client, selector) = context(&input)?;
+    let (client, selector) = context(&state, &input).await?;
     Ok(ok(client.user_subscription(&selector, &user).await?))
 }
 
@@ -310,25 +323,25 @@ async fn create(
     Path(user): Path<String>,
     request: Request,
 ) -> Result {
-    change(state.enterprise, user, request, Mutation::Create).await
+    change(state, user, request, Mutation::Create).await
 }
 async fn upgrade(
     State(state): State<RestState>,
     Path(user): Path<String>,
     request: Request,
 ) -> Result {
-    change(state.enterprise, user, request, Mutation::Upgrade).await
+    change(state, user, request, Mutation::Upgrade).await
 }
 async fn downgrade(
     State(state): State<RestState>,
     Path(user): Path<String>,
     request: Request,
 ) -> Result {
-    change(state.enterprise, user, request, Mutation::Downgrade).await
+    change(state, user, request, Mutation::Downgrade).await
 }
 
 async fn change(
-    control: Arc<Control>,
+    state: RestState,
     user: String,
     request: Request,
     mutation: fn(Plan) -> Mutation,
@@ -340,8 +353,9 @@ async fn change(
         .cloned()
         .ok_or_else(ApiError::internal)?;
     let body: ChangePlan = body(request).await?;
-    let (client, selector) = context(&input)?;
-    let result = control
+    let (client, selector) = context(&state, &input).await?;
+    let result = state
+        .enterprise
         .execute(
             client,
             selector,
@@ -373,7 +387,7 @@ async fn cancel(
         .get::<RequestAudit>()
         .cloned()
         .ok_or_else(ApiError::internal)?;
-    let (client, selector) = context(&input)?;
+    let (client, selector) = context(&state, &input).await?;
     let dry_run = input.dry_run.unwrap_or(false);
     let result = state
         .enterprise
@@ -599,7 +613,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_dedicated_daemon_environment_provides_aws_credentials() {
+    fn legacy_credentials_use_only_the_dedicated_daemon_environment() {
         let input: ScopeQuery = serde_json::from_value(json!({})).unwrap();
         let mut values = HashMap::from([
             ("AWS_ACCESS_KEY_ID", "AKIA000000000EXAMPLE"),
