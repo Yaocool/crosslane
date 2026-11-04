@@ -87,19 +87,15 @@ crosslane ready
 `health` checks that the daemon responds; `ready` checks whether a configured
 service can accept work. A generation request is needed to verify upstream
 access. Never use an upstream credential as the client key.
-HTTP `/`, `/health`, and `/ready` use the [independent status listener](docs/startup-and-debugging.md#independent-status-http),
-enabled with `[status_http]`. Business service ports serve client-compatible endpoints.
-[Admin REST API](docs/admin-rest.md) on the independent port uses dedicated Bearer authentication
-for accounts, tags, services, grouped quotas and runtime management, with an optional read-only token.
-Bulk account creation accepts CLI-compatible SSO CSV for automatic login and persistence, with concurrency and per-row progress.
-Use `crosslane admin token create/list/show/rotate/disable/enable/revoke` to manage independent
-admin credentials; plaintext is returned only at creation/rotation, and only digests are stored.
-`crosslane config edit admin` edits authentication and its `[status_http]` listener together;
-see `crosslane guide admin` for initial setup and reload behavior. Kiro enterprise users
-and subscriptions use [dedicated admin endpoints](docs/kiro-enterprise-admin.md) with daemon-side AWS credentials; `crosslane admin kiro configure` stores them separately, encrypted, and applies changes without a restart.
-`crosslane admin kiro subscription` provides `plans/profiles/scope/users/list/show` queries and
-`add/upgrade/downgrade/cancel` mutations, each supporting `--dry-run`. Cancellation defaults to period end;
-use `--mode immediate` explicitly for immediate cancellation. It uses the daemon Unix socket and credentials without a REST listener or Admin token.
+
+## Administration
+
+The CLI manages local resources over the daemon's Unix socket. HTTP status checks
+and optional Admin REST use an independent listener, normally `127.0.0.1:7651`,
+enabled through `[status_http]`. [Admin REST](docs/admin-rest.md) uses dedicated
+admin tokens; [Kiro Enterprise administration](docs/kiro-enterprise-admin.md)
+uses AWS credentials stored by the daemon. Client keys, admin tokens, and AWS
+credentials are separate.
 
 ## Connect a client
 
@@ -125,11 +121,19 @@ crosslane service list
 crosslane models list
 crosslane stats --since 1h
 crosslane logs show --tail 100
-crosslane logs trace <TRACE_ID>
+crosslane logs trace TRACE_ID
 crosslane help --all
 ```
 
-For deployment, account management, model controls, logs, and recovery, see the
-[operations guide](docs/startup-and-debugging.md). For building and validating
-changes, see [CONTRIBUTING.md](CONTRIBUTING.md). Crosslane is licensed under
-[MIT](LICENSE).
+## Documentation
+
+| Guide | Contents |
+| --- | --- |
+| [Operations](docs/startup-and-debugging.md) | Deployment, accounts, services, models, logs, and backup |
+| [Request processing](docs/request-processing.md) | Cache accounting, tool loading, latency, redaction, and compaction |
+| [Client compatibility](docs/client-compatibility.md) | Tool protocols, web search, attribution, CRS, and upstream refusals |
+| [Admin REST API](docs/admin-rest.md) | Admin tokens, local accounts and services, bulk operations, JSON response export |
+| [Kiro Enterprise administration](docs/kiro-enterprise-admin.md) | AWS credentials, user details, direct/group subscriptions, and plan changes |
+| [Contributing](CONTRIBUTING.md) | Development, validation, and documentation maintenance |
+
+Crosslane is licensed under [MIT](LICENSE).

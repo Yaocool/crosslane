@@ -2,8 +2,18 @@
 
 [English](startup-and-debugging.md) | [简体中文](startup-and-debugging.zh-CN.md) | [项目说明](../README.zh-CN.md)
 
-本文介绍部署、账号、服务访问、日常检查和备份。命令在仓库根目录执行，并使用
-与服务匹配的 `crosslane` CLI。
+本文介绍部署、账号、服务、模型、日常排障和备份。命令在仓库根目录执行，
+并使用与 daemon 匹配的 `crosslane` CLI。
+
+| 任务 | 入口 |
+| --- | --- |
+| 部署与升级 | [环境与配置](#环境与配置)、[Docker](#docker) |
+| 添加账号与创建服务 | [账号](#账号)、[服务与客户端访问](#服务与客户端访问) |
+| 调整模型与额度 | [模型与额度](#模型与额度) |
+| 排查运行问题 | [日志与排障](#日志与排障)、[备份与恢复](#备份与恢复) |
+| 配置缓存、工具加载、脱敏或压缩 | [请求处理](request-processing.zh-CN.md) |
+| 接入客户端、网页搜索或 CRS | [客户端兼容](client-compatibility.zh-CN.md) |
+| 自动化管理或管理 Kiro 企业订阅 | [Admin REST](admin-rest.zh-CN.md)、[Kiro 企业订阅管理](kiro-enterprise-admin.zh-CN.md) |
 
 ## 环境与配置
 
@@ -60,6 +70,7 @@ crosslane help account --all
 | `service` | 业务监听、允许来源、客户端 Key 绑定和账号池 |
 | `apikey` | 客户端访问凭据、来源/模型权限、限额与用量 |
 | `models` / `model-map` | 模型目录与全局禁用 / 客户端模型名映射规则 |
+| `admin` | 管理令牌与 Kiro 企业 AWS 凭证、用户和订阅 |
 | `tasks` / `alert` | 周期任务 / 共享通知目标及当前 Kiro 告警事件 |
 
 无参数的顶层命令组显示帮助；自动化中使用 `--json` 时必须指定操作。`account overage`
@@ -107,11 +118,7 @@ Kiro 批量添加使用独立的 `email,password` 两列 CSV；支持带引号�
 完成后，再使用当前登录密码重试。Crosslane 不会自动修改组织密码；`add-sso --headful`
 仍可用于手工处理浏览器中的验证步骤。
 
-原生 Runtime 的 OAuth 请求、ControlPlane 模型目录和 extension 管理 REST 使用各自的
-协议与身份头。管理请求默认访问 `management.{region}.kiro.dev`；缺失 Profile 的发现
-结果有 15 分钟、最多 500 项的账号隔离缓存。默认 Web Search 使用 Runtime 根路径的
-`InvokeMCP`；显式 `CROSSLANE_MCP_URL` / `upstream.web_search_endpoint` 保留旧
-JSON-RPC 兼容格式。
+Kiro 上游端点与协议说明见[客户端兼容](client-compatibility.zh-CN.md#kiro-端点与上游拒绝)。
 
 ### GitHub Copilot
 
@@ -200,6 +207,8 @@ User-Agent。没有业务服务时，`/health` 仍返回 `200`，`/ready` 返回
 独立监听还可开启带独立 Bearer 鉴权的 `/admin/v1` 管理接口，支持按来源和标签管理账号、
 创建和启停服务、查询分组账号池及额度。配置与完整接口见 [Admin REST API](admin-rest.zh-CN.md)。
 
+### 创建监听
+
 新安装不会自动创建业务监听。创建服务并妥善保存命令输出的客户端 API Key：
 
 ```bash
@@ -213,6 +222,8 @@ crosslane ready
 ```bash
 crosslane service create --name copilot --host 127.0.0.1 --provider copilot --default-provider copilot
 ```
+
+### 来源路由与故障切换
 
 同时使用 Kiro 和 Copilot 的服务会自动均衡无来源前缀、未命中模型映射的请求：
 
@@ -245,6 +256,8 @@ Messages、Chat Completions、Responses 及 `count_tokens` 使用相同调度入
 自动均衡使用服务与 Key 已允许的来源范围。用日志事件 `upstream.provider.selected` 和
 `upstream.provider.failover` 配合 `trace_id` 查看均衡与切换过程。
 
+### 客户端鉴权
+
 服务只接受已绑定的客户端 Key。生成接口还会检查客户端产品 User-Agent。接入其他客户端时，
 操作员可在服务或客户端 Key 上设置 `--skip-user-agent-check true`；Key 认证和其他服务限制
 仍然生效。调整访问前先查看命令帮助：
@@ -253,52 +266,6 @@ Messages、Chat Completions、Responses 及 `count_tokens` 使用相同调度入
 crosslane help service edit
 crosslane help apikey edit
 ```
-
-## 桌面端工具与网页搜索
-
-Copilot Responses 流保留首次出现的响应 ID，并按输出序号统一消息 ID，使增量、
-结束事件和最终输出快照指向同一条消息。Copilot 在事件间改变不透明 ID 时，
-桌面客户端仍能合并流式内容与完成消息，避免回答显示两遍。
-消息阶段、工具调用 ID、引用和 `copilot_usage` 保持原样。
-
-Claude 上游不接受工具 schema 根部的 `oneOf`、`allOf`、`anyOf` 时，Crosslane
-将组合约束移到等价的条件子 schema，保留分支必填字段、定义引用和闭合对象约束。
-Responses 的 namespace 函数工具和 custom 工具在上游使用唯一名称，返回客户端时恢复原来的 namespace
-和名称。适配层分别对 namespace 和工具名保留 128 字符上限，拼接后的内部名称超过该长度时，
-会在工具声明、历史调用及 tool choice 中统一使用请求内的唯一别名；流式、非流式输出均恢复原字段。
-Claude Code 的 `thinking.display: "updates"` 会适配为上游支持的 `summarized`，
-保留 thinking 设置；`omitted` 仍隐藏思考内容。
-Kiro 工具调用在返回客户端前会校验是否匹配本次请求的工具声明，流式、非流式都适用。
-已知别名恢复原名；客户端明确声明的 hash 名仍合法。未知名称返回
-`upstream_tool_name_mismatch`：非流式为 HTTP 502，流式为错误事件，不切换账号重试，
-也不输出该工具调用。`proxy.tool_name.mapping_miss` 日志包含 trace/request ID、
-工具调用 ID 及有长度限制的工具名，不记录工具参数和 schema。
-代理执行的 Tool Search/Web Search 继续使用服务端工具处理逻辑。
-Copilot Messages 请求会移除上游不支持的 Anthropic `safeguards` 扩展，token counting
-请求也使用相同适配，避免新版 Claude Code 请求被拒绝。
-
-Copilot 普通生成请求保持原来源，即使 Responses 工具列表声明了 `web_search`。
-模型实际调用搜索后，搜索及本轮后续回答交给 Kiro，不回退到 Copilot。Claude Code 的
-WebSearch 服务端子请求也使用此路径。为 Copilot 服务在已有 `[[proxy_service]]` 配置中加入：
-
-```toml
-web_search_provider = "kiro" # Kiro provider 实例 ID
-```
-
-这项配置只授权搜索及其后续生成，仍受服务账号标签、加入/排除账号和客户端模型权限限制。
-Kiro 服务省略该项时使用自身默认来源。修改后执行 `crosslane config reload`。
-未配置 Kiro、没有可用账号、搜索失败或搜索后的 Kiro 生成失败时，返回
-`web_search is not supported`，不把失败包装成搜索成功。
-
-Responses 返回 `web_search_call`、真实来源链接与 URL 引用，并保留流式事件和工具历史。
-`external_web_access:false` 仅复用该服务和 Key 的五分钟搜索缓存；未命中时明确报错。
-需要实时搜索的 Codex 客户端可在配置中设置 `web_search = "live"`。搜索历史续接仅在
-同一服务和 Key 下有效，最长保留三十分钟；服务重启后需要发送新请求。
-Claude 服务端搜索支持 `allowed_domains` 或 `blocked_domains`，两者不能同时提供。
-域名自动包含子域名，搜索路径支持前缀和 `*` 通配符；域名必须使用 ASCII 主机名，不能带
-协议、端口、凭据或主机名通配符。代理向 Kiro MCP 的查询加入 `site:` / `-site:` 约束，
-并在结果进入模型续写、引用和加密回放前按 URL 再次过滤。无匹配时返回空搜索结果。
-`user_location` 仍不支持，提供时会明确报错。
 
 ## 模型与额度
 
@@ -332,268 +299,12 @@ Kiro overage 默认关闭。
 `crosslane account overage enable --max-credits 500`；关闭时运行
 `crosslane account overage disable`。上游限制和已在处理中的请求仍可能影响最终用量。
 
-## Kiro prompt cache 用量
-
-`features.enable_prompt_cache` 默认是 `false`。运行
-`crosslane config edit features`，将其改为 `true` 后保存，CLI 会校验并热重载。
-Kiro 通常只报告 credits，不报告 token 和缓存计数，因此 Crosslane 使用与输入、输出
-统计相同的 tokenizer 在本地模拟缓存用量。这些估算不代表 Kiro 后端真实命中或 credits
-折扣；上游实际报告的 credits 仍单独结算。
-
-Claude 请求需在内容块或请求根部提供 `cache_control: {"type":"ephemeral"}`。
-OpenAI Chat/Responses 会进行隐式前缀核算，无需这个 Anthropic 扩展；有效的显式
-标记也会转换为 Kiro `cachePoint`。本地记录按上游账号、实际模型及可选的 OpenAI
-`prompt_cache_key` 隔离，默认保留 5 分钟，显式 `ttl=1h` 则保留 1 小时，读取时续期；
-daemon 重启会清空记录。这是本地策略，不保证上游保留时长。
-
-成功完成的首次请求计为缓存创建。后续请求在断点前最多回看 20 个块，读取最长的
-已记录前缀，仅将新增部分计为创建。缓存标记移动不会破坏已有前缀；前置工具定义、
-角色或内容变化则会影响匹配。失败、取消以及未产生输出的拒绝不会建立缓存记录。
-本地最小前缀长度为：Opus 5/5.5、Sonnet/Haiku 5.5 为 512 token；Opus 4.7 为
-2,048；Opus 4.5/4.6、Haiku 4.5 为 4,096；其他模型为 1,024。这些是 Crosslane 的
-本地核算规则。上游如有明确缓存计数（包括 0），优先保留上游值。
-
-Claude Code 和 `/v1/messages` 的 `cache_read_input_tokens`、
-`cache_creation_input_tokens` 都是输入的一部分，`input_tokens` 表示剩余未缓存输入，
-三者相加才是内部记录的完整输入。`output_tokens` 是生成输出，不是缓存写入量。
-流式 `message_start` 包含初始本地缓存计划，最终 `message_delta.usage` 与非流式
-`usage` 返回完成后的核算结果。请求诊断和 `proxy.usage.accounting` 日志会将 token、
-缓存来源标记为 `estimated`，与实际额度的 `credits_source=server` 分开记录。
-
-OpenAI Chat Completions 在 `usage.prompt_tokens_details` 中返回 `cached_tokens`（读）
-和 `cache_write_tokens`（写）；Responses 在 `usage.input_tokens_details` 中返回同样两个字段。
-两者都已包含在输入总量中。Chat 流式请求需设置
-`stream_options: {"include_usage": true}` 才会收到最终用量块；Responses 流式响应
-在终止事件中返回用量，参见 [OpenAI 官方缓存用量说明](https://developers.openai.com/api/docs/guides/prompt-caching#monitor-cache-performance)。
-
-Kiro 路径下，两个 OpenAI 入口都支持使用 `prompt_cache_key` 提供稳定的亲和提示，
-该值会哈希为上游 conversation ID，并隔离本地缓存核算，但不会固定账号。Kiro 的缓存
-断点仍通过上述 `cache_control` 扩展转换，不承诺 OpenAI 的保留时长或断点 TTL。
-Kiro 对显式 `prompt_cache_breakpoint`，以及要求预热、最短 `ttl` 或 `mode=explicit`
-的 `prompt_cache_options`，会在生成前返回 HTTP 400，不会把预热悄悄降级为普通生成。
-空值、默认控制、`prewarm=false` 和旧版 `prompt_cache_retention` 提示仍可接受，
-但不承诺旧版提示中的保留时长。
-原生 OpenAI Chat 与 Responses 上游之间转换协议时，会保留
-目标协议能表达的 `prompt_cache_options`、`prompt_cache_retention` 及内容块的
-`prompt_cache_breakpoint`。预热和 12 小时最短保留时长要求原生 Responses；
-目标仅支持 Chat 或 Messages 时明确拒绝。
-
-即使 Chat 客户端省略或关闭 `stream_options.include_usage`，Copilot 仍会向上游请求
-用量用于内部记账。HTTP 层先记录真实 token、缓存计数及供应商账单，再移除该客户端
-未请求的用量块和账单元数据；正文、错误和 `[DONE]` 保留。明确请求 usage 的客户端
-仍会收到完整统计，Messages 和 Responses 保持各自正常的用量事件。
-内部统计将 Messages 的普通输入、缓存读取和写入相加作为输入总量；OpenAI 的输入
-总量本就包含缓存部分，直接保留。对外响应仍遵循各自协议的输入 token 语义。
-
-## 请求延迟控制
-
-### Claude Code 的 MCP 工具按需加载
-
-使用 Crosslane 的自定义 `ANTHROPIC_BASE_URL` 时，Claude Code 默认可能关闭工具搜索，
-导致每轮把所有 MCP 工具加载进模型上下文。在启动 Claude Code 前显式启用：
-
-```bash
-ENABLE_TOOL_SEARCH=true claude
-```
-
-也可以将以下字段合并进 Claude Code 的 `~/.claude/settings.json`，然后重新启动会话：
-
-```json
-{
-  "env": {
-    "ENABLE_TOOL_SEARCH": "true"
-  }
-}
-```
-
-Crosslane 的 `features.enable_tool_search` 默认为 `true`。客户端 `ToolSearch` 调用
-仍交给客户端执行；`defer_loading` 工具只在历史中被 `tool_reference` 引用或实际使用后
-加载到 Kiro 请求，未命中的定义不进入上游上下文。已经使用的工具和显式 `tool_choice`
-指定的工具保持可用；长工具名在上游使用别名，返回客户端时恢复原名。显式关闭代理工具
-搜索时，带延迟工具的请求仍会被拒绝，不会静默加载全部工具。
-
-普通内置工具、system 和对话历史仍会占用上下文；这项设置不会自动缩短这些内容。
-可对照 `proxy.request.prepared` 的 `loaded_tool_count`、`deferred_tool_count`、
-`loaded_tool_bytes` 和 `input_tokens` 判断实际减少量，再比较首包与完整响应耗时。
-计数只涵盖本次请求携带的定义，不包含 Claude Code 留在客户端的完整 MCP 目录。
-开关说明见 [Claude Code MCP 文档](https://code.claude.com/docs/en/mcp#configure-tool-search)。
-
-Copilot 业务模型查询优先复用启用账号在 `provider.models.max_stale_ms` 范围内的
-目录快照，由周期任务或显式刷新更新目录。其他账号缺少目录时，不会阻塞已有可用
-快照的请求；首次发现或全部快照过期时仍需查询上游，过期模型不会用于授权和选号。
-目录刷新按 `provider.settings.model_refresh_concurrency` 控制同时查询的账号数，
-默认 32，实际并发不超过启用账号数。大账号池可提高该值，例如 64；上游出现限流时
-可调低。该值必须大于零，不影响已有可用快照的业务查询。
-
-```toml
-[provider.settings]
-model_refresh_concurrency = 32
-```
-
-可在对应 Copilot 实例的 `[provider.settings]` 中设置以下正整数，单位为毫秒：
-
-```toml
-stream_read_timeout_ms = 600000
-oauth_refresh_timeout_ms = 30000
-account_queue_wait_timeout_ms = 30000
-```
-
-读取超时限制连续无数据的时间，包括等待响应头；持续收到数据的长流不会被总时长
-限制截断。OAuth 刷新总超时覆盖响应头和响应体；排队超时会取消等待，返回本地
-`503` / `server_overloaded`，不标记供应商状态或影响账号健康。
-
-Kiro 在流式重试或续答前释放上一轮连接名额。本地槽位耗尽返回 `503` /
-`server_overloaded`，不会换账号重复等待或扣减账号健康。在首个有效内容前，重试次数
-遵循 `upstream.max_retries`，账号数量不会扩大预算；工具结果后的空回复仍保留独立的
-有界语义重试。工具结果续答出现有效文本后立即流出；工具参数校验完成后直接发送，
-不再额外休眠。`features.tool_call_buffer_delay_ms` 为兼容旧配置保留，默认值为零，
-已不参与请求等待。
-
-上述控制适用于 Anthropic Messages、OpenAI Chat Completions 和 Responses。
-请求鉴权、客户端检查、模型权限和 50 MiB 请求体上限保持原有规则；工具参数校验和
-各协议的完成/失败事件格式保持不变。启用 `crs` 时，Messages 的流式服务错误仍使用
-HTTP 200 SSE，并在 `error.status` 中携带实际状态，例如本地过载的 503。
-
-## Kiro 请求内容脱敏
-
-通过 `crosslane config edit features` 编辑 `[features]` 下的开关：
-
-```toml
-[features]
-enable_request_redaction = true # false 关闭，默认 true
-enable_request_redaction_notice = false # 独立的最终回答提示开关，需要 crs feature
-# 默认配置直接展示完整提示文案，可改为任意多行 Markdown：
-request_redaction_notice_text = '''
----
-
-> **⚠️ Crosslane 安全提示：疑似敏感凭证已脱敏**
->
-> 本次新输入中有内容被规则判断为疑似敏感凭证，已在发送给上游模型前替换为占位符。此判断可能存在误报，工具执行所需参数会在本地还原。
->
-> **请注意凭证的使用方式：**优先使用环境变量引用或安全凭证配置，避免直接粘贴明文凭证。'''
-```
-
-保存后自动校验并热重载，无需重启；可用 `crosslane config show features --effective`
-确认生效值。修改只影响新请求，已开始请求的工具调用、重试和摘要沿用原策略。
-关闭时不再识别和替换新凭证、不添加引用提示或扩展工具 schema，正文、历史、
-工具参数和摘要按真实值发送给 Kiro。此前生成的 checkpoint 封套仍会在本地解包，
-保证旧摘要可继续使用。此开关不控制配置导出、Debug 和错误日志已有的脱敏。
-
-启用 `crs` feature 的构建可设置 `enable_request_redaction_notice = true`：确认该 HTTP
-请求的最新用户输入（正文、工具返回结果或文本附件）在成功的上游生成请求中被脱敏后，
-在 Claude 最终回答的原文本块末尾追加安全提示。历史消息、旧工具参数和结果、system、
-工具定义及环境信息仍会脱敏并记录诊断，但不会单独触发本次提示，避免历史凭证导致
-每次追问都重复提示；本次新输入再次包含同一凭证时仍会提示。
-
-开关默认关闭。`request_redaction_notice_text` 在新配置和 `crosslane config edit features`
-中直接展示完整默认 Markdown，便于管理员定位和修改；旧配置未设置该字段时使用同一
-默认文案。显式设为 `""` 或纯空白时不提示。自定义正文前自动添加一个空行，其他内容
-原样保留，不做变量替换。开关和文案均对新请求热更新；已开始请求继续使用开始时的
-文案。默认提示使用“疑似敏感凭证”，说明规则可能误报，不调用模型，也不带入凭证
-或占位符。提示属于回答正文，会进入后续历史，并非 Claude Code
-原生系统 warning。提示不改动工具参数、调用 ID、结束原因和模型用量。工具调用响应、
-客户端压缩摘要、错误、不完整或截断的回答、明确声明的结构化输出及 JSON
-回答均不会追加。OpenAI 响应及未经过此脱敏边界的其他 provider 不追加提示；关闭
-脱敏时也不会提示。
-默认提示使用分隔线、粗体标题和多行引用块突出显示；颜色和背景由客户端渲染决定，
-不注入 ANSI 控制码或 HTML，也不新增响应块或事件。
-
-为避免模型复述历史提示后代理再追加一份，转发给 Kiro 前会移除历史 assistant
-正文末尾的完整默认/旧版默认提示。自定义提示只有在有界内存记录中核对到由本进程追加的
-完整回答指纹和删除位置时才会清理，避免将 `Done` 等普通正文误删；记录不保存回答原文。
-进程重启、记录过期或有歧义时保留未知自定义正文。客户端历史、当前输入和工具参数不变。
-追加前也会检查回答是否已有完整提示，兼容常见引用、粗体和换行差异；代码标识符和代码内
-空白仍须一致，代码块中的示例不当成实际提示，并防止同一响应重复追加。
-
-Kiro 生成请求在最终发送前默认执行统一的本地规则脱敏，不使用大模型、远程判别
-接口或额外网络请求。处理范围包括当前消息、system 和历史消息、工具参数和返回值、
-工具描述及 schema 的示例内容。启用时，自动压缩的摘要输入、摘要合并和生成重试也经过同一
-发送入口；Kiro MCP 搜索 query 使用同一套文本规则。
-
-规则结合敏感字段名、配置和命令中的凭证赋值、常见 key/token 格式、认证头、
-凭证 URL、私钥块及当前 Kiro 账号已知凭证的精确匹配，将命中值替换为带随机
-请求标识的唯一占位符。同一逻辑请求中的相同值复用占位符，映射只保存在内存中，
-由内部重试、工具续接和自动摘要共享，不写入日志或磁盘。实际 HTTP 鉴权凭证、
-Profile、模型名、工具名、调用关联 ID 和正常的 token 数量控制字段保持有效。
-上下文与请求字节预算按同一脱敏副本计算，包含占位符、引用提示和 schema 扩展的开销。
-摘要先脱敏再分片，切分与本地截断保留完整凭证引用；预算无法容纳一个完整引用时会明确报错。
-
-云凭证支持在正文中识别腾讯云 `AKID`、阿里云 `LTAI` / `STS.`、火山引擎及金山云
-`AKLT`、AWS `AKIA` / `ASIA` 和 Google `AIza` 等特征前缀。无固定前缀的 SecretKey
-通过 `SecretId`、`SecretKey`、`AccessKeyId`、`AccessKeySecret`、`SecretAccessKey`、
-`SecurityToken`、`ak` / `sk` 等字段名及配置赋值识别，覆盖腾讯云、阿里云、华为云、
-百度云、七牛云、京东云等常见凭证命名；Azure 的 `AccountKey`、
-`SharedAccessSignature` 和 `sig` 也会处理。环境变量赋值和命令参数沿用同一规则。
-单独出现且没有特征前缀、字段名或已知值上下文的随机 SecretKey 无法可靠识别。
-
-常见鉴权语法另有确定性规则，避免仅依赖字段名：
-
-- `Authorization` / `Proxy-Authorization` 请求头及键值对数组，覆盖 Basic、Bearer、
-  Digest、NTLM / Negotiate、OAuth、HMAC / 云厂商签名等方案；Cookie 和 API key 头同样处理。
-- curl 的 `-u` / `-U`、`--user` / `--proxy-user`、OAuth bearer、内联 Cookie、
-  TLS 证书口令；支持参数连写、引号及常用短选项组合。HTTPie / xh、wget、
-  Redis、MySQL / MariaDB、sshpass 和 OpenSSL 的常见凭证参数也会处理。
-- netrc 的 password / account、Docker / npm 的 Base64 Basic 凭证、常见 Python
-  Basic / Digest / NTLM 构造和 auth 元组、Node auth 用户密码字符串或对象。
-- 凭证 URL、数据库连接串、OAuth 表单及明确授权码流程中的 code / assertion。
-
-这些规则区分实际凭证与公共控制信息：CORS `Access-Control-Allow-Credentials: true`、
-WWW / Proxy-Authenticate 的公共挑战、布尔状态字段、明确的 fetch credentials 模式、
-MySQL / PostgreSQL 的交互密码提示开关、curl 凭证文件路径和纯环境变量引用均保留。
-`GOOGLE_APPLICATION_CREDENTIALS` 的 [ADC 文件路径](https://docs.cloud.google.com/docs/authentication/application-default-credentials)也保留，文件内容仍按凭证规则处理。
-PowerShell 的 `$Env:NAME` / `${env:NAME}` 同样保留；Node、Python、Deno、Bun、Rust
-等已识别环境变量表达式中的明文字面默认凭证会单独替换，引用和表达式结构保留，
-包括外层绑定使用普通变量名、或表达式位于 shell 的引号内的情况。
-日志前后缀、Markdown 代码围栏中的 JSON 同样解码字段名后脱敏，覆盖 `\u5bc6\u7801`
-等转义键名；包含此类敏感键的损坏 JSON 会保守替换整个片段，工具重放可还原原文。
-连接串只替换密码部分，不吞掉后续数据库等配置；已识别命令的字面凭证按本地 shell
-语法解码后映射，模型复制引用到另一工具时可恢复实际参数，原始命令重放则保留源码。
-检测不执行命令、展开变量或读取凭证文件，也不会调用模型判断。此规则集覆盖常用明确
-语法，不能承诺识别所有自定义认证协议、无标签随机字符串或任意混合脚本。
-
-模型应在工具参数中原样复制占位符。网关在本地将完整工具参数解析为 JSON 后还原，
-保留原始字符串、数字和布尔值的类型，并正确处理引号、换行及并行调用的流式分片。
-普通回答不自动展开秘密；压缩摘要中的秘密会按需转换为可还原的 checkpoint 封套，
-客户端重放摘要时由网关本地解码并建立新映射，发给 Kiro 的仍是当前请求的占位符。
-封套是凭证的编码载体，并非加密。工具参数中的 `$TOKEN`、`${TOKEN}`、`%TOKEN%`
-和 `$env:TOKEN` 等环境变量引用保持原样，实际字面秘密仍按规则处理。
-POSIX 单引号或 ANSI 引号中的 `$TOKEN`、POSIX 命令中的 `%TOKEN%` 是字面值，
-不会按变量引用放行；明确的 Windows 命令和 shell 声明继续按其引用语法处理。
-Go、Java、.NET、Rust、Ruby、PHP、Deno、Bun 和 `import.meta.env` 的常见环境变量
-取值语法，有明确代码声明或代码语言围栏、且仅含变量名时也会保留。无代码上下文的
-.env / YAML 值继续保守处理。JSON 凭证值、工具参数中的新增 getter
-写法属于字面数据，不适用代码引用豁免。敏感字段中的内联默认值、拼接明文字面值仍会屏蔽，包括
-内容恰好是 `$TOKEN` 的字面字符串；未知或不完整的表达式继续保守处理，不执行代码、
-调用 getter 或展开环境变量。
-curl、SDK 或 netrc 的字面凭证、敏感 schema 默认值即使内容看起来像 getter，也仍会脱敏；已明确识别为
-凭证的完整值优先于引用语法豁免处理。
-
-降低误报依靠明确语法，不会因为值较短、常见、用于示例或看起来公开就直接放行。
-`key: "Enter"`、`cache_key: "product:42"`、`password: "true"` 等歧义字段仍会脱敏，
-已识别凭证在其他字符串中的重复内容也继续匹配。同一字符串可能既是业务值，也是真实
-弱凭证；缺少额外上下文时，规则无法同时承诺零误报和零漏报。
-
-对明确识别的 Bash、shell、exec_command 等 POSIX 命令工具，还原时按常见的裸值、
-单引号和双引号上下文处理转义，避免秘密字符变成 shell 语法。普通 HTTP/JSON 参数
-不添加 shell 引号。原样重放的命令和 JSON 文本会优先按请求内来源记录恢复，保留
-原有转义、空格和换行。任意 heredoc、嵌套命令替换、PowerShell 或 shell 内嵌 Python/SQL
-等语言不做通用语义推断；这类工具应使用结构化凭证参数或执行端环境变量。
-
-映射不跨独立 HTTP 请求共享；客户端后续历史应使用已还原的工具参数，或保留摘要中的
-checkpoint 封套供新请求重新建立映射。未知请求的
-占位符不会被猜测还原，模型改写或丢失的占位符也无法可靠恢复。
-
-UTF-8 的 txt、md、csv、html 附件会在 Base64 解码后处理并重新编码。
-PDF、Office、图片等二进制附件不做 OCR 或内容提取，其内部秘密不在文本规则的
-覆盖范围内。规则也无法保证识别任意无标签口令、未知凭证格式或编码、拆分后的秘密。
-命中的业务数据在模型侧同样只显示占位符；只有可信执行路径按本地映射还原参数。
-
 ## 日志与排障
 
 ```bash
 crosslane logs show --tail 100
 crosslane logs follow --level warn
-crosslane logs trace <TRACE_ID>
+crosslane logs trace TRACE_ID
 crosslane status --since 30m
 crosslane stats --detail --since 1h
 ```
@@ -637,204 +348,9 @@ crosslane stats --detail --since 1h
 | 流式中断 | 最终流事件和 Trace 日志 |
 | 上下文超限 | 实际选中模型及请求大小 |
 
-### Kiro 请求大小与自动压缩
-
-Anthropic 请求先经过 50 MiB 的 HTTP 请求体限制，翻译后的 Kiro 请求默认最多
-8 MiB（`context.max_upstream_payload_bytes`）。模型输入窗口优先采用实际选中模型的
-元数据；普通请求和压缩后的请求分别使用 `safe_input_ratio` 与
-`compact_safe_input_ratio`，默认 0.95 和 0.99。
-
-启用 `context.auto_compact_on_overflow`（默认开启）时，历史导致字节或 token 超限会在
-上游发送前进行语义摘要。成功提交的 checkpoint 必须覆盖所有被移除的原文，包括正文
-中部事实和后续修正。摘要超时、容量不足、上游失败或完整 checkpoint 无法放入窗口时，
-返回 `compaction_failed`（422），保留原始上下文，不再把截取头尾的片段作为完整压缩边界。
-系统指令、已加载工具、当前消息及其必需的工具调用链保持原样。不可压缩部分自身超限
-时，400 错误通过 `current_message` 或 `required_context` 区分范围，提示缩小或拆分
-输入、分页读取结果；压缩旧历史无法解决这类超限。
-
-单次粘贴、附件或工具结果过大时，恢复步骤直接写在错误消息里，让 Claude Code 能显示：
-停止重复发送同一份大输入，拆成较小片段或分页读取工具结果。保留当前 session，尝试
-`/compact`，也可以发送一条不附带大输入的简短消息，让客户端尝试自动压缩。简短消息
-可能与被拒绝的大输入合并；大输入仍处于当前轮次，或可压缩的对话组不足时，直接
-`/compact` 也可能失败。如果仍失败，在交互式 Claude Code 中用 Esc Esc 或 `/rewind`
-只编辑过大的那一轮，拆小后重发，保留之前的对话。`required_context` 超限要先缩小
-必需的系统指令、启用的工具定义或其他必需输入，压缩历史无法缩小这些内容。
-这些带本地数值诊断的 Messages 错误保留语义状态 400、
-`context_length_exceeded`、数值诊断及 `retryable: false`；可压缩的历史超限与上游
-上下文错误保留原有文案，继续触发客户端自动压缩。启用 `crs` 后，本地上下文错误的
-非流式 JSON 使用 HTTP 200 传输，在 `error.status` 和 `x-crosslane-error-status` 中
-保留 400，避免 CRS Console 重写恢复详情；流式链路继续使用 SSE 错误事件。
-
-摘要预算采用所选模型的窗口，全局窗口只作缺少元数据时的回退。当前用户消息作为可分段
-的源记录，不再重复放进每段指令。每段同时满足 token 和序列化字节限制；初始最多 16 段、
-同时最多两个请求，共享一个操作截止时间。上游原生上下文限制拒绝摘要时，可以在原截止
-时间和用量统计内将完整原文重新分成更小的段，只重试一次，不截断内容。
-摘要流报告上游暂时不可用，或大段输出缺少摘要闭合标签时，只对失败的源分段重试一次，
-大段会拆成更小的段；小段的格式错误明确返回失败。
-已经成功的其他摘要继续保留，失败轮次的部分输出不会发布，每次调用单独统计用量。
-子分段串行执行，沿用原并发限制和截止时间；日志事件
-`proxy.compaction.summary_part_retry.started` 可识别这条恢复路径与触发原因。失败元数据
-区分上游流错误和摘要校验错误，并记录标签数量，不记录摘要内容。
-`proxy.upstream.context_usage` 将上游上下文百分比或原生输入计数与本地估算分别记录，
-避免把随内容变化的 tokenizer 差异误认为固定字节或 token 限制。
-
-启用 `crs` 时，如果本地 tokenizer 低估了所选模型的输入占用，有效的上游占用率还会
-提前触发自动压缩。校准按账号、模型、会话和源 checkpoint 隔离，30 分钟后过期，
-只收紧发送判断，不改写计费 tokens、客户端输出上限或公布的模型窗口。向同一模型
-发送完整原文摘要分段时，也使用该校准限制输入。内部摘要将可见消息明确标注为源记录，
-在分段前保留原始角色标记和完整正文，不把原始 assistant 回复当成新摘要任务自身的助手发言。
-账号和端点策略允许时，Claude 5
-摘要采用原生完成及拒绝元数据。空摘要、严格识别的通用内部流错误，以及原生
-`MODEL_TEMPORARILY_UNAVAILABLE` 流内容量错误只恢复失败分段一次；明确拒绝、认证、
-额度和其他专用错误不重试。并行分段返回明确拒绝时，拒绝原因优先于其他分段的暂时错误，
-也不会被等待已受理分段记账时发生的整体超时掩盖。
-恢复保留完整原文、已受理调用的记账和原操作截止时间。
-完整摘要及必需当前上下文无法满足预留空间目标，但能放入安全窗口时，可使用安全窗口。
-任一分段最终失败后，不再发起新的恢复子分段；已受理调用继续完成用量结算。
-
-Tool Search 检查包含新工具定义与结果的完整续轮请求。持有账号名额时，只能提交在预算内
-完整保留原文的 checkpoint；无法完整保留时，保留历史并拒绝超限续轮，避免丢失事实或
-再获取一个摘要请求名额。客户端忽略 checkpoint 时，服务端按已校验的历史前缀重放
-完整 checkpoint。
-
-普通 Kiro 请求若没有任何助手输出，会重试一次；仍为空时明确返回错误。有效正文、工具
-调用、推理和终止语义继续保留。流式重试不会重放已展示的内容或重复发布压缩边界。
-启用 `crs` 时，Claude 接口的这次空回复重试会在当前工具描述后补充执行边界：模型返回
-结构化调用，由客户端或代理执行。首轮请求保持原样，工具名称、schema、参数和会话正文
-均不改写；描述加提示后超过 1024 UTF-8 字节时保留原描述，不截断。增强后的续轮仍须通过
-上下文和输出预算校验，重试次数不增加。
-设置 `features.buffer_tool_calls=false` 时，普通工具参数片段仍立即流式输出；
-展示内容后发生流错误会结束本次响应，不再重复调用上游。
-非流式轮次在重试或工具续轮前释放已完成的上游连接名额，单连接池也能正常继续。
-
-大文本的 token 估算按 UTF-8 边界分块，并为边界保留少量余量，避免 tokenizer 在大段
-连续空白中抛异常；实际消息与工具 JSON 不会因此拆分。`/v1/messages/count_tokens`
-继续只返回本地估算，不触发新的摘要或压缩。关闭自动压缩时保留原有超限拒绝行为。
-日志中的 `payload_budget_overflow`、`pending_server_tools_payload_overflow` 和
-`tool_search_continuation_overflow` 可用于确认压缩触发位置。
-
-Kiro 返回 `CONTENT_LENGTH_EXCEEDS_THRESHOLD` 或 `Input content length exceeds threshold`
-时，即使本地估算未超过模型公布的窗口，也会进入上下文恢复流程。自动恢复只重试一次；
-客户端主动请求摘要时，关闭自动压缩仍可恢复。摘要恢复会分段处理完整原文，并保留客户端
-摘要指令。该上游错误没有报告准确的 token 限制，也不会被当作账号故障。
-
-Claude Code 原生摘要请求会在最终生成时整合完整、按时间排序的分段 checkpoint，
-省去重复的上游合并请求。完整分段也会附在最终摘要指令旁，放在源历史之后；原生最终摘要不再重复携带 checkpoint 已覆盖的可选原文，
-避免早期事实被较长的近期原文和局部缺失声明掩盖。任一分段的明确值优先于其他分段的局部“没看到”声明；
-只有明确的后续修正或决策变更才能取代先前事实。分段 checkpoint 不会被截断。
-如果完整内容放不进目标窗口或实际路由到的较小窗口，Crosslane 会对已生成的分段
-进行语义合并，并沿用摘要输入、时间与用量限制。其他服务端压缩请求保留原来的上游合并。
-`proxy.compaction.summary_merge.completed` 日志增加 `merge_mode`（`client_final_summary`
-或 `upstream`）和 `duration_ms`；上游合并另有 `proxy.compaction.summary_merge.started`。
-单分段摘要保持原来的处理方式。
-
-### 客户端与会话归属
-
-所有构建都支持客户端识别，无需启用 `crs` feature。Claude Code 从旧格式或 JSON 字符串格式的
-`metadata.user_id` 提取设备、会话；Codex 从 `client_metadata` 提取
-`x-codex-installation-id`、`session_id`、`thread_id`，相应 HTTP 头作为后备。
-CRS Console 和 OpenAI Responses 转发保留这些字段时即可使用，无需修改 CRS。
-
-`proxy.client.context` 事件及请求日志的 `diagnostics.client_context` 记录哈希后的
-`user_ref`、`session_ref`、`thread_ref`、客户端类型与身份来源。同一设备/安装在不同会话中
-保持相同用户归属；这不代表自然人或 CRS Key。信息缺失时保持未知，异常或过长的标识会被忽略。
-
-生成与 token 计数采用一致的会话规则，压缩重放按服务、Crosslane Key、设备、会话/线程隔离，
-并继续校验完整历史前缀。Responses 续接在原有服务/Key 归属校验后继承省略的信息；分叉线程使用
-独立的上游会话，已知设备冲突返回请求错误。由 provider 保存历史的 Responses 归属信息仅在
-成功响应后保存在内存，最多 256 条、30 分钟；`store: false` 禁止保留。
-账号池调度、额度与按请求内容计算的 token 缓存继续使用原有策略。
-
-### Claude Relay Service 响应兼容
-
-Claude Messages 作为 CRS Console/CCR 上游时，使用
-`cargo build -p crosslaned --bin crosslaned --release --features crs` 构建。
-该 feature 对二进制中的所有 Claude Messages 监听服务生效，普通 Cargo 构建默认关闭。
-默认使用 Console 兼容策略。只接入 CCR 的监听服务可在现有 `[[proxy_service]]` 项内配置
-`crs_relay = "ccr"`；该策略保留 HTTP 错误状态，供 Claude Code 执行原生参数恢复。
-省略此项或设置为 `"console"` 时，继续使用下文的 Console 错误传输策略。
-此配置在未启用 `crs` 的构建中不改变 HTTP 行为。
-完整 Docker 镜像默认启用全部 Cargo feature，包括 `sso` 和 `crs`。
-使用 `./deploy/docker-setup.sh --build` 本地构建并部署，或
-`docker build --target runtime-full -t crosslane:full .` 仅构建镜像。
-如需只启用部分 feature，可为 `docker build` 传入
-`--build-arg CROSSLANED_FEATURES=crosslaned/sso`，此时关闭 `crs`。
-
-新构建的 `crosslaned --version` 会显示编译 feature；容器内运行
-`docker exec <容器名> crosslaned --version`，检查是否包含 `crs=true`。
-旧构建可直接探测 Crosslane 监听端口（不经过 CRS）：
-
-```bash
-curl -i "$CROSSLANE_URL/v1/messages" \
-  -H "x-api-key: $CROSSLANE_API_KEY" \
-  -H 'User-Agent: claude-cli/2.1.295 (external, cli)' \
-  -H 'Content-Type: application/json' --data '{"stream":true}'
-```
-
-此请求通过认证后仅触发本地必填字段校验，不调用上游。启用 `crs` 时返回
-HTTP 200、`text/event-stream` 和 `event: error`；CCR 策略或未启用时返回 HTTP 400 JSON。
-
-Kiro 和 Copilot 返回的错误状态码保留原值，包括 401、402、403、413、503、504 和 529。
-非流式响应及未启用 `crs` 的响应使用原 HTTP 状态码；CRS 兼容的 Claude 流式响应将原值
-写入 SSE 错误字段。错误分类和凭据脱敏不映射供应商状态码。没有供应商 HTTP 错误响应的
-传输、协议故障继续使用代理自身的错误状态。
-
-启用 `crs` 后，错误正文保留 Anthropic 格式、脱敏原因、操作建议、失败阶段、请求 ID、
-`error.status` 和已知的真实 `error.upstream_status`。上下文错误还保留 token 诊断和
-压缩重试结果。无需修改 CRS 代码。现有 CRS Console 会把非 2xx JSON 错误正文替换成
-固定文案。为保留本地 `context_length_exceeded` / `context_validation` 错误，非流式
-Claude Messages 使用 HTTP 200 传输 `type: "error"` JSON，在 `error.status` 和
-`x-crosslane-error-status` 中保留语义状态 400，并禁止缓存。正文不包含成功消息、结束原因或
-用量；客户端必须检查 `type` / `error`，不能仅凭 HTTP 200 判断生成成功。请求统计仍记为
-400 失败，同时记录客户端传输状态 200。这个例外只适用于启用 `crs` 的本地上下文错误；
-未启用 `crs`、OpenAI 接口、客户端认证及供应商错误保留原 HTTP 状态。
-其他非流式错误仍可能被 Console 脱敏；CCR 路径会保留其原始非流式错误正文。
-
-Claude 请求设置 `stream: true` 且采用 Console 策略时，供应商错误采用 HTTP 200 加 SSE
-`event: error`，在 `error.status`、`error.upstream_status` 和 `x-crosslane-error-status`
-中保留原始状态码。流开始前的错误先初始化零用量的空文本块，避免 Claude Code 退回非流式
-重试后被 Console 清理掉错误详情。客户端认证、方法和 HTTP 请求体限制错误保留原 HTTP 状态。
-成功的 SSE 响应已经开始输出后，后续错误继续通过流内事件表达。请求统计分别记录失败状态和
-客户端 HTTP 200 传输状态。服务端检查最初最多 64 KiB 或五秒的 SSE 事件，也会补充已经开始
-输出助手内容后的错误诊断。
-
-Console 路径遇到明确的 `output_config.effort` 不受支持的 HTTP 400 时，只在输出前向
-同一账号重试一次，且只删除该字段；不会删除 thinking 历史、签名或工具参数。CCR 策略保留
-HTTP 400，由客户端自行恢复。其他字段拒绝和其他 HTTP 400 不会触发这次兼容重试。
-重试只锁定原 provider 实例的原账号，保留服务排除项及 provider 权限，不会将标签池或
-显式绑定的账号池扩大为全局账号池。
-
-流内 JSON 字符串以 ASCII Unicode 转义传给 CRS，避免 CRS 逐块 UTF-8 解码损坏中文或
-工具参数，客户端解析后的值保持一致。纯 ASCII 流块复用原缓冲区，Unicode 转义以固定
-十六进制写入，避免逐字符格式化和重复复制；为兼容 CRS，Unicode 转义的线路字节开销仍存在。
-单个事件超过 64 KiB 时只跳过该事件的诊断解析，
-后续事件仍会检查。原生 Messages 流缺少结束信号或仍有未闭合内容块时，EOF 会被记录为
-502 并返回流内错误，不会补造成功事件或关闭未完成工具。已闭合内容块且已有结束原因、
-仅缺少 `message_stop` 的情况单独处理。
-
-能观测到的下游取消记为 499，并且仅结算已经收到的 usage；未知 token 或供应商费用不估造。
-Console 未向 Crosslane 传播取消时，Crosslane 无法判断客户端已离开。自动路由只允许在
-首段内容或工具开始之前切换。`failover_timeout_ms` 仍是自动路由每个来源各自的尝试期限，
-`0` 只关闭该来源的尝试期限；固定来源不新增此期限，也不隐式设置整次请求的总期限。
-候选检查和最终响应检查共享同一个五秒窗口，避免对首段 SSE 重复等待。
-CRS 丢弃的 `Retry-After` 等响应头不能靠 Crosslane 增加同名头恢复。
-被舍弃的自动路由候选仍按实际 provider、账号和模型累计已收到的用量；最终结果只计为
-一次客户端请求，内部摘要请求仍独立记账。
-
-Claude Code 的延迟 `tool_addition` / `tool_removal` 声明在 `crs` 构建中按消息顺序投影为
-当前 `tools[]`，既支持已有工具的引用，也支持新增 custom 工具定义。声明原位置改为文字
-通知并保留缓存标记，原有工具调用 ID、工具参数、thinking 和签名不变。
-明确移除之前的历史工具引用转为保留原始引用内容的文字记录；官方搜索结果保留调用配对及
-仍可用的引用。已移除工具不会重新进入当前目录，移除后的新引用及未知引用仍明确拒绝。
-生成与 count_tokens 使用相同处理。未知引用、冲突重定义和不支持的定义类型会明确拒绝，
-有效目录仍须通过原有工具配对、容量与结构校验；未启用 `crs` 的行为不变。
-
-最新的非空 assistant `compaction` 块重置工具变更历史，先以其中的 `tool_changes` 恢复
-检查点工具状态，再应用后续变更；已经丢弃的旧声明和引用不会修改当前目录或拒绝续聊。
-`content` 为 null 或缺失的压缩块仍视为无操作。这是一次式的旧协议目录投影，检查点原块
-及其签名保持不变。显式 `tool_choice=none` 在禁用工具功能时仍保留已完成的工具配对，
-以及解释历史所需的 schema 来源数据；这些声明不会激活 Tool Search、Web Search、
-恢复待执行调用或发布可调用工具。生成与 token 计数使用相同的工具策略。
+上下文超限与自动压缩见[请求处理](request-processing.zh-CN.md#上下文与自动压缩)；
+工具、网页搜索及 CRS 错误传递见[客户端兼容](client-compatibility.zh-CN.md)。
+管理接口错误与响应保存见 [Admin REST](admin-rest.zh-CN.md#保存与排查-json-响应)。
 
 ## 备份与恢复
 

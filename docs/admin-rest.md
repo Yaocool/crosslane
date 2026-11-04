@@ -1,39 +1,30 @@
 # Admin REST API
 
-Kiro Console enterprise subscriptions are managed under `/admin/v1/kiro/enterprise`,
-separately from local account pools. List users, inspect direct/inherited subscriptions,
-activate, cancel, upgrade and downgrade using only the Admin Bearer token. AWS credentials
-are managed by the daemon. Crosslane does not issue a separate Identity Center application assignment
-request; AWS may assign it automatically. Use `crosslane admin kiro configure` for private encrypted AWS credentials and hot updates;
-`show/clear/use-env` manage their status and source. The CLI also supports
-`crosslane admin kiro subscription` for all corresponding operations: `plans/profiles/scope/users/list/show`
-queries and `add/upgrade/downgrade/cancel` mutations, with `--dry-run` on all four mutations.
-Cancellation defaults to period end; use `--mode immediate` explicitly for immediate cancellation.
-CLI operations use the Unix socket without a REST listener or Admin token.
-See [Kiro Enterprise administration](kiro-enterprise-admin.md) for setup and callers.
+[English](admin-rest.md) | [简体中文](admin-rest.zh-CN.md) | [Project overview](../README.md)
 
-The API uses the independent HTTP listener, normally
-`http://127.0.0.1:7651/admin/v1`, alongside public `/health` and `/ready`.
-It remains available without any business service. Business ports do not serve administration.
-Resources are grouped as Accounts, Services, Providers, Operations, APIKeys, and KiroEnterprise.
-`GET /admin/v1/openapi.json` provides an authenticated OpenAPI 3.1 document.
+Base URL: `http://127.0.0.1:7651/admin/v1`. The API shares the independent status
+listener with public `/health` and `/ready` and works without a business service.
+Business ports do not serve administration. Admin tokens are independent of
+model-client keys.
+
+This guide covers Crosslane accounts, services, pools, quotas, and runtime actions.
+For AWS credentials, enterprise users, and subscription changes, see
+[Kiro Enterprise administration](kiro-enterprise-admin.md). These are separate from
+local proxy accounts; the Kiro CLI can also use the Unix socket without enabling REST.
+
+`GET /admin/v1/openapi.json` returns the authenticated OpenAPI 3.1 schema. Its
+[repository source](../crates/crosslaned/src/admin/rest/openapi.json) is the complete
+field reference; the examples below cover common workflows.
+
+[Setup](#enable-and-authenticate) · [Accounts](#accounts) · [Bulk creation](#bulk-creation-and-automatic-sso) · [Services](#services) · [Quotas](#quota-semantics) · [Responses](#responses-and-audit) · [Save JSON](#save-and-inspect-json-responses)
 
 ## Enable and authenticate
 
-Use `crosslane admin token` to manage multiple independent credentials. Commands run over
-its existing Unix socket and do not require a pre-existing Bearer token. These credentials
-are separate from model-client keys managed by `crosslane apikey`.
+### Initial setup
 
-New configurations disable both `[status_http]` and `[admin.rest]`; the default listener
-is `127.0.0.1:7651`. Upgrades preserve existing files. `crosslane config edit admin`
-(or `config edit status-http`) exposes both sections together and fills missing
-documented defaults in older configurations, then validates the combined update.
-Exiting without changing a setting preserves the original file and does not reload
-providers or services; pending restart fields are still reported. If the full-config
-editor exits unsuccessfully, the original file is restored.
-
-For initial setup, run `crosslane config edit admin`, enable the independent listener
-below, keep `[admin.rest] enabled = false`, then save to reload automatically:
+New configurations disable both `[status_http]` and `[admin.rest]`. Run
+`crosslane config edit admin` (or `config edit status-http`) to edit them together.
+First enable the listener, keep `[admin.rest] enabled = false`, and save:
 
 ```toml
 [status_http]
@@ -42,76 +33,27 @@ host = "127.0.0.1"
 port = 7651
 ```
 
-Listener enable/disable, host and port changes apply without restarting the daemon.
-Use `crosslane config reload` after editing the file manually. A replacement address is
-bound before switching; a failed bind retains the previous listener and runtime configuration.
-Changing hosts on the same port briefly rebinds, restoring the old listener if it fails.
-Business services keep running. Admin batch reports, capacity limits and Kiro user locks
-survive the switch; retired connections cannot use the new listener's authentication state.
-Older daemons may still report a listener restart requirement; upgrade the daemon for hot reload.
-
-Create the first token and enable administration using the explicit `--enable-rest` flag:
+Then create the first token and enable REST explicitly:
 
 ```bash
 crosslane admin token create --name ops --enable-rest
 crosslane admin token create --name monitor --role read-only
 crosslane admin token list
-crosslane admin token show ops
 ```
 
-`--enable-rest` requires an enabled listener whose running enable state, host, and port
-match the saved configuration. Unapplied listener changes reject creation until a successful reload,
-so REST is not activated on the previous address. It does not open a new
-port or reconfigure business services. Without it, creation retains the current admin switch.
-Token changes apply to subsequent requests immediately, without restart or a separate reload.
-Initial REST activation from a config edit likewise waits for the intended listener;
-creating or rotating credentials during that wait cannot activate it at the old address.
-An already active REST interface can continue rotating credentials if a listener reload fails.
+The CLI uses the owner-only daemon Unix socket and needs no existing Bearer token.
+`--enable-rest` requires the running listener's enabled state, host, and port to
+match the saved configuration; reload failed/pending listener changes first. It does
+not create a port or change business services. Without it, creation preserves the
+current REST switch.
 
-If tokens already exist, enable `[status_http]` and `[admin.rest]` together using
-`crosslane config edit admin`, then save to reload the listener. There is no
-need to create another token. You can also create a token without `--enable-rest` while the
-listener is disabled, then enable both sections in the editor. Enabling REST without its
-listener or without any configured token remains invalid.
+If tokens already exist, enable `[status_http]` and `[admin.rest]` in the same edit;
+no additional token is needed. You can also create a token while the listener is
+disabled, then enable both sections. REST cannot be enabled without a listener and
+a configured token.
 
-Inspect the running configuration with `crosslane config show admin --effective` and
-`config show status-http --effective`; use `admin token list` for credential metadata and
-access state. When disabling the listener, disable REST in the same edit.
-`config reset status-http` disables REST too, preserving credentials and the socket.
-`config reset admin` removes all admin tokens and resets the socket, preserving the listener.
-Socket defaults come from the daemon's environment. With older daemons that do not report
-this default, the current socket is retained instead of using the CLI's `CROSSLANE_HOME`
-or `XDG_RUNTIME_DIR`. A full `config reset` also removes admin tokens and disables REST
-and the status listener; the original configuration is backed up before resetting.
-
-| Command | Purpose |
-| --- | --- |
-| `admin token create --name NAME` | Create; `--role admin` is the default, `add` is an alias |
-| `admin token list` | Metadata and admin/listener enabled state |
-| `admin token show ID_OR_NAME` | One token's metadata |
-| `admin token rotate ID_OR_NAME` | Return a fresh secret; invalidate the old one, preserving ID/name/role/enabled state |
-| `admin token disable ID_OR_NAME` | Disable and retain the record |
-| `admin token enable ID_OR_NAME` | Re-enable a disabled record |
-| `admin token revoke ID_OR_NAME` | Permanently remove; `delete` and `rm` are aliases |
-
-Multiple `admin` or `read-only` credentials can remain active simultaneously, allowing named
-callers to rotate or revoke independently. Commands reject `--provider` and ignore the
-`CROSSLANE_PROVIDER` default. Revoking the last token disables Admin REST while retaining public
-status and business configuration. Already authenticated requests and accepted batch jobs
-are not automatically cancelled by revocation.
-
-Token changes take effect only after the configuration write succeeds. On a write error,
-the previous file is verified or restored before returning; a rollback that cannot be verified
-is reported explicitly. These failures emit `config.persistence_failed` without logging secrets.
-
-Plaintext is returned only by successful create/rotate, never recoverable through list/show.
-Only SHA256 digests are persisted. Neither metadata commands nor their JSON output expose
-secrets or hashes. Automation can read `secret` from
-`crosslane --json admin token create --name ci`; do not log that creation response.
-Audit events record token ID, role and action; authenticated `admin.http.request` events add
-`token_id` to distinguish callers.
-
-Send the plaintext token, never its digest or a query-string token:
+Set `CROSSLANE_ADMIN_TOKEN` in your environment to the plaintext returned by
+create/rotate, then send it in the Authorization header:
 
 ```bash
 BASE=http://127.0.0.1:7651/admin/v1
@@ -119,13 +61,66 @@ curl -H "Authorization: Bearer $CROSSLANE_ADMIN_TOKEN" "$BASE/providers"
 curl -H "Authorization: Bearer $CROSSLANE_ADMIN_TOKEN" "$BASE/openapi.json"
 ```
 
-Full access permits all admin operations; read-only permits GET / HEAD and returns `403` for
-writes. Missing, invalid, disabled or revoked credentials return `401`; disabled Admin REST
-returns `404`. Model-client keys grant no management access. Authentication covers the schema,
-unknown routes and unsupported methods. The listener uses HTTP, independently of business TLS;
-use an HTTPS reverse proxy or SSH tunnel for remote access.
+Do not send the digest or use a query-string token. Read-only credentials permit
+GET/HEAD; writes return `403`. Missing, invalid, disabled, or revoked tokens return
+`401`; disabled Admin REST returns `404`. Model-client keys grant no admin access.
+These checks include the schema, unknown routes, and unsupported methods. The
+listener uses HTTP independently of business TLS; use HTTPS termination or an SSH
+tunnel for remote access.
 
-Legacy manual digest configuration remains supported:
+### Token lifecycle
+
+| Command (prefix `crosslane`) | Purpose |
+| --- | --- |
+| `admin token create --name NAME` | Create; default role `admin`, `add` is an alias |
+| `admin token list` | Token metadata and REST/listener enabled state |
+| `admin token show ID_OR_NAME` | One token's metadata |
+| `admin token rotate ID_OR_NAME` | Return a new secret and invalidate the old one; retain ID/name/role/enabled state |
+| `admin token disable ID_OR_NAME` | Disable and retain the record |
+| `admin token enable ID_OR_NAME` | Re-enable a disabled record |
+| `admin token revoke ID_OR_NAME` | Permanently remove; `delete` and `rm` are aliases |
+
+Plaintext is returned only at successful creation/rotation. Only SHA256 digests are
+stored; list/show and their JSON output expose neither secrets nor digests. Automation
+can read `secret` from `crosslane --json admin token create --name ci`; do not log the
+full creation response. Named tokens allow independent caller rotation and revocation;
+up to 128 named tokens plus two legacy credentials are supported. Token commands
+reject `--provider` and ignore `CROSSLANE_PROVIDER`.
+
+Changes apply to subsequent requests after the configuration write succeeds. Failed
+writes verify or restore the prior file; unverifiable rollback is reported explicitly
+with `config.persistence_failed`, without secrets. Revoking the last token disables
+Admin REST while preserving public status and business configuration. Already
+authenticated requests and accepted batch jobs are not cancelled by revocation.
+Audit events identify the token ID, role, and action.
+
+### Reload and reset
+
+Listener enable/disable, host, and port support hot reload. Saving in the editor
+validates and applies the combined configuration; manual edits need
+`crosslane config reload`. A failed bind retains the old listener and runtime
+configuration. Same-port host changes briefly rebind and restore the old listener
+on failure. Business services, accepted batches, capacity limits, and Kiro user locks
+survive listener changes. Initial REST activation waits for the intended listener,
+including when credentials change during reload. An already active REST interface
+can rotate tokens if a listener reload fails. Older daemons may require an upgrade.
+
+| Command | Effect |
+| --- | --- |
+| `config show admin --effective` | Inspect active admin settings |
+| `config show status-http --effective` | Inspect the active listener |
+| `config reset status-http` | Disable the listener and REST; retain tokens and socket |
+| `config reset admin` | Remove admin tokens and reset the socket; retain the listener |
+| `config reset` | Back up the original config, then reset it, removing tokens and disabling REST/status HTTP |
+
+Disable REST in the same edit when disabling its listener. Changing `admin.socket`
+requires restart. Socket reset defaults come from the daemon's environment; an old
+daemon that does not report them retains the current socket. Unchanged editor exits
+do not reload providers/services; failed full-config edits restore the original file.
+
+### Legacy digest configuration
+
+Manual digests remain compatible:
 
 ```toml
 [admin.rest]
@@ -134,26 +129,13 @@ token_sha256 = "REPLACE_WITH_64_HEX_SHA256_DIGEST"
 # read_token_sha256 = "REPLACE_WITH_DISTINCT_READ_ONLY_DIGEST"
 ```
 
-These appear as `legacy-admin` / `legacy-read-only` and support show, rotate, disable, enable
-and revoke. Changing a legacy entry materializes only that credential in the named list,
-retaining its ID, role and validity except for the requested rotation/revocation; the other
-legacy credential is unaffected. New tokens use `[[admin.rest.tokens]]`, supporting up to 128
-named tokens in addition to the two legacy compatibility identities.
+They appear as `legacy-admin` / `legacy-read-only` and support the same lifecycle
+commands. Changing one materializes only that credential in `[[admin.rest.tokens]]`,
+preserving its identity/role/state except for the requested change. The other remains
+valid.
 
-For manual digest generation:
-
-```bash
-python3 - <<'PYTOKEN'
-import hashlib
-import secrets
-token = secrets.token_urlsafe(32)
-print("Bearer token:", token)
-print("SHA256:", hashlib.sha256(token.encode()).hexdigest())
-PYTOKEN
-```
-
-Use `crosslane config reload` after manual digest or listener address/port edits.
-Changing `admin.socket` still requires restart. Full help: `crosslane help admin token`; guide: `crosslane guide admin`.
+Reload after manual edits. Full help: `crosslane help admin token`;
+setup guide: `crosslane guide admin`.
 
 ## Accounts
 
@@ -182,6 +164,8 @@ Account control operations and service bindings resolve identities and return me
 local snapshots. Account/pool queries and explicit refresh/probe use their usual upstream
 paths; authentication during creation still validates against the provider. This keeps a
 slow quota endpoint from holding the configuration transaction during enable, tag, or delete.
+
+### Create and import
 
 Create a Kiro API key account:
 
@@ -241,6 +225,8 @@ also accept `auth: "sso"`, `email`, `password`, HTTPS `start_url`, optional `reg
 Omitted `start_url` uses `[sso]` defaults. The request waits for the existing SSO flow; allow
 time for login. Builds without `sso` return `501`. Account creation/deletion updates existing
 durable storage and the running account pool.
+
+### Filters and grouping
 
 List filters: `provider`, `tag`, `status` (health), `enabled_only`, `untagged_only`.
 `sort` accepts `name`, `id`, or `credit`; the default is natural display-name order.
@@ -403,7 +389,7 @@ are not cancelled.
 
 ```bash
 curl -X DELETE 'http://127.0.0.1:7651/admin/v1/accounts/kiro/acc_12345678?force=true' \
-  -H "Authorization: Bearer $ADMIN_TOKEN"
+  -H "Authorization: Bearer $CROSSLANE_ADMIN_TOKEN"
 ```
 
 The CLI equivalent is `crosslane account rm acc_12345678 --provider kiro --force --yes`;
@@ -458,10 +444,10 @@ brief service state, without quotas or service IDs.
 
 ## Responses and audit
 
-Successes use `{"data":...}`, `201` for single resource creation, `202` for batch submission,
-and `200` otherwise. OpenAPI returns its
+Successes use `{"data":...}`. Queries normally return `200`, single resource creation
+`201`, and batch submissions or accepted Kiro subscription writes `202`; check the endpoint contract. OpenAPI returns its
 standard root object. Errors use `{"error":{"code":"...","message":"..."}}`:
-`400` invalid input, `401` unauthenticated, `403` read-only restriction, `404` missing/disabled,
+`400` invalid input, `401` unauthenticated, `403` read-only restriction or denied Kiro AWS permissions, `404` missing/disabled,
 `405` unsupported method, `409` binding/duplicate conflicts or a provider replaced during
 account validation, `413` oversized body,
 `502` failed upstream action, `503` temporarily unavailable, `501` unsupported build feature.
@@ -471,3 +457,40 @@ Bodies are limited to 2 MiB and authenticated concurrency to 16 requests; overfl
 `503`. Responses include `Cache-Control: no-store` and `x-request-id: admin_...`.
 The `admin.http.request` audit event records request ID, method, route template, role, status,
 and duration. It excludes Bearer tokens, bodies, query strings, and raw account path parameters.
+
+## Save and inspect JSON responses
+
+Keep the HTTP headers and body separate when exporting. The example uses the
+same `BASE` and `CROSSLANE_ADMIN_TOKEN` as above:
+
+```bash
+curl -sS --connect-timeout 10 --max-time 150 \
+  --dump-header crosslane-response.headers \
+  --output crosslane-response.raw \
+  --write-out '\nHTTP %{http_code}\n' \
+  -H "Authorization: Bearer $CROSSLANE_ADMIN_TOKEN" \
+  -H 'Accept: application/json' \
+  "$BASE/providers"
+```
+
+For Kiro user export, use `$BASE/kiro/enterprise/users?region=us-east-1` instead;
+configure the daemon's AWS credentials first. Once curl completes successfully
+and reports HTTP 200, format and publish the file:
+
+```bash
+python3 -m json.tool --no-ensure-ascii crosslane-response.raw > crosslane-response.json.tmp \
+  && mv crosslane-response.json.tmp crosslane-response.json
+```
+
+Only valid JSON replaces the final file. For failures, inspect:
+
+```bash
+cat crosslane-response.headers
+head -c 2000 crosslane-response.raw
+```
+
+`Expecting value: line 1 column 1` means the input is empty or not JSON; it does not
+identify the HTTP failure. Piping `curl -f` directly into a JSON formatter can hide
+an HTTP error body. `-i` mixes response headers into stdout, so use `--dump-header`
+with `--output` for JSON export. A 401 indicates an invalid/missing Admin token;
+000 means no valid HTTP response. Inspect the saved body for other errors.

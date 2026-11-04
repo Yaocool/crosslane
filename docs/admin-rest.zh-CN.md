@@ -1,32 +1,28 @@
 # Admin REST API
 
-Kiro 官方企业订阅管理位于 `/admin/v1/kiro/enterprise`，与 Crosslane 本地账号池分开。
-支持列用户、查询直接/组继承订阅、开通、取消、升级和降级；AWS 管理员凭据由
-`crosslaned` 管理，REST 调用方仍只传 Admin token。开通时 Crosslane 不额外调用 Identity Center
-应用分配接口，允许 AWS 后端自动分配。AWS 凭证用 `crosslane admin kiro configure` 独立加密保存并热生效；
-`show/clear/use-env` 管理状态和来源。CLI 的 `crosslane admin kiro subscription` 覆盖所有对应操作：
-`plans/profiles/scope/users/list/show` 查询，`add/upgrade/downgrade/cancel` 写入，四个写命令均支持
-`--dry-run`。取消默认周期结束；`--mode immediate` 明确立即取消。CLI 使用 Unix socket，无需 REST 监听或 Admin token。
-完整配置、接口和调用示例见 [Kiro 企业订阅管理](kiro-enterprise-admin.zh-CN.md)。
+[English](admin-rest.md) | [简体中文](admin-rest.zh-CN.md) | [项目说明](../README.zh-CN.md)
 
-管理接口使用独立 HTTP 监听，默认地址为 `http://127.0.0.1:7651/admin/v1`。
-它与 `/health`、`/ready` 共用进程监听，不依赖任何业务 service。业务端口不提供管理接口。
-接口按 Accounts、Services、Providers、Operations、APIKeys、KiroEnterprise 分组；开启后可通过
-`GET /admin/v1/openapi.json` 获取带鉴权定义的 OpenAPI 3.1 文档。
+管理前缀：`http://127.0.0.1:7651/admin/v1`。接口与公开的 `/health`、`/ready`
+共用独立状态监听，不依赖业务 service；业务端口不提供管理接口。
+Admin token 与模型客户端 Key 分开管理。
+
+本文介绍 Crosslane 本地账号、服务、账号池、额度及运行管理。AWS 凭证、企业用户和
+套餐变更见 [Kiro 企业订阅管理](kiro-enterprise-admin.zh-CN.md)，这些资源与本地
+代理账号不同；Kiro CLI 也可直接走 Unix socket，无需开启 REST。
+
+`GET /admin/v1/openapi.json` 返回带鉴权定义的 OpenAPI 3.1 文档，
+[仓库内的 schema](../crates/crosslaned/src/admin/rest/openapi.json) 是完整字段参考，
+下文示例覆盖常用操作。
+
+[启用](#启用与鉴权) · [账号](#账号管理) · [批量添加](#批量增加与自动-sso) · [服务](#service-管理) · [额度](#额度含义) · [响应](#响应与审计) · [保存 JSON](#保存与排查-json-响应)
 
 ## 启用与鉴权
 
-推荐通过 `crosslane admin token` 管理多把独立令牌。命令使用已有 Unix socket，
-不需要先有 Bearer Token；与 `crosslane apikey` 管理的业务客户端 Key 分开。
+### 首次启用
 
-新配置的 `[status_http]` 和 `[admin.rest]` 默认均为关闭，监听默认 `127.0.0.1:7651`；
-升级不会覆盖已有配置。运行 `crosslane config edit admin`（或 `config edit status-http`）
-会同时展示两个模块，并补齐旧配置缺少的默认字段和说明，保存时一起校验。
-未改设置直接退出时，原文件保持不变，也不会重载 provider 或 service；仍会报告磁盘配置
-相对于当前运行状态需要重启的字段。完整配置编辑器异常退出时会恢复原文件。
-
-首次启用时，运行 `crosslane config edit admin`，先设置以下监听，保留
-`[admin.rest] enabled = false`，保存后自动重载：
+新配置的 `[status_http]` 与 `[admin.rest]` 默认均关闭。运行
+`crosslane config edit admin`（或 `config edit status-http`）一起编辑两个模块。
+先开启监听，保持 `[admin.rest] enabled = false`，保存：
 
 ```toml
 [status_http]
@@ -35,66 +31,22 @@ host = "127.0.0.1"
 port = 7651
 ```
 
-独立监听的启用、关闭、地址和端口支持热重载，无需重启 daemon；也可执行
-`crosslane config reload` 应用手工编辑的文件。新地址会先绑定，绑定失败则保留原监听和运行配置。
-同端口修改 host 时会短暂重绑，失败后恢复原监听。业务服务继续运行，管理批量任务进度、
-并发名额和 Kiro 操作锁跨监听切换保留，旧连接不能使用新监听的鉴权配置。
-旧 daemon 仍可能返回监听字段需重启；升级到支持热重载的 daemon 后，此限制解除。
-
-随后创建第一把令牌，使用 `--enable-rest` 同时开启管理 REST：
+随后创建第一把令牌，并显式开启 REST：
 
 ```bash
 crosslane admin token create --name ops --enable-rest
 crosslane admin token create --name monitor --role read-only
 crosslane admin token list
-crosslane admin token show ops
 ```
 
-`--enable-rest` 要求状态监听已启用，且运行中的启用状态、地址和端口与磁盘配置一致；
-监听变更尚未成功重载时会拒绝创建，先用 `crosslane config reload` 检查并应用，避免在旧地址上提前开启 REST。该参数不修改业务 service，也不会自动开启新的
-监听端口。省略该参数时，仅创建令牌，保留当前管理开关。首次监听设置后，Token 变更
-立即对后续请求生效，无需重启或另行 `config reload`。
-直接在配置中首次开启 REST 时同样会等待目标监听生效；等待期间创建或轮换令牌不会
-提前开启旧地址上的 REST。已开启的 REST 可在监听重载失败后继续轮换令牌。
+CLI 通过 daemon 的属主专用 Unix socket 操作，无需已有 Bearer token。
+`--enable-rest` 要求运行中的监听启停状态、地址和端口与磁盘配置一致；监听变更失败或
+尚未应用时先重载。该参数不新增端口或修改业务服务；省略时保留当前 REST 开关。
 
-已有令牌时，无需再创建：在 `crosslane config edit admin` 中将 `[status_http] enabled = true`
-与 `[admin.rest] enabled = true` 一起保存并热重载。也可先在监听关闭时
-执行 `admin token create --name ops`（不带 `--enable-rest`），再按此方式一起开启。
-直接开启 REST 而未开启监听，或尚未配置任何令牌，仍会校验失败。
+已有令牌时，将 `[status_http]` 与 `[admin.rest]` 一起开启即可，无需重复创建。
+也可先在监听关闭时创建令牌，再一并启用；没有监听或没有配置令牌时不能开启 REST。
 
-`crosslane config show admin --effective` 与 `config show status-http --effective` 可分别查询
-当前运行配置；`crosslane admin token list` 查询令牌和访问状态，不显示令牌明文或摘要。
-关闭监听时在编辑器中同时关闭 REST。`config reset status-http` 会同时关闭 REST，并保留
-令牌和 socket；`config reset admin` 会清除全部管理令牌并重置 socket，保留状态监听。
-socket 默认值取自 daemon 的环境；连接未提供该默认值的旧 daemon 时保留当前 socket，
-避免使用 CLI 的 `CROSSLANE_HOME` 或 `XDG_RUNTIME_DIR` 将管理路径移到其他目录。
-不指定模块的 `config reset` 同样会清除管理令牌，并关闭 REST 和状态监听；操作前会备份原配置。
-
-| 命令 | 功能 |
-| --- | --- |
-| `admin token create --name NAME` | 创建令牌，默认 `--role admin`；`add` 为别名 |
-| `admin token list` | 列出全部令牌元数据，以及管理 REST/监听是否开启 |
-| `admin token show ID_OR_NAME` | 查询单把令牌元数据 |
-| `admin token rotate ID_OR_NAME` | 生成并返回新明文；旧明文立即失效，保留 ID、名称、权限及启停状态 |
-| `admin token disable ID_OR_NAME` | 停用并保留记录 |
-| `admin token enable ID_OR_NAME` | 重新启用已停用的令牌 |
-| `admin token revoke ID_OR_NAME` | 永久删除令牌；`delete`、`rm` 为别名 |
-
-支持多把 `admin` 或 `read-only` 令牌同时有效，可按调用方分别命名、轮换、停用或撤销。
-命令不接受 `--provider`，不受 `CROSSLANE_PROVIDER` 默认值影响。
-最后一把令牌撤销后，会关闭 `admin.rest.enabled`，独立状态监听和业务服务保持原配置。
-已通过鉴权的请求及已受理的批量任务不会因令牌撤销而自动取消。
-
-令牌变更仅在配置写入成功后生效。写入报错时会核对或恢复原文件，再返回错误；无法验证回滚成功
-时会明确说明。相关日志事件为 `config.persistence_failed`，不记录令牌明文。
-
-明文只在 `create` / `rotate` 成功时返回一次，无法通过 `list` / `show` 找回。
-配置仅保存 SHA256 摘要；列表、详情及其 JSON 输出均不包含明文或摘要。
-自动化可用 `crosslane --json admin token create --name ci`，从响应的 `secret` 字段
-取得新明文；不要将完整创建响应写进普通日志。审计日志仅记录令牌 ID、角色及操作；
-管理 HTTP 请求成功匹配令牌后，`admin.http.request` 也包含 `token_id`，便于区分调用方。
-
-请求必须发送明文，不能发送摘要，也不接受查询字符串中的令牌：
+将创建或轮换返回的令牌明文放入环境变量 `CROSSLANE_ADMIN_TOKEN`，通过请求头发送：
 
 ```bash
 BASE=http://127.0.0.1:7651/admin/v1
@@ -102,12 +54,57 @@ curl -H "Authorization: Bearer $CROSSLANE_ADMIN_TOKEN" "$BASE/providers"
 curl -H "Authorization: Bearer $CROSSLANE_ADMIN_TOKEN" "$BASE/openapi.json"
 ```
 
-完整权限令牌允许全部管理操作，只读令牌仅允许 GET / HEAD，写请求返回 `403`。
-缺失、错误、已停用或已撤销的令牌返回 `401`；管理接口关闭时返回 `404`。普通模型
-客户端 Key 不会获得管理权限。这些规则同样覆盖 OpenAPI、未知管理路径和不支持的方法。
-该监听使用 HTTP，不复用业务 TLS；跨机器接入使用 HTTPS 反向代理或 SSH 隧道。
+不能发送摘要或通过查询参数传 token。只读令牌允许 GET/HEAD，写请求返回 `403`。
+缺失、错误、停用或已撤销的令牌返回 `401`，管理接口关闭返回 `404`。普通模型客户端
+Key 不授予管理权限；OpenAPI、未知路径和不支持的方法同样先鉴权。该监听不复用业务
+TLS，跨机器访问需使用 HTTPS 反向代理或 SSH 隧道。
 
-旧的手工摘要配置继续兼容：
+### 令牌管理
+
+| 命令（前缀 `crosslane`） | 用途 |
+| --- | --- |
+| `admin token create --name NAME` | 创建，默认角色 `admin`，`add` 为别名 |
+| `admin token list` | 令牌元数据及 REST/监听启用状态 |
+| `admin token show ID_OR_NAME` | 单把令牌元数据 |
+| `admin token rotate ID_OR_NAME` | 返回新明文、旧明文失效；保留 ID、名称、角色及启停状态 |
+| `admin token disable ID_OR_NAME` | 停用并保留记录 |
+| `admin token enable ID_OR_NAME` | 重新启用 |
+| `admin token revoke ID_OR_NAME` | 永久删除，`delete`、`rm` 为别名 |
+
+明文只在创建或轮换成功时返回一次。配置仅保存 SHA256 摘要；列表、详情及其 JSON
+均不包含明文或摘要。自动化可从 `crosslane --json admin token create --name ci`
+的 `secret` 字段取得新明文，不应记录完整创建响应。可按调用方独立命名、轮换和撤销，
+最多支持 128 把命名令牌及两项旧凭证。命令不接受 `--provider`，不受
+`CROSSLANE_PROVIDER` 默认值影响。
+
+变更在配置写入成功后立即影响后续请求。写入失败时核对或恢复原文件，无法验证回滚
+时明确报错，并记录不含秘密的 `config.persistence_failed`。撤销最后一把令牌会关闭
+REST，保留公开状态监听及业务配置；已鉴权请求和已受理批量任务不会自动取消。
+审计记录包含令牌 ID、角色及动作。
+
+### 重载与重置
+
+监听启停、地址和端口支持热重载。编辑器保存时一并校验并应用，手工编辑后执行
+`crosslane config reload`。绑定失败保留原监听和运行配置；同端口更改 host 时短暂重绑，
+失败恢复原监听。业务服务、已受理批量任务、并发限额和 Kiro 用户锁跨监听变更保留。
+首次启用 REST 会等待目标监听生效，期间修改凭证也不会提前在旧地址开启；已经启用的
+REST 可在监听重载失败后继续轮换令牌。旧 daemon 可能需要升级以支持热重载。
+
+| 命令 | 作用 |
+| --- | --- |
+| `config show admin --effective` | 当前生效的管理配置 |
+| `config show status-http --effective` | 当前生效的监听配置 |
+| `config reset status-http` | 关闭监听和 REST，保留令牌与 socket |
+| `config reset admin` | 清除令牌并重置 socket，保留监听 |
+| `config reset` | 先备份再重置完整配置，清除令牌并关闭 REST/状态监听 |
+
+关闭监听时同次编辑也要关闭 REST。修改 `admin.socket` 仍需重启；socket 重置默认值
+取自 daemon 环境，旧 daemon 未提供默认值时保留当前路径。编辑器未改设置退出时不重载
+provider/service；完整配置编辑失败时恢复原文件。
+
+### 兼容手工摘要配置
+
+旧式摘要继续兼容：
 
 ```toml
 [admin.rest]
@@ -116,26 +113,12 @@ token_sha256 = "替换为完整权限令牌的64位SHA256十六进制摘要"
 # read_token_sha256 = "替换为另一把只读令牌的64位SHA256十六进制摘要"
 ```
 
-它们在 CLI 中显示为 `legacy-admin`、`legacy-read-only`，同样可执行
-`show`、`rotate`、`disable`、`enable`、`revoke`。首次修改某个旧令牌时，CLI 会把该令牌
-转入命名列表并保留 ID、角色和原有有效性（轮换/撤销除外），另一把旧令牌不受影响。
-新令牌写入 `[[admin.rest.tokens]]`，不再受“一把管理、一把只读”的限制；最多支持
-128 把命名令牌，另保留两项旧配置的兼容身份。
+CLI 中显示为 `legacy-admin` / `legacy-read-only`，支持相同的令牌管理命令。
+修改其中一把时仅将它转入 `[[admin.rest.tokens]]`，除本次变更外保留原身份、角色及状态，
+另一把不受影响。
 
-手工生成摘要时仍可使用：
-
-```bash
-python3 - <<'PYTOKEN'
-import hashlib
-import secrets
-token = secrets.token_urlsafe(32)
-print("Bearer token:", token)
-print("SHA256:", hashlib.sha256(token.encode()).hexdigest())
-PYTOKEN
-```
-
-手工修改摘要或监听地址/端口后均可执行 `crosslane config reload`；修改 `admin.socket` 仍需重启。
-完整命令帮助：`crosslane help admin token`，操作指南：`crosslane guide admin`。
+手工修改后重载配置。完整帮助：`crosslane help admin token`；启用指南：
+`crosslane guide admin`。
 
 ## 账号管理
 
@@ -163,6 +146,8 @@ PYTOKEN
 账号启停、标签、删除和 service 绑定操作使用本地快照定位账号及返回元数据。
 账号/账号池查询、显式 refresh/probe 仍按原有逻辑访问上游；新增账号的鉴权也继续向
 provider 校验。慢额度接口因此不会在这些本地变更期间占住配置事务。
+
+### 创建与导入
 
 创建 Kiro API Key 账号：
 
@@ -217,6 +202,8 @@ Kiro OAuth 导入使用 `auth: "oauth"` 和以下 `credentials`，还可提供 `
 `start_url`、可选 `region` 和 `tags`；省略 `start_url` 时使用 `[sso]` 默认值。该操作
 同步等待现有 SSO 流程，客户端应预留登录等待时间。无 `sso` feature 时返回 `501`。
 新增或删除账号会写入既有账号存储并应用到运行时。
+
+### 筛选与分组
 
 查询示例：
 
@@ -371,7 +358,7 @@ curl -X POST "$BASE/services" \
 
 ```bash
 curl -X DELETE 'http://127.0.0.1:7651/admin/v1/accounts/kiro/acc_12345678?force=true' \
-  -H "Authorization: Bearer $ADMIN_TOKEN"
+  -H "Authorization: Bearer $CROSSLANE_ADMIN_TOKEN"
 ```
 
 CLI 等价命令为 `crosslane account rm acc_12345678 --provider kiro --force --yes`，
@@ -422,9 +409,10 @@ Copilot 的 `local_aiu_usage` 是本机观察到的累计计费数据，与上�
 
 ## 响应与审计
 
-成功响应为 `{"data":...}`，单个资源创建返回 `201`，批量任务提交返回 `202`，其余成功返回 `200`；OpenAPI 文档直接返回
+成功响应为 `{"data":...}`；查询通常返回 `200`，单个资源创建返回 `201`，批量任务提交及
+Kiro 订阅写入受理返回 `202`，以对应接口契约为准。OpenAPI 文档直接返回
 标准文档对象。错误为 `{"error":{"code":"...","message":"..."}}`，使用 `400` 参数错误、
-`401` 未认证、`403` 只读权限限制、`404` 资源不存在或管理接口关闭、`405` 方法不支持、
+`401` 未认证、`403` 只读权限限制或 Kiro AWS 权限不足、`404` 资源不存在或管理接口关闭、`405` 方法不支持、
 `409` 绑定或重复资源冲突、账号校验期间 provider 被替换，`413` 请求体过大、`502` 上游动作失败、`503` 暂时不可用、
 `501` 构建不支持。上游错误文本沿用既有脱敏处理。
 
@@ -432,3 +420,37 @@ Copilot 的 `local_aiu_usage` 是本机观察到的累计计费数据，与上�
 响应带 `Cache-Control: no-store` 和 `x-request-id: admin_...`。
 审计日志事件为 `admin.http.request`，包含请求 ID、HTTP 方法、路由模板、权限角色、
 状态码与耗时；不记录 Bearer token、请求正文、查询字符串或原始账号路径参数。
+
+## 保存与排查 JSON 响应
+
+导出时将 HTTP 响应头与正文分开保存。沿用上文的 `BASE` 和 `CROSSLANE_ADMIN_TOKEN`：
+
+```bash
+curl -sS --connect-timeout 10 --max-time 150 \
+  --dump-header crosslane-response.headers \
+  --output crosslane-response.raw \
+  --write-out '\nHTTP %{http_code}\n' \
+  -H "Authorization: Bearer $CROSSLANE_ADMIN_TOKEN" \
+  -H 'Accept: application/json' \
+  "$BASE/providers"
+```
+
+导出 Kiro 用户时将 URL 改为 `$BASE/kiro/enterprise/users?region=us-east-1`，并先配置
+daemon 的 AWS 凭证。确认 curl 成功完成且 HTTP 为 200 后，再格式化并生成最终文件：
+
+```bash
+python3 -m json.tool --no-ensure-ascii crosslane-response.raw > crosslane-response.json.tmp \
+  && mv crosslane-response.json.tmp crosslane-response.json
+```
+
+只有 JSON 解析成功才替换最终文件。失败时先查看：
+
+```bash
+cat crosslane-response.headers
+head -c 2000 crosslane-response.raw
+```
+
+`Expecting value: line 1 column 1` 表示输入为空或不是 JSON，本身不能定位 HTTP 错误。
+将 `curl -f` 直接管道给格式化工具可能隐藏 HTTP 错误正文；`-i` 会将响应头混进标准输出，
+导出 JSON 应使用 `--dump-header` 与 `--output` 分开保存。401 表示 Admin token 缺失或
+无效，000 表示未收到有效 HTTP 响应；其他错误应查看已保存的正文。

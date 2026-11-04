@@ -1,5 +1,7 @@
 # Kiro 企业订阅管理
 
+[English](kiro-enterprise-admin.md) | [简体中文](kiro-enterprise-admin.zh-CN.md) | [项目说明](../README.zh-CN.md)
+
 管理前缀：`http://127.0.0.1:7651/admin/v1/kiro/enterprise`。
 复用 [Admin REST](admin-rest.zh-CN.md) 的独立监听、Bearer 鉴权和角色：
 只读令牌可 GET/HEAD；开通、取消和升降级需要完整管理权限。
@@ -7,9 +9,13 @@
 这里操作的是 AWS/Kiro 的企业用户与订阅。Crosslane 本地账号仍通过 `/admin/v1/accounts`
 管理。开通订阅不会自动做浏览器 SSO，也不会把账号导入本地账号池。
 
+[CLI](#通过-cli-管理订阅) · [AWS 凭证](#配置-aws-管理员凭据) · [接口](#接口) · [用户与订阅查询](#查询用户与订阅) · [HTTP 写入](#http-订阅变更) · [权限与排障](#aws-权限与排障)
+
 ## 通过 CLI 管理订阅
 
-CLI 已覆盖下文现有 Kiro 管理 REST 的全部操作：
+先运行 `crosslane admin kiro configure` 保存 AWS 凭证。订阅命令通过 daemon 的属主
+专用 Unix socket 使用这些凭证，**无需 Admin token，也无需开启 REST/状态监听**。
+CLI 与 daemon 均需升级；Docker 调用端需能访问管理 socket，或在容器内执行命令。
 
 | 命令（前缀 `crosslane admin kiro subscription`） | 用途 |
 | --- | --- |
@@ -25,49 +31,29 @@ CLI 已覆盖下文现有 Kiro 管理 REST 的全部操作：
 | `cancel <USER> [--mode end-of-period\|immediate]` | 取消直接订阅，默认周期结束 |
 
 ```bash
-crosslane admin kiro subscription profiles
-crosslane admin kiro subscription scope
 crosslane admin kiro subscription users
-crosslane admin kiro subscription plans
-crosslane admin kiro subscription list
+crosslane --json admin kiro subscription list
 crosslane admin kiro subscription show user@example.com
-crosslane --json admin kiro subscription show USER_ID
 
-# 写操作先只读预览；确认后去掉 --dry-run 实际提交
+# 只读预览；去掉 --dry-run 会实际提交变更。
 crosslane admin kiro subscription add user@example.com --plan pro --dry-run
 crosslane admin kiro subscription upgrade user@example.com --plan power --dry-run
 crosslane admin kiro subscription downgrade user@example.com --plan pro --dry-run
 crosslane admin kiro subscription cancel user@example.com --dry-run
-crosslane admin kiro subscription cancel USER_ID --mode immediate --dry-run
 ```
 
-首次使用先运行 `crosslane admin kiro configure` 保存 AWS 凭证，详见下一节。
-上述命令通过 daemon 的属主专用 Unix socket 执行，使用 daemon 保存的同一组 AWS 凭证，
-**无需 Admin token，也无需开启状态或 Admin REST 监听**。Docker 部署需在本机挂载管理
-socket，或在容器内执行 CLI。CLI 与 daemon 均需升级；旧 daemon 返回明确的升级提示。
+`USER` 接受 Identity Center 的精确用户名、UserId 或用户 ARN，无需 URL 编码。
+套餐为 `pro`、`pro-plus`、`pro-max`、`power`。范围参数 `--region`、`--profile-arn`、
+`--application-arn`、`--identity-center-region`、`--legacy` 放在动作后，`profiles`
+只接受 region/legacy；省略时使用保存的默认值和自动发现。Legacy 仅支持 `us-east-1`，
+取消时必须显式指定 `--mode immediate`，不会自动启用。
+别名与完整参数见 `crosslane help admin kiro subscription --all`。
 
-`USER` 接受 Identity Center 的精确 `userName`、UserId 或用户 ARN，不需要 URL 编码。
-`add`、`upgrade`、`downgrade` 的 `--plan` 必填，支持 `pro`、`pro-plus`、`pro-max`、`power`。
-`scope`、`users`、`list`、`show` 与四个写命令后可附加 `--region`、`--profile-arn`、
-`--application-arn`、`--identity-center-region`、`--legacy`；`profiles` 只接受 `--region` 和
-`--legacy`。未指定的范围使用已保存的配置和自动发现。`--legacy` 只支持 `us-east-1`，不会自动回退。
-`subscriptions` 是 `subscription` 的别名；`create`、`activate` 是 `add` 的别名；
-`delete`、`remove`、`rm` 是 `cancel` 的别名。
-
-四个写命令默认实际提交；`--dry-run` 只读预览，不能验证所有 AWS 写权限。
-升级预期即时生效，降级预期下月生效，使用 `show` 查看当前及待生效套餐。
-取消默认 `--mode end-of-period`（也接受 `end_of_period`），周期结束时取消；
-`immediate` 预期立即停用，但计费仍可能至当月底。旧控制面取消必须显式使用
-`--legacy --mode immediate`，CLI 不会自动改为立即取消。取消保留 Identity Center 用户，
-不修改组继承订阅。`users` 不逐一展开组成员关系，查询某人的继承情况请使用 `show`。
-
-CLI 复用 REST 的范围校验、用户级操作锁、8 个并发写操作限额和完成审计，日志中
-`source=unix_socket` 可区分 CLI 调用；不会额外发送重复的 SSO 分配请求，允许 AWS 后端自动分配应用。
-“AWS 已受理”不代表权益或计费已生效；命令不自动重试，超时、中断或结果不明后先用 `show`
-确认状态。终端查询提示保留本次 socket 和范围参数。JSON 错误保留上游错误码、request ID 和
-`write_outcome`，不返回 AWS 密钥。
-
-顶层 `crosslane subscriptions --provider kiro` 继续使用本地账号凭证查询计划，不执行订阅写入。
+写命令默认实际提交。`--dry-run` 检查发现过程和操作条件，不能验证 AWS 写权限。
+CLI 与 REST 共用用户锁、8 个写操作名额和完成审计，CLI 日志标记 `source=unix_socket`。
+超时或结果不明后先用 `show` 查询，再决定是否重试；详见[订阅语义](#订阅语义与错误处理)。
+独立的顶层命令 `crosslane subscriptions --provider kiro` 使用本地账号凭证查询可用套餐，
+不管理企业订阅分配。
 
 ## 配置 AWS 管理员凭据
 
@@ -171,21 +157,8 @@ AWS 凭据缺失、不完整或环境变量编码无效时，远程查询/写入
 | `CROSSLANE_KIRO_ADMIN_APPLICATION_ARN` | 可选，选择 Profile 关联的 Identity Center 应用 |
 | `CROSSLANE_KIRO_ADMIN_IDENTITY_CENTER_REGION` | 可选，仅在 Profile 缺少 `ssoRegion` 时补充，不能覆盖 Profile 已记录的其他区域 |
 
-仓库默认 `docker-compose.yml` 已映射上述全部变量；在宿主机 `.env` 中按 `.env.example`
-填写即可。自定义 Compose 文件需要在 `crosslaned` 服务中保留相应映射，例如：
-
-```yaml
-services:
-  crosslaned:
-    environment:
-      CROSSLANE_KIRO_ADMIN_ACCESS_KEY_ID: ${CROSSLANE_KIRO_ADMIN_ACCESS_KEY_ID:-}
-      CROSSLANE_KIRO_ADMIN_SECRET_ACCESS_KEY: ${CROSSLANE_KIRO_ADMIN_SECRET_ACCESS_KEY:-}
-      CROSSLANE_KIRO_ADMIN_REGION: ${CROSSLANE_KIRO_ADMIN_REGION:-us-east-1}
-      CROSSLANE_KIRO_ADMIN_SESSION_TOKEN: ${CROSSLANE_KIRO_ADMIN_SESSION_TOKEN:-}
-      CROSSLANE_KIRO_ADMIN_PROFILE_ARN: ${CROSSLANE_KIRO_ADMIN_PROFILE_ARN:-}
-      CROSSLANE_KIRO_ADMIN_APPLICATION_ARN: ${CROSSLANE_KIRO_ADMIN_APPLICATION_ARN:-}
-      CROSSLANE_KIRO_ADMIN_IDENTITY_CENTER_REGION: ${CROSSLANE_KIRO_ADMIN_IDENTITY_CENTER_REGION:-}
-```
+仓库的 [Compose 配置](../docker-compose.yml) 已映射这些变量，在宿主机 `.env` 中按
+[.env.example](../.env.example) 填写即可。自定义 Compose 文件需要保留对应的 environment 映射。
 
 可选环境变量为空字符串时按未设置处理；临时 `ASIA` 凭据仍必须有非空 SessionToken。
 查询参数中显式传入的空 Profile/Application ARN 仍会被拒绝，不会静默改选默认目标。
@@ -202,7 +175,7 @@ services:
 | GET | `/plans` | `pro`、`pro-plus`、`pro-max`、`power` 与 AWS 套餐名 |
 | GET | `/profiles` | 验证 AWS 调用身份并列出该账号、该区域的 Kiro Profile |
 | GET | `/scope` | 自动发现并验证 Profile、Identity Center 实例、应用和身份库 |
-| GET | `/users` | 列出身份库全部用户，附直接 USER 订阅；应用的 GROUP 订阅另列 |
+| GET | `/users` | 用户名、显示名、邮箱及直接订阅；包含身份库全部用户，组订阅另列 |
 | GET | `/subscriptions` | 当前应用全部 USER/GROUP 订阅，包括当前套餐与待生效套餐 |
 | GET | `/users/{user}/subscription` | 指定用户的直接订阅和当前组成员关系继承的订阅 |
 | POST | `/users/{user}/subscription` | 开通直接 USER 订阅；已有直接订阅返回 409 |
@@ -229,49 +202,121 @@ Profile 的区域及所属 AWS 账号必须与当前请求和 STS 调用身份�
 当前实现支持商业 AWS 分区；不支持中国区或 GovCloud。`legacy=true` 显式启用旧控制面，
 仅支持 `us-east-1`，且只能立即取消；默认不使用旧控制面或失败后自动切换。
 
-## 调用示例
+## 查询用户与订阅
 
-调用方只设置 Crosslane 的 Admin token，不需要 AWS AK/SK：
+需要 `user_name`、`display_name`、`emails` 时使用 `/users`。该接口查询 Identity Store
+的 `ListUsers`，再按 UserId 关联直接订阅；`/subscriptions` 只返回订阅主体 ID、套餐和
+状态，没有关联用户目录资料。
+
+`/users` 返回**身份库全部用户**，包含没有直接订阅的用户。应用组订阅单独放在
+`group_subscriptions`，不逐个展开成员；`direct_subscriptions` 为空也可能有组继承权益。
+查询某人的直接及当前组继承订阅使用 `/users/{user}/subscription`（CLI 为 `show`）。
+目录中缺失的用户名或显示名返回 null，缺失邮箱返回空数组。查询范围是选定的 AWS 账号、
+区域与应用，不是所有 AWS 账号或区域。
 
 ```bash
 BASE=http://127.0.0.1:7651/admin/v1/kiro/enterprise
-ADMIN_TOKEN='替换为Crosslane管理令牌'
-USER_ID='替换为IdentityCenter的UserId'
+# 将已有 Admin token 放入环境变量 CROSSLANE_ADMIN_TOKEN。
+curl -sS -H "Authorization: Bearer $CROSSLANE_ADMIN_TOKEN" "$BASE/profiles"
+curl -sS -H "Authorization: Bearer $CROSSLANE_ADMIN_TOKEN" "$BASE/scope"
+curl -sS -H "Authorization: Bearer $CROSSLANE_ADMIN_TOKEN" "$BASE/users?region=us-east-1"
+curl -sS -H "Authorization: Bearer $CROSSLANE_ADMIN_TOKEN" "$BASE/subscriptions?region=us-east-1"
+```
 
-# 发现范围、列举用户和订阅
-curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" "$BASE/profiles"
-curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" "$BASE/scope"
-curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" "$BASE/users"
-curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" "$BASE/subscriptions"
-curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" "$BASE/users/$USER_ID/subscription"
+HTTP 用户查询不需要请求体，替换实际监听地址和令牌：
+
+```http
+GET /admin/v1/kiro/enterprise/users?region=us-east-1 HTTP/1.1
+Host: 127.0.0.1:7651
+Authorization: Bearer <CROSSLANE_ADMIN_TOKEN>
+Accept: application/json
+```
+
+以下响应使用虚构示例数据：
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+Cache-Control: no-store
+
+{
+  "data": {
+    "scope": {
+      "account_id": "123456789012",
+      "kiro_region": "us-east-1",
+      "identity_center_region": "us-east-1",
+      "identity_store_id": "d-1111222233",
+      "instance_arn": "arn:aws:sso:::instance/ssoins-1111222233334444",
+      "application_arn": "arn:aws:sso::123456789012:application/ssoins-1111222233334444/apl-1111222233334444",
+      "profile_arn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/example",
+      "legacy": false
+    },
+    "users": [
+      {
+        "user_id": "11111111-1111-4111-8111-111111111111",
+        "user_name": "user@example.com",
+        "display_name": "Example User",
+        "emails": [
+          "user@example.com"
+        ],
+        "direct_subscriptions": [
+          {
+            "principal_type": "USER",
+            "principal_id": "11111111-1111-4111-8111-111111111111",
+            "subscription_type": "KIRO_ENTERPRISE_PRO",
+            "plan": "pro",
+            "pending_subscription_type": null,
+            "pending_plan": null,
+            "status": "ACTIVE"
+          }
+        ]
+      }
+    ],
+    "group_subscriptions": []
+  }
+}
+```
+
+`plan` 是当前套餐，`pending_plan` 是待生效套餐或 null；底层 `subscription_type`
+字段保留 AWS 原值，包括未知档位。格式化保存与 HTTP 错误排查见
+[保存与排查 JSON 响应](admin-rest.zh-CN.md#保存与排查-json-响应)，将其中 URL 换为
+上面的完整 `/users` 地址即可。
+
+## HTTP 订阅变更
+
+以下命令使用完整管理令牌；写操作默认实际提交，`dry_run` 才是预览。
+
+```bash
+BASE=http://127.0.0.1:7651/admin/v1/kiro/enterprise
+USER_ID=REPLACE_WITH_IDENTITY_CENTER_USER_ID
 
 # 开通预览：执行只读发现与校验，不提交订阅写入
-curl -fsS -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+curl -fsS -X POST -H "Authorization: Bearer $CROSSLANE_ADMIN_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"plan":"pro-plus","dry_run":true}' \
   "$BASE/users/$USER_ID/subscription"
 
 # 实际开通；AWS 可自动分配应用，Crosslane 不额外重复调用
-curl -fsS -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+curl -fsS -X POST -H "Authorization: Bearer $CROSSLANE_ADMIN_TOKEN" \
   -H 'Content-Type: application/json' -d '{"plan":"pro-plus"}' \
   "$BASE/users/$USER_ID/subscription"
 
 # 将较低档位升级为 pro-max
-curl -fsS -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+curl -fsS -X POST -H "Authorization: Bearer $CROSSLANE_ADMIN_TOKEN" \
   -H 'Content-Type: application/json' -d '{"plan":"pro-max"}' \
   "$BASE/users/$USER_ID/subscription/upgrade"
 
 # 将较高档位降级为 pro
-curl -fsS -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+curl -fsS -X POST -H "Authorization: Bearer $CROSSLANE_ADMIN_TOKEN" \
   -H 'Content-Type: application/json' -d '{"plan":"pro"}' \
   "$BASE/users/$USER_ID/subscription/downgrade"
 
 # 月底停止访问；省略 mode 时也是 end_of_period
-curl -fsS -X DELETE -H "Authorization: Bearer $ADMIN_TOKEN" \
+curl -fsS -X DELETE -H "Authorization: Bearer $CROSSLANE_ADMIN_TOKEN" \
   "$BASE/users/$USER_ID/subscription?mode=end_of_period"
 
 # 立即停止直接订阅的访问；订阅计费仍到月底结束
-curl -fsS -X DELETE -H "Authorization: Bearer $ADMIN_TOKEN" \
+curl -fsS -X DELETE -H "Authorization: Bearer $CROSSLANE_ADMIN_TOKEN" \
   "$BASE/users/$USER_ID/subscription?mode=immediate"
 ```
 
@@ -317,6 +362,8 @@ HTTP 2xx 中的 AWS 错误信封同样按失败处理，无法确认的错误体
 - `unknown`：写入时超时、传输异常、服务端失败、异常重定向或响应无法解析，结果可能已经生效；先查询，
   不要直接重复写入。
 
+## AWS 权限与排障
+
 权限依据见 [Kiro IAM](https://kiro.dev/docs/enterprise/iam/)：
 订阅写入需要 `q:CreateAssignment`、`q:UpdateAssignment`、`q:DeleteAssignment`，查询需要
 `user-subscriptions:ListApplicationClaims`。调用方还需具有 `user-subscriptions:CreateClaim`、
@@ -351,6 +398,8 @@ Claim 事件的 `sourceIPAddress` 为 `q.amazonaws.com`
 并不单独证明 `aws:SourceIp` 条件失败：[AWS 文档](https://docs.aws.amazon.com/IAM/latest/UserGuide/access_forward_access_sessions.html)
 说明，经公网端点发起的请求，其源 IP 会保留到后续转发访问会话（FAS）中；通过 VPC 端点的请求需按文档
 另行处理网络条件。
+
+### 上游协议与验证范围
 
 Kiro 的套餐操作及 claim 查询采用 Console 后端协议，并非稳定公开的 AWS SDK 服务模型；
 参考 [Kiro 官方仓库的调用记录](https://github.com/kirodotdev/Kiro/issues/10166)。

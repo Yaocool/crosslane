@@ -2,8 +2,18 @@
 
 [English](startup-and-debugging.md) | [简体中文](startup-and-debugging.zh-CN.md) | [Project overview](../README.md)
 
-This guide covers deployment, accounts, service access, routine checks, and
-backup. Run commands from the repository root with a matching `crosslane` CLI.
+This guide covers deployment, accounts, services, models, routine troubleshooting,
+and backup. Run commands from the repository root with a CLI matching the daemon.
+
+| Task | Guide |
+| --- | --- |
+| Deploy or upgrade | [Requirements](#requirements-and-configuration), [Docker](#docker) |
+| Add accounts or create services | [Accounts](#accounts), [Services and client access](#services-and-client-access) |
+| Manage models and quotas | [Models and quotas](#models-and-quotas) |
+| Troubleshoot or restore data | [Logs](#logs-and-troubleshooting), [Backup and recovery](#backup-and-recovery) |
+| Configure caching, tool loading, redaction, or compaction | [Request processing](request-processing.md) |
+| Connect clients, web search, or CRS | [Client compatibility](client-compatibility.md) |
+| Automate administration or manage Kiro subscriptions | [Admin REST](admin-rest.md), [Kiro Enterprise administration](kiro-enterprise-admin.md) |
 
 ## Requirements and configuration
 
@@ -67,6 +77,7 @@ crosslane help account --all
 | `service` | Business listeners, allowed providers, client key bindings, and account pools |
 | `apikey` | Client credentials, provider/model permissions, limits, and usage |
 | `models` / `model-map` | Model discovery and global disabling / client model mapping rules |
+| `admin` | Admin tokens and Kiro enterprise AWS credentials, users, and subscriptions |
 | `tasks` / `alert` | Scheduled tasks / shared notification targets and current Kiro events |
 
 Bare top-level groups display help; scripts using `--json` must select an action.
@@ -122,12 +133,7 @@ the specific blocker immediately. Complete that organization sign-in step, then
 retry with the current login password. Crosslane does not change organization
 passwords; `add-sso --headful` remains available for manual browser verification.
 
-Native OAuth Runtime calls, the ControlPlane catalog, and extension management REST
-use separate protocols and identity headers. Management defaults to
-`management.{region}.kiro.dev`. Missing-profile discovery successes use an
-account-scoped cache of up to 500 entries for 15 minutes. Default Web Search uses
-`InvokeMCP` at the Runtime root; explicit `CROSSLANE_MCP_URL` or
-`upstream.web_search_endpoint` retains legacy JSON-RPC compatibility.
+For Kiro endpoint and protocol details, see [client compatibility](client-compatibility.md#kiro-endpoints-and-upstream-refusals).
 
 ### GitHub Copilot
 
@@ -235,6 +241,8 @@ The independent listener can also expose `/admin/v1` with separate Bearer authen
 for account/provider/tag management, service lifecycle, grouped pools and quotas.
 See [Admin REST API](admin-rest.md) for configuration and endpoints.
 
+### Create a listener
+
 A new installation has no business listener. Create one and save the client
 API key printed by the command:
 
@@ -249,6 +257,8 @@ To make a service use only Copilot, specify its provider and default provider:
 ```bash
 crosslane service create --name copilot --host 127.0.0.1 --provider copilot --default-provider copilot
 ```
+
+### Provider routing and failover
 
 A service exposing both Kiro and Copilot automatically balances unqualified
 requests that do not match an explicit model mapping:
@@ -294,6 +304,8 @@ Explicit cross-provider mappings still require the source provider's
 allowed by the service and key. Correlate `upstream.provider.selected` and
 `upstream.provider.failover` log events with `trace_id` to inspect decisions.
 
+### Client authentication
+
 A service accepts only its bound client keys. Generation routes also enforce
 a client product User-Agent policy. For another client, an operator can set
 `--skip-user-agent-check true` on the service or client key; key authentication
@@ -304,64 +316,6 @@ before changing access:
 crosslane help service edit
 crosslane help apikey edit
 ```
-
-## Desktop tools and web search
-
-Copilot Responses streams retain the first upstream response ID and one item ID
-per output index across deltas, completion events, and the final output snapshot.
-This lets desktop clients reconcile streamed text with completed messages without
-showing the answer twice when Copilot changes its opaque IDs between events.
-Message phases, tool call IDs, citations, and `copilot_usage` remain unchanged.
-
-For Claude upstreams that reject root `oneOf`, `allOf`, or `anyOf` tool schemas,
-Crosslane moves those constraints into an equivalent conditional subschema,
-preserving required branches, local definitions, and closed object constraints.
-Responses namespace function/custom tools use unique upstream names and restore their
-original namespace and name in client output. The adapter bounds namespace and
-leaf name independently to 128 characters. If their flattened internal name is
-longer, it uses a request-scoped alias consistently in declarations, history and
-tool choice; streamed and non-streamed output retain the original fields.
-Claude Code's `thinking.display: "updates"` is adapted to upstream `summarized`
-while retaining thinking settings;
-`omitted` continues to hide thinking output.
-Kiro tool calls are checked against the originating request's tool declarations
-before reaching the client, in both streaming and non-streaming responses.
-Known aliases restore the original name; a hash-looking name explicitly declared
-by the client remains valid. Unknown names fail with `upstream_tool_name_mismatch`
-(HTTP 502 for non-streaming, an error event for streaming), without rotating
-accounts or emitting the unknown tool call. The `proxy.tool_name.mapping_miss`
-log records the trace/request IDs, call ID and a bounded tool name, without
-tool arguments or schemas. Proxy-managed Tool Search/Web Search retain their
-server-tool handling.
-Copilot Messages requests omit the unsupported Anthropic `safeguards` extension,
-including on token-counting requests, so newer Claude Code requests are accepted.
-
-Copilot handles ordinary generation even when a Responses catalog advertises
-`web_search`. An actual search call switches both search and the turn's following
-generation to Kiro, with no Copilot fallback. Claude Code's server-side WebSearch
-subrequests also take this route. Add to the existing Copilot `[[proxy_service]]`:
-
-```toml
-web_search_provider = "kiro" # Kiro provider instance ID
-```
-
-This grants only search and its continuation. Service account tags, explicit
-account inclusions/exclusions, and client model permissions still apply. Kiro
-services default to their own provider when this field is omitted. Run
-`crosslane config reload` after editing. Missing Kiro configuration/accounts,
-search failures, and failed Kiro continuations report `web_search is not supported`.
-
-Responses include `web_search_call`, real source links and URL citations, with
-streaming events and replayable tool history. `external_web_access:false` uses
-only the service/key's five-minute search cache and reports a cache miss. Codex
-clients needing live search can set `web_search = "live"`. Search replay is scoped
-to the same service/key, lasts at most thirty minutes, and expires on restart.
-Claude server-side search supports either `allowed_domains` or `blocked_domains`,
-but not both. Domains include their subdomains; search paths support prefixes and
-`*` wildcards. Use ASCII host names without schemes, ports, credentials, or host
-wildcards. The proxy adds `site:` / `-site:` query constraints and filters returned
-URLs before model continuation, citations, and encrypted replay. No matches yield
-an empty search result. `user_location` is still rejected explicitly.
 
 ## Models and quotas
 
@@ -402,326 +356,12 @@ per account, run `crosslane account overage enable --max-credits 500`; use
 `crosslane account overage disable` to turn it off. Upstream limits and requests
 already in progress can still affect final usage.
 
-## Kiro prompt cache usage
-
-`features.enable_prompt_cache` defaults to `false`. Use
-`crosslane config edit features` to set it to `true`; saving validates and
-reloads the configuration. Kiro normally reports credits without token/cache
-counts, so Crosslane estimates cache usage locally with the tokenizer used for
-input and output usage. This is usage simulation, not a claim that Kiro reused
-its backend cache or discounted its credits. Actual reported credit charges
-remain independent of these token estimates.
-
-Claude requests require an explicit `cache_control: {"type":"ephemeral"}`
-breakpoint or the same control at the request root. OpenAI Chat/Responses use
-implicit prefix accounting without requiring this Anthropic extension. Valid
-explicit controls are also translated into native Kiro `cachePoint` blocks.
-Local entries are isolated by upstream account, resolved model and optional
-OpenAI `prompt_cache_key`. They expire after 5 minutes (or 1 hour for an explicit
-`ttl=1h` control), refresh on reuse and are lost when crosslaned restarts.
-Client TTL values are local policy, not an upstream retention guarantee.
-
-A completed cold request records cache creation. A later request can read the
-longest matching prefix within 20 blocks of a breakpoint and creates only the
-new suffix. Moving cache markers does not invalidate unchanged content; changing
-preceding tools, roles or content does. Failed/cancelled generations and empty
-refusals do not seed entries. Prefixes below the local model threshold are
-ignored: 512 tokens for Opus 5/5.5 and Sonnet/Haiku 5.5; 2,048 for Opus 4.7;
-4,096 for Opus 4.5/4.6 and Haiku 4.5; 1,024 otherwise. These are Crosslane's local
-accounting rules. Explicit upstream cache counters, including zero, take
-precedence when present.
-
-For Claude Code and `/v1/messages`, `cache_read_input_tokens` and
-`cache_creation_input_tokens` are input subsets. `input_tokens` is the remaining
-uncached input; their sum equals the total input counted for accounting.
-`output_tokens` counts generated output and is not a cache-write counter.
-Streaming `message_start` includes the initial local cache plan; final
-`message_delta.usage` and non-streaming `usage` contain completed accounting.
-Request diagnostics and the `proxy.usage.accounting` log identify token/cache
-sources as `estimated`, separately from `credits_source=server`.
-
-For OpenAI Chat Completions, `usage.prompt_tokens_details` contains
-`cached_tokens` (reads) and `cache_write_tokens` (writes). Responses returns
-the same two fields in `usage.input_tokens_details`. Both are subsets of the input total. Chat streaming
-requires `stream_options: {"include_usage": true}` to receive the final usage
-chunk; Responses streaming includes usage in its terminal response event.
-See the [official OpenAI cache usage documentation](https://developers.openai.com/api/docs/guides/prompt-caching#monitor-cache-performance).
-
-On Kiro routes, `prompt_cache_key` gives both OpenAI endpoints a stable affinity
-hint, hashed into the upstream conversation ID, and scopes local cache accounting.
-It does not pin an account. Native Kiro cache points still use the `cache_control` extension
-described above, without OpenAI retention or breakpoint-lifetime guarantees.
-Kiro rejects explicit `prompt_cache_breakpoint` markers and
-`prompt_cache_options` that request prewarming, a minimum `ttl`, or `mode=explicit`
-with HTTP 400 before generation. A prewarm is never downgraded to a normal
-generation. Null/default controls, `prewarm=false`, and legacy
-`prompt_cache_retention` hints remain accepted; retention is not guaranteed.
-Between native OpenAI Chat and Responses upstreams, protocol conversion preserves
-`prompt_cache_options`, `prompt_cache_retention`, and content-level
-`prompt_cache_breakpoint` markers when the target can represent them. Prewarming
-and a 12-hour minimum lifetime require native Responses and are rejected when
-the selected upstream only supports Chat or Messages.
-
-Copilot requests upstream usage for accounting even when the Chat caller omits
-or disables `stream_options.include_usage`. The HTTP boundary records those real
-tokens, cache counters, and supplier bills before suppressing usage-only chunks
-and billing metadata from that caller. Content, errors and `[DONE]` stay intact.
-Clients that explicitly request usage still receive it. Messages and Responses
-retain their normal usage events.
-Internal statistics normalize Messages input as ordinary input plus cache reads
-and writes. OpenAI input totals already include those subsets and are preserved.
-The public responses retain each protocol's own input-token semantics.
-
-## Request latency controls
-
-### Load Claude Code MCP tools on demand
-
-Claude Code can disable tool search when `ANTHROPIC_BASE_URL` points to
-Crosslane, loading every MCP tool into the model context on each turn. Enable
-it explicitly before starting Claude Code:
-
-```bash
-ENABLE_TOOL_SEARCH=true claude
-```
-
-Alternatively, merge this field into Claude Code's `~/.claude/settings.json`
-and restart the session:
-
-```json
-{
-  "env": {
-    "ENABLE_TOOL_SEARCH": "true"
-  }
-}
-```
-
-Crosslane enables `features.enable_tool_search` by default. Client `ToolSearch`
-calls remain client-executed. A `defer_loading` definition enters a Kiro
-request only after a history `tool_reference` discovers it or the tool has
-been used; unmatched definitions stay out of the upstream context. Previously
-used tools and a tool explicitly selected by `tool_choice` remain available.
-Long names use upstream aliases and are restored in client responses. If
-proxy tool search is explicitly disabled, deferred-tool requests still fail
-instead of silently loading the full catalog.
-
-Ordinary built-in tools, system instructions, and conversation history still
-consume context. Compare `loaded_tool_count`, `deferred_tool_count`,
-`loaded_tool_bytes`, and `input_tokens` in `proxy.request.prepared`, then
-measure both first-byte and complete response times. Counts cover definitions
-in this request, not the full MCP catalog retained by Claude Code. See the
-[Claude Code MCP documentation](https://code.claude.com/docs/en/mcp#configure-tool-search)
-for the client switch.
-
-Copilot model lookups reuse an enabled account's catalog up to
-`provider.models.max_stale_ms` while scheduled or explicit refreshes update it.
-A missing catalog on another account does not block requests with a usable
-snapshot. Cold or fully expired catalogs still require discovery; expired
-models cannot authorize or schedule a request. Refresh concurrency is controlled
-by `provider.settings.model_refresh_concurrency` (default: 32, no more than the
-enabled account count). Large pools can raise it, for example to 64; lower it if
-the upstream rate limits discovery. It must be positive and does not make
-requests with usable snapshots wait for discovery.
-
-```toml
-[provider.settings]
-model_refresh_concurrency = 32
-```
-
-Copilot accepts these positive millisecond values in the corresponding
-`[provider.settings]` table:
-
-```toml
-stream_read_timeout_ms = 600000
-oauth_refresh_timeout_ms = 30000
-account_queue_wait_timeout_ms = 30000
-```
-
-The stream timeout bounds continuous inactivity, including waiting for response
-headers, and permits longer streams that keep making progress. The OAuth
-deadline covers headers and body; the queue deadline cancels admission with a
-local `503` / `server_overloaded`, without a supplier status or an account-health
-penalty.
-
-Kiro releases the previous transport slot before retrying or continuing a
-stream. Local slot exhaustion returns `503` / `server_overloaded` without
-account switching or an account-health penalty. Before the first semantic
-output, retries use `upstream.max_retries`; account count cannot increase this
-budget. A hollow continuation after tool results retains its separate bounded
-semantic retry. Valid text from a tool-result continuation streams immediately.
-Completed tool arguments are sent after validation without an extra delay;
-`features.tool_call_buffer_delay_ms` remains accepted for old configurations but
-is ignored and defaults to zero.
-
-These controls cover Anthropic Messages, OpenAI Chat Completions, and Responses.
-Authentication, client checks, model permissions, and the 50 MiB request-body
-limit retain their existing rules. Tool argument validation and protocol-specific
-completion/failure event formats are preserved. With `crs`, streaming Messages
-service errors still use HTTP 200 SSE and carry the actual status in
-`error.status`, for example 503 for local overload.
-
-## Kiro request secret redaction
-
-Run `crosslane config edit features` to edit the switch in `[features]`:
-
-```toml
-[features]
-enable_request_redaction = true # false disables it; default: true
-enable_request_redaction_notice = false # opt-in final-answer notice; requires crs
-# Fresh configs display the complete default notice here. Replace it with any multiline Markdown:
-request_redaction_notice_text = '''
----
-
-> **⚠️ Crosslane 安全提示：疑似敏感凭证已脱敏**
->
-> 本次新输入中有内容被规则判断为疑似敏感凭证，已在发送给上游模型前替换为占位符。此判断可能存在误报，工具执行所需参数会在本地还原。
->
-> **请注意凭证的使用方式：**优先使用环境变量引用或安全凭证配置，避免直接粘贴明文凭证。'''
-```
-
-Saving validates and hot-reloads the configuration without a restart. Check the
-active value with `crosslane config show features --effective`. Changes apply to
-new requests; existing tool rounds, retries and summaries retain their original
-policy. When disabled, the gateway does not classify or replace new credentials,
-add reference hints or extend tool schemas: messages, history, tool inputs and
-summaries reach Kiro with their real values. Previously generated checkpoint
-capsules are still decoded locally so old summaries remain usable. Existing
-config-export, Debug and error-log sanitization is separate from this switch.
-
-With `crs` builds, set `enable_request_redaction_notice = true` to append a security
-notice to the existing final Claude text block after the latest user input in this
-HTTP request (text, tool results or text attachments) was masked in a successful
-upstream generation request. History, old tool arguments/results, system prompts,
-tool definitions and environment information remain redacted and included in
-diagnostics, but cannot independently trigger another notice. Supplying the same
-credential again in new input still triggers a notice.
-
-The switch defaults to false. Fresh configurations and `crosslane config edit features`
-display the complete default Markdown in `request_redaction_notice_text` for administrators
-to edit. Omitting the field in an older configuration selects that same default;
-explicitly setting it to `""` or whitespace suppresses notices. Custom Markdown is
-appended after a blank line and otherwise preserved without variable substitution.
-Both the switch and text hot-reload for new requests; in-flight requests retain
-the text selected at their start. The default describes **suspected credentials**
-and possible false positives. It contains no credential or placeholder values and
-is generated locally without a model. The notice is ordinary
-answer text and enters the conversation history, rather than a native Claude Code
-system warning. It does not change tool arguments, IDs, stop reasons or reported
-model usage. Tool-call responses, client compaction summaries, errors, incomplete
-or truncated answers, declared structured output and JSON answers
-are left unchanged. OpenAI responses and providers without this redaction boundary
-do not receive notices. Disabling redaction also prevents notices.
-The default notice uses a separator, a bold heading and a multiline blockquote
-without ANSI codes or HTML. Colors and backgrounds depend on the client renderer.
-No extra response blocks or events are added for either default or custom text.
-
-Before forwarding to Kiro, the proxy removes complete default or legacy default
-notice suffixes from assistant history. Custom suffixes require a locally recorded
-whole-answer fingerprint and unambiguous removal position, so ordinary text such as
-`Done` is preserved. The bounded in-memory records contain no answer text. Unknown
-custom text is retained after a restart, expiry or ambiguous match. Client history,
-current input and tool arguments remain intact. Before appending, both response paths
-check for a complete existing notice, tolerating common blockquote, emphasis and line
-wrapping changes. Code identifiers and whitespace within code must still agree;
-fenced examples do not count as actual notices. Repeated local appends are prevented.
-
-With the switch enabled, Kiro generation requests pass through local,
-deterministic redaction at the final transport boundary. Detection uses no language model, remote classifier,
-or extra network request. It covers current messages, system/history messages,
-tool arguments/results, tool descriptions and schema examples. Automatic summary
-inputs, summary merging and generation retries share this boundary. Kiro MCP web
-search queries use the same text rules.
-
-Sensitive field names, credential assignments in configuration or commands,
-recognizable key/token formats, authentication headers, credential URLs, private
-key blocks and exact copies of the current Kiro account's known credentials are
-replaced with unique placeholders containing a random request identifier. Equal
-values share a placeholder within a logical request. The in-memory mapping is
-shared by internal retries, tool continuations and automatic summaries, and is
-never written to logs or disk. Actual HTTP authentication, profile/model/tool
-names, call correlation IDs and token limit controls remain usable.
-Context and byte budgets use the same redacted copy, including the cost of
-placeholders, the reference hint and schema alternatives.
-Summary sources are masked before partitioning, and splitting or local truncation
-keeps credential references intact. A budget too small for one reference fails
-explicitly.
-
-Cloud rules recognize characteristic prefixes in prose: Tencent `AKID`, Alibaba
-`LTAI` / `STS.`, Volcengine and Kingsoft `AKLT`, AWS `AKIA` / `ASIA`, and Google
-`AIza`. Opaque secrets use credential fields and assignments such as `SecretId`,
-`SecretKey`, `AccessKeyId`, `AccessKeySecret`, `SecretAccessKey`, `SecurityToken`
-and `ak` / `sk`, covering common Tencent, Alibaba, Huawei, Baidu, Qiniu and JD
-credential names. Azure `AccountKey`, `SharedAccessSignature` and `sig` are also
-covered. Environment assignments and command flags use the same rules. Random
-unlabeled SecretKeys without a recognized prefix or previously identified value
-cannot be reliably detected.
-
-The model is instructed to copy placeholders exactly into tool arguments. The
-gateway parses complete arguments as JSON and restores their original string,
-number and boolean values locally, preserving escaping and fragmented parallel
-calls. Ordinary answers stay masked. Secrets actually referenced in compaction
-checkpoints become reversible checkpoint capsules. When a client replays that
-summary, the gateway decodes them locally into a fresh mapping; Kiro receives
-only the current request's placeholders. Capsules encode credentials and are not
-encryption. Environment references such as `$TOKEN`, `${TOKEN}`,
-`%TOKEN%` and `$env:TOKEN` remain expressions; literal secrets still match the rules.
-Named environment lookups in Go, Java, .NET, Rust, Ruby, PHP, Deno, Bun and
-`import.meta.env` are also preserved in explicit source declarations or named
-source-code fences when they contain only a variable name. Bare .env/YAML values
-remain conservative. Newly supported getters inside JSON credential values or
-tool parameters are literal data and do not receive this source-code exemption.
-Inline defaults and concatenated literals in sensitive fields remain private, including literal
-strings spelling `$TOKEN`. Unknown or malformed expressions are handled
-conservatively; no code, getter or environment expansion is executed.
-Getter spellings inside literal curl/SDK/netrc credentials and sensitive schema
-defaults are still masked;
-an exact value already identified as a credential also takes precedence over
-the reference exemption.
-Recognized Deno, Bun and Rust defaults are also masked when the outer variable
-has an ordinary name or the expression is inside a quoted shell program.
-Embedded JSON in logs and Markdown fences is parsed with decoded field names,
-including escaped keys such as `\u5bc6\u7801`. Malformed JSON with such sensitive
-keys is conservatively replaced as a whole fragment; tool replay retains the
-original source. POSIX single/ANSI-quoted `$TOKEN` and POSIX `%TOKEN%` credential
-arguments are literal secrets. Explicit Windows commands and shell declarations
-retain their own variable-reference semantics.
-
-False-positive reduction uses recognized syntax, not exemptions for short,
-common, example or apparently public values. Ambiguous fields such as
-`key: "Enter"`, `cache_key: "product:42"` and `password: "true"` still mask
-their values. Known credential copies still match inside larger strings. Without
-additional context, an arbitrary business value and an actual weak credential
-can be identical; the rules cannot guarantee both zero false positives and zero
-false negatives.
-
-For explicitly recognized POSIX tools such as Bash, shell and exec_command,
-restoration escapes common unquoted, single-quoted and double-quoted arguments so
-secret characters do not become shell syntax. Ordinary HTTP/JSON parameters get
-no shell quoting. Commands and JSON text copied unchanged use request-local
-source records to retain their original escaping, whitespace and newlines.
-Arbitrary heredocs, nested substitutions, PowerShell and
-languages embedded in shell arguments such as Python/SQL are not interpreted;
-those tools should use structured credential parameters or executor environment
-variables.
-
-Mappings are not shared across independent HTTP requests. Clients should replay
-the restored tool parameters in later history or retain checkpoint capsules so a
-new request can recreate the mapping. Unknown request placeholders are
-not guessed, and placeholders changed or omitted by the model cannot be reliably
-recovered.
-
-UTF-8 txt, md, csv and html attachments are decoded from Base64, redacted and
-encoded again. Binary PDF, Office and image attachments are not OCRed or parsed;
-secrets inside them are outside the text rules' coverage. Rules cannot guarantee
-recognition of arbitrary unlabeled passwords, unknown credential formats, or
-encoded/split secrets. Matching business data is also shown to the model only as
-references; restoration happens in trusted local execution paths using the map.
-
 ## Logs and troubleshooting
 
 ```bash
 crosslane logs show --tail 100
 crosslane logs follow --level warn
-crosslane logs trace <TRACE_ID>
+crosslane logs trace TRACE_ID
 crosslane status --since 30m
 crosslane stats --detail --since 1h
 ```
@@ -761,276 +401,6 @@ to five seconds while waiting for content or an early error.
 Incoming body reads have a 15-second idle timeout for each chunk; an upload that
 keeps making progress can take longer than 15 seconds in total.
 
-### Kiro request size and automatic compaction
-
-Anthropic requests have a 50 MiB HTTP body limit. The translated Kiro payload
-defaults to 8 MiB (`context.max_upstream_payload_bytes`). Input windows use the
-selected model's metadata when available, with `safe_input_ratio` (default 0.95)
-for ordinary requests and `compact_safe_input_ratio` (default 0.99) after compaction.
-
-With `context.auto_compact_on_overflow` enabled (the default), history that exceeds
-byte or token budgets is summarized semantically before dispatch. A completed
-checkpoint covers all discarded source records, including middle facts and later
-corrections. Summary timeouts, capacity limits, upstream failures and checkpoints
-that cannot fit return `compaction_failed` (422) without replacing the original
-context. Crosslane never promotes a clipped head/tail excerpt to a completed
-compaction boundary. System instructions, loaded tools, current input and its
-required tool chain remain intact. If this indivisible input exceeds the window,
-the 400 context error identifies `current_message` or `required_context` and
-recommends reducing/splitting input or paginating results; compacting older history
-cannot solve that condition.
-
-For a single oversized paste, attachment or tool result, the error message itself
-includes recovery steps so Claude Code can display them: stop resending the same
-large input, split it into smaller parts or paginate tool results. Keep the same
-session and try `/compact`, or send a short follow-up without the large input to
-allow automatic compaction. A short follow-up may be merged with the rejected
-input, and immediate `/compact` can fail while that input remains the current
-turn or there are too few conversation groups to compact. If either still fails,
-use Esc Esc or `/rewind` in interactive Claude Code to edit only the oversized
-turn and resend it in smaller parts; earlier conversation need not be cleared.
-For `required_context`, first reduce the required system instructions, enabled
-tool definitions or other mandatory input; compacting history cannot shrink
-them. These locally diagnosed Messages errors retain semantic status 400, `context_length_exceeded`, numeric
-diagnostics and `retryable: false`. Compactable history overflow and upstream
-context errors keep their native wording so client automatic compaction continues
-to work. With `crs`, local context errors use HTTP 200 error JSON for non-streaming
-transport, retaining 400 in `error.status` and `x-crosslane-error-status` so CRS
-Console preserves recovery details. Streaming requests retain SSE error events.
-
-Summary budgets use the selected model's window, with the configured window as a
-fallback only. The latest user turn is a partitionable source record rather than
-instruction overhead repeated in every part. Every part fits both estimated token
-and serialized byte limits; at most 16 initial parts and two concurrent requests
-share one operation deadline. A native upstream context rejection allows one repartition of
-the full source into smaller parts within that same deadline and usage accounting.
-If an upstream summary stream reports temporary service unavailability, or a large
-source part returns an incomplete summary wrapper, only that failed source part is
-retried once, using smaller parts for a large input. Small malformed summaries fail
-explicitly. Successful sibling summaries are retained, partial output is discarded, and every attempt is
-accounted. Child requests run sequentially within the existing concurrency limit
-and deadline. `proxy.compaction.summary_part_retry.started` identifies this recovery
-and its reason. Failure metadata distinguishes upstream stream errors from summary
-validation and records wrapper counts without logging summary content.
-`proxy.upstream.context_usage` logs upstream context percentages or native input
-counts separately from local estimates; content-dependent tokenizer differences
-must not be interpreted as a fixed byte or token limit.
-
-With `crs`, valid upstream occupancy can also bring automatic compaction forward
-when the local tokenizer underestimates the selected model's input. Calibration
-is isolated by account, model, conversation and source checkpoint, expires after
-30 minutes, and only makes admission more conservative. It does not change billed
-tokens, the client's output limit, or the advertised model window. The same
-calibration bounds complete source parts sent to that model for summarization.
-Internal summaries quote visible messages as source records, retaining their
-original speaker labels and complete text before partitioning; earlier assistant
-replies are data rather than the summarizer's own assistant history. Claude 5 summaries use native
-completion/refusal metadata where the account and endpoint policy permit it. Empty summaries and narrowly identified generic
-internal stream errors, and native `MODEL_TEMPORARILY_UNAVAILABLE` stream capacity
-errors receive one failed-part recovery; explicit refusals, authentication, quota
-and other specialized errors are not retried. A native refusal takes precedence
-over transient errors or an operation timeout while an accepted sibling is still
-settling. Recovery keeps the original source, accepted
-attempt accounting and operation deadline. A complete summary may use the safe
-window when the softer headroom target cannot fit its required current context.
-Once a part fails permanently, no new recovery children are dispatched; already
-accepted calls still settle their usage.
-
-Tool Search checks the complete continuation including new definitions and
-results. While holding an account slot, it may publish only a complete verbatim
-checkpoint that fits the budget. Otherwise it preserves history and rejects the
-oversized continuation instead of discarding source facts or opening another
-summary request. Verified history-prefix replay restores complete checkpoints for
-clients that discard compaction blocks.
-
-An ordinary Kiro response with no assistant output is retried once, then returned
-as an explicit error if still empty. Valid text, tool calls, reasoning and terminal
-semantics remain supported. Streaming retries do not replay visible output or
-publish duplicate compaction boundaries. With `crs`, this empty-response retry on
-the Claude interface appends a tool-description clarification: return a structured
-call for the client or proxy to execute. The first attempt, names, schemas,
-arguments and conversation text stay unchanged. Descriptions that would exceed
-1,024 UTF-8 bytes retain their original text without truncation. The updated
-continuation still passes context and output-budget validation; the retry count
-does not increase. With `features.buffer_tool_calls=false`,
-ordinary tool argument fragments still stream immediately; an error after visible
-output ends that stream without replaying the upstream call.
-Nonstreaming rounds release the completed upstream connection slot before
-retrying or continuing server tools, including with a one-connection pool.
-
-Large-text token estimates use bounded UTF-8 chunks with a small boundary
-allowance, avoiding tokenizer exceptions on long whitespace spans. Actual messages
-and tool JSON are unchanged. `/v1/messages/count_tokens` remains a local estimate
-and does not start new compaction or upstream summary requests. Disabling automatic
-compaction preserves limit rejection. Compaction logs identify the stage with
-`payload_budget_overflow`, `pending_server_tools_payload_overflow`, or
-`tool_search_continuation_overflow`.
-
-Kiro's `CONTENT_LENGTH_EXCEEDS_THRESHOLD` and `Input content length exceeds threshold`
-errors also trigger context recovery, even when local estimates fit the advertised
-window. Automatic recovery retries once; client-requested summaries can recover
-with automatic compaction disabled. Summary recovery partitions the complete
-source and preserves the client's summary instruction. The upstream error does
-not report an exact token limit and is not treated as an account failure.
-
-Claude Code's native summary request reconciles complete, chronologically ordered
-source checkpoints during its final generation. Crosslane also places these records
-next to the final summary instruction, after the source history. Native final summaries omit optional verbatim duplicates
-already covered by the checkpoint. This avoids a duplicate upstream
-consolidation request. Explicit values from any part take precedence over another
-part's local absence claims; only explicit later corrections or changed decisions
-supersede earlier facts. These checkpoints are never clipped. If they cannot fit
-the target or a smaller resolved window, Crosslane semantically consolidates the
-saved parts within the summary input, time and usage limits. Other server compaction
-requests keep their existing upstream consolidation. Logs use
-`proxy.compaction.summary_merge.completed` with `merge_mode` (`client_final_summary`
-or `upstream`) and `duration_ms`; upstream merges also log
-`proxy.compaction.summary_merge.started`. Single-part summaries remain unchanged.
-
-### Anonymous client and conversation attribution
-
-Client context is available in every build, independently of the `crs` feature.
-Claude Code's old and JSON-encoded `metadata.user_id` formats provide a device ID
-and session ID. Codex's `client_metadata` provides `x-codex-installation-id`,
-`session_id`, and `thread_id`; matching HTTP headers are accepted as fallbacks.
-Body telemetry takes precedence. No CRS code changes are required for Console
-and OpenAI Responses relays that preserve these fields.
-
-The `proxy.client.context` event and request-log `diagnostics.client_context`
-contain hashed `user_ref`, `session_ref`, and `thread_ref`, plus client kind and
-identity source. A user reference groups one device/installation across sessions;
-it is not a person or CRS key. Missing identity remains unknown. Malformed or
-oversized telemetry is ignored, and identifiers are never added to model input.
-
-Generation and token counting use the same conversation/replay scope, isolated
-by service, authenticated Crosslane key, device, and session/thread. Compaction
-replay still validates the full history prefix. Owned Responses continuations
-inherit omitted telemetry; explicit forks keep separate upstream conversations.
-A conflicting known device produces a request error. Attribution for provider
-Responses is retained in memory for up to 30 minutes (256 entries), after a
-successful response; `store: false` disables retention. Existing account pool
-selection, quotas, and content-based token-count caching retain their policies.
-
-### Claude Relay Service response compatibility
-
-Build `crosslaned` with `cargo build -p crosslaned --bin crosslaned --release --features crs`
-when its Claude Messages endpoint is used as a Claude Relay Service Console/CCR upstream. This Cargo
-feature applies to every Claude Messages listener in that binary. It is disabled in the default
-Cargo build.
-
-Console compatibility is the default. For a listener used only by CCR, set
-`crs_relay = "ccr"` inside its existing `[[proxy_service]]` entry. This preserves
-HTTP error statuses so Claude Code can perform native parameter recovery.
-Omit the setting or use `"console"` for the Console transport described below.
-The setting does not change HTTP behavior in builds without `crs`.
-
-Full Docker images enable all Cargo features, including `sso` and `crs`, by default.
-Use `./deploy/docker-setup.sh --build` to build and deploy locally, or
-`docker build --target runtime-full -t crosslane:full .` to build an image only.
-To select a feature subset, pass `--build-arg CROSSLANED_FEATURES=crosslaned/sso`
-to `docker build`; this disables `crs`.
-
-New builds report compiled features with `crosslaned --version`; inside Docker,
-run `docker exec <container> crosslaned --version` and check `crs=true`.
-For older builds, directly probe the Crosslane listener (bypassing CRS):
-
-```bash
-curl -i "$CROSSLANE_URL/v1/messages" \
-  -H "x-api-key: $CROSSLANE_API_KEY" \
-  -H 'User-Agent: claude-cli/2.1.295 (external, cli)' \
-  -H 'Content-Type: application/json' --data '{"stream":true}'
-```
-
-This authenticated probe fails local validation without calling an upstream.
-With Console compatibility it returns HTTP 200, `text/event-stream` and `event: error`;
-CCR compatibility and builds without the feature return HTTP 400 JSON.
-
-Supplier error statuses are preserved for Kiro and Copilot, including 401, 402,
-403, 413, 503, 504, and 529. Non-streaming and non-CRS responses use the original
-HTTP status; CRS-compatible Claude streams carry it in their SSE error payload.
-Error classification and credential redaction do not map supplier statuses.
-Transport or protocol failures without a supplier HTTP error still use the
-proxy's own error status.
-
-With `crs` enabled, errors include Anthropic-shaped JSON with the sanitized cause,
-action hint, failure stage, request ID, `error.status`, and the known supplier
-status in `error.upstream_status`. Context errors retain token diagnostics and
-compaction-retry results. No CRS code changes are required. CRS Console replaces
-non-2xx JSON bodies with fixed messages. Local `context_length_exceeded` errors
-at `context_validation` therefore use HTTP 200 with `type: "error"` JSON for
-non-streaming Claude Messages. Semantic status 400 remains in `error.status` and
-`x-crosslane-error-status`, and caching is disabled. The body contains no successful
-message, stop reason, or usage: clients must inspect `type` / `error` rather than
-treating HTTP 200 alone as generation success. Statistics retain failure status
-400 and separately record client transport status 200. This exception applies only
-to local context errors with `crs`; non-CRS builds, OpenAI endpoints, client
-authentication, and supplier errors retain their original HTTP statuses. Console
-may still sanitize other non-streaming errors; CCR preserves their original bodies.
-
-For Claude `stream: true` with Console compatibility, supplier errors use HTTP 200 and an SSE
-`event: error`, preserving the original status in `error.status`,
-`error.upstream_status` and `x-crosslane-error-status`. Early errors initialize a
-zero-usage empty text block before the error, preventing Claude Code from falling
-back to non-streaming and losing details through Console sanitization. Client
-authentication, method, and HTTP body-limit failures retain their HTTP statuses.
-Once a successful SSE response has started, subsequent errors remain in the
-committed stream. Request statistics record failure status separately from the
-HTTP 200 client transport. Crosslane checks up to 64 KiB or five seconds of initial
-SSE events and enriches errors after assistant content starts.
-
-Console compatibility retries an explicit HTTP 400 rejection of
-`output_config.effort` once, before output, using the same account and removing
-only that field. Thinking history, signatures, and tool arguments stay intact.
-CCR preserves HTTP 400 for client recovery. Other HTTP 400 errors do not trigger
-this compatibility retry. Recovery freezes the retry to the original provider
-instance and account, retaining service exclusions and provider permissions;
-it cannot expand a tagged or explicitly bound pool into the global pool.
-
-SSE JSON strings use ASCII Unicode escapes on the CRS hop to protect Chinese
-text and tool arguments from per-chunk UTF-8 decoding. Decoded values are
-unchanged. ASCII slices reuse their original buffers; Unicode escapes use fixed
-hexadecimal output without per-character formatting allocations. Unicode wire
-expansion remains necessary for CRS compatibility. An event exceeding 64 KiB skips only that event's diagnostic parsing;
-inspection resumes at the next event. A native Messages EOF without a completion signal
-or with open content blocks records a 502 and emits an error, without fabricating
-successful completion or closing an unfinished tool. Closed blocks plus a stop
-reason but no `message_stop` are treated separately.
-
-Observable downstream cancellations record 499 and settle only received usage;
-unknown tokens and supplier charges stay unreported. Crosslane cannot infer a
-cancellation that Console does not propagate. Automatic routing can switch only
-before content or a tool starts. `failover_timeout_ms` remains a separate deadline
-for each automatic provider attempt; zero disables only that provider's attempt
-deadline. Pinned routes do not gain this deadline, and no implicit request-wide
-deadline is added. Candidate and response preflight share one five-second window
-instead of waiting twice. Adding
-`Retry-After` in Crosslane cannot restore a header that CRS discards.
-Discarded automatic candidates retain their observed usage in their actual
-provider, account and model totals, while the final outcome counts as one client
-request. Internal summary requests keep their separate accounting.
-
-With `crs`, late `tool_addition` / `tool_removal` declarations update the current
-`tools[]` catalog in message order, supporting references and new custom tool
-definitions. Their original positions become text notices with cache markers
-retained. Tool call IDs, arguments, thinking and signatures stay intact. Historical
-references preceding an explicit removal become text records retaining the original
-reference data; official search results retain call pairing and active references.
-Removed tools stay outside the current catalog. New references after removal still
-fail validation. Generation and count_tokens share this projection. Unknown
-references, conflicting definitions and unsupported definition kinds fail
-explicitly; normal history, capacity and schema checks still apply. Builds
-without `crs` keep their existing behavior.
-
-The latest non-empty assistant `compaction` block resets the tool-change history.
-Its `tool_changes` restores the checkpoint's tool state before later changes
-apply; discarded earlier changes and references cannot alter or reject the active
-catalog. Null or missing compaction content remains a no-op. The checkpoint block
-and its signature are preserved by this one-pass legacy catalog projection.
-Explicit `tool_choice=none` retains completed tool pairs and the schemas needed
-to interpret them as source data, even when tool features are disabled. These
-declarations cannot activate Tool Search or Web Search, resume pending calls, or
-publish callable tools. Generation and token counting use the same tool policy.
-
 | Symptom | First checks |
 | --- | --- |
 | `health` fails | Daemon/container status and logs |
@@ -1039,6 +409,10 @@ publish callable tools. Generation and token counting use the same tool policy.
 | 503 | Account availability, quota, and concurrency |
 | Stream stops early | Final stream event and trace logs |
 | Context limit | Actual selected model and request size |
+
+For context limits and compaction, see [request processing](request-processing.md#context-and-automatic-compaction).
+For tools, web search, and CRS error delivery, see [client compatibility](client-compatibility.md).
+For management errors and response export, see [Admin REST](admin-rest.md#save-and-inspect-json-responses).
 
 ## Backup and recovery
 

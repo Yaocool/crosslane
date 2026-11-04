@@ -76,19 +76,14 @@ crosslane ready
 
 `health` 检查 daemon 是否响应；`ready` 检查已配置服务是否具备接收请求的条件。
 还需实际发送生成请求才能验证上游可用。不要把上游凭证当作客户端 Key。
-HTTP 的 `/`、`/health`、`/ready` 通过[独立状态监听](docs/startup-and-debugging.zh-CN.md#独立状态-http)
-提供，需启用 `[status_http]`；业务服务端口只承载客户端兼容接口。
-独立端口上的 [Admin REST API](docs/admin-rest.zh-CN.md) 使用专用 Bearer 鉴权，提供账号、
-标签、服务、分组额度及常用运行管理接口，支持独立只读令牌。
-账号批量接口可直接上传与 CLI 相同的 SSO CSV，自动登录并入库，支持并发和逐条进度查询。
-通过 `crosslane admin token create/list/show/rotate/disable/enable/revoke` 管理多把独立
-管理令牌，明文只在创建或轮换时显示，配置仅保存摘要。
-`crosslane config edit admin` 可一起编辑鉴权和 `[status_http]` 监听；首次启用及重载步骤见
-`crosslane guide admin`。Kiro 企业用户与套餐使用[独立管理接口](docs/kiro-enterprise-admin.zh-CN.md)，
-AWS 管理员凭据通过 `crosslane admin kiro configure` 独立加密保存并热生效，兼容旧环境变量配置。
-CLI 的 `crosslane admin kiro subscription` 提供 `plans/profiles/scope/users/list/show` 查询，
-以及 `add/upgrade/downgrade/cancel` 订阅管理；四个写命令均支持 `--dry-run`。取消默认周期结束，
-可用 `--mode immediate` 明确立即取消。通过 Unix socket 使用 daemon 凭证，无需开启 REST 或提供 Admin token。
+
+## 管理入口
+
+CLI 通过 daemon 的 Unix socket 管理本地资源。HTTP 状态检查和可选的 Admin REST
+使用独立端口，默认 `127.0.0.1:7651`，需先启用 `[status_http]`。
+[Admin REST](docs/admin-rest.zh-CN.md) 使用独立管理令牌；
+[Kiro 企业订阅管理](docs/kiro-enterprise-admin.zh-CN.md) 使用 daemon 保存的 AWS 凭证。
+客户端 Key、Admin token 和 AWS 凭证各自独立。
 
 ## 接入客户端
 
@@ -113,9 +108,19 @@ crosslane service list
 crosslane models list
 crosslane stats --since 1h
 crosslane logs show --tail 100
-crosslane logs trace <TRACE_ID>
+crosslane logs trace TRACE_ID
 crosslane help --all
 ```
 
-部署、账号、模型、日志与恢复见[运维指南](docs/startup-and-debugging.zh-CN.md)；
-构建和验证见[贡献指南](CONTRIBUTING.md)。项目使用 [MIT 许可](LICENSE)。
+## 文档
+
+| 文档 | 内容 |
+| --- | --- |
+| [运维指南](docs/startup-and-debugging.zh-CN.md) | 部署、账号、服务、模型、日志与备份 |
+| [请求处理](docs/request-processing.zh-CN.md) | 缓存用量、工具加载、延迟、脱敏与自动压缩 |
+| [客户端兼容](docs/client-compatibility.zh-CN.md) | 工具协议、网页搜索、会话归属、CRS 与上游拒绝 |
+| [Admin REST API](docs/admin-rest.zh-CN.md) | 管理令牌、本地账号与服务、批量操作、JSON 响应保存 |
+| [Kiro 企业订阅管理](docs/kiro-enterprise-admin.zh-CN.md) | AWS 凭证、用户资料、直接/组订阅与套餐变更 |
+| [贡献指南](CONTRIBUTING.md) | 开发、验证和文档维护 |
+
+项目使用 [MIT 许可](LICENSE)。

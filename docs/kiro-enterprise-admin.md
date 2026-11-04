@@ -1,5 +1,7 @@
 # Kiro Enterprise administration
 
+[English](kiro-enterprise-admin.md) | [简体中文](kiro-enterprise-admin.zh-CN.md) | [Project overview](../README.md)
+
 Base URL: `http://127.0.0.1:7651/admin/v1/kiro/enterprise`.
 Uses the independent [Admin REST listener](admin-rest.md), its Bearer authentication and roles.
 Read-only tokens permit GET/HEAD; activation, cancellation and plan changes require full access.
@@ -7,9 +9,14 @@ Read-only tokens permit GET/HEAD; activation, cancellation and plan changes requ
 These resources represent AWS/Kiro enterprise subscriptions. Local Crosslane accounts still use
 `/admin/v1/accounts`. Activation does not perform browser SSO or import an account into a local pool.
 
+[CLI](#manage-subscriptions-from-the-cli) · [AWS credentials](#daemon-credentials) · [Endpoints](#endpoints) · [User queries](#query-users-and-subscriptions) · [HTTP mutations](#http-subscription-changes) · [Permissions](#aws-permissions-and-diagnostics)
+
 ## Manage subscriptions from the CLI
 
-The CLI covers every operation in the existing Kiro management REST API:
+First configure AWS credentials with `crosslane admin kiro configure`. Subscription
+commands use the owner-only daemon Unix socket and those credentials; **no Admin
+token or REST/status listener is required**. Upgrade both the CLI and daemon. Docker
+callers need access to the management socket or must run inside the container.
 
 | Command (prefix `crosslane admin kiro subscription`) | Purpose |
 | --- | --- |
@@ -25,54 +32,31 @@ The CLI covers every operation in the existing Kiro management REST API:
 | `cancel <USER> [--mode end-of-period\|immediate]` | Cancel a direct subscription; default at period end |
 
 ```bash
-crosslane admin kiro subscription profiles
-crosslane admin kiro subscription scope
 crosslane admin kiro subscription users
-crosslane admin kiro subscription plans
-crosslane admin kiro subscription list
+crosslane --json admin kiro subscription list
 crosslane admin kiro subscription show user@example.com
-crosslane --json admin kiro subscription show USER_ID
 
-# Read-only previews; remove --dry-run to submit the actual change
+# Read-only previews; removing --dry-run submits the actual change.
 crosslane admin kiro subscription add user@example.com --plan pro --dry-run
 crosslane admin kiro subscription upgrade user@example.com --plan power --dry-run
 crosslane admin kiro subscription downgrade user@example.com --plan pro --dry-run
 crosslane admin kiro subscription cancel user@example.com --dry-run
-crosslane admin kiro subscription cancel USER_ID --mode immediate --dry-run
 ```
 
-For first-time setup, run `crosslane admin kiro configure` as described below. These commands use
-the owner-only daemon Unix socket and the daemon's stored AWS credentials. **No Admin token,
-status listener or Admin REST listener is required.** For Docker, mount the management socket on the
-client or run the CLI inside the container. Upgrade both `crosslane` and `crosslaned`; older daemons
-return an upgrade hint.
+`USER` accepts an exact Identity Center username, UserId, or user ARN without URL
+encoding. Plans are `pro`, `pro-plus`, `pro-max`, and `power`. Scope selectors
+`--region`, `--profile-arn`, `--application-arn`, `--identity-center-region`, and
+`--legacy` follow the action; `profiles` accepts only region/legacy. Omitted values
+use saved defaults and discovery. Legacy mode supports only `us-east-1`, requires
+explicit `--mode immediate` for cancellation, and is never selected automatically.
+Use `crosslane help admin kiro subscription --all` for aliases and full options.
 
-`USER` accepts an exact Identity Center `userName`, UserId or user ARN without URL encoding.
-`add`, `upgrade`, and `downgrade` require `--plan`: `pro`, `pro-plus`, `pro-max`, or `power`.
-Place optional `--region`, `--profile-arn`, `--application-arn`, `--identity-center-region`, and
-`--legacy` flags after `scope`, `users`, `list`, `show`, or any mutation command. `profiles` only
-accepts `--region` and `--legacy`. Omitted selectors use saved defaults and discovery. Legacy mode
-supports only `us-east-1` and is never an automatic fallback. `subscriptions` aliases `subscription`;
-`create` and `activate` alias `add`; `delete`, `remove`, and `rm` alias `cancel`.
-
-All four mutations submit an actual change by default. `--dry-run` performs read-only discovery
-and validation; it cannot verify all AWS write permissions. Upgrades are expected to apply immediately;
-downgrades next month. Use `show` to inspect current and pending plans. Cancellation defaults to
-`--mode end-of-period` (`end_of_period` is also accepted). `immediate` is expected to remove access
-immediately, while billing may continue until month end. Legacy cancellation requires explicit
-`--legacy --mode immediate`; the CLI never silently selects immediate cancellation. Cancellation
-preserves the Identity Center user and inherited group claims. `users` does not expand every user's
-group memberships; use `show` for a particular user's inherited claims.
-
-CLI and REST share scope checks, per-user mutation locks, eight concurrent mutation slots and completion
-auditing; CLI audit records carry `source=unix_socket`. AWS may automatically assign the application;
-Crosslane does not issue a separate duplicate SSO assignment request. API acceptance does not establish
-entitlement or billing activation. No automatic retries are made: query with `show` after a timeout,
-interruption or uncertain outcome. Terminal query hints retain the socket and scope selectors.
-JSON errors retain the sanitized AWS code, request ID and `write_outcome`, without AWS secrets.
-
-The existing top-level `crosslane subscriptions --provider kiro` continues to query plans with local
-account credentials and does not mutate subscriptions.
+Mutations write by default. A dry run checks discovery and operation conditions,
+not AWS write permissions. CLI and REST share user locks, eight mutation slots,
+and completion audits (`source=unix_socket` for CLI). After a timeout or uncertain
+write, query with `show` before retrying; see [subscription semantics](#semantics-and-diagnostics).
+The separate top-level `crosslane subscriptions --provider kiro` queries available
+plans with local account credentials and does not manage enterprise assignments.
 
 ## Daemon credentials
 
@@ -177,21 +161,9 @@ process environment require a daemon restart, not `config reload`.
 | `CROSSLANE_KIRO_ADMIN_APPLICATION_ARN` | Optional selection among applications associated with that Profile |
 | `CROSSLANE_KIRO_ADMIN_IDENTITY_CENTER_REGION` | Optional fallback when the Profile lacks `ssoRegion`; cannot override a different recorded region |
 
-The repository's default `docker-compose.yml` forwards all variables above. Configure
-the host `.env` using `.env.example`; custom Compose files need equivalent mappings, for example:
-
-```yaml
-services:
-  crosslaned:
-    environment:
-      CROSSLANE_KIRO_ADMIN_ACCESS_KEY_ID: ${CROSSLANE_KIRO_ADMIN_ACCESS_KEY_ID:-}
-      CROSSLANE_KIRO_ADMIN_SECRET_ACCESS_KEY: ${CROSSLANE_KIRO_ADMIN_SECRET_ACCESS_KEY:-}
-      CROSSLANE_KIRO_ADMIN_REGION: ${CROSSLANE_KIRO_ADMIN_REGION:-us-east-1}
-      CROSSLANE_KIRO_ADMIN_SESSION_TOKEN: ${CROSSLANE_KIRO_ADMIN_SESSION_TOKEN:-}
-      CROSSLANE_KIRO_ADMIN_PROFILE_ARN: ${CROSSLANE_KIRO_ADMIN_PROFILE_ARN:-}
-      CROSSLANE_KIRO_ADMIN_APPLICATION_ARN: ${CROSSLANE_KIRO_ADMIN_APPLICATION_ARN:-}
-      CROSSLANE_KIRO_ADMIN_IDENTITY_CENTER_REGION: ${CROSSLANE_KIRO_ADMIN_IDENTITY_CENTER_REGION:-}
-```
+The repository [Compose configuration](../docker-compose.yml) forwards these variables.
+Set the host `.env` using [.env.example](../.env.example); custom Compose files need
+the corresponding environment mappings.
 
 Empty optional environment variables are treated as unset; temporary `ASIA` credentials still
 require a nonempty session token. Explicit empty Profile/Application query selectors remain invalid.
@@ -209,7 +181,7 @@ Paths below are relative to `/admin/v1/kiro/enterprise`.
 | GET | `/plans` | Supported plan names and their AWS subscription types |
 | GET | `/profiles` | Verify the AWS caller and discover profiles in that account/region |
 | GET | `/scope` | Resolve/validate Profile, Identity Center instance, application and identity store |
-| GET | `/users` | All directory users and their direct USER claims; application GROUP claims separately |
+| GET | `/users` | Usernames, display names, emails, and direct claims for all directory users; group claims separately |
 | GET | `/subscriptions` | All USER/GROUP claims for the application, including pending plans |
 | GET | `/users/{user}/subscription` | Direct claims and claims inherited through current group memberships |
 | POST | `/users/{user}/subscription` | Activate a direct USER subscription; existing direct claims return 409 |
@@ -239,47 +211,123 @@ with the selected Profile and its Identity Center instance. Commercial AWS parti
 and GovCloud are unsupported. Explicit `legacy=true` supports only us-east-1 and immediate
 cancellation; no automatic legacy fallback occurs.
 
-## Callers
+## Query users and subscriptions
 
-Only the Crosslane Admin token is needed by callers:
+Use `/users` when you need `user_name`, `display_name`, and `emails`. It calls
+Identity Store `ListUsers` and joins direct claims by UserId. `/subscriptions`
+returns claim IDs, plans, and status only; it does not join directory details.
+
+`/users` lists **all directory users**, including those without direct subscriptions.
+Application group claims appear separately in `group_subscriptions`, without
+expanding members. An empty `direct_subscriptions` array does not exclude inherited
+access. Use `/users/{user}/subscription` (CLI `show`) for one user's direct and
+currently inherited claims. Missing directory names remain null; missing emails
+produce an empty array. Queries cover the selected account/region/application,
+not all AWS accounts or regions.
 
 ```bash
 BASE=http://127.0.0.1:7651/admin/v1/kiro/enterprise
-ADMIN_TOKEN='REPLACE_WITH_CROSSLANE_ADMIN_TOKEN'
-USER_ID='REPLACE_WITH_IDENTITY_CENTER_USER_ID'
+# Set CROSSLANE_ADMIN_TOKEN to your existing Admin token.
+curl -sS -H "Authorization: Bearer $CROSSLANE_ADMIN_TOKEN" "$BASE/profiles"
+curl -sS -H "Authorization: Bearer $CROSSLANE_ADMIN_TOKEN" "$BASE/scope"
+curl -sS -H "Authorization: Bearer $CROSSLANE_ADMIN_TOKEN" "$BASE/users?region=us-east-1"
+curl -sS -H "Authorization: Bearer $CROSSLANE_ADMIN_TOKEN" "$BASE/subscriptions?region=us-east-1"
+```
 
-curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" "$BASE/profiles"
-curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" "$BASE/scope"
-curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" "$BASE/users"
-curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" "$BASE/subscriptions"
-curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" "$BASE/users/$USER_ID/subscription"
+The HTTP user query needs no body. Replace the listener address and token:
+
+```http
+GET /admin/v1/kiro/enterprise/users?region=us-east-1 HTTP/1.1
+Host: 127.0.0.1:7651
+Authorization: Bearer <CROSSLANE_ADMIN_TOKEN>
+Accept: application/json
+```
+
+Example response with fictional data:
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+Cache-Control: no-store
+
+{
+  "data": {
+    "scope": {
+      "account_id": "123456789012",
+      "kiro_region": "us-east-1",
+      "identity_center_region": "us-east-1",
+      "identity_store_id": "d-1111222233",
+      "instance_arn": "arn:aws:sso:::instance/ssoins-1111222233334444",
+      "application_arn": "arn:aws:sso::123456789012:application/ssoins-1111222233334444/apl-1111222233334444",
+      "profile_arn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/example",
+      "legacy": false
+    },
+    "users": [
+      {
+        "user_id": "11111111-1111-4111-8111-111111111111",
+        "user_name": "user@example.com",
+        "display_name": "Example User",
+        "emails": [
+          "user@example.com"
+        ],
+        "direct_subscriptions": [
+          {
+            "principal_type": "USER",
+            "principal_id": "11111111-1111-4111-8111-111111111111",
+            "subscription_type": "KIRO_ENTERPRISE_PRO",
+            "plan": "pro",
+            "pending_subscription_type": null,
+            "pending_plan": null,
+            "status": "ACTIVE"
+          }
+        ]
+      }
+    ],
+    "group_subscriptions": []
+  }
+}
+```
+
+`plan` is the current tier; `pending_plan` is the pending tier or null. The underlying
+`subscription_type` fields preserve AWS values, including unknown tiers. For formatted
+file export and HTTP error diagnosis, use [Save and inspect JSON responses](admin-rest.md#save-and-inspect-json-responses);
+replace that example's URL with the full `/users` URL above.
+
+## HTTP subscription changes
+
+These calls require a full-access Admin token. Writes submit actual changes unless
+`dry_run` is explicitly enabled.
+
+```bash
+BASE=http://127.0.0.1:7651/admin/v1/kiro/enterprise
+USER_ID=REPLACE_WITH_IDENTITY_CENTER_USER_ID
 
 # Read-only preflight: no subscription write is submitted.
-curl -fsS -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+curl -fsS -X POST -H "Authorization: Bearer $CROSSLANE_ADMIN_TOKEN" \
   -H 'Content-Type: application/json' -d '{"plan":"pro-plus","dry_run":true}' \
   "$BASE/users/$USER_ID/subscription"
 
 # Activate; Kiro may assign the application internally, without a duplicate client call.
-curl -fsS -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+curl -fsS -X POST -H "Authorization: Bearer $CROSSLANE_ADMIN_TOKEN" \
   -H 'Content-Type: application/json' -d '{"plan":"pro-plus"}' \
   "$BASE/users/$USER_ID/subscription"
 
 # Upgrade from a lower current plan.
-curl -fsS -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+curl -fsS -X POST -H "Authorization: Bearer $CROSSLANE_ADMIN_TOKEN" \
   -H 'Content-Type: application/json' -d '{"plan":"pro-max"}' \
   "$BASE/users/$USER_ID/subscription/upgrade"
 
 # Downgrade from a higher current plan.
-curl -fsS -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+curl -fsS -X POST -H "Authorization: Bearer $CROSSLANE_ADMIN_TOKEN" \
   -H 'Content-Type: application/json' -d '{"plan":"pro"}' \
   "$BASE/users/$USER_ID/subscription/downgrade"
 
 # End-of-month access removal (also the default).
-curl -fsS -X DELETE -H "Authorization: Bearer $ADMIN_TOKEN" \
+curl -fsS -X DELETE -H "Authorization: Bearer $CROSSLANE_ADMIN_TOKEN" \
   "$BASE/users/$USER_ID/subscription?mode=end_of_period"
 
 # Immediate direct-subscription access removal; billing still ends at month end.
-curl -fsS -X DELETE -H "Authorization: Bearer $ADMIN_TOKEN" \
+curl -fsS -X DELETE -H "Authorization: Bearer $CROSSLANE_ADMIN_TOKEN" \
   "$BASE/users/$USER_ID/subscription?mode=immediate"
 ```
 
@@ -332,6 +380,8 @@ If response streaming fails after headers, the received HTTP status and request 
 - `unknown`: a write timed out, failed in transit, hit a server failure/unexpected redirect, or returned an invalid
   response. It may already have taken effect; query before retrying.
 
+## AWS permissions and diagnostics
+
 See [Kiro IAM](https://kiro.dev/docs/enterprise/iam/) for permissions. Subscription operations use
 `q:CreateAssignment`, `q:UpdateAssignment`, `q:DeleteAssignment`. The caller also needs
 `user-subscriptions:CreateClaim`, `user-subscriptions:UpdateClaim` and
@@ -370,6 +420,8 @@ whose `sourceIPAddress` is `q.amazonaws.com` does not itself prove that an `aws:
 condition failed: [AWS documents](https://docs.aws.amazon.com/IAM/latest/UserGuide/access_forward_access_sessions.html)
 that forward access sessions following a public endpoint request retain its original source IP.
 Requests through VPC endpoints require separate handling of the documented network conditions.
+
+### Backend protocol and validation scope
 
 Subscription/claim operations use Kiro Console backend protocols rather than a versioned public
 AWS SDK service contract; see the [Kiro repository request example](https://github.com/kirodotdev/Kiro/issues/10166).
