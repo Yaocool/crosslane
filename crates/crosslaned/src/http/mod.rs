@@ -7,6 +7,8 @@ mod client_context_tests;
 mod context_recovery;
 #[cfg(feature = "crs")]
 pub(crate) mod crs;
+#[cfg(feature = "crs")]
+pub(crate) use crs::redaction_notice::NoticeHistory;
 mod handlers;
 #[cfg(test)]
 mod model_scope_tests;

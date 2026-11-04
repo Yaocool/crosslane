@@ -567,6 +567,15 @@ Run `crosslane config edit features` to edit the switch in `[features]`:
 [features]
 enable_request_redaction = true # false disables it; default: true
 enable_request_redaction_notice = false # opt-in final-answer notice; requires crs
+# Fresh configs display the complete default notice here. Replace it with any multiline Markdown:
+request_redaction_notice_text = '''
+---
+
+> **⚠️ Crosslane 安全提示：疑似敏感凭证已脱敏**
+>
+> 本次新输入中有内容被规则判断为疑似敏感凭证，已在发送给上游模型前替换为占位符。此判断可能存在误报，工具执行所需参数会在本地还原。
+>
+> **请注意凭证的使用方式：**优先使用环境变量引用或安全凭证配置，避免直接粘贴明文凭证。'''
 ```
 
 Saving validates and hot-reloads the configuration without a restart. Check the
@@ -578,20 +587,42 @@ summaries reach Kiro with their real values. Previously generated checkpoint
 capsules are still decoded locally so old summaries remain usable. Existing
 config-export, Debug and error-log sanitization is separate from this switch.
 
-With `crs` builds, set `enable_request_redaction_notice = true` to append a fixed
-security notice to the existing final Claude text block after credentials were
-actually masked in a successful upstream request. This independent switch defaults
-to false and hot-reloads for new requests. The notice contains no credential or
-placeholder values and is generated locally without a model. It is ordinary
+With `crs` builds, set `enable_request_redaction_notice = true` to append a security
+notice to the existing final Claude text block after the latest user input in this
+HTTP request (text, tool results or text attachments) was masked in a successful
+upstream generation request. History, old tool arguments/results, system prompts,
+tool definitions and environment information remain redacted and included in
+diagnostics, but cannot independently trigger another notice. Supplying the same
+credential again in new input still triggers a notice.
+
+The switch defaults to false. Fresh configurations and `crosslane config edit features`
+display the complete default Markdown in `request_redaction_notice_text` for administrators
+to edit. Omitting the field in an older configuration selects that same default;
+explicitly setting it to `""` or whitespace suppresses notices. Custom Markdown is
+appended after a blank line and otherwise preserved without variable substitution.
+Both the switch and text hot-reload for new requests; in-flight requests retain
+the text selected at their start. The default describes **suspected credentials**
+and possible false positives. It contains no credential or placeholder values and
+is generated locally without a model. The notice is ordinary
 answer text and enters the conversation history, rather than a native Claude Code
 system warning. It does not change tool arguments, IDs, stop reasons or reported
 model usage. Tool-call responses, client compaction summaries, errors, incomplete
 or truncated answers, declared structured output and JSON answers
 are left unchanged. OpenAI responses and providers without this redaction boundary
 do not receive notices. Disabling redaction also prevents notices.
-The notice uses a separator, a bold heading and a multiline blockquote. Colors
-and backgrounds depend on the client renderer; no ANSI codes, HTML, extra
-response blocks or events are injected.
+The default notice uses a separator, a bold heading and a multiline blockquote
+without ANSI codes or HTML. Colors and backgrounds depend on the client renderer.
+No extra response blocks or events are added for either default or custom text.
+
+Before forwarding to Kiro, the proxy removes complete default or legacy default
+notice suffixes from assistant history. Custom suffixes require a locally recorded
+whole-answer fingerprint and unambiguous removal position, so ordinary text such as
+`Done` is preserved. The bounded in-memory records contain no answer text. Unknown
+custom text is retained after a restart, expiry or ambiguous match. Client history,
+current input and tool arguments remain intact. Before appending, both response paths
+check for a complete existing notice, tolerating common blockquote, emphasis and line
+wrapping changes. Code identifiers and whitespace within code must still agree;
+fenced examples do not count as actual notices. Repeated local appends are prevented.
 
 With the switch enabled, Kiro generation requests pass through local,
 deterministic redaction at the final transport boundary. Detection uses no language model, remote classifier,

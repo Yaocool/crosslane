@@ -367,6 +367,44 @@ fn request_redaction_notice_defaults_off_and_accepts_only_boolean_switches() {
 }
 
 #[test]
+fn request_redaction_notice_text_supports_multiline_markdown_and_legacy_defaults() {
+    for source in [
+        "",
+        "[features]\nenable_request_redaction_notice = true\n",
+        DEFAULT_CONFIG_TOML,
+    ] {
+        let config: Config = toml::from_str(source).unwrap();
+        assert_eq!(
+            config.features.request_redaction_notice_text,
+            DEFAULT_REQUEST_REDACTION_NOTICE_TEXT
+        );
+    }
+    for blank in ["", " \n\t"] {
+        let mut config = Config::default();
+        config.features.request_redaction_notice_text = blank.into();
+        let roundtrip: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(roundtrip.features.request_redaction_notice_text, blank);
+    }
+    let source = "[features]\nrequest_redaction_notice_text = '''\n> **疑似敏感凭证**\n>\n> 请使用 `$TOKEN`。\n'''\n";
+    let config: Config = toml::from_str(source).unwrap();
+    assert_eq!(
+        config.features.request_redaction_notice_text,
+        "> **疑似敏感凭证**\n>\n> 请使用 `$TOKEN`。\n"
+    );
+    let roundtrip: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+    assert_eq!(
+        roundtrip.features.request_redaction_notice_text,
+        config.features.request_redaction_notice_text
+    );
+    for invalid in ["false", "0", "[]", "{}"] {
+        assert!(toml::from_str::<Config>(&format!(
+            "[features]\nrequest_redaction_notice_text = {invalid}\n"
+        ))
+        .is_err());
+    }
+}
+
+#[test]
 fn summary_timeout_default_preserves_existing_explicit_settings() {
     for (source, expected) in [
         ("", 120_000),
@@ -416,6 +454,10 @@ fn overage_is_disabled_by_default_and_can_be_enabled_for_the_pool() {
 fn documented_default_covers_every_config_field() {
     let documented: toml::Value = toml::from_str(&uncomment_documented_settings())
         .expect("all documented settings must form valid TOML");
+    assert_eq!(
+        documented["features"]["request_redaction_notice_text"].as_str(),
+        Some(DEFAULT_REQUEST_REDACTION_NOTICE_TEXT)
+    );
     let expected = fully_populated_config();
     let serialized = toml::to_string(&expected).expect("serialize populated config");
     let expected: toml::Value = toml::from_str(&serialized).expect("parse populated config");
@@ -449,12 +491,19 @@ fn provider_pool_balance_config_round_trips_and_rejects_invalid_weights() {
 fn uncomment_documented_settings() -> String {
     DEFAULT_CONFIG_TOML
         .lines()
-        .filter_map(|line| {
+        .map(|line| {
             let trimmed = line.trim();
-            let setting = trimmed.strip_prefix("# ").unwrap_or(trimmed);
+            let Some(setting) = trimmed.strip_prefix("# ") else {
+                return line;
+            };
             let is_table = setting.starts_with('[') && setting.ends_with(']');
             let is_value = setting.contains(" = ");
-            (is_table || is_value).then_some(setting)
+            // Keep active lines verbatim, including multiline string bodies.
+            if is_table || is_value {
+                setting
+            } else {
+                line
+            }
         })
         .collect::<Vec<_>>()
         .join("\n")

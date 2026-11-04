@@ -2525,9 +2525,10 @@ pub fn response(
                 && decoded.tools.is_empty()
             {
                 for data in claude.redaction_notice(
-                    context.redaction_notice,
+                    context.redaction_notice.as_deref(),
                     &redaction,
                     super::claude_stop_reason(&decoded, context.max_tokens, current_round_output_tokens),
+                    &context.state.redaction_notices,
                 ) {
                     yield Ok::<Bytes, Infallible>(Bytes::from(data));
                 }

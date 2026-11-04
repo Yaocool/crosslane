@@ -404,7 +404,7 @@ async fn handle_claude_route_inner(
     #[cfg(feature = "crs")]
     let redaction_notice = super::super::crs::redaction_notice::requested(
         &request,
-        config.features.enable_request_redaction_notice,
+        &config.features,
         client_compaction,
     );
     if client_compaction {
@@ -506,6 +506,10 @@ async fn handle_claude_route_inner(
         .resolved_model_info(&route.mapped)
         .and_then(|model| model.additional_model_request_fields_schema);
     let mut payload = claude_to_kiro(&request, &options);
+    #[cfg(feature = "crs")]
+    if !client_compaction {
+        super::super::crs::redaction_notice::strip_history(&mut payload, &state.redaction_notices);
+    }
     payload.restore_summary_secrets = client_compaction;
     if client_compaction {
         crosslane_translate::prepare_compaction_source_history(&mut payload);
@@ -2142,7 +2146,7 @@ pub(super) async fn handle_openai_route(
                 thinking_output_format,
                 include_usage_chunk,
                 #[cfg(feature = "crs")]
-                redaction_notice: false,
+                redaction_notice: None,
                 web_tool_names: std::collections::HashMap::new(),
                 tool_search: None,
                 max_tool_search_operations: 0,

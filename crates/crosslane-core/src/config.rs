@@ -372,6 +372,15 @@ impl Default for PoolConfig {
     }
 }
 
+/// Default administrator-editable Markdown for request credential notices.
+pub const DEFAULT_REQUEST_REDACTION_NOTICE_TEXT: &str = r#"---
+
+> **⚠️ Crosslane 安全提示：疑似敏感凭证已脱敏**
+>
+> 本次新输入中有内容被规则判断为疑似敏感凭证，已在发送给上游模型前替换为占位符。此判断可能存在误报，工具执行所需参数会在本地还原。
+>
+> **请注意凭证的使用方式：**优先使用环境变量引用或安全凭证配置，避免直接粘贴明文凭证。"#;
+
 /// 功能开关。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -412,6 +421,8 @@ pub struct FeaturesConfig {
     pub enable_request_redaction: bool,
     /// 是否在 Claude 最终回答末尾追加脱敏提示（仅 crs feature）。
     pub enable_request_redaction_notice: bool,
+    /// 脱敏提示的 Markdown 正文；未配置时使用默认文案，空白时不提示。
+    pub request_redaction_notice_text: String,
     /// 空字符串表示自动选择。
     pub default_model_id: String,
 }
@@ -437,6 +448,7 @@ impl Default for FeaturesConfig {
             enable_tool_leak_filter: true,
             enable_request_redaction: true,
             enable_request_redaction_notice: false,
+            request_redaction_notice_text: DEFAULT_REQUEST_REDACTION_NOTICE_TEXT.into(),
             default_model_id: String::new(),
         }
     }
@@ -2523,8 +2535,19 @@ enable_tool_leak_filter = true
 # 工具参数还原与该开关保持一致；修改后热更新，对新请求生效。
 enable_request_redaction = true
 # 是否在 Claude 最终回答末尾追加脱敏提示；仅 crs feature 生效，默认关闭。
+# 仅本次新输入的正文、工具结果或文本附件触发；历史和常驻配置仍脱敏，但不单独触发提示。
 # 结构化输出、工具调用响应和客户端压缩摘要不会追加；修改后对新请求热更新。
 enable_request_redaction_notice = false
+# 提示正文，支持 TOML 多行字符串和 Markdown；未配置时使用下列默认文案，设为空字符串或纯空白时不提示。
+# 修改后对新请求热更新；自定义正文前自动添加一个空行，其余格式原样保留。
+request_redaction_notice_text = '''
+---
+
+> **⚠️ Crosslane 安全提示：疑似敏感凭证已脱敏**
+>
+> 本次新输入中有内容被规则判断为疑似敏感凭证，已在发送给上游模型前替换为占位符。此判断可能存在误报，工具执行所需参数会在本地还原。
+>
+> **请注意凭证的使用方式：**优先使用环境变量引用或安全凭证配置，避免直接粘贴明文凭证。'''
 # 客户端未指定模型或模型解析需要兜底时使用的模型 ID；空字符串表示自动选择。
 default_model_id = ""
 

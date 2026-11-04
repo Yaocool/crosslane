@@ -94,14 +94,15 @@ impl RedactionSession {
         self.enabled
     }
 
-    /// Record protection on an actual outgoing generation payload, rather than
-    /// inferring it from mappings discovered by an input-budget estimate.
+    /// Record protection of newly supplied input on an actual outgoing generation
+    /// payload. History, system/tool definitions and budget-only mappings cannot
+    /// trigger a notice for a later client request.
     #[cfg(feature = "crs")]
     pub fn record_transmitted_payload(&self, payload: &Value) {
         if !self.enabled || self.has_transmitted_redactions() {
             return;
         }
-        if self.outgoing_redaction_report(payload, 0).triggered {
+        if self.current_input_has_redactions(payload) {
             self.state
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -2990,23 +2991,85 @@ mod tests {
         let session = RedactionSession::new();
         let masked = session.redact_text("token=notice-fixture-secret", &[]);
         assert!(!session.has_transmitted_redactions());
-        for value in [
-            json!({"content":"token=$CLOUD_TOKEN"}),
-            json!({"content":"__CROSSLANE_SECRET_00000000000000000000000000000000_0__"}),
-            json!({"content":"[Gateway credential references] __CROSSLANE_SECRET_"}),
+        let wire = |content: &str| json!({"conversationState":{"currentMessage":{"userInputMessage":{"content":content}}}});
+        for content in [
+            "token=$CLOUD_TOKEN",
+            "__CROSSLANE_SECRET_00000000000000000000000000000000_0__",
+            "[Gateway credential references] __CROSSLANE_SECRET_",
         ] {
-            session.record_transmitted_payload(&value);
+            session.record_transmitted_payload(&wire(content));
             assert!(!session.has_transmitted_redactions());
         }
-        session
-            .clone()
-            .record_transmitted_payload(&json!({"nested":[{"content":masked}]}));
+        session.clone().record_transmitted_payload(&wire(&masked));
         assert!(session.has_transmitted_redactions());
-        session.record_transmitted_payload(&json!({"content":"later clean continuation"}));
+        session.record_transmitted_payload(&wire("later clean continuation"));
         assert!(session.has_transmitted_redactions());
         let disabled = RedactionSession::with_enabled(false);
-        disabled.record_transmitted_payload(&json!({"content":masked}));
+        disabled.record_transmitted_payload(&wire(&masked));
         assert!(!disabled.has_transmitted_redactions());
+    }
+
+    #[cfg(feature = "crs")]
+    #[test]
+    fn historical_and_persistent_redactions_do_not_trigger_current_input_notices() {
+        let session = RedactionSession::new();
+        let masked = session.redact_text("token=notice-fixture-secret", &[]);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&masked);
+        let mut wire = json!({
+            "conversationState":{
+                "history":[
+                    {"userInputMessage":{"content":masked,"documents":[{"name":"old","format":"txt","source":{"bytes":encoded}}],"userInputMessageContext":{"toolResults":[{"content":[{"text":masked}]}]}}},
+                    {"assistantResponseMessage":{"content":masked,"toolUses":[{"input":{"token":masked}}]}}
+                ],
+                "currentMessage":{"userInputMessage":{
+                    "content":"[Gateway credential references] __CROSSLANE_SECRET_\nclean new question",
+                    "userInputMessageContext":{
+                        "tools":[{"toolSpecification":{"description":masked,"inputSchema":{"json":{"default":masked}}}}],
+                        "envState":{"currentWorkingDirectory":masked}
+                    }
+                }}
+            },
+            "additionalModelRequestFields":{"token":masked}
+        });
+        assert!(session.outgoing_redaction_report(&wire, 2).triggered);
+        session.record_transmitted_payload(&wire);
+        assert!(!session.has_transmitted_redactions());
+        session.record_transmitted_payload(&json!({"params":{"arguments":{"query":masked}}}));
+        assert!(!session.has_transmitted_redactions());
+        // Reusing an old value in genuinely new input must still warn.
+        wire["conversationState"]["currentMessage"]["userInputMessage"]["content"] = json!(masked);
+        session.record_transmitted_payload(&wire);
+        assert!(session.has_transmitted_redactions());
+    }
+
+    #[cfg(feature = "crs")]
+    #[test]
+    fn current_tool_results_and_text_documents_trigger_notices_but_images_do_not() {
+        for input in ["tool_result", "document_text", "document_name", "image"] {
+            let session = RedactionSession::new();
+            let masked = session.redact_text("token=notice-fixture-secret", &[]);
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&masked);
+            let user = match input {
+                "tool_result" => {
+                    json!({"userInputMessageContext":{"toolResults":[{"content":[{"text":masked}]}]}})
+                }
+                "document_text" => {
+                    json!({"documents":[{"name":"new","format":"md","source":{"bytes":encoded}}]})
+                }
+                "document_name" => {
+                    json!({"documents":[{"name":masked,"format":"txt","source":{"bytes":""}}]})
+                }
+                _ => json!({"images":[{"format":"png","source":{"bytes":encoded}}]}),
+            };
+            session.record_transmitted_payload(
+                &json!({"conversationState":{"currentMessage":{"userInputMessage":user}}}),
+            );
+            assert_eq!(
+                session.has_transmitted_redactions(),
+                input != "image",
+                "{input}"
+            );
+        }
     }
 
     fn assert_schema_allows_marker(schema: &Value, marker: &Value) {

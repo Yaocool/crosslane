@@ -679,10 +679,16 @@ async fn compaction_summary_uses_the_same_redaction_boundary() {
         .expect("compaction planning")
         .expect("fixture has compactable history");
     let mut summary = compaction_summary_payload(&source, &plan, "claude-sonnet-4");
+    summary
+        .conversation_state
+        .current_message
+        .user_input_message
+        .content
+        .push_str("\napi_key=summary-fixture-only-credential");
     sanitize_kiro_tool_history(&mut summary);
     let before = serde_json::to_value(&summary).unwrap();
     assert!(before.to_string().contains("ksk_fixture_result_123"));
-    client(&server)
+    let response = client(&server)
         .generate(
             &account(AuthMethod::ApiKey),
             &summary,
@@ -690,10 +696,14 @@ async fn compaction_summary_uses_the_same_redaction_boundary() {
         )
         .await
         .expect("summary generation");
+    assert!(response.redaction_report().triggered);
+    #[cfg(feature = "crs")]
+    assert!(!response.redaction_session().has_transmitted_redactions());
     assert_eq!(serde_json::to_value(&summary).unwrap(), before);
     let requests = server.received_requests().await.unwrap();
     let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
     let encoded = body.to_string();
+    assert!(!encoded.contains("summary-fixture-only-credential"));
     for secret in SECRETS {
         assert!(
             !encoded.contains(secret),

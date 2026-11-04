@@ -2719,11 +2719,12 @@ fn render_config_module_editor(
         for setting in [
             "enable_request_redaction",
             "enable_request_redaction_notice",
+            "request_redaction_notice_text",
         ] {
             if features.get(setting).is_some() {
                 continue;
             }
-            // Make the new switch discoverable when editing a legacy config.
+            // Make new redaction settings discoverable in legacy configs.
             // Clone its default item so the same explanation appears here and
             // in fresh installations without rewriting unrelated settings.
             let defaults = crosslane_core::config::DEFAULT_CONFIG_TOML

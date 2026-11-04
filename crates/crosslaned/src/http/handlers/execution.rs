@@ -1508,7 +1508,7 @@ pub(super) async fn nonstream_claude(
     resumed_server_events: Vec<ClaudeServerEvent>,
     diagnostics: RequestDiagnostics,
     web_tool_names: std::collections::HashMap<String, String>,
-    #[cfg(feature = "crs")] redaction_notice: bool,
+    #[cfg(feature = "crs")] redaction_notice: Option<String>,
 ) -> Result<Response, ApiError> {
     let prompt_cache_plan =
         state
@@ -1681,8 +1681,9 @@ pub(super) async fn nonstream_claude(
     #[cfg(feature = "crs")]
     let response = super::super::crs::redaction_notice::append_to_response(
         response,
-        redaction_notice,
+        redaction_notice.as_deref(),
         &redaction,
+        &state.redaction_notices,
     );
     let mut log = request_log(
         &trace_id,

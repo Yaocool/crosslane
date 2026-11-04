@@ -127,7 +127,7 @@ pub struct StreamContext {
     pub buffer_tool_calls: bool,
     pub enable_tool_leak_filter: bool,
     #[cfg(feature = "crs")]
-    pub redaction_notice: bool,
+    pub redaction_notice: Option<String>,
     /// Actual per-request decision. Beta headers only advertise capability and
     /// remain present when Claude Code sends `thinking.type = "disabled"`.
     pub thinking_enabled: bool,
@@ -673,7 +673,7 @@ struct ClaudeState {
     local_cache_plan: Option<super::prompt_cache::PromptCachePlan>,
     visible_text: String,
     #[cfg(feature = "crs")]
-    text_block_offset: usize,
+    text_block_offsets: Vec<usize>,
     emitted_citation_links: HashSet<String>,
     web_search_replay: WebSearchReplayCodec,
 }
@@ -705,7 +705,7 @@ impl ClaudeState {
             local_cache_plan: None,
             visible_text: String::new(),
             #[cfg(feature = "crs")]
-            text_block_offset: 0,
+            text_block_offsets: Vec::new(),
             emitted_citation_links: HashSet::new(),
             web_search_replay,
         }
@@ -796,7 +796,7 @@ impl ClaudeState {
         self.block = Some((index, kind));
         #[cfg(feature = "crs")]
         if kind == "text" {
-            self.text_block_offset = self.visible_text.len();
+            self.text_block_offsets.push(self.visible_text.len());
         }
         output.push(sse(&json!({
             "type":"content_block_start","index":index,"content_block":initial
@@ -1056,25 +1056,53 @@ impl ClaudeState {
     #[cfg(feature = "crs")]
     fn redaction_notice(
         &mut self,
-        requested: bool,
+        notice: Option<&str>,
         session: &crosslane_translate::RedactionSession,
         stop_reason: &str,
+        history: &super::NoticeHistory,
     ) -> Vec<String> {
+        let Some(notice) = notice else {
+            return Vec::new();
+        };
+        let current_block_offset = self.text_block_offsets.last().copied().unwrap_or_default();
         if !self.block.is_some_and(|(_, kind)| kind == "text")
             || !super::crs::redaction_notice::should_append(
-                requested,
+                true,
                 session,
                 stop_reason,
-                &self.visible_text[self.text_block_offset..],
+                &self.visible_text[current_block_offset..],
             )
         {
             return Vec::new();
         }
+        // Block boundaries are not bytes in the original answer. Add them only
+        // to the comparison copy so a notice in an earlier block remains visible
+        // to deduplication when later text arrives without a leading newline.
+        let ends = self
+            .text_block_offsets
+            .iter()
+            .skip(1)
+            .copied()
+            .chain(std::iter::once(self.visible_text.len()));
+        let visible_text = self
+            .text_block_offsets
+            .iter()
+            .zip(ends)
+            .map(|(&start, end)| &self.visible_text[start..end])
+            .collect::<Vec<_>>()
+            .join("\n");
+        if super::crs::redaction_notice::already_present(&visible_text, notice) {
+            return Vec::new();
+        }
         // event() reuses the open block. A separate notice block would hide
         // the answer in Claude Code's final JSON result.
-        self.event(&KiroEvent::AssistantResponse {
-            content: super::crs::redaction_notice::NOTICE.into(),
-        })
+        let events = self.event(&KiroEvent::AssistantResponse {
+            content: notice.into(),
+        });
+        history.remember(&self.visible_text[current_block_offset..], notice);
+        history.remember(&format!("{visible_text}{notice}"), notice);
+        history.remember(&self.visible_text, notice);
+        events
     }
 
     fn citations(

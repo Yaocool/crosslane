@@ -850,6 +850,40 @@ fn features_edit_exposes_and_toggles_redaction_notice_in_legacy_configs() {
 }
 
 #[test]
+fn features_edit_exposes_and_preserves_multiline_redaction_notice_text() {
+    let features = resolve_config_module("features").unwrap();
+    let original = "[features]\nenable_request_redaction_notice = true\n";
+    let editor = render_config_module_editor(original, features).unwrap();
+    let parsed: crosslane_core::config::Config = toml::from_str(&editor).unwrap();
+    assert_eq!(
+        parsed.features.request_redaction_notice_text,
+        crosslane_core::config::DEFAULT_REQUEST_REDACTION_NOTICE_TEXT
+    );
+    let edited = "[features]\nenable_request_redaction_notice = true\nrequest_redaction_notice_text = '''\n## 安全提示\n\n疑似敏感凭证，请检查 `$TOKEN`。\n'''";
+    let merged = merge_edited_config_module(original, features, edited).unwrap();
+    let parsed: crosslane_core::config::Config = toml::from_str(&merged).unwrap();
+    assert_eq!(
+        parsed.features.request_redaction_notice_text,
+        "## 安全提示\n\n疑似敏感凭证，请检查 `$TOKEN`。\n"
+    );
+    let reopened = render_config_module_editor(&merged, features).unwrap();
+    let parsed: crosslane_core::config::Config = toml::from_str(&reopened).unwrap();
+    assert!(parsed
+        .features
+        .request_redaction_notice_text
+        .contains("`$TOKEN`"));
+    assert!(parsed.features.enable_request_redaction_notice);
+    let cleared = merge_edited_config_module(
+        &merged,
+        features,
+        "[features]\nenable_request_redaction_notice = true\nrequest_redaction_notice_text = \"\"\n",
+    ).unwrap();
+    let reopened = render_config_module_editor(&cleared, features).unwrap();
+    let parsed: crosslane_core::config::Config = toml::from_str(&reopened).unwrap();
+    assert!(parsed.features.request_redaction_notice_text.is_empty());
+}
+
+#[test]
 fn config_module_edit_rejects_other_top_level_modules() {
     let original = crosslane_store::bootstrap::render_default_config(
         &crosslane_core::config::Config::default().admin.socket,

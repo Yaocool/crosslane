@@ -497,6 +497,25 @@ mod tests {
     }
 
     #[test]
+    fn redaction_notice_text_reload_preserves_the_inflight_config_snapshot() {
+        let handle = ConfigHandle::new(Config::default());
+        for text in ["> **疑似敏感凭证**\n> 请检查。", "updated\n\n- next", ""] {
+            let inflight = handle.current();
+            let previous = inflight.features.request_redaction_notice_text.clone();
+            let mut edited = (*inflight).clone();
+            edited.features.request_redaction_notice_text = text.into();
+            let (next, needs_restart) = merge_hot_reload(&inflight, edited);
+            assert!(needs_restart.is_empty());
+            handle.replace(next);
+            assert_eq!(
+                handle.current().features.request_redaction_notice_text,
+                text
+            );
+            assert_eq!(inflight.features.request_redaction_notice_text, previous);
+        }
+    }
+
+    #[test]
     fn runtime_hook_failure_keeps_previous_config() {
         let directory = tempdir().expect("tempdir");
         let path = directory.path().join("config.toml");

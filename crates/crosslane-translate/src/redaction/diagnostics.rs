@@ -38,6 +38,23 @@ impl RedactionSession {
         payload: &Value,
         protected_history_messages: usize,
     ) -> RedactionReport {
+        self.inspect_redactions(payload, protected_history_messages, false)
+    }
+
+    /// Notices describe only newly supplied input. Keep full-payload diagnostics
+    /// separate so historical credentials and persistent tool definitions remain
+    /// protected without warning on every subsequent client request.
+    #[cfg(feature = "crs")]
+    pub(super) fn current_input_has_redactions(&self, payload: &Value) -> bool {
+        self.inspect_redactions(payload, 0, true).triggered
+    }
+
+    fn inspect_redactions(
+        &self,
+        payload: &Value,
+        protected_history_messages: usize,
+        current_input_only: bool,
+    ) -> RedactionReport {
         let mut report = RedactionReport {
             enabled: self.enabled,
             triggered: false,
@@ -58,7 +75,28 @@ impl RedactionSession {
             sources: BTreeMap::new(),
             protected_history_messages,
         };
-        inspector.visit(payload, "", "payload", false);
+        if current_input_only {
+            for (path, source) in [
+                (
+                    "/conversationState/currentMessage/userInputMessage/content",
+                    "current_user_text",
+                ),
+                (
+                    "/conversationState/currentMessage/userInputMessage/userInputMessageContext/toolResults",
+                    "tool_result",
+                ),
+                (
+                    "/conversationState/currentMessage/userInputMessage/documents",
+                    "document",
+                ),
+            ] {
+                if let Some(value) = payload.pointer(path) {
+                    inspector.visit(value, path, source, false);
+                }
+            }
+        } else {
+            inspector.visit(payload, "", "payload", false);
+        }
         inspector.report.sources = inspector.sources.into_values().collect();
         report
     }

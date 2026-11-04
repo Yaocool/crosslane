@@ -13,6 +13,9 @@ const NOTICE: &str = "⚠️ Crosslane 安全提示：";
 #[derive(Clone)]
 enum Reply {
     Text(String),
+    FragmentedText(String),
+    DelayedText(String),
+    EchoHistory,
     Tool { name: String, input: Value },
     Error,
 }
@@ -68,14 +71,34 @@ impl wiremock::Respond for NoticeUpstream {
                 ));
             }
             reply => {
+                let echoed = payload["conversationState"]["history"]
+                    .as_array()
+                    .and_then(|history| {
+                        history.iter().rev().find_map(|message| {
+                            message["assistantResponseMessage"]["content"].as_str()
+                        })
+                    })
+                    .unwrap_or(ANSWER);
                 let text = match reply {
-                    Reply::Text(text) => text.as_str(),
+                    Reply::Text(text) | Reply::DelayedText(text) | Reply::FragmentedText(text) => {
+                        text.as_str()
+                    }
+                    Reply::EchoHistory => echoed,
                     _ => ANSWER,
                 };
-                body.extend(event_stream_frame(
-                    "assistantResponseEvent",
-                    json!({"content":text}),
-                ));
+                if matches!(reply, Reply::FragmentedText(_)) {
+                    for ch in text.chars() {
+                        body.extend(event_stream_frame(
+                            "assistantResponseEvent",
+                            json!({"content":ch.to_string()}),
+                        ));
+                    }
+                } else {
+                    body.extend(event_stream_frame(
+                        "assistantResponseEvent",
+                        json!({"content":text}),
+                    ));
+                }
             }
         }
         body.extend(event_stream_frame(
@@ -83,9 +106,14 @@ impl wiremock::Respond for NoticeUpstream {
             json!({"usage":{"inputTokens":100,"outputTokens":3,"creditsConsumed":0.1}}),
         ));
         self.requests.lock().unwrap().push(payload);
-        ResponseTemplate::new(200)
+        let response = ResponseTemplate::new(200)
             .insert_header("content-type", "application/vnd.amazon.eventstream")
-            .set_body_bytes(body)
+            .set_body_bytes(body);
+        if matches!(&self.reply, Reply::DelayedText(_)) {
+            response.set_delay(Duration::from_millis(400))
+        } else {
+            response
+        }
     }
 }
 
@@ -125,7 +153,7 @@ fn events(body: &str) -> Vec<Value> {
         .collect()
 }
 
-fn assert_answer(body: &str, stream: bool, notice: bool, answer: &str) {
+fn answer_text(body: &str, stream: bool) -> String {
     let (text, usage, stop) = if stream {
         let values = events(body);
         let starts = values
@@ -172,11 +200,18 @@ fn assert_answer(body: &str, stream: bool, notice: bool, answer: &str) {
     };
     assert_eq!(stop, "end_turn");
     assert_eq!(usage["output_tokens"], 3);
+    text
+}
+
+fn assert_answer(body: &str, stream: bool, notice: bool, answer: &str) {
+    let text = answer_text(body, stream);
     assert!(text.starts_with(answer), "original answer must be retained");
     assert_eq!(text.matches(NOTICE).count(), usize::from(notice));
     if notice {
         assert!(text.contains("\n\n---\n\n> **⚠️ Crosslane 安全提示："));
         assert!(text.contains("\n>\n> **请注意凭证的使用方式：**"));
+        assert!(text.contains("疑似敏感凭证"));
+        assert!(text.contains("可能存在误报"));
         assert!(!text.contains('\u{1b}'));
     } else {
         assert_eq!(text, answer);
@@ -223,7 +258,340 @@ async fn notice_reload_preserves_answers_and_reuses_the_original_text_block() {
 }
 
 #[tokio::test]
-async fn image_requests_with_public_documentation_only_warn_for_actual_credentials() {
+async fn an_upstream_notice_is_not_appended_again_even_when_its_markdown_changes() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    for notice in [
+        crosslane_core::config::DEFAULT_REQUEST_REDACTION_NOTICE_TEXT,
+        "---\n\n> **⚠️ Crosslane 安全提示：已触发凭证脱敏**\n>\n> 本次识别到的敏感凭证已在发送给上游模型前替换为占位符。工具执行所需参数会在本地还原。\n>\n> **请注意凭证的使用方式：**优先使用环境变量引用或安全凭证配置，避免直接粘贴明文凭证。",
+        "## 管理员提示\n\n> **疑似凭证**，请使用 `$TOKEN`。",
+    ] {
+        let mock = MockServer::start().await;
+        mount_context_alignment_models(&mock).await;
+        let reformatted = notice.replace("**", "").replace("> ", "").replace('\n', "\r\n");
+        let echoed = format!("{ANSWER}\n\n{reformatted}");
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(NoticeUpstream { requests:Arc::default(), reply:Reply::FragmentedText(echoed.clone()) })
+            .mount(&mock).await;
+        let port = unused_tcp_port();
+        let daemon = Daemon::start_http(port, &format!("{}/generateAssistantResponse", mock.uri())).await;
+        import_context_alignment_account(&daemon, 0.0).await;
+        configure(&daemon, true, true).await;
+        if notice.starts_with("## 管理员") {
+            super::model_policy::configure(&daemon, |config| config.features.request_redaction_notice_text = notice.into()).await;
+        }
+        for stream in [false, true] {
+            let body = call(&daemon, port, &request(stream)).await.text().await.unwrap();
+            assert_eq!(answer_text(&body, stream), echoed);
+        }
+        daemon.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn historical_notice_suffixes_are_not_sent_back_to_the_model() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    mount_context_alignment_models(&mock).await;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(NoticeUpstream {
+            requests: Arc::clone(&requests),
+            reply: Reply::EchoHistory,
+        })
+        .mount(&mock)
+        .await;
+    let port = unused_tcp_port();
+    let daemon =
+        Daemon::start_http(port, &format!("{}/generateAssistantResponse", mock.uri())).await;
+    import_context_alignment_account(&daemon, 0.0).await;
+    configure(&daemon, true, true).await;
+    for notice in [
+        crosslane_core::config::DEFAULT_REQUEST_REDACTION_NOTICE_TEXT,
+        "> 自定义完整提示\n> 疑似凭证，请检查。",
+    ] {
+        super::model_policy::configure(&daemon, |config| {
+            config.features.request_redaction_notice_text = notice.into()
+        })
+        .await;
+        for stream in [false, true] {
+            let issued = call(&daemon, port, &request(stream))
+                .await
+                .text()
+                .await
+                .unwrap();
+            let historical =
+                if notice == crosslane_core::config::DEFAULT_REQUEST_REDACTION_NOTICE_TEXT {
+                    format!("{ANSWER}\n\n{notice}\n\n{notice}")
+                } else {
+                    answer_text(&issued, stream)
+                };
+            for triggered in [false, true] {
+                let mut req = request(stream);
+                req["messages"] = json!([
+                    {"role":"user","content":"An earlier question."},
+                    {"role":"assistant","content":historical},
+                    {"role":"user","content":if triggered {format!("token={SECRET}")} else {"A clean new question.".into()}}
+                ]);
+                let body = call(&daemon, port, &req).await.text().await.unwrap();
+                let expected = if triggered && cfg!(feature = "crs") {
+                    format!("{ANSWER}\n\n{notice}")
+                } else if !cfg!(feature = "crs") {
+                    historical.clone()
+                } else {
+                    ANSWER.into()
+                };
+                assert_eq!(answer_text(&body, stream), expected);
+                let wire = requests.lock().unwrap().last().unwrap().clone();
+                let historical_answer = wire["conversationState"]["history"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .rev()
+                    .find_map(|message| message["assistantResponseMessage"]["content"].as_str())
+                    .unwrap();
+                assert_eq!(
+                    historical_answer,
+                    if cfg!(feature = "crs") {
+                        ANSWER.to_owned()
+                    } else {
+                        historical.clone()
+                    }
+                );
+                assert!(!wire.to_string().contains(SECRET));
+            }
+        }
+    }
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn multiline_notice_text_hot_reloads_and_explicit_blank_disables_it() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    mount_context_alignment_models(&mock).await;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(NoticeUpstream {
+            requests: Arc::clone(&requests),
+            reply: Reply::Text(ANSWER.into()),
+        })
+        .mount(&mock)
+        .await;
+    let port = unused_tcp_port();
+    let daemon =
+        Daemon::start_http(port, &format!("{}/generateAssistantResponse", mock.uri())).await;
+    import_context_alignment_account(&daemon, 0.0).await;
+    configure(&daemon, true, true).await;
+    for text in [
+        "## 管理员自定义提示\n\n> 疑似敏感凭证，请使用 `$TOKEN`。\n\n- 请检查  \n  保留 Markdown 换行。\n",
+        "> 已更新的提示\n> 第二行 😀",
+        "",
+        " \n\t",
+        crosslane_core::config::DEFAULT_REQUEST_REDACTION_NOTICE_TEXT,
+    ] {
+        super::model_policy::configure(&daemon, |config| {
+            config.features.request_redaction_notice_text = text.into();
+        }).await;
+        for stream in [false, true] {
+            let body = call(&daemon, port, &request(stream)).await.text().await.unwrap();
+            let expected = if cfg!(feature = "crs") && !text.trim().is_empty() {
+                format!("{ANSWER}\n\n{text}")
+            } else {
+                ANSWER.into()
+            };
+            assert_eq!(answer_text(&body, stream), expected);
+            let wire = requests.lock().unwrap().last().unwrap().to_string();
+            assert!(!wire.contains(SECRET));
+            assert!(!wire.contains("管理员自定义提示"));
+            assert!(!wire.contains("已更新的提示"));
+        }
+    }
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn verified_custom_history_survives_reload_without_deleting_unverified_suffixes() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    mount_context_alignment_models(&mock).await;
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(NoticeUpstream {
+            requests: Arc::default(),
+            reply: Reply::EchoHistory,
+        })
+        .mount(&mock)
+        .await;
+    let port = unused_tcp_port();
+    let daemon =
+        Daemon::start_http(port, &format!("{}/generateAssistantResponse", mock.uri())).await;
+    import_context_alignment_account(&daemon, 0.0).await;
+    configure(&daemon, true, true).await;
+    let updated = "> 更新后的疑似凭证提示。";
+    for stream in [false, true] {
+        super::model_policy::configure(&daemon, |config| {
+            config.features.request_redaction_notice_text = "Done".into()
+        })
+        .await;
+        let issued = answer_text(
+            &call(&daemon, port, &request(stream))
+                .await
+                .text()
+                .await
+                .unwrap(),
+            stream,
+        );
+        super::model_policy::configure(&daemon, |config| {
+            config.features.request_redaction_notice_text = updated.into()
+        })
+        .await;
+        for (historical, triggered) in [
+            (issued.clone(), false),
+            (
+                "A different legitimate task result\n\nDone".to_owned(),
+                false,
+            ),
+            (issued.clone(), true),
+        ] {
+            let mut req = request(stream);
+            req["messages"] = json!([
+                {"role":"user","content":"An earlier task."},
+                {"role":"assistant","content":historical},
+                {"role":"user","content":if triggered {format!("token={SECRET}")} else {"A clean new question.".into()}}
+            ]);
+            let actual = answer_text(
+                &call(&daemon, port, &req).await.text().await.unwrap(),
+                stream,
+            );
+            let expected = if cfg!(feature = "crs") && historical == issued {
+                if triggered {
+                    format!("{ANSWER}\n\n{updated}")
+                } else {
+                    ANSWER.into()
+                }
+            } else {
+                historical
+            };
+            assert_eq!(actual, expected);
+        }
+    }
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn notice_reload_keeps_the_text_selected_when_each_request_started() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    mount_context_alignment_models(&mock).await;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(NoticeUpstream {
+            requests: Arc::clone(&requests),
+            reply: Reply::DelayedText(ANSWER.into()),
+        })
+        .mount(&mock)
+        .await;
+    let port = unused_tcp_port();
+    let daemon =
+        Daemon::start_http(port, &format!("{}/generateAssistantResponse", mock.uri())).await;
+    import_context_alignment_account(&daemon, 0.0).await;
+    configure(&daemon, true, true).await;
+    for stream in [false, true] {
+        super::model_policy::configure(&daemon, |config| {
+            config.features.request_redaction_notice_text = "> before reload\n> 疑似凭证".into();
+        })
+        .await;
+        let previous_requests = requests.lock().unwrap().len();
+        let req = request(stream);
+        let reload = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if requests.lock().unwrap().len() > previous_requests {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            super::model_policy::configure(&daemon, |config| {
+                config.features.request_redaction_notice_text = "> after reload\n> 已更新".into();
+            })
+            .await;
+        };
+        let (response, ()) = tokio::join!(call(&daemon, port, &req), reload);
+        let body = response.text().await.unwrap();
+        let expected = if cfg!(feature = "crs") {
+            format!("{ANSWER}\n\n> before reload\n> 疑似凭证")
+        } else {
+            ANSWER.into()
+        };
+        assert_eq!(answer_text(&body, stream), expected);
+        let body = call(&daemon, port, &req).await.text().await.unwrap();
+        let expected = if cfg!(feature = "crs") {
+            format!("{ANSWER}\n\n> after reload\n> 已更新")
+        } else {
+            ANSWER.into()
+        };
+        assert_eq!(answer_text(&body, stream), expected);
+    }
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn history_and_persistent_context_stay_redacted_without_repeating_notices() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    mount_context_alignment_models(&mock).await;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(NoticeUpstream {
+            requests: Arc::clone(&requests),
+            reply: Reply::Text(ANSWER.into()),
+        })
+        .mount(&mock)
+        .await;
+    let port = unused_tcp_port();
+    let daemon =
+        Daemon::start_http(port, &format!("{}/generateAssistantResponse", mock.uri())).await;
+    import_context_alignment_account(&daemon, 0.0).await;
+    configure(&daemon, true, true).await;
+    for stream in [false, true] {
+        let mut req = request(stream);
+        let body = call(&daemon, port, &req).await.text().await.unwrap();
+        assert_answer(&body, stream, cfg!(feature = "crs"), ANSWER);
+        let previous_answer = answer_text(&body, stream);
+        req["system"] = json!(format!("token={SECRET}"));
+        req["tools"] = json!([{"name":"fixture","description":format!("token={SECRET}"),"input_schema":{"type":"object","properties":{"token":{"type":"string","default":SECRET}}}}]);
+        req["messages"].as_array_mut().unwrap().extend([
+            json!({"role":"assistant","content":previous_answer}),
+            json!({"role":"user","content":"A clean follow-up question."}),
+        ]);
+        for (content, notice) in [
+            ("A clean follow-up question.".to_owned(), false),
+            ("Another clean follow-up.".to_owned(), false),
+            (format!("Use token={SECRET} again."), cfg!(feature = "crs")),
+        ] {
+            req["messages"].as_array_mut().unwrap().last_mut().unwrap()["content"] = json!(content);
+            let body = call(&daemon, port, &req).await.text().await.unwrap();
+            assert_answer(&body, stream, notice, ANSWER);
+            let wire = requests.lock().unwrap().last().unwrap().clone();
+            assert!(!wire.to_string().contains(SECRET));
+            assert!(wire["conversationState"]["history"]
+                .to_string()
+                .contains("__CROSSLANE_SECRET_"));
+        }
+    }
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn image_requests_redact_historical_credentials_without_repeating_notices() {
     let _guard = HTTP_TEST_LOCK.lock().await;
     let mock = MockServer::start().await;
     mount_context_alignment_models(&mock).await;
@@ -287,12 +655,7 @@ async fn image_requests_with_public_documentation_only_warn_for_actual_credentia
             });
             let response = call(&daemon, port, &body).await;
             assert_eq!(response.status(), 200);
-            assert_answer(
-                &response.text().await.unwrap(),
-                stream,
-                has_secret && cfg!(feature = "crs"),
-                ANSWER,
-            );
+            assert_answer(&response.text().await.unwrap(), stream, false, ANSWER);
             let wire = requests.lock().unwrap().last().unwrap().clone();
             let current = &wire["conversationState"]["currentMessage"]["userInputMessage"];
             assert_eq!(current["images"][0]["source"]["bytes"], image);
@@ -461,7 +824,7 @@ async fn notice_skips_disabled_redaction_clean_requests_structured_output_and_tr
 }
 
 #[tokio::test]
-async fn notice_preserves_tool_parameters_and_only_appears_after_the_tool_result() {
+async fn notice_preserves_tool_parameters_and_only_warns_for_new_tool_result_credentials() {
     let _guard = HTTP_TEST_LOCK.lock().await;
     let mock = MockServer::start().await;
     mount_context_alignment_models(&mock).await;
@@ -526,6 +889,10 @@ async fn notice_preserves_tool_parameters_and_only_appears_after_the_tool_result
             json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"notice-tool","content":"ok"}]})
         ]);
         let body = call(&daemon, port, &req).await.text().await.unwrap();
+        assert_answer(&body, stream, false, ANSWER);
+        req["messages"].as_array_mut().unwrap().last_mut().unwrap()["content"][0]["content"] =
+            json!(format!("token={SECRET}"));
+        let body = call(&daemon, port, &req).await.text().await.unwrap();
         assert_answer(&body, stream, cfg!(feature = "crs"), ANSWER);
     }
     daemon.stop().await;
@@ -574,7 +941,7 @@ async fn notice_never_changes_json_answers_or_partial_failures() {
 #[cfg(feature = "crs")]
 #[tokio::test]
 #[ignore = "requires CROSSLANE_CRS_SOURCE and CROSSLANE_CLAUDE_CODE_BIN; only local mock requests"]
-async fn real_claude_code_retains_answer_notice_and_read_tool_through_unmodified_crs() {
+async fn real_claude_code_retains_answer_and_read_tool_without_rewarning_on_history() {
     let _guard = HTTP_TEST_LOCK.lock().await;
     let claude = std::env::var("CROSSLANE_CLAUDE_CODE_BIN").unwrap();
     let isolated = tempfile::tempdir().unwrap();
@@ -632,7 +999,7 @@ async fn real_claude_code_retains_answer_notice_and_read_tool_through_unmodified
     assert_eq!(result["is_error"], false, "{result}");
     let answer = result["result"].as_str().unwrap();
     assert!(answer.starts_with(ANSWER), "{answer}");
-    assert_eq!(answer.matches(NOTICE).count(), 1);
+    assert_eq!(answer.matches(NOTICE).count(), 0);
     assert!(!answer.contains(SECRET));
     let captured = requests.lock().unwrap().clone();
     assert_eq!(captured.len(), 2, "one tool turn and one final answer");

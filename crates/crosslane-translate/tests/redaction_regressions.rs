@@ -63,7 +63,11 @@ fn assert_protected(text: &str, secret: &str) {
         #[cfg(feature = "crs")]
         {
             session.record_transmitted_payload(&wire);
-            assert!(session.has_transmitted_redactions());
+            assert_eq!(
+                session.has_transmitted_redactions(),
+                matches!(surface, Surface::Body | Surface::ToolResult),
+                "only new input should trigger a notice: {surface:?}"
+            );
         }
         assert_eq!(serde_json::to_value(&source).unwrap(), before);
         for message in &sent.conversation_state.history {

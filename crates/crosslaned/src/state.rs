@@ -168,6 +168,8 @@ pub struct AppState {
     pub(crate) compaction_replay: CompactionReplayTracker,
     #[cfg(feature = "crs")]
     pub(crate) context_pressure: crate::http::crs::ContextPressure,
+    #[cfg(feature = "crs")]
+    pub(crate) redaction_notices: crate::http::NoticeHistory,
     pub prompt_cache: PromptCacheTracker,
     /// Ephemeral, credential-scoped state for Responses `store=true` turns.
     pub responses_sessions: ResponsesSessionStore,
@@ -330,6 +332,8 @@ impl AppState {
             compaction_replay: CompactionReplayTracker::default(),
             #[cfg(feature = "crs")]
             context_pressure: crate::http::crs::ContextPressure::default(),
+            #[cfg(feature = "crs")]
+            redaction_notices: crate::http::NoticeHistory::default(),
             prompt_cache: PromptCacheTracker::default(),
             responses_sessions: ResponsesSessionStore::default(),
             response_client_contexts: crate::http::responses::ResponseClientContexts::default(),

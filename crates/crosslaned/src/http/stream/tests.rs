@@ -3,9 +3,17 @@ use super::*;
 #[cfg(feature = "crs")]
 #[test]
 fn redaction_notice_uses_only_the_current_answer_block() {
+    let history = crate::http::NoticeHistory::default();
+    let text = format!(
+        "\n\n{}",
+        crosslane_core::config::DEFAULT_REQUEST_REDACTION_NOTICE_TEXT
+    );
+    let notice = Some(text.as_str());
     let session = crosslane_translate::RedactionSession::new();
     let masked = session.redact_text("token=fixture-secret", &[]);
-    session.record_transmitted_payload(&json!({"content":masked}));
+    session.record_transmitted_payload(
+        &json!({"conversationState":{"currentMessage":{"userInputMessage":{"content":masked}}}}),
+    );
     let mut state = ClaudeState::new("message".into(), "fixture".into(), 10, replay_codec());
     state.event(&KiroEvent::AssistantResponse {
         content: "earlier answer".into(),
@@ -16,12 +24,12 @@ fn redaction_notice_uses_only_the_current_answer_block() {
         json!({"type":"thinking","thinking":""}),
     );
     assert!(state
-        .redaction_notice(true, &session, "end_turn")
+        .redaction_notice(notice, &session, "end_turn", &history)
         .is_empty());
     state.switch_block(&mut Vec::new(), "text", json!({"type":"text","text":""}));
     assert!(
         state
-            .redaction_notice(true, &session, "end_turn")
+            .redaction_notice(notice, &session, "end_turn", &history)
             .is_empty(),
         "a citation-only block must not become a notice-only result"
     );
@@ -30,7 +38,7 @@ fn redaction_notice_uses_only_the_current_answer_block() {
     });
     assert!(
         state
-            .redaction_notice(true, &session, "end_turn")
+            .redaction_notice(notice, &session, "end_turn", &history)
             .is_empty(),
         "JSON in the last block stays valid despite earlier prose"
     );
@@ -43,17 +51,49 @@ fn redaction_notice_uses_only_the_current_answer_block() {
         content: "final answer".into(),
     });
     assert!(state
-        .redaction_notice(true, &session, "tool_use")
+        .redaction_notice(notice, &session, "tool_use", &history)
         .is_empty());
     let original_block = state.block.unwrap().0;
-    let output = streamed_values(&state.redaction_notice(true, &session, "end_turn"));
+    let output = streamed_values(&state.redaction_notice(notice, &session, "end_turn", &history));
     assert_eq!(output.len(), 1);
     assert_eq!(output[0]["type"], "content_block_delta");
     assert_eq!(output[0]["index"], original_block);
-    assert_eq!(
-        output[0]["delta"]["text"],
-        super::super::crs::redaction_notice::NOTICE
+    assert_eq!(output[0]["delta"]["text"], text);
+    assert!(
+        state
+            .redaction_notice(notice, &session, "end_turn", &history)
+            .is_empty(),
+        "repeated finalization must not append the notice again"
     );
+}
+
+#[cfg(feature = "crs")]
+#[test]
+fn streaming_redaction_notice_is_not_added_twice_across_fragments_and_blocks() {
+    let history = crate::http::NoticeHistory::default();
+    let notice = "\n\n## 管理员提示\n\n> **疑似凭证**，请使用 `$TOKEN`。";
+    let session = crosslane_translate::RedactionSession::new();
+    let masked = session.redact_text("token=fixture-secret", &[]);
+    session.record_transmitted_payload(
+        &json!({"conversationState":{"currentMessage":{"userInputMessage":{"content":masked}}}}),
+    );
+    let mut state = ClaudeState::new("message".into(), "fixture".into(), 10, replay_codec());
+    for ch in format!("answer{notice}").chars() {
+        state.event(&KiroEvent::AssistantResponse {
+            content: ch.to_string(),
+        });
+    }
+    state.switch_block(
+        &mut Vec::new(),
+        "thinking",
+        json!({"type":"thinking","thinking":""}),
+    );
+    state.event(&KiroEvent::AssistantResponse {
+        content: "More details.".into(),
+    });
+    assert!(state
+        .redaction_notice(Some(notice), &session, "end_turn", &history)
+        .is_empty());
 }
 
 #[test]
