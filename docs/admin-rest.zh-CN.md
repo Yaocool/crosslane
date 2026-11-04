@@ -2,9 +2,12 @@
 
 Kiro 官方企业订阅管理位于 `/admin/v1/kiro/enterprise`，与 Crosslane 本地账号池分开。
 支持列用户、查询直接/组继承订阅、开通、取消、升级和降级；AWS 管理员凭据由
-`crosslaned` 管理，调用方仍只传 Admin token。开通不会额外分配 Identity Center
-应用访问权限。AWS 凭证用 `crosslane admin kiro configure` 独立加密保存并热生效；
-`show/clear/use-env` 管理状态和来源。完整配置、接口和 curl 示例见 [Kiro 企业订阅管理](kiro-enterprise-admin.zh-CN.md)。
+`crosslaned` 管理，REST 调用方仍只传 Admin token。开通时 Crosslane 不额外调用 Identity Center
+应用分配接口，允许 AWS 后端自动分配。AWS 凭证用 `crosslane admin kiro configure` 独立加密保存并热生效；
+`show/clear/use-env` 管理状态和来源。CLI 的 `crosslane admin kiro subscription` 覆盖所有对应操作：
+`plans/profiles/scope/users/list/show` 查询，`add/upgrade/downgrade/cancel` 写入，四个写命令均支持
+`--dry-run`。取消默认周期结束；`--mode immediate` 明确立即取消。CLI 使用 Unix socket，无需 REST 监听或 Admin token。
+完整配置、接口和调用示例见 [Kiro 企业订阅管理](kiro-enterprise-admin.zh-CN.md)。
 
 管理接口使用独立 HTTP 监听，默认地址为 `http://127.0.0.1:7651/admin/v1`。
 它与 `/health`、`/ready` 共用进程监听，不依赖任何业务 service。业务端口不提供管理接口。

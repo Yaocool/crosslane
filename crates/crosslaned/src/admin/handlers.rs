@@ -54,6 +54,18 @@ pub async fn dispatch(state: &Arc<AppState>, request: Request) -> Response {
         }
         method::ADMIN_KIRO_CREDENTIALS_CLEAR => kiro_credentials::clear(state).await,
         method::ADMIN_KIRO_CREDENTIALS_USE_ENV => kiro_credentials::use_environment(state).await,
+        method::ADMIN_KIRO_SUBSCRIPTION_PLANS
+        | method::ADMIN_KIRO_SUBSCRIPTION_PROFILES
+        | method::ADMIN_KIRO_SUBSCRIPTION_SCOPE
+        | method::ADMIN_KIRO_SUBSCRIPTION_USERS
+        | method::ADMIN_KIRO_SUBSCRIPTION_LIST
+        | method::ADMIN_KIRO_SUBSCRIPTION_SHOW
+        | method::ADMIN_KIRO_SUBSCRIPTION_ADD
+        | method::ADMIN_KIRO_SUBSCRIPTION_UPGRADE
+        | method::ADMIN_KIRO_SUBSCRIPTION_DOWNGRADE
+        | method::ADMIN_KIRO_SUBSCRIPTION_CANCEL => {
+            crate::admin::rest::handle_kiro_rpc(state, &request.method, request.params).await
+        }
         method::ADMIN_TOKEN_LIST => tokens::list(state),
         method::ADMIN_TOKEN_SHOW => tokens::show(state, request.params),
         method::ADMIN_TOKEN_CREATE => tokens::create(state, request.params).await,

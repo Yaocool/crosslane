@@ -36,12 +36,41 @@ impl AdminClient {
             .await
     }
 
+    /// Preserve structured domain errors for commands with a JSON error format.
+    pub async fn call_response(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<Response> {
+        self.response_with_timeout(method, params, response_timeout(method))
+            .await
+    }
+
     async fn call_with_response_timeout<T: DeserializeOwned>(
         &mut self,
         method: &str,
         params: serde_json::Value,
         response_timeout: Duration,
     ) -> Result<T> {
+        match self
+            .response_with_timeout(method, params, response_timeout)
+            .await?
+        {
+            Response::Ok { result, .. } => {
+                serde_json::from_value(result).context("解析响应结果失败")
+            }
+            Response::Err { error, .. } => {
+                Err(anyhow!("服务端返回错误 {}: {}", error.code, error.message))
+            }
+        }
+    }
+
+    async fn response_with_timeout(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+        response_timeout: Duration,
+    ) -> Result<Response> {
         let id = self.next_id;
         self.next_id += 1;
         let connected =
@@ -75,14 +104,7 @@ impl AdminClient {
             })?
             .context("读取响应失败")?
             .ok_or_else(|| anyhow!("服务端在响应前关闭了连接"))?;
-        match decode_line::<Response>(&raw)? {
-            Response::Ok { result, .. } => {
-                serde_json::from_value(result).context("解析响应结果失败")
-            }
-            Response::Err { error, .. } => {
-                Err(anyhow!("服务端返回错误 {}: {}", error.code, error.message))
-            }
-        }
+        Ok(decode_line::<Response>(&raw)?)
     }
 }
 
@@ -91,6 +113,16 @@ fn response_timeout(method_name: &str) -> Duration {
         method::STATUS | method::POOL => Duration::from_secs(15),
         method::LOGS => Duration::from_secs(45),
         method::ACCOUNT_ADD_SSO => Duration::from_secs(300),
+        method::ADMIN_KIRO_SUBSCRIPTION_PLANS
+        | method::ADMIN_KIRO_SUBSCRIPTION_PROFILES
+        | method::ADMIN_KIRO_SUBSCRIPTION_SCOPE
+        | method::ADMIN_KIRO_SUBSCRIPTION_USERS
+        | method::ADMIN_KIRO_SUBSCRIPTION_LIST
+        | method::ADMIN_KIRO_SUBSCRIPTION_SHOW
+        | method::ADMIN_KIRO_SUBSCRIPTION_ADD
+        | method::ADMIN_KIRO_SUBSCRIPTION_UPGRADE
+        | method::ADMIN_KIRO_SUBSCRIPTION_DOWNGRADE
+        | method::ADMIN_KIRO_SUBSCRIPTION_CANCEL => Duration::from_secs(180),
         method::DIAGNOSE_ACCOUNT
         | method::DIAGNOSE_ENDPOINTS
         | method::ACCOUNT_REFRESH
@@ -125,6 +157,20 @@ mod tests {
         assert!(response_timeout(method::ACCOUNT_ADD_SSO) > Duration::from_secs(120));
         assert!(response_timeout(method::ACCOUNT_REFRESH) > Duration::from_secs(120));
         assert!(response_timeout(method::DIAGNOSE_ACCOUNT) > Duration::from_secs(300));
+        // Kiro Enterprise operations have a 120-second daemon deadline.
+        for method in [
+            method::ADMIN_KIRO_SUBSCRIPTION_PROFILES,
+            method::ADMIN_KIRO_SUBSCRIPTION_SCOPE,
+            method::ADMIN_KIRO_SUBSCRIPTION_USERS,
+            method::ADMIN_KIRO_SUBSCRIPTION_LIST,
+            method::ADMIN_KIRO_SUBSCRIPTION_SHOW,
+            method::ADMIN_KIRO_SUBSCRIPTION_ADD,
+            method::ADMIN_KIRO_SUBSCRIPTION_UPGRADE,
+            method::ADMIN_KIRO_SUBSCRIPTION_DOWNGRADE,
+            method::ADMIN_KIRO_SUBSCRIPTION_CANCEL,
+        ] {
+            assert!(response_timeout(method) > Duration::from_secs(120));
+        }
     }
 
     #[tokio::test]

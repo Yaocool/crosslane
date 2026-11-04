@@ -6,8 +6,19 @@ use zeroize::Zeroizing;
 
 use crate::{client::AdminClient, output::print_json};
 
+mod subscription;
+
 #[derive(Debug, Subcommand)]
 pub enum KiroAdminCommand {
+    /// 查询、开通、升级、降级和取消 Kiro 企业订阅；使用 daemon 保存的 AWS 凭证。
+    #[command(
+        visible_alias = "subscriptions",
+        after_help = "通过本机 Unix socket 执行，不需要 Admin token 或 REST 监听。目标为 Identity Center 的精确 userName、UserId 或用户 ARN，不是 Crosslane 本地账号 ID。\n写命令默认实际提交，支持 --dry-run 只读预览。取消默认周期结束；旧控制面须显式 --mode immediate。\nAWS 按原生流程自动处理应用分配，Crosslane 不额外重复调用；不会导入账号池或执行浏览器 SSO。\n\n示例：\n  crosslane admin kiro subscription plans\n  crosslane admin kiro subscription profiles\n  crosslane admin kiro subscription scope\n  crosslane admin kiro subscription users\n  crosslane admin kiro subscription list\n  crosslane admin kiro subscription add user@example.com --plan power --dry-run\n  crosslane admin kiro subscription add user@example.com --plan power\n  crosslane admin kiro subscription show user@example.com\n  crosslane admin kiro subscription upgrade user@example.com --plan power --dry-run\n  crosslane admin kiro subscription downgrade user@example.com --plan pro --dry-run\n  crosslane admin kiro subscription cancel user@example.com --dry-run\n  crosslane admin kiro subscription cancel USER_ID --mode immediate\n  crosslane --json admin kiro subscription show user@example.com"
+    )]
+    Subscription {
+        #[command(subcommand)]
+        command: Option<subscription::SubscriptionCommand>,
+    },
     /// 完整替换 Kiro 管理凭证；AK/SK 隐藏输入，保存后热生效。
     #[command(
         visible_alias = "set",
@@ -124,6 +135,14 @@ pub(super) async fn run(
     json: bool,
 ) -> Result<()> {
     let (method, params) = match command {
+        KiroAdminCommand::Subscription { command } => {
+            return subscription::run(
+                client,
+                command.expect("empty command groups are handled locally"),
+                json,
+            )
+            .await;
+        }
         KiroAdminCommand::Configure { stdin } => (
             method::ADMIN_KIRO_CREDENTIALS_CONFIGURE,
             serde_json::to_value(input(stdin).await?)?,

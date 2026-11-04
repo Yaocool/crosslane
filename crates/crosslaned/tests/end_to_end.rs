@@ -128,6 +128,9 @@ mod admin_rest;
 #[path = "end_to_end/kiro_enterprise.rs"]
 mod kiro_enterprise;
 
+#[path = "end_to_end/kiro_subscriptions.rs"]
+mod kiro_subscriptions;
+
 #[path = "end_to_end/kiro_credentials.rs"]
 mod kiro_credentials;
 

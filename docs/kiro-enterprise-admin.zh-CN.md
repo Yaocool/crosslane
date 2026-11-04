@@ -7,6 +7,68 @@
 这里操作的是 AWS/Kiro 的企业用户与订阅。Crosslane 本地账号仍通过 `/admin/v1/accounts`
 管理。开通订阅不会自动做浏览器 SSO，也不会把账号导入本地账号池。
 
+## 通过 CLI 管理订阅
+
+CLI 已覆盖下文现有 Kiro 管理 REST 的全部操作：
+
+| 命令（前缀 `crosslane admin kiro subscription`） | 用途 |
+| --- | --- |
+| `plans` | 静态套餐清单，不访问 AWS，也不验证权限 |
+| `profiles` | 验证 AWS 身份并列出当前区域的 Kiro Profile |
+| `scope` | 发现并验证 Profile、Identity Center 实例、应用与身份库 |
+| `users` | 身份库全部用户及直接订阅，应用 GROUP 订阅另列 |
+| `list` | 当前应用全部 USER/GROUP 订阅及待生效套餐 |
+| `show <USER>` | 用户的直接订阅和当前组成员关系继承的订阅 |
+| `add <USER> --plan <PLAN>` | 开通直接订阅；已有直接订阅时拒绝重复开通 |
+| `upgrade <USER> --plan <PLAN>` | 升级唯一的直接订阅，目标套餐必须更高 |
+| `downgrade <USER> --plan <PLAN>` | 降级唯一的直接订阅，目标套餐必须更低 |
+| `cancel <USER> [--mode end-of-period\|immediate]` | 取消直接订阅，默认周期结束 |
+
+```bash
+crosslane admin kiro subscription profiles
+crosslane admin kiro subscription scope
+crosslane admin kiro subscription users
+crosslane admin kiro subscription plans
+crosslane admin kiro subscription list
+crosslane admin kiro subscription show user@example.com
+crosslane --json admin kiro subscription show USER_ID
+
+# 写操作先只读预览；确认后去掉 --dry-run 实际提交
+crosslane admin kiro subscription add user@example.com --plan pro --dry-run
+crosslane admin kiro subscription upgrade user@example.com --plan power --dry-run
+crosslane admin kiro subscription downgrade user@example.com --plan pro --dry-run
+crosslane admin kiro subscription cancel user@example.com --dry-run
+crosslane admin kiro subscription cancel USER_ID --mode immediate --dry-run
+```
+
+首次使用先运行 `crosslane admin kiro configure` 保存 AWS 凭证，详见下一节。
+上述命令通过 daemon 的属主专用 Unix socket 执行，使用 daemon 保存的同一组 AWS 凭证，
+**无需 Admin token，也无需开启状态或 Admin REST 监听**。Docker 部署需在本机挂载管理
+socket，或在容器内执行 CLI。CLI 与 daemon 均需升级；旧 daemon 返回明确的升级提示。
+
+`USER` 接受 Identity Center 的精确 `userName`、UserId 或用户 ARN，不需要 URL 编码。
+`add`、`upgrade`、`downgrade` 的 `--plan` 必填，支持 `pro`、`pro-plus`、`pro-max`、`power`。
+`scope`、`users`、`list`、`show` 与四个写命令后可附加 `--region`、`--profile-arn`、
+`--application-arn`、`--identity-center-region`、`--legacy`；`profiles` 只接受 `--region` 和
+`--legacy`。未指定的范围使用已保存的配置和自动发现。`--legacy` 只支持 `us-east-1`，不会自动回退。
+`subscriptions` 是 `subscription` 的别名；`create`、`activate` 是 `add` 的别名；
+`delete`、`remove`、`rm` 是 `cancel` 的别名。
+
+四个写命令默认实际提交；`--dry-run` 只读预览，不能验证所有 AWS 写权限。
+升级预期即时生效，降级预期下月生效，使用 `show` 查看当前及待生效套餐。
+取消默认 `--mode end-of-period`（也接受 `end_of_period`），周期结束时取消；
+`immediate` 预期立即停用，但计费仍可能至当月底。旧控制面取消必须显式使用
+`--legacy --mode immediate`，CLI 不会自动改为立即取消。取消保留 Identity Center 用户，
+不修改组继承订阅。`users` 不逐一展开组成员关系，查询某人的继承情况请使用 `show`。
+
+CLI 复用 REST 的范围校验、用户级操作锁、8 个并发写操作限额和完成审计，日志中
+`source=unix_socket` 可区分 CLI 调用；不会额外发送重复的 SSO 分配请求，允许 AWS 后端自动分配应用。
+“AWS 已受理”不代表权益或计费已生效；命令不自动重试，超时、中断或结果不明后先用 `show`
+确认状态。终端查询提示保留本次 socket 和范围参数。JSON 错误保留上游错误码、request ID 和
+`write_outcome`，不返回 AWS 密钥。
+
+顶层 `crosslane subscriptions --provider kiro` 继续使用本地账号凭证查询计划，不执行订阅写入。
+
 ## 配置 AWS 管理员凭据
 
 ### CLI 配置与热生效（推荐）
@@ -189,7 +251,7 @@ curl -fsS -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
   -d '{"plan":"pro-plus","dry_run":true}' \
   "$BASE/users/$USER_ID/subscription"
 
-# 实际开通，不额外创建 Identity Center 应用分配
+# 实际开通；AWS 可自动分配应用，Crosslane 不额外重复调用
 curl -fsS -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H 'Content-Type: application/json' -d '{"plan":"pro-plus"}' \
   "$BASE/users/$USER_ID/subscription"
@@ -215,8 +277,12 @@ curl -fsS -X DELETE -H "Authorization: Bearer $ADMIN_TOKEN" \
 
 三个 POST 写操作均支持请求体 `dry_run=true`；DELETE 支持查询参数 `dry_run=true`。
 预览返回 `200` 和 `status=preview`，实际写入接受返回 `202` 和 `status=api_accepted`。
+预览仅验证发现过程和操作条件，不调用 AWS 写接口，因此不能验证 Assignment 及下游 Claim 的写入权限。
 两者都需要完整管理令牌；响应中的 `application_assignment_requested` 固定为 `false`。
-不接受 `assign_application` 等额外请求体字段。
+不接受 `assign_application` 等额外请求体字段。该标志只表示 Crosslane 没有单独发送
+CreateApplicationAssignment/DeleteApplicationAssignment 请求，不代表用户最终不会被分配应用。
+Kiro 后端处理 Assignment RPC 时可自行完成应用分配，Crosslane 不再额外重复调用；
+也不会创建/删除 Identity Center 用户或修改用户的组成员关系。
 
 订阅写操作及预览最多同时运行 8 个，满额时返回 `503 busy`。同一 AWS 账号、区域和解析后
 用户 ID 的重叠操作返回 `409`，用户名和 UUID 别名共用保护；不同用户可以并发。
@@ -232,8 +298,8 @@ curl -fsS -X DELETE -H "Authorization: Bearer $ADMIN_TOKEN" \
 
 按 [Kiro 官方管理规则](https://kiro.dev/docs/enterprise/subscription-management/)，升级通常立即
 生效，降级次月生效；取消可选择月底停止访问或立即停止访问，两种方式的订阅均到月底结束。
-取消 USER 直接订阅不会移除组继承权益。这里只取消订阅，不删除 Identity Center 用户、
-Crosslane 本地账号，也不添加/删除直接应用分配。
+取消 USER 直接订阅不会移除组继承权益。Crosslane 不删除 Identity Center 用户或本地账号，
+也不单独发送应用分配的增删请求；Kiro RPC 在 AWS 内部的应用分配行为由 AWS 控制。
 
 升级与降级必须有唯一直接 USER claim，并能识别当前档位；未知套餐、多个直接 claim、
 目标档位与操作方向不一致时，写入前返回 409。`subscription_type` 与 `plan` 是当前套餐，
@@ -253,11 +319,38 @@ HTTP 2xx 中的 AWS 错误信封同样按失败处理，无法确认的错误体
 
 权限依据见 [Kiro IAM](https://kiro.dev/docs/enterprise/iam/)：
 订阅写入需要 `q:CreateAssignment`、`q:UpdateAssignment`、`q:DeleteAssignment`，查询需要
-`user-subscriptions:ListApplicationClaims`；发现还使用 `codewhisperer:ListProfiles`、
+`user-subscriptions:ListApplicationClaims`。调用方还需具有 `user-subscriptions:CreateClaim`、
+`user-subscriptions:UpdateClaim`、`user-subscriptions:DeleteClaim`，供 Kiro 代表该身份执行下游订阅写入；
+只有 `q:*Assignment` 权限不能授权这些下游调用。发现还使用 `codewhisperer:ListProfiles`、
 `sso:DescribeInstance`、`sso:DescribeApplication`、`identitystore:ListUsers`、
 `identitystore:GetUserId`、`identitystore:DescribeUser`、`identitystore:ListGroupMembershipsForMember`
 以及 STS 身份查询。具体资源权限、SCP 和跨账号约束仍由 AWS 决定。
-Crosslane 不需要 `sso:CreateApplicationAssignment` 或 `sso:DeleteApplicationAssignment`。
+调用方还需要 `sso-directory:DescribeUser`：User Subscriptions 在 CreateClaim 内部可代表
+该身份调用它；`identitystore:DescribeUser` 属于另一项 IAM 动作，不能替代。随后 Kiro 可代表
+调用方执行 `sso:CreateApplicationAssignment`，因此开通还需要这项权限，即使 Crosslane 没有
+单独发送 SSO 写请求。已有 Profile/应用时，实际核对到的开通链路为：
+
+```text
+q:CreateAssignment
+  -> user-subscriptions:CreateClaim
+       -> sso-directory:DescribeUser
+  -> sso:CreateApplicationAssignment
+```
+
+控制台还会使用 `sso-directory:SearchUsers`、`sso-directory:DescribeUsers`、
+`sso:ListApplicationAssignments`、`user-subscriptions:ListUserSubscriptions` 等界面查询权限；
+不能仅因它们出现在控制台历史中，就认定 Crosslane 开通接口也需要。已有 Profile 下开通订阅
+同样不依赖 Profile 的创建、修改或删除权限。
+
+遇到 Assignment 的 `AccessDenied` 时，应同时检查 CloudTrail 中 `q.amazonaws.com` 的 Assignment
+事件与 `user-subscriptions.amazonaws.com` 的下游 Claim 事件。外层 CreateAssignment 可能只返回通用
+拒绝信息，下游事件才说明具体缺失的权限。必须同时包含只读事件：CreateClaim 的通用拒绝可能来自
+更内层 `sso-directory.amazonaws.com` 的 DescribeUser 授权失败。应按调用身份和较小时间范围筛选，
+不要只看 `ReadOnly=false`，并结合目标用户、应用与 `invokedBy` 关联各层事件。
+Claim 事件的 `sourceIPAddress` 为 `q.amazonaws.com`
+并不单独证明 `aws:SourceIp` 条件失败：[AWS 文档](https://docs.aws.amazon.com/IAM/latest/UserGuide/access_forward_access_sessions.html)
+说明，经公网端点发起的请求，其源 IP 会保留到后续转发访问会话（FAS）中；通过 VPC 端点的请求需按文档
+另行处理网络条件。
 
 Kiro 的套餐操作及 claim 查询采用 Console 后端协议，并非稳定公开的 AWS SDK 服务模型；
 参考 [Kiro 官方仓库的调用记录](https://github.com/kirodotdev/Kiro/issues/10166)。

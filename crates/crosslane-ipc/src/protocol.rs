@@ -199,6 +199,16 @@ pub mod method {
     pub const ADMIN_KIRO_CREDENTIALS_CONFIGURE: &str = "admin.kiro.credentials.configure";
     pub const ADMIN_KIRO_CREDENTIALS_CLEAR: &str = "admin.kiro.credentials.clear";
     pub const ADMIN_KIRO_CREDENTIALS_USE_ENV: &str = "admin.kiro.credentials.useEnvironment";
+    pub const ADMIN_KIRO_SUBSCRIPTION_PLANS: &str = "admin.kiro.subscription.plans";
+    pub const ADMIN_KIRO_SUBSCRIPTION_PROFILES: &str = "admin.kiro.subscription.profiles";
+    pub const ADMIN_KIRO_SUBSCRIPTION_SCOPE: &str = "admin.kiro.subscription.scope";
+    pub const ADMIN_KIRO_SUBSCRIPTION_USERS: &str = "admin.kiro.subscription.users";
+    pub const ADMIN_KIRO_SUBSCRIPTION_LIST: &str = "admin.kiro.subscription.list";
+    pub const ADMIN_KIRO_SUBSCRIPTION_SHOW: &str = "admin.kiro.subscription.show";
+    pub const ADMIN_KIRO_SUBSCRIPTION_ADD: &str = "admin.kiro.subscription.add";
+    pub const ADMIN_KIRO_SUBSCRIPTION_UPGRADE: &str = "admin.kiro.subscription.upgrade";
+    pub const ADMIN_KIRO_SUBSCRIPTION_DOWNGRADE: &str = "admin.kiro.subscription.downgrade";
+    pub const ADMIN_KIRO_SUBSCRIPTION_CANCEL: &str = "admin.kiro.subscription.cancel";
 
     /// 全部方法名。
     pub const ALL: &[&str] = &[
@@ -212,6 +222,16 @@ pub mod method {
         ADMIN_KIRO_CREDENTIALS_CONFIGURE,
         ADMIN_KIRO_CREDENTIALS_CLEAR,
         ADMIN_KIRO_CREDENTIALS_USE_ENV,
+        ADMIN_KIRO_SUBSCRIPTION_PLANS,
+        ADMIN_KIRO_SUBSCRIPTION_PROFILES,
+        ADMIN_KIRO_SUBSCRIPTION_SCOPE,
+        ADMIN_KIRO_SUBSCRIPTION_USERS,
+        ADMIN_KIRO_SUBSCRIPTION_LIST,
+        ADMIN_KIRO_SUBSCRIPTION_SHOW,
+        ADMIN_KIRO_SUBSCRIPTION_ADD,
+        ADMIN_KIRO_SUBSCRIPTION_UPGRADE,
+        ADMIN_KIRO_SUBSCRIPTION_DOWNGRADE,
+        ADMIN_KIRO_SUBSCRIPTION_CANCEL,
         V2_CAPABILITIES,
         V2_PROVIDER_LIST,
         V2_PROVIDER_SHOW,

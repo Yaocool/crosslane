@@ -21,7 +21,7 @@ use crate::output::{format_relative, format_timestamp, print_json, render_table}
     disable_help_subcommand = true,
     about = "Kiro 与 GitHub Copilot 模型代理管理工具",
     long_about = "查看 Kiro、GitHub Copilot 提供源及服务状态，管理账号、模型、API key 与配置。\n\n示例：\n  crosslane provider list\n  crosslane account list --provider kiro\n  crosslane account list --provider copilot\n  crosslane models list --provider all\n  crosslane guide kiro\n  crosslane guide copilot",
-    after_help = "命令归属：\n  provider：上游实例及驱动设置；account：上游登录账号与凭证\n  service：业务监听、来源范围和账号池；apikey：访问业务接口的客户端 Key\n  admin token：独立管理 REST 的访问令牌\n  models：模型目录、解析和全局禁用；model-map：客户端模型名的映射规则\n  status/health/ready/stats/pool/logs：运行观测；tasks：周期任务\n  config：运行配置；alert：告警通知目标；diagnose/subscriptions：Kiro 专项\n  restart/stop/uninstall：Docker 宿主机操作\n\n帮助入口：crosslane <命令路径> --help、crosslane help <命令路径>\n完整命令树：crosslane help --all；局部命令树：crosslane help account --all\n接入说明：crosslane guide kiro、crosslane guide copilot"
+    after_help = "命令归属：\n  provider：上游实例及驱动设置；account：上游登录账号与凭证\n  service：业务监听、来源范围和账号池；apikey：访问业务接口的客户端 Key\n  admin token：独立管理 REST 的访问令牌；admin kiro：AWS 管理凭证与企业订阅\n  models：模型目录、解析和全局禁用；model-map：客户端模型名的映射规则\n  status/health/ready/stats/pool/logs：运行观测；tasks：周期任务\n  config：运行配置；alert：告警通知目标；diagnose/subscriptions：Kiro 专项\n  restart/stop/uninstall：Docker 宿主机操作\n\n帮助入口：crosslane <命令路径> --help、crosslane help <命令路径>\n完整命令树：crosslane help --all；局部命令树：crosslane help account --all\n接入说明：crosslane guide kiro、crosslane guide copilot"
 )]
 struct Cli {
     /// 提供源实例 ID（见 provider list）；可放在任意子命令前后，也可用 CROSSLANE_PROVIDER。
@@ -64,9 +64,9 @@ struct TimeRangeArgs {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// 管理 Admin REST 令牌与 Kiro 官方管理凭证；通过 Unix socket 执行。
+    /// 管理 Admin REST 令牌、Kiro 官方管理凭证与企业订阅；通过 Unix socket 执行。
     #[command(
-        after_help = "首次启用：crosslane config edit admin 同时编辑 [status_http] 和 [admin.rest]，先开启监听并保存重载，再创建 --enable-rest 令牌。\n\n示例：\n  crosslane admin token create --name ops --enable-rest\n  crosslane admin token list\n  crosslane admin token rotate ops\n  crosslane admin token revoke ops\n  crosslane admin kiro configure\n  crosslane admin kiro show\n\nKiro AK/SK 独立加密保存，CLI 修改后热生效，不写 config.toml。操作说明：crosslane guide admin"
+        after_help = "REST 首次启用：crosslane config edit admin 同时编辑 [status_http] 和 [admin.rest]，先开启监听并保存重载，再创建 --enable-rest 令牌。\n\n示例：\n  crosslane admin token create --name ops --enable-rest\n  crosslane admin token list\n  crosslane admin token rotate ops\n  crosslane admin token revoke ops\n  crosslane admin kiro configure\n  crosslane admin kiro show\n  crosslane admin kiro subscription add user@example.com --plan power\n  crosslane admin kiro subscription show user@example.com\n\nKiro 订阅 CLI 无需开启 REST 或 Admin token。Kiro AK/SK 独立加密保存，CLI 修改后热生效，不写 config.toml。操作说明：crosslane guide admin"
     )]
     Admin {
         #[command(subcommand)]
@@ -179,7 +179,7 @@ enum Command {
     },
     /// 查询 Kiro 订阅计划；Copilot 不提供权威订阅数据。
     #[command(
-        after_help = "仅 Kiro 返回权威订阅计划；Copilot 返回 supported=false。Copilot 账号授权与可用模型请用 account probe/models list 检查。\n\n示例：\n  crosslane subscriptions --provider kiro\n  crosslane subscriptions --provider all\n  crosslane account probe --provider copilot <ACCOUNT_ID>"
+        after_help = "此命令只查询计划；开通企业订阅使用 admin kiro subscription add <USER> --plan power。仅 Kiro 返回权威订阅计划；Copilot 返回 supported=false。Copilot 账号授权与可用模型请用 account probe/models list 检查。\n\n示例：\n  crosslane subscriptions --provider kiro\n  crosslane subscriptions --provider all\n  crosslane account probe --provider copilot <ACCOUNT_ID>"
     )]
     Subscriptions {
         /// Kiro 账号 ID 或邮箱；省略时使用可调度账号查询订阅计划。

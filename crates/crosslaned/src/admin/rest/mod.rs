@@ -7,6 +7,8 @@ mod openapi;
 mod services;
 mod views;
 
+pub(crate) use enterprise::handle_rpc as handle_kiro_rpc;
+
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -63,16 +65,23 @@ struct RequestAudit {
     request_id: String,
     token_id: String,
     role: &'static str,
+    source: &'static str,
+}
+
+impl RestState {
+    fn new(app: Arc<AppState>) -> Self {
+        Self {
+            requests: Arc::clone(&app.admin_rest.requests),
+            account_creates: Arc::clone(&app.admin_rest.account_creates),
+            batches: Arc::clone(&app.admin_rest.batches),
+            enterprise: Arc::clone(&app.admin_rest.enterprise),
+            app,
+        }
+    }
 }
 
 pub(crate) fn router(app: Arc<AppState>) -> Router {
-    let state = RestState {
-        requests: Arc::clone(&app.admin_rest.requests),
-        account_creates: Arc::clone(&app.admin_rest.account_creates),
-        batches: Arc::clone(&app.admin_rest.batches),
-        enterprise: Arc::clone(&app.admin_rest.enterprise),
-        app,
-    };
+    let state = RestState::new(app);
     Router::new()
         .nest("/kiro/enterprise", enterprise::router())
         .route("/openapi.json", get(openapi::schema))
@@ -230,6 +239,7 @@ async fn authenticate(
                 request_id: request_id.clone(),
                 token_id: identity.id.clone(),
                 role: identity.role.as_str(),
+                source: "rest",
             });
         }
         next.run(request).await

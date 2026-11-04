@@ -21,6 +21,9 @@ use tracing::instrument::WithSubscriber;
 
 use super::{body, ok, query, ApiError, RequestAudit, RestState};
 
+mod ipc;
+pub(crate) use ipc::handle as handle_rpc;
+
 pub(super) fn router() -> Router<RestState> {
     Router::new()
         .route("/plans", get(plans))
@@ -86,6 +89,7 @@ fn record_completion(
     };
     tracing::info!(event = "admin.kiro.subscription.completed", operation,
         request_id = %audit.request_id, token_id = %audit.token_id, role = audit.role,
+        source = audit.source,
         status = result.as_ref().map(|result| result.status).unwrap_or("failed"),
         error_code = result.as_ref().err().map(|error| error.code), write_outcome,
         upstream_status = result.as_ref().err().and_then(|error| error.upstream_status),
@@ -447,6 +451,7 @@ mod tests {
             request_id: "admin_round_two".into(),
             token_id: "adm_round_two".into(),
             role: "admin",
+            source: "rest",
         };
         let request = tracing::subscriber::with_default(subscriber, || {
             tokio::spawn(

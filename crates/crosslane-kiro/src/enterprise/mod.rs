@@ -1,6 +1,7 @@
 //! Kiro Enterprise Console administration, separate from OAuth account pools.
 //! Credentials and discovery state live for one operation only. Identity Center
-//! is read-only here: we never create/delete users or application assignments.
+//! is never written directly here. Kiro's Assignment RPCs can perform their own
+//! application-assignment writes inside AWS; we do not duplicate those calls.
 mod coordinator;
 mod identity;
 mod transport;

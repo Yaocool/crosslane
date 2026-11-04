@@ -306,6 +306,8 @@ pub struct MutationResult {
     pub deletion_mode: Option<DeletionMode>,
     pub expected_effect: &'static str,
     pub upstream_request_id: Option<String>,
+    /// Whether Crosslane sent a separate SSO application-assignment request.
+    /// False does not exclude application assignments performed inside Kiro.
     pub application_assignment_requested: bool,
 }
 

@@ -74,7 +74,7 @@ const TOPICS: &[(&str, &str)] = &[
     ("sso", "Kiro IAM Identity Center SSO 单账号与批量导入"),
     ("service", "代理服务生命周期"),
     ("apikey", "API key、限额与用量"),
-    ("admin", "Admin REST 多令牌与 Kiro 管理凭证的安全配置"),
+    ("admin", "Admin REST 多令牌、Kiro 管理凭证与企业订阅"),
     ("pool", "Kiro 评分与 Copilot 账号模型支持"),
     ("balance", "Kiro 账号池调度评分原理"),
     ("diagnose", "Kiro 网络和账号真实推理诊断"),
@@ -122,7 +122,8 @@ pub fn print(topic: Option<&str>, provider: Option<&str>) -> Result<()> {
 
 fn topic_text(topic: &str) -> Result<&'static str> {
     let text = match topic {
-        "admin" => r#"Admin REST 令牌与 Kiro 管理凭证（全局，不接受 --provider）
+        "admin" => r#"Admin REST 令牌、Kiro 管理凭证与企业订阅（全局，不接受 --provider）
+以下监听和令牌配置只用于 REST；admin kiro CLI 通过 Unix socket 工作，无需开启 REST。
 1. 运行 crosslane config edit admin（或 config edit status-http），同屏编辑 [admin] 与 [status_http]；旧配置会补齐缺少的默认字段。
    先设置 [status_http] enabled=true，保留 [admin.rest] enabled=false；默认地址 127.0.0.1:7651。
    保存后自动重载，再执行第 2 步；监听的启停、地址和端口均不需要重启 daemon。
@@ -143,7 +144,7 @@ fn topic_text(topic: &str) -> Result<&'static str> {
 已有令牌时，可在 config edit admin 中直接设置 [admin.rest] enabled=true，无需重复创建。关闭状态监听时须同时关闭 REST；config reset status-http 会完成这两项，并保留令牌。config reset admin 会清除令牌和重置 socket，保留状态监听。
 编辑器未改设置直接退出时不写文件、不重载服务，仍提示待重启字段。--enable-rest 要求运行监听与磁盘配置的启用状态、地址和端口一致，监听配置尚未应用时会拒绝创建，请先执行 crosslane config reload。socket 默认值取自 daemon；连接未提供默认值的旧 daemon 时保留当前 socket。完整 config reset 也会清除管理令牌并关闭 REST/状态监听，操作前自动备份。
 旧 token_sha256/read_token_sha256 配置继续兼容，在列表中显示为 legacy-admin/legacy-read-only，也可使用这些 ID 管理。最后一把令牌撤销后关闭 Admin REST，公开状态和业务 service 保持原配置。
-Kiro 企业用户与套餐通过 /admin/v1/kiro/enterprise 管理，调用方只传 Admin token。
+Kiro 企业用户与套餐也可通过 /admin/v1/kiro/enterprise 管理，REST 调用方只传 Admin token。
 AWS 管理员凭证使用以下命令，不写 config.toml：
   crosslane admin kiro configure
   crosslane admin kiro configure --stdin < /secure/kiro-admin-input.json
@@ -152,7 +153,27 @@ AWS 管理员凭证使用以下命令，不写 config.toml：
   crosslane admin kiro use-env
 configure 完整替换凭证及区域/范围，隐藏输入 AK/SK/SessionToken；--stdin 读取完整 JSON，不接受密钥 argv 参数。daemon 将其 AES-256-GCM 加密保存到数据目录的 .secrets/kiro-admin.enc，同目录 kiro-admin.key 保存本机加密密钥；目录 0700、文件 0600，拒绝链接和不安全权限。修改对后续管理请求热生效，不重启 daemon，也不影响已受理操作。
 写入结果为本次提交快照；并发修改后的最新状态用 show 查询。若返回 persistence_warning，修改已热生效，但崩溃后的持久性未确认，检查存储后重试原操作。show 只显示状态和来源。clear 删除当前凭证并持久化停用标记，不会回落旧环境变量；use-env 写入显式环境来源标记，恢复 daemon 启动环境中的 CROSSLANE_KIRO_ADMIN_* 来源。文件错误时拒绝远程管理，不自动回落；仅环境变量模式的更新仍需重启/重建进程。
-这些凭证不属于 config reset；使用 admin kiro clear 停用。API、日志和普通配置导出不返回 AK/SK/SessionToken。保护加密文件及本机密钥的备份，两者齐全可解密。接口说明：docs/admin-rest.zh-CN.md、docs/kiro-enterprise-admin.zh-CN.md。"#,
+这些凭证不属于 config reset；使用 admin kiro clear 停用。API、日志和普通配置导出不返回 AK/SK/SessionToken。保护加密文件及本机密钥的备份，两者齐全可解密。
+
+通过 CLI 管理 Kiro 企业订阅（覆盖现有 Kiro 管理 REST 的全部操作）：
+  crosslane admin kiro subscription plans
+  crosslane admin kiro subscription profiles
+  crosslane admin kiro subscription scope
+  crosslane admin kiro subscription users
+  crosslane admin kiro subscription list
+  crosslane admin kiro subscription add user@example.com --plan power --dry-run
+  crosslane admin kiro subscription add user@example.com --plan power
+  crosslane admin kiro subscription show user@example.com
+  crosslane --json admin kiro subscription show USER_ID
+  crosslane admin kiro subscription upgrade user@example.com --plan power --dry-run
+  crosslane admin kiro subscription downgrade user@example.com --plan pro --dry-run
+  crosslane admin kiro subscription cancel user@example.com --dry-run
+  crosslane admin kiro subscription cancel USER_ID --mode immediate
+用户接受 Identity Center 的精确 userName、UserId 或用户 ARN；不需要 URL 编码。add/upgrade/downgrade 的 --plan 必填，支持 pro/pro-plus/pro-max/power。scope 参数 --region/--profile-arn/--application-arn/--identity-center-region/--legacy 放在 scope/users/list/show 或写命令后，省略时使用 daemon 凭证配置与自动发现。profiles 只接受 --region/--legacy。subscriptions 是 subscription 的别名；create/activate 是 add 的别名，delete/remove/rm 是 cancel 的别名。
+upgrade/downgrade 要求唯一的直接订阅，并校验目标套餐高于/低于当前套餐；升级预期即时生效，降级预期下月生效。cancel 默认 --mode end-of-period（也接受 end_of_period），周期结束取消；immediate 预期立即停用，但计费仍可能至当月底。--legacy 取消必须明确使用 --mode immediate。取消保留 Identity Center 用户和组继承订阅。users 列出全部身份库用户及其直接订阅，应用 GROUP 订阅另列，不逐一展开用户组成员关系；个人继承情况用 show 查询。
+这些命令使用 daemon 保存的 AK/SK，通过 Unix socket 执行，无需 Admin token 或 HTTP 监听；Docker 部署需访问挂载的管理 socket。CLI 与 REST 共享操作锁、并发限制与审计。两端需同时升级，旧 daemon 会返回升级提示。
+add/upgrade/downgrade/cancel 默认实际提交；加 --dry-run 只读预览，不能验证 AWS 写权限。开通不导入本地账号、不执行浏览器 SSO；允许 AWS 自动分配 Kiro 应用，Crosslane 不额外重复调用。AWS 已受理不代表订阅或计费已生效。命令不会自动重试；超时、中断或结果不明时先 show 查询，再决定是否重试。
+接口说明：docs/admin-rest.zh-CN.md、docs/kiro-enterprise-admin.zh-CN.md。"#,
         "provider" => {
             r#"命令适用范围
   两者共用：provider、status、ready、account add/list/show/rm/enable/disable/tag/export/refresh/probe/reset-health/services、pool、models、model-map、service、apikey、stats、logs show/follow；--provider 可放在任意子命令前后，也可设置 CROSSLANE_PROVIDER；列表与 --all 操作默认聚合全部来源，单账号按 ID 自动识别；export 保持旧 Kiro 格式，需 --provider all 才导出全部。
@@ -256,7 +277,7 @@ Copilot API 地址优先使用账号 token 返回的 endpoint；仅当缺失且�
             "`crosslane diagnose all/endpoints/account` 是 Kiro 上游专项诊断：检查 CodeWhisperer/AmazonQ/OIDC 端点，并对 Kiro 账号发起真实推理。Copilot 请用 `crosslane account probe --provider copilot <ACCOUNT_ID>` 和 `crosslane models list --provider copilot --refresh` 检查账号与模型；不要把 Kiro 端点诊断结果当成 Copilot 可用性。"
         }
         "subscriptions" => {
-            "`crosslane subscriptions --provider kiro [账号]` 查询 Kiro 上游企业订阅计划；省略账号时使用可调度 Kiro 账号。Copilot 不提供权威订阅/席位数据，`--provider copilot` 或 `all` 中该来源返回 supported=false；Copilot 可用性请用 `account probe --provider copilot` 和 `models list --provider copilot` 检查。"
+            "`crosslane subscriptions --provider kiro [账号]` 查询 Kiro 上游企业订阅计划；省略账号时使用可调度 Kiro 账号。此命令不执行订阅写入。通过 AWS 管理员凭证管理企业订阅请用 `crosslane admin kiro subscription`：plans/profiles/scope/users/list/show 查询，add/upgrade/downgrade/cancel 写入，四个写命令均支持 --dry-run；取消默认周期结束。详见 `crosslane guide admin`。Copilot 不提供权威订阅/席位数据，`--provider copilot` 或 `all` 中该来源返回 supported=false；Copilot 可用性请用 `account probe --provider copilot` 和 `models list --provider copilot` 检查。"
         }
         "tasks" => {
             "`crosslane tasks list` 查看全部任务及可手工运行列；`tasks run --help` 列出接受的任务名，Shell 补全也提供这些名称。account_file_watcher/adaptive_admission 仅由调度器运行。`token_refresh/status_check/health_recheck` 操作 Kiro 账号池；`model_cache_refresh` 可用 `tasks run model_cache_refresh --provider <ID>` 按来源刷新；`stats_persist/daily_reset/proxy_service_reconcile` 为全局任务。Kiro 任务只接受 --provider kiro；全局任务不接受 --provider。Copilot API token 在其 provider 内独立按需刷新，不使用 Kiro 的 token_refresh 任务。"

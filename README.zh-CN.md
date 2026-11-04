@@ -86,6 +86,9 @@ HTTP 的 `/`、`/health`、`/ready` 通过[独立状态监听](docs/startup-and-
 `crosslane config edit admin` 可一起编辑鉴权和 `[status_http]` 监听；首次启用及重载步骤见
 `crosslane guide admin`。Kiro 企业用户与套餐使用[独立管理接口](docs/kiro-enterprise-admin.zh-CN.md)，
 AWS 管理员凭据通过 `crosslane admin kiro configure` 独立加密保存并热生效，兼容旧环境变量配置。
+CLI 的 `crosslane admin kiro subscription` 提供 `plans/profiles/scope/users/list/show` 查询，
+以及 `add/upgrade/downgrade/cancel` 订阅管理；四个写命令均支持 `--dry-run`。取消默认周期结束，
+可用 `--mode immediate` 明确立即取消。通过 Unix socket 使用 daemon 凭证，无需开启 REST 或提供 Admin token。
 
 ## 接入客户端
 

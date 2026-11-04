@@ -9,13 +9,13 @@ use crosslane_ipc::protocol::{
 use crate::client::AdminClient;
 use crate::output::{format_timestamp, print_json, render_table};
 
-mod kiro;
+pub(crate) mod kiro;
 
 #[derive(Debug, Subcommand)]
 pub enum AdminCommand {
-    /// 配置 Kiro 官方管理凭证；独立加密保存并热生效，不写 config.toml。
+    /// 管理 Kiro 官方凭证与企业订阅；通过本机 socket 使用 daemon 保存的 AWS 凭证。
     #[command(
-        after_help = "凭证通过 Unix socket 写入 daemon 数据目录的 .secrets/kiro-admin.enc；目录 0700、文件 0600。\nconfigure 隐藏输入 AK/SK/SessionToken，--stdin 支持 JSON；不接受密钥命令行参数。保存后后续 Kiro 管理请求立即使用新凭证，不重启 daemon。\nshow 只返回状态；clear 停用凭证且阻止回落旧环境变量；use-env 显式恢复环境变量来源。\n\n示例：\n  crosslane admin kiro configure\n  crosslane admin kiro configure --stdin < /secure/kiro-admin-input.json\n  crosslane admin kiro show\n  crosslane admin kiro clear\n  crosslane admin kiro use-env"
+        after_help = "凭证通过 Unix socket 写入 daemon 数据目录的 .secrets/kiro-admin.enc；目录 0700、文件 0600。\nconfigure 隐藏输入 AK/SK/SessionToken，--stdin 支持 JSON；不接受密钥命令行参数。保存后后续 Kiro 管理请求立即使用新凭证，不重启 daemon。\nshow 只返回凭证状态；clear 停用凭证且阻止回落旧环境变量；use-env 显式恢复环境变量来源。\nsubscription 提供 plans/profiles/scope/users/list/show/add/upgrade/downgrade/cancel，管理 Identity Center 用户的企业订阅；无需开启 REST 或提供 Admin token，与本地账号池分开。\n\n示例：\n  crosslane admin kiro configure\n  crosslane admin kiro configure --stdin < /secure/kiro-admin-input.json\n  crosslane admin kiro show\n  crosslane admin kiro subscription plans\n  crosslane admin kiro subscription add user@example.com --plan power\n  crosslane admin kiro subscription show user@example.com\n  crosslane admin kiro clear\n  crosslane admin kiro use-env"
     )]
     Kiro {
         #[command(subcommand)]

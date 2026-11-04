@@ -97,6 +97,9 @@ admin credentials; plaintext is returned only at creation/rotation, and only dig
 `crosslane config edit admin` edits authentication and its `[status_http]` listener together;
 see `crosslane guide admin` for initial setup and reload behavior. Kiro enterprise users
 and subscriptions use [dedicated admin endpoints](docs/kiro-enterprise-admin.md) with daemon-side AWS credentials; `crosslane admin kiro configure` stores them separately, encrypted, and applies changes without a restart.
+`crosslane admin kiro subscription` provides `plans/profiles/scope/users/list/show` queries and
+`add/upgrade/downgrade/cancel` mutations, each supporting `--dry-run`. Cancellation defaults to period end;
+use `--mode immediate` explicitly for immediate cancellation. It uses the daemon Unix socket and credentials without a REST listener or Admin token.
 
 ## Connect a client
 

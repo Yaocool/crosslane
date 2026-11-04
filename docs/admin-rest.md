@@ -3,9 +3,14 @@
 Kiro Console enterprise subscriptions are managed under `/admin/v1/kiro/enterprise`,
 separately from local account pools. List users, inspect direct/inherited subscriptions,
 activate, cancel, upgrade and downgrade using only the Admin Bearer token. AWS credentials
-are managed by the daemon. Activation never adds a separate Identity Center application
-assignment. Use `crosslane admin kiro configure` for private encrypted AWS credentials and hot updates;
-`show/clear/use-env` manage their status and source. See [Kiro Enterprise administration](kiro-enterprise-admin.md) for setup and callers.
+are managed by the daemon. Crosslane does not issue a separate Identity Center application assignment
+request; AWS may assign it automatically. Use `crosslane admin kiro configure` for private encrypted AWS credentials and hot updates;
+`show/clear/use-env` manage their status and source. The CLI also supports
+`crosslane admin kiro subscription` for all corresponding operations: `plans/profiles/scope/users/list/show`
+queries and `add/upgrade/downgrade/cancel` mutations, with `--dry-run` on all four mutations.
+Cancellation defaults to period end; use `--mode immediate` explicitly for immediate cancellation.
+CLI operations use the Unix socket without a REST listener or Admin token.
+See [Kiro Enterprise administration](kiro-enterprise-admin.md) for setup and callers.
 
 The API uses the independent HTTP listener, normally
 `http://127.0.0.1:7651/admin/v1`, alongside public `/health` and `/ready`.

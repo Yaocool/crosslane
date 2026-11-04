@@ -7,6 +7,73 @@ Read-only tokens permit GET/HEAD; activation, cancellation and plan changes requ
 These resources represent AWS/Kiro enterprise subscriptions. Local Crosslane accounts still use
 `/admin/v1/accounts`. Activation does not perform browser SSO or import an account into a local pool.
 
+## Manage subscriptions from the CLI
+
+The CLI covers every operation in the existing Kiro management REST API:
+
+| Command (prefix `crosslane admin kiro subscription`) | Purpose |
+| --- | --- |
+| `plans` | Static plan list; does not contact AWS or validate permissions |
+| `profiles` | Verify AWS identity and list profiles in the selected region |
+| `scope` | Discover and validate the profile, Identity Center instance, application and identity store |
+| `users` | All identity-store users with direct subscriptions; application GROUP claims listed separately |
+| `list` | All application USER/GROUP claims, including pending plans |
+| `show <USER>` | Direct and currently inherited group subscriptions |
+| `add <USER> --plan <PLAN>` | Activate a direct subscription; reject an existing one |
+| `upgrade <USER> --plan <PLAN>` | Upgrade a unique direct subscription to a higher plan |
+| `downgrade <USER> --plan <PLAN>` | Downgrade a unique direct subscription to a lower plan |
+| `cancel <USER> [--mode end-of-period\|immediate]` | Cancel a direct subscription; default at period end |
+
+```bash
+crosslane admin kiro subscription profiles
+crosslane admin kiro subscription scope
+crosslane admin kiro subscription users
+crosslane admin kiro subscription plans
+crosslane admin kiro subscription list
+crosslane admin kiro subscription show user@example.com
+crosslane --json admin kiro subscription show USER_ID
+
+# Read-only previews; remove --dry-run to submit the actual change
+crosslane admin kiro subscription add user@example.com --plan pro --dry-run
+crosslane admin kiro subscription upgrade user@example.com --plan power --dry-run
+crosslane admin kiro subscription downgrade user@example.com --plan pro --dry-run
+crosslane admin kiro subscription cancel user@example.com --dry-run
+crosslane admin kiro subscription cancel USER_ID --mode immediate --dry-run
+```
+
+For first-time setup, run `crosslane admin kiro configure` as described below. These commands use
+the owner-only daemon Unix socket and the daemon's stored AWS credentials. **No Admin token,
+status listener or Admin REST listener is required.** For Docker, mount the management socket on the
+client or run the CLI inside the container. Upgrade both `crosslane` and `crosslaned`; older daemons
+return an upgrade hint.
+
+`USER` accepts an exact Identity Center `userName`, UserId or user ARN without URL encoding.
+`add`, `upgrade`, and `downgrade` require `--plan`: `pro`, `pro-plus`, `pro-max`, or `power`.
+Place optional `--region`, `--profile-arn`, `--application-arn`, `--identity-center-region`, and
+`--legacy` flags after `scope`, `users`, `list`, `show`, or any mutation command. `profiles` only
+accepts `--region` and `--legacy`. Omitted selectors use saved defaults and discovery. Legacy mode
+supports only `us-east-1` and is never an automatic fallback. `subscriptions` aliases `subscription`;
+`create` and `activate` alias `add`; `delete`, `remove`, and `rm` alias `cancel`.
+
+All four mutations submit an actual change by default. `--dry-run` performs read-only discovery
+and validation; it cannot verify all AWS write permissions. Upgrades are expected to apply immediately;
+downgrades next month. Use `show` to inspect current and pending plans. Cancellation defaults to
+`--mode end-of-period` (`end_of_period` is also accepted). `immediate` is expected to remove access
+immediately, while billing may continue until month end. Legacy cancellation requires explicit
+`--legacy --mode immediate`; the CLI never silently selects immediate cancellation. Cancellation
+preserves the Identity Center user and inherited group claims. `users` does not expand every user's
+group memberships; use `show` for a particular user's inherited claims.
+
+CLI and REST share scope checks, per-user mutation locks, eight concurrent mutation slots and completion
+auditing; CLI audit records carry `source=unix_socket`. AWS may automatically assign the application;
+Crosslane does not issue a separate duplicate SSO assignment request. API acceptance does not establish
+entitlement or billing activation. No automatic retries are made: query with `show` after a timeout,
+interruption or uncertain outcome. Terminal query hints retain the socket and scope selectors.
+JSON errors retain the sanitized AWS code, request ID and `write_outcome`, without AWS secrets.
+
+The existing top-level `crosslane subscriptions --provider kiro` continues to query plans with local
+account credentials and does not mutate subscriptions.
+
 ## Daemon credentials
 
 ### CLI configuration and hot updates (recommended)
@@ -192,7 +259,7 @@ curl -fsS -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H 'Content-Type: application/json' -d '{"plan":"pro-plus","dry_run":true}' \
   "$BASE/users/$USER_ID/subscription"
 
-# Activate without a separate application assignment.
+# Activate; Kiro may assign the application internally, without a duplicate client call.
 curl -fsS -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H 'Content-Type: application/json' -d '{"plan":"pro-plus"}' \
   "$BASE/users/$USER_ID/subscription"
@@ -218,9 +285,14 @@ curl -fsS -X DELETE -H "Authorization: Bearer $ADMIN_TOKEN" \
 
 All POST mutations support JSON `dry_run=true`; DELETE accepts query `dry_run=true`. Previews
 return 200/`preview`, accepted writes return 202/`api_accepted`. Both need full Admin privileges.
+Previews validate discovery and the requested operation without calling the AWS write APIs; they
+cannot verify assignment or downstream claim write permissions.
 `application_assignment_requested` is always false. Additional fields such as `assign_application`
-are rejected. Crosslane never calls CreateApplicationAssignment/DeleteApplicationAssignment,
-creates/deletes an Identity Center user, or changes a group assignment.
+are rejected. The flag means that Crosslane did not send a separate
+CreateApplicationAssignment/DeleteApplicationAssignment request. Kiro can perform application
+assignments internally while processing its Assignment RPCs; false does not mean the user remains
+unassigned. Crosslane does not duplicate these AWS-managed calls, create/delete Identity Center
+users, or change group memberships.
 
 At most eight subscription mutations/previews can run concurrently; saturation returns `503 busy`.
 Overlapping operations for the same AWS account, region and resolved user return 409. Username/UUID
@@ -261,12 +333,43 @@ If response streaming fails after headers, the received HTTP status and request 
   response. It may already have taken effect; query before retrying.
 
 See [Kiro IAM](https://kiro.dev/docs/enterprise/iam/) for permissions. Subscription operations use
-`q:CreateAssignment`, `q:UpdateAssignment`, `q:DeleteAssignment` and
+`q:CreateAssignment`, `q:UpdateAssignment`, `q:DeleteAssignment`. The caller also needs
+`user-subscriptions:CreateClaim`, `user-subscriptions:UpdateClaim` and
+`user-subscriptions:DeleteClaim` for downstream subscription writes performed by Kiro on the
+caller's behalf. Assignment permissions alone do not authorize these downstream calls. Queries use
 `user-subscriptions:ListApplicationClaims`. Discovery uses `codewhisperer:ListProfiles`,
 `sso:DescribeInstance`, `sso:DescribeApplication`, `identitystore:ListUsers`,
 `identitystore:GetUserId`, `identitystore:DescribeUser`, `identitystore:ListGroupMembershipsForMember`
 and STS caller identity. AWS resource permissions, SCPs and cross-account constraints still apply.
-Crosslane does not need CreateApplicationAssignment/DeleteApplicationAssignment permissions.
+The caller also needs `sso-directory:DescribeUser`: User Subscriptions can call this on the
+caller's behalf during CreateClaim. `identitystore:DescribeUser` is a different IAM action and does
+not authorize it. Kiro can then call `sso:CreateApplicationAssignment` on the caller's behalf, so
+activation also needs that permission even though Crosslane sends no separate SSO write.
+In an existing profile/application, the observed activation chain is:
+
+```text
+q:CreateAssignment
+  -> user-subscriptions:CreateClaim
+       -> sso-directory:DescribeUser
+  -> sso:CreateApplicationAssignment
+```
+
+The Kiro console additionally uses actions such as `sso-directory:SearchUsers`,
+`sso-directory:DescribeUsers`, `sso:ListApplicationAssignments` and
+`user-subscriptions:ListUserSubscriptions` for its UI. Seeing those in console history does not
+make them dependencies of Crosslane's activation request. Profile create/update/delete permissions
+are likewise not needed merely to activate a subscription in an existing profile.
+
+For an assignment `AccessDenied`, inspect both the `q.amazonaws.com` assignment event and the
+downstream `user-subscriptions.amazonaws.com` claim event in CloudTrail. The latter can identify
+the missing permission even when CreateAssignment returns only a generic denial. Include read-only
+events too: a failed `sso-directory.amazonaws.com` DescribeUser can be hidden by a generic
+CreateClaim denial. Filter by caller and a narrow time range rather than only `ReadOnly=false`,
+then correlate the target user, application and `invokedBy` fields. A claim event
+whose `sourceIPAddress` is `q.amazonaws.com` does not itself prove that an `aws:SourceIp`
+condition failed: [AWS documents](https://docs.aws.amazon.com/IAM/latest/UserGuide/access_forward_access_sessions.html)
+that forward access sessions following a public endpoint request retain its original source IP.
+Requests through VPC endpoints require separate handling of the documented network conditions.
 
 Subscription/claim operations use Kiro Console backend protocols rather than a versioned public
 AWS SDK service contract; see the [Kiro repository request example](https://github.com/kirodotdev/Kiro/issues/10166).
