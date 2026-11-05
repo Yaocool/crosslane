@@ -58,6 +58,44 @@ impl wiremock::Respond for CredentialEcho {
     }
 }
 
+#[derive(Clone)]
+struct VisibleCredentialEcho {
+    requests: Arc<Mutex<Vec<Value>>>,
+}
+
+impl wiremock::Respond for VisibleCredentialEcho {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let payload: Value = serde_json::from_slice(&request.body).unwrap();
+        let content = payload
+            .pointer("/conversationState/currentMessage/userInputMessage/content")
+            .and_then(Value::as_str)
+            .unwrap();
+        let marker = reference_in(content).expect("upstream receives a reference");
+        let split = marker.len() / 2;
+        let mut body = event_stream_frame(
+            "assistantResponseEvent",
+            json!({"content":format!("key: {}", &marker[..split])}),
+        );
+        body.extend(event_stream_frame(
+            "messageMetadataEvent",
+            json!({"usage":{"inputTokens":100}}),
+        ));
+        body.extend(event_stream_frame("usageEvent", json!({"outputTokens":40})));
+        body.extend(event_stream_frame(
+            "contextUsageEvent",
+            json!({"contextUsagePercentage":25.0}),
+        ));
+        body.extend(event_stream_frame(
+            "assistantResponseEvent",
+            json!({"content":format!("{} done", &marker[split..])}),
+        ));
+        self.requests.lock().unwrap().push(payload);
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "application/vnd.amazon.eventstream")
+            .set_body_bytes(body)
+    }
+}
+
 fn reference_in(content: &str) -> Option<&str> {
     content.match_indices(MARKER_PREFIX).find_map(|(start, _)| {
         let suffix = &content[start + MARKER_PREFIX.len()..];
@@ -243,6 +281,97 @@ async fn config_reload_toggles_request_redaction_without_changing_tool_arguments
                 );
                 check_wire(requests.lock().unwrap().last().unwrap(), enabled);
             }
+        }
+    }
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn visible_credential_references_survive_interleaved_metadata_in_json_and_sse() {
+    let _http_guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    mount_context_alignment_models(&mock).await;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(VisibleCredentialEcho {
+            requests: Arc::clone(&requests),
+        })
+        .expect(4)
+        .mount(&mock)
+        .await;
+    let port = unused_tcp_port();
+    let daemon =
+        Daemon::start_http(port, &format!("{}/generateAssistantResponse", mock.uri())).await;
+    import_context_alignment_account(&daemon, 0.0).await;
+    configure_redaction(&daemon, true).await;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap();
+    for claude in [true, false] {
+        for stream in [false, true] {
+            let route = if claude {
+                "messages"
+            } else {
+                "chat/completions"
+            };
+            let response = client
+                .post(format!("http://127.0.0.1:{port}/v1/{route}"))
+                .bearer_auth(daemon.api_key.as_deref().unwrap())
+                .header("user-agent", if claude {
+                    "claude-cli/2.1.296 (external, sdk-cli)"
+                } else {
+                    "codex_cli_rs/0.147.0 (e2e)"
+                })
+                .json(&json!({
+                    "model":"source-large","max_tokens":256,"stream":stream,
+                    "messages":[{"role":"user","content":format!("token={SECRET}\nRepeat the token.")}]
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            let body = response.text().await.unwrap();
+            let text = if stream {
+                body.lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter(|data| *data != "[DONE]")
+                    .map(|data| serde_json::from_str::<Value>(data).unwrap())
+                    .filter_map(|event| {
+                        if claude {
+                            event.pointer("/delta/text")
+                        } else {
+                            event.pointer("/choices/0/delta/content")
+                        }
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                    })
+                    .collect::<String>()
+            } else {
+                let response: Value = serde_json::from_str(&body).unwrap();
+                if claude {
+                    response["content"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter_map(|block| block["text"].as_str())
+                        .collect::<String>()
+                } else {
+                    response["choices"][0]["message"]["content"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                }
+            };
+            assert_eq!(
+                text,
+                format!("key: {SECRET} done"),
+                "claude={claude}, stream={stream}"
+            );
+            assert!(!body.contains(MARKER_PREFIX));
+            let sent = requests.lock().unwrap();
+            assert!(!sent.last().unwrap().to_string().contains(SECRET));
         }
     }
     daemon.stop().await;

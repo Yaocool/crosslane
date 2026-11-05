@@ -10,6 +10,9 @@ mod diagnostics;
 mod embedded_json;
 mod policy;
 mod shell;
+mod visible;
+
+pub use visible::partial_marker_start;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Range;

@@ -296,6 +296,8 @@ pub fn response(
             let mut upstream_tool_names = std::collections::HashMap::new();
             let mut thinking_filter = ThinkingContentFilter::new(context.thinking_enabled && effective_thinking)
                 .with_omitted_summary(payload.thinking_summary_omitted());
+            let mut visible_restorer =
+                super::super::visible_restore::VisibleTextRestorer::new(redaction.clone());
             loop {
                 tokio::select! {
                     _ = async {
@@ -342,6 +344,7 @@ pub fn response(
                                             .push(event)
                                             .into_iter()
                                             .flat_map(|event| thinking_filter.push(event))
+                                            .flat_map(|event| visible_restorer.push(event))
                                             .collect::<Vec<_>>();
                                         for mut event in events {
                                             restore_tool_event_name(&mut event, &mut upstream_tool_names);
@@ -514,6 +517,11 @@ pub fn response(
                     events.extend(thinking_filter.push(event));
                 }
                 events.extend(thinking_filter.finish());
+                let mut events = events
+                    .into_iter()
+                    .flat_map(|event| visible_restorer.push(event))
+                    .collect::<Vec<_>>();
+                events.extend(visible_restorer.finish());
                 for mut event in events {
                     restore_tool_event_name(&mut event, &mut upstream_tool_names);
                     let internal_search =

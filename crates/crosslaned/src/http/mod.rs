@@ -21,6 +21,7 @@ pub(crate) mod stream;
 mod timing;
 mod tool_names;
 mod usage;
+mod visible_restore;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};

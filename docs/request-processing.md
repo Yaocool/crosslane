@@ -223,7 +223,7 @@ be reliably recognized. The rules cannot guarantee zero false positives or misse
 
 The model must copy placeholders exactly into tool arguments. The gateway parses
 complete JSON arguments and restores string, number, and boolean values locally,
-including fragmented parallel calls. Ordinary answer text stays masked. Recognized
+including fragmented parallel calls. References the model repeats in ordinary answer text are also restored before reaching the client; a reference split across stream chunks is held until complete. Reasoning stays masked so its signature remains valid. Recognized
 POSIX shell tools receive context-aware escaping; ordinary HTTP/JSON parameters do
 not receive shell quoting. Unchanged command/JSON replay preserves source escaping,
 whitespace, and newlines.

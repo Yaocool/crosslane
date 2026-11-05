@@ -286,6 +286,8 @@ pub(super) async fn collect_nonstream_rounds(
         // an empty-response retry or server-tool continuation opens another one.
         drop(upstream_permit);
         let event_count = events.len();
+        let mut visible_restorer =
+            super::super::visible_restore::VisibleTextRestorer::new(redaction.clone());
         let mut leak_filter =
             ToolLeakFilter::for_payload(config.features.enable_tool_leak_filter, &payload)
                 .with_redaction(redaction);
@@ -298,7 +300,11 @@ pub(super) async fn collect_nonstream_rounds(
         let mut stop_matched = false;
         'events: for event in events {
             for event in leak_filter.push(event) {
-                for event in thinking_filter.push(event) {
+                for event in thinking_filter
+                    .push(event)
+                    .into_iter()
+                    .flat_map(|event| visible_restorer.push(event))
+                {
                     if push_nonstream_event(
                         &mut decoded,
                         &mut stop_filter,
@@ -326,6 +332,11 @@ pub(super) async fn collect_nonstream_rounds(
                 trailing_events.extend(thinking_filter.push(event));
             }
             trailing_events.extend(thinking_filter.finish());
+            let mut trailing_events = trailing_events
+                .into_iter()
+                .flat_map(|event| visible_restorer.push(event))
+                .collect::<Vec<_>>();
+            trailing_events.extend(visible_restorer.finish());
             for event in trailing_events {
                 if push_nonstream_event(&mut decoded, &mut stop_filter, &mut visible_text, event)
                     .map_err(|message| {
