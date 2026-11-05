@@ -236,10 +236,16 @@ async fn mutate(state: &Arc<AppState>, change: Change) -> Handled {
         .map_err(|error| RpcError::bad_params(error.to_string()))?;
     let effective = crosslane_store::config_loader::merge_admin_rest_auth(&current, &disk);
     let output = render(&raw, &disk.admin.rest)?;
+    // Preserve pending disk edits without treating them as applied. Restore
+    // must retain the latest tokens, including rotations and revocations.
+    let applied_text = state
+        .applied_config_text()
+        .map(|applied| render(&applied, &effective))
+        .transpose()?;
     write_config_update_locked(state, &raw, &output).await?;
     // No model/provider/listener reconfiguration is required for an auth change.
     state.apply_admin_rest_auth_locked(effective);
-    state.mark_config_reloaded(now_secs());
+    state.mark_admin_rest_auth_reloaded(now_secs(), applied_text);
     let config = state.config.current();
     tracing::info!(event="admin.token.changed",action=event,token_id=%changed.id,role=changed.role.as_str(),"admin token configuration changed");
     if let Some(secret) = plaintext {

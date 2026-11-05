@@ -321,9 +321,16 @@ service 变更基于磁盘最新配置，保留尚未热重载的客户端 Key �
 写操作在配置事务内解析原始目标。账号池和 Key 查询会核对返回的 service ID；旧 ID 如果被解析成
 另一个 service 的名称，会返回 `404`，避免返回其他 service 的数据。
 详情与账号池查询支持 `group_by=provider|tag`，以及可选
-`provider` 筛选。账号池准确遵循 service 的允许来源、标签、手工绑定及排除项；不使用
-`/health` 的“仅未打标签账号”条件。未设置 `account_tag` 的 service 使用全局池，包含
-带标签账号；设置多个标签时匹配其中任一标签。
+`provider` 筛选。账号池准确遵循 service 的允许来源、标签、手工绑定及排除项。未设置
+`account_tag` 的 service 只使用未打标签的账号，带标签账号只能通过匹配的标签或手工绑定加入；
+设置多个标签时匹配其中任一标签。账号标签可以随时修改或移除，即使账号已被 service 使用，
+新请求会按新标签重新计算账号池；删除仍被 service 使用的账号前需要先解绑。修改 service 标签
+（包括运行中的 service）或账号标签时，如果会让某个启用中的 service 从有可用账号变为没有可用账号，
+请求会被拒绝（REST 返回 `409`）；`POST /accounts/{provider}/{id}/tags` 传 `"force": true`、
+CLI 的 `account tag`/`service edit`/`config edit`/`config reload` 加 `--force` 可强制应用。
+直接编辑 `config.toml` 后由 SIGHUP 或文件监听触发的重载没有强制选项：被拒绝时，被拒绝的文件另存为
+`config.toml.rejected-<毫秒时间戳>`，`config.toml` 恢复为当前运行配置，磁盘与运行配置始终一致。
+确认后用 `crosslane config edit --force` 重新应用该修改。
 
 Service 修改读取磁盘上的最新配置，保留待生效的客户端 Key 变更，并校验运行配置及重启后的
 磁盘配置；自动分配端口会避开当前和待启用的状态端口。写入失败时会核对或恢复原文件，无法验证

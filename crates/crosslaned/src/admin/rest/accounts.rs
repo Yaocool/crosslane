@@ -528,6 +528,8 @@ struct Tags {
     add: Vec<String>,
     #[serde(default)]
     remove: Vec<String>,
+    #[serde(default)]
+    force: bool,
 }
 pub(super) async fn tags(
     State(state): State<RestState>,
@@ -544,7 +546,7 @@ pub(super) async fn tags(
     rpc(
         &state.app,
         method::V2_ACCOUNT_TAG,
-        json!({"provider":provider,"id":account,"add":add,"remove":remove}),
+        json!({"provider":provider,"id":account,"add":add,"remove":remove,"force":input.force}),
     )
     .await?;
     Ok(ok(cached_lookup(&state.app, &provider, &account).await?))

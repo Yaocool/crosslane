@@ -517,6 +517,8 @@ pub(super) async fn handle_account_tag(state: &Arc<AppState>, params: Value) -> 
         add: Vec<String>,
         #[serde(default)]
         remove: Vec<String>,
+        #[serde(default)]
+        force: bool,
     }
     let params: Params = parse_params(params)?;
     let single = params.id.clone();
@@ -539,9 +541,12 @@ pub(super) async fn handle_account_tag(state: &Arc<AppState>, params: Value) -> 
     };
     let add = normalize(params.add)?;
     let remove = normalize(params.remove)?;
+    // Keep the pool check and the commit atomic against concurrent tag edits.
+    let _pool_change = state.lock_pool_change().await;
     let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut ordered = Vec::new();
     let mut seen = BTreeSet::new();
+    let mut changes = Vec::new();
     // Resolve and validate the entire batch before any provider is mutated.
     for id in &ids {
         let reference = resolve_account_ref(state, params.provider.as_deref(), id).await?;
@@ -558,34 +563,28 @@ pub(super) async fn handle_account_tag(state: &Arc<AppState>, params: Value) -> 
                 "account specified more than once: {reference}"
             )));
         }
-        let mut tags = account.tags.iter().cloned().collect::<BTreeSet<_>>();
-        tags.extend(add.iter().cloned());
-        tags.retain(|tag| !remove.contains(tag));
-        if tags != account.tags.iter().cloned().collect() {
-            ensure_provider_tags_change_safe(
-                state,
-                &account.provider_id,
-                &account.id,
-                &account.tags,
-                &tags.iter().cloned().collect::<Vec<_>>(),
-            )?;
-        }
-        if account.provider_id == "kiro" {
-            let kiro = state
-                .with_accounts(|store| store.find(&account.id).cloned())
-                .ok_or_else(|| RpcError::bad_params(format!("account not found: {id}")))?;
-            let mut tags = account.tags.iter().cloned().collect::<BTreeSet<_>>();
-            tags.extend(add.iter().cloned());
-            tags.retain(|tag| !remove.contains(tag));
-            if tags != account.tags.iter().cloned().collect() {
-                super::accounts::ensure_account_unbound(state, &kiro, "changing its tags")?;
-            }
+        let mut after = account.tags.iter().cloned().collect::<BTreeSet<_>>();
+        after.extend(add.iter().cloned());
+        after.retain(|tag| !remove.contains(tag));
+        let after = after.into_iter().collect::<Vec<_>>();
+        if !super::pool_guard::same_tags(&account.tags, &after) {
+            changes.push(super::pool_guard::TagChange {
+                provider: account.provider_id.clone(),
+                id: account.id.clone(),
+                before: account.tags.clone(),
+                after,
+            });
         }
         groups
             .entry(account.provider_id)
             .or_default()
             .push(account.id);
         ordered.push(key);
+    }
+    if !params.force {
+        if let Some(error) = super::pool_guard::account_tag_change_error(state, &changes).await? {
+            return Err(RpcError::bad_params(error));
+        }
     }
     let mut results = BTreeMap::new();
     for (provider, ids) in groups {
@@ -602,24 +601,6 @@ pub(super) async fn handle_account_tag(state: &Arc<AppState>, params: Value) -> 
         } else {
             let _mutation = state.lock_config_mutation().await;
             let runtime = copilot_runtime(state, &provider).await?;
-            for id in &ids {
-                let account = runtime
-                    .account(id)
-                    .await
-                    .ok_or_else(|| RpcError::bad_params(format!("account not found: {id}")))?;
-                let mut tags = account.tags.iter().cloned().collect::<BTreeSet<_>>();
-                tags.extend(add.iter().cloned());
-                tags.retain(|tag| !remove.contains(tag));
-                if tags != account.tags.iter().cloned().collect() {
-                    ensure_provider_tags_change_safe(
-                        state,
-                        &provider,
-                        &account.id,
-                        &account.tags,
-                        &tags.into_iter().collect::<Vec<_>>(),
-                    )?;
-                }
-            }
             for account in runtime
                 .update_accounts_tags(&ids, &add, &remove)
                 .await
@@ -661,28 +642,10 @@ fn ensure_provider_account_unbound(
     if services.is_empty() {
         return Ok(());
     }
-    Err(RpcError::bad_params(format!("account {provider}/{id} is bound to proxy service(s) {}; unbind it before changing tags or removing it",services.join(", "))))
-}
-
-fn ensure_provider_tags_change_safe(
-    state: &AppState,
-    provider: &str,
-    id: &str,
-    before: &[String],
-    after: &[String],
-) -> Result<(), RpcError> {
-    // Labels on global/manual pools do not change membership. Only removal from
-    // an existing tagged pool needs an explicit service unbind first.
-    let config = state.config.current();
-    let leaves_pool = config.proxy_service.iter().any(|service| {
-        service.includes_provider_account(provider, id, before)
-            && !service.includes_provider_account(provider, id, after)
-    });
-    if leaves_pool {
-        ensure_provider_account_unbound(state, provider, id, before)
-    } else {
-        Ok(())
-    }
+    Err(RpcError::bad_params(format!(
+        "account {provider}/{id} is bound to proxy service(s) {}; unbind it before removing it",
+        services.join(", ")
+    )))
 }
 
 pub(super) async fn handle_account_probe(state: &Arc<AppState>, params: Value) -> Handled {

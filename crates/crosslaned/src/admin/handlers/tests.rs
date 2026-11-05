@@ -10,6 +10,7 @@ use super::*;
 mod account_persistence;
 #[cfg(unix)]
 mod config_persistence;
+mod config_snapshot;
 mod force_removal;
 mod identity_selection;
 mod service_transactions;
@@ -320,18 +321,6 @@ async fn copilot_service_pool_uses_tags_qualified_bindings_and_exclusions() {
         dispatch(
             &state,
             Request::new(
-                3,
-                method::V2_ACCOUNT_TAG,
-                serde_json::json!({"id":"acc_b85b28b7","remove":["team"]})
-            )
-        )
-        .await,
-        Response::Err { .. }
-    ));
-    assert!(matches!(
-        dispatch(
-            &state,
-            Request::new(
                 4,
                 method::V2_ACCOUNT_REMOVE,
                 serde_json::json!({"id":"acc_b85b28b7"})
@@ -340,6 +329,35 @@ async fn copilot_service_pool_uses_tags_qualified_bindings_and_exclusions() {
         .await,
         Response::Err { .. }
     ));
+    // A bound account may still change purpose: dropping the tag moves it out
+    // of the tagged pool, and re-adding it moves it back.
+    let untagged = expect_ok(
+        dispatch(
+            &state,
+            Request::new(
+                3,
+                method::V2_ACCOUNT_TAG,
+                serde_json::json!({"id":"acc_b85b28b7","remove":["team"]}),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(untagged["tags"], serde_json::json!([]));
+    let result = service_accounts_result(&state, &service, false)
+        .await
+        .unwrap();
+    assert_eq!(result["provider_accounts"], serde_json::json!([]));
+    expect_ok(
+        dispatch(
+            &state,
+            Request::new(
+                31,
+                method::V2_ACCOUNT_TAG,
+                serde_json::json!({"id":"acc_b85b28b7","add":["team"]}),
+            ),
+        )
+        .await,
+    );
     config.proxy_service[0].excluded_account_ids = vec!["copilot/acc_b85b28b7".into()];
     state.config.replace(config.clone());
     let result = service_accounts_result(&state, &config.proxy_service[0], false)
@@ -1112,19 +1130,21 @@ async fn service_account_pool_combines_tag_manual_accounts_and_exclusions() {
     assert_eq!(removed.accounts[0].id, "acc_00000002");
     assert_eq!(removed.excluded_account_ids, ["acc_00000001"]);
 
-    let blocked = dispatch(
-        &state,
-        Request::new(
-            6,
-            method::ACCOUNT_TAG,
-            serde_json::json!({"id":"acc_00000002","add":["new"]}),
-        ),
-    )
-    .await;
-    assert!(matches!(
-        blocked,
-        Response::Err { error, .. } if error.message.contains("bound to proxy service")
-    ));
+    let retagged = expect_ok(
+        dispatch(
+            &state,
+            Request::new(
+                6,
+                method::ACCOUNT_TAG,
+                serde_json::json!({"id":"acc_00000002","add":["new"]}),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(
+        retagged["tags"],
+        serde_json::json!(["new", "shared", "team-b"])
+    );
 
     expect_ok(
         dispatch(
@@ -1301,7 +1321,8 @@ async fn account_services_reports_every_effective_binding_and_its_sources() {
             .collect::<Vec<_>>(),
         ["global", "tagged"]
     );
-    assert_eq!(result.services[0].binding_sources, ["global", "manual"]);
+    // The account is tagged, so it reaches the untagged service only manually.
+    assert_eq!(result.services[0].binding_sources, ["manual"]);
     assert_eq!(result.services[1].binding_sources, ["tag:team-a"]);
     assert!(result.services.iter().all(|service| service.running));
     state.shutdown.cancel();
@@ -1354,15 +1375,41 @@ async fn service_account_add_cannot_bind_an_account_removed_from_durable_storage
     state.shutdown.cancel();
 }
 
+async fn reload_with_service_tags(
+    state: &Arc<AppState>,
+    tags: Option<ServiceAccountTags>,
+    force: bool,
+) -> ConfigReloadResult {
+    let mut next = state.config.current().as_ref().clone();
+    next.proxy_service[0].account_tag = tags;
+    tokio::fs::write(
+        &state.paths.config_file,
+        toml::to_string(&next).expect("render config"),
+    )
+    .await
+    .expect("write config");
+    serde_json::from_value(expect_ok(
+        dispatch(
+            state,
+            Request::new(
+                1,
+                method::CONFIG_RELOAD,
+                serde_json::json!({ "force": force }),
+            ),
+        )
+        .await,
+    ))
+    .expect("reload result")
+}
+
 #[tokio::test]
-async fn enabled_service_must_be_stopped_before_changing_its_account_tag() {
-    let mut account = sample_account("acc_00000001", "a@example.com", true);
-    account.tags = vec!["team-a".into(), "team-b".into()];
-    let (_directory, state) = state_with(vec![account]).await;
+async fn running_service_tag_change_is_rejected_only_when_it_empties_the_pool() {
+    let mut tagged = sample_account("acc_00000001", "a@example.com", true);
+    tagged.tags = vec!["team-a".into()];
+    let (_directory, state) = state_with(vec![tagged]).await;
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("ephemeral port");
     let port = listener.local_addr().expect("address").port();
     drop(listener);
-
     expect_ok(
         dispatch(
             &state,
@@ -1374,43 +1421,304 @@ async fn enabled_service_must_be_stopped_before_changing_its_account_tag() {
         )
         .await,
     );
-    let mut equivalent = state.config.current().as_ref().clone();
-    equivalent.proxy_service[0].account_tag = Some(ServiceAccountTags::Many(vec!["team-a".into()]));
-    state
-        .apply_config_transaction(&equivalent)
-        .await
-        .expect("equivalent tag representation does not change the pool");
+    assert!(state.config.current().proxy_service[0].enabled);
 
-    let mut changed_while_running = state.config.current().as_ref().clone();
-    changed_while_running.proxy_service[0].account_tag = Some(ServiceAccountTags::Many(vec![
-        "team-a".into(),
-        "team-b".into(),
-    ]));
-    let error = state
-        .apply_config_transaction(&changed_while_running)
-        .await
-        .expect_err("running service tag change must fail");
-    assert!(error.contains("must be disabled"), "{error}");
+    // A running service may change tags while an account stays available.
+    let widened = reload_with_service_tags(
+        &state,
+        Some(ServiceAccountTags::Many(vec![
+            "team-a".into(),
+            "team-b".into(),
+        ])),
+        false,
+    )
+    .await;
+    assert!(widened.applied, "{:?}", widened.error);
 
-    let mut stopped = state.config.current().as_ref().clone();
-    stopped.proxy_service[0].enabled = false;
-    state
-        .apply_config_transaction(&stopped)
-        .await
-        .expect("stop service");
-    let mut changed = stopped;
-    changed.proxy_service[0].account_tag = Some(ServiceAccountTags::Many(vec![
-        "team-a".into(),
-        "team-b".into(),
-    ]));
-    state
-        .apply_config_transaction(&changed)
-        .await
-        .expect("change stopped service tag");
+    // Clearing the tag leaves only untagged accounts, and none exist.
+    let rejected = reload_with_service_tags(&state, None, false).await;
+    assert!(!rejected.applied);
+    let error = rejected.error.expect("rejection reason");
+    assert!(error.contains("no available account"), "{error}");
+    assert!(error.contains("force"), "{error}");
     assert_eq!(
         state.config.current().proxy_service[0].selected_account_tags(),
         ["team-a", "team-b"]
     );
+
+    let forced = reload_with_service_tags(&state, None, true).await;
+    assert!(forced.applied, "{:?}", forced.error);
+    assert!(state.config.current().proxy_service[0].uses_global_account_pool());
+    state.shutdown.cancel();
+}
+
+async fn create_service(state: &Arc<AppState>, name: &str, tag: Option<&str>) {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("ephemeral port");
+    let port = listener.local_addr().expect("address").port();
+    drop(listener);
+    expect_ok(
+        dispatch(
+            state,
+            Request::new(
+                1,
+                method::SERVICE_CREATE,
+                serde_json::json!({"name":name,"port":port,"account_tag":tag}),
+            ),
+        )
+        .await,
+    );
+}
+
+#[tokio::test]
+async fn rejected_daemon_reload_restores_the_running_file_and_keeps_the_edit() {
+    let mut tagged = sample_account("acc_00000001", "a@example.com", true);
+    tagged.tags = vec!["team-a".into()];
+    let (directory, state) = state_with(vec![tagged]).await;
+    create_service(&state, "team", Some("team-a")).await;
+    let applied = tokio::fs::read_to_string(&state.paths.config_file)
+        .await
+        .expect("applied config");
+    state.remember_applied_config_file();
+
+    // A manual edit that would empty the running service.
+    let current = state.config.current();
+    let mut pending = current.as_ref().clone();
+    pending.proxy_service[0].account_tag = None;
+    let rejected = toml::to_string(&pending).expect("render config");
+    tokio::fs::write(&state.paths.config_file, &rejected)
+        .await
+        .expect("write config");
+
+    // SIGHUP and the file watcher have no force flag: they reject the edit,
+    // put the running configuration back on disk and keep the edit aside.
+    let error = reload_pool_guard(&state, &current, &pending)
+        .await
+        .expect_err("daemon reload must not empty a running service");
+    crate::config_rejection::restore_rejected(&state, &error).await;
+    assert_eq!(
+        tokio::fs::read_to_string(&state.paths.config_file)
+            .await
+            .expect("restored config"),
+        applied
+    );
+    let mut saved = Vec::new();
+    let mut entries = tokio::fs::read_dir(state.paths.config_file.parent().expect("dir"))
+        .await
+        .expect("list");
+    while let Some(entry) = entries.next_entry().await.expect("entry") {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("config.toml.rejected-")
+        {
+            saved.push(entry.path());
+        }
+    }
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    assert_eq!(
+        tokio::fs::read_to_string(&saved[0]).await.expect("saved"),
+        rejected
+    );
+    assert_eq!(
+        state.config.current().proxy_service[0].selected_account_tags(),
+        ["team-a"]
+    );
+    drop(directory);
+    state.shutdown.cancel();
+}
+
+#[tokio::test]
+async fn unknown_applied_file_reports_drift_in_status_until_a_reload_succeeds() {
+    let mut tagged = sample_account("acc_00000001", "a@example.com", true);
+    tagged.tags = vec!["team-a".into()];
+    let (_directory, state) = state_with(vec![tagged]).await;
+    create_service(&state, "team", Some("team-a")).await;
+
+    // A read failure after an apply must forget the snapshot, not keep an
+    // older one that a later rejection would write back.
+    state.remember_applied_config_file();
+    assert!(state.applied_config_text().is_some());
+    let config_file = state.paths.config_file.clone();
+    let hidden = config_file.with_extension("hidden");
+    tokio::fs::rename(&config_file, &hidden)
+        .await
+        .expect("hide");
+    state.remember_applied_config_file();
+    assert!(state.applied_config_text().is_none());
+    tokio::fs::rename(&hidden, &config_file)
+        .await
+        .expect("restore");
+
+    let current = state.config.current();
+    let mut pending = current.as_ref().clone();
+    pending.proxy_service[0].account_tag = None;
+    let rejected = toml::to_string(&pending).expect("render config");
+    tokio::fs::write(&config_file, &rejected)
+        .await
+        .expect("write");
+    let error = reload_pool_guard(&state, &current, &pending)
+        .await
+        .expect_err("must reject");
+    crate::config_rejection::restore_rejected(&state, &error).await;
+
+    // Nothing is written back; status names the problem and the fix.
+    assert_eq!(
+        tokio::fs::read_to_string(&config_file).await.expect("read"),
+        rejected
+    );
+    let status: crosslane_ipc::protocol::StatusResult = serde_json::from_value(expect_ok(
+        dispatch(
+            &state,
+            Request::new(2, method::STATUS, serde_json::json!({})),
+        )
+        .await,
+    ))
+    .expect("status");
+    let drift = status.config_drift.expect("drift reported");
+    assert_eq!(drift.kind, "applied_text_unknown");
+    assert!(drift.detail.contains("team ("), "{}", drift.detail);
+    assert!(
+        drift.resolution.contains("config edit --force"),
+        "{}",
+        drift.resolution
+    );
+    assert!(
+        drift.resolution.contains("config reload"),
+        "{}",
+        drift.resolution
+    );
+    assert!(drift.rejected_file.is_some());
+
+    // Applying the edit explicitly makes disk and runtime equal again.
+    let forced: ConfigReloadResult = serde_json::from_value(expect_ok(
+        dispatch(
+            &state,
+            Request::new(3, method::CONFIG_RELOAD, serde_json::json!({"force": true})),
+        )
+        .await,
+    ))
+    .expect("forced reload");
+    assert!(forced.applied, "{:?}", forced.error);
+    assert!(state.config_drift().is_none());
+    assert!(state.applied_config_text().is_some());
+    state.shutdown.cancel();
+}
+
+#[tokio::test]
+async fn tagged_account_in_untagged_service_reports_only_its_manual_binding() {
+    let mut tagged = sample_account("acc_00000001", "a@example.com", true);
+    tagged.tags = vec!["team-a".into()];
+    let (_directory, state) = state_with(vec![tagged]).await;
+    create_service(&state, "default", None).await;
+    expect_ok(
+        dispatch(
+            &state,
+            Request::new(
+                2,
+                method::SERVICE_ACCOUNT_ADD,
+                serde_json::json!({"service":"default","accounts":["acc_00000001"]}),
+            ),
+        )
+        .await,
+    );
+    let bound = expect_ok(
+        dispatch(
+            &state,
+            Request::new(
+                3,
+                method::ACCOUNT_SERVICES,
+                serde_json::json!({"id":"acc_00000001"}),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(
+        bound["services"][0]["binding_sources"],
+        serde_json::json!(["manual"])
+    );
+    state.shutdown.cancel();
+}
+
+#[tokio::test]
+async fn account_tag_change_that_empties_an_enabled_service_requires_force() {
+    let mut tagged = sample_account("acc_00000001", "a@example.com", true);
+    tagged.tags = vec!["team-a".into()];
+    let untagged = sample_account("acc_00000002", "b@example.com", true);
+    let (_directory, state) = state_with(vec![tagged, untagged]).await;
+    for (name, tag) in [("team", Some("team-a")), ("default", None)] {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("ephemeral port");
+        let port = listener.local_addr().expect("address").port();
+        drop(listener);
+        expect_ok(
+            dispatch(
+                &state,
+                Request::new(
+                    1,
+                    method::SERVICE_CREATE,
+                    serde_json::json!({"name":name,"port":port,"account_tag":tag}),
+                ),
+            )
+            .await,
+        );
+    }
+    let tag = |id: &str, change: serde_json::Value| {
+        let mut params = change;
+        params["id"] = serde_json::json!(id);
+        Request::new(2, method::V2_ACCOUNT_TAG, params)
+    };
+
+    // Removing the last tag empties "team" (it also joins "default").
+    let response = dispatch(
+        &state,
+        tag("acc_00000001", serde_json::json!({"remove":["team-a"]})),
+    )
+    .await;
+    assert!(matches!(
+        &response,
+        Response::Err { error, .. }
+            if error.message.contains("team (") && error.message.contains("no available account")
+    ));
+    // Tagging the only untagged account empties "default".
+    let response = dispatch(
+        &state,
+        tag("acc_00000002", serde_json::json!({"add":["x"]})),
+    )
+    .await;
+    assert!(matches!(
+        &response,
+        Response::Err { error, .. }
+            if error.message.contains("default (") && error.message.contains("no available account")
+    ));
+    assert_eq!(
+        state.with_accounts(|store| store.find("acc_00000001").expect("tagged").tags.clone()),
+        ["team-a"]
+    );
+    assert!(state.with_accounts(|store| store
+        .find("acc_00000002")
+        .expect("untagged")
+        .tags
+        .is_empty()));
+
+    // Changes that keep every enabled pool non-empty pass without force.
+    expect_ok(
+        dispatch(
+            &state,
+            tag("acc_00000001", serde_json::json!({"add":["extra"]})),
+        )
+        .await,
+    );
+
+    let forced = expect_ok(
+        dispatch(
+            &state,
+            tag(
+                "acc_00000001",
+                serde_json::json!({"remove":["team-a"],"force":true}),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(forced["tags"], serde_json::json!(["extra"]));
     state.shutdown.cancel();
 }
 
@@ -1681,10 +1989,6 @@ async fn account_tag_batch_rejects_invalid_targets_without_partial_changes() {
             "account not found",
         ),
         (
-            vec!["a@example.com", "b@example.com"],
-            "bound to proxy service",
-        ),
-        (
             vec!["a@example.com", "acc_00000001"],
             "specified more than once",
         ),
@@ -1732,6 +2036,23 @@ async fn account_tag_batch_rejects_invalid_targets_without_partial_changes() {
             .tags
             .is_empty()));
     }
+    // Being bound to a service no longer blocks a tag change.
+    let retagged = expect_ok(
+        dispatch(
+            &state,
+            Request::new(
+                4,
+                method::ACCOUNT_TAG,
+                serde_json::json!({"ids": ["a@example.com", "b@example.com"], "add": ["new"]}),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(retagged["accounts"][0]["tags"], serde_json::json!(["new"]));
+    assert_eq!(
+        retagged["accounts"][1]["tags"],
+        serde_json::json!(["new", "team-a"])
+    );
     state.shutdown.cancel();
 }
 

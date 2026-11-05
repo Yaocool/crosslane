@@ -2,6 +2,7 @@
 
 mod admin;
 mod alerts;
+mod config_rejection;
 mod http;
 mod logging;
 mod meter;
@@ -87,6 +88,7 @@ async fn main() -> Result<()> {
     let config_handle = ConfigHandle::new(config);
     let socket_path = config_handle.current().admin.socket.clone().into();
     let state = Arc::new(AppState::load(paths, config_handle, accounts).await?);
+    state.remember_applied_config_file();
     state.status_http.initialize(Arc::clone(&state)).await?;
     let reload_state = Arc::clone(&state);
     let reload_runtime = tokio::runtime::Handle::current();
@@ -96,6 +98,15 @@ async fn main() -> Result<()> {
         CONFIG_DEBOUNCE,
         Arc::new(move |config| {
             reload_runtime.block_on(async {
+                let _pool_change = reload_state.lock_pool_change().await;
+                let current = reload_state.config.current();
+                // The watcher holds the config file lock while this hook runs.
+                if let Err(error) =
+                    admin::handlers::reload_pool_guard(&reload_state, &current, config).await
+                {
+                    config_rejection::restore_rejected(&reload_state, &error).await;
+                    return Err(error);
+                }
                 reload_state.apply_config_transaction(config).await?;
                 reload_state.mark_config_reloaded(now_secs());
                 Ok(())
@@ -175,6 +186,12 @@ async fn reload_after_sighup(state: &Arc<AppState>) {
                 let (next, needs_restart) = merge_hot_reload(&current, next);
                 for field in needs_restart {
                     warn!(field, "SIGHUP field requires restart to take effect");
+                }
+                let _pool_change = state.lock_pool_change().await;
+                if let Err(error) = admin::handlers::reload_pool_guard(state, &current, &next).await
+                {
+                    config_rejection::restore_rejected(state, &error).await;
+                    return;
                 }
                 match state.apply_config_transaction(&next).await {
                     Ok(()) => {

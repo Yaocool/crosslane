@@ -190,6 +190,14 @@ pub struct AppState {
     quota_alert_sync: tokio::sync::Mutex<()>,
     account_mutation: tokio::sync::Mutex<()>,
     config_mutation: tokio::sync::Mutex<()>,
+    /// Serializes "would this empty a service pool?" checks with the change
+    /// they approve. Lock order: config file, this lock, `config_mutation`.
+    pool_change: tokio::sync::Mutex<()>,
+    /// Last applied `config.toml` text, including subsequent authentication
+    /// updates, written back when a daemon-initiated reload is rejected.
+    applied_config_text: RwLock<Option<String>>,
+    /// Set while `config.toml` is known to differ from the running config.
+    config_drift: RwLock<Option<crosslane_ipc::protocol::ConfigDriftView>>,
 }
 
 /// Holds both layers of the account storage transaction lock.
@@ -350,6 +358,9 @@ impl AppState {
             quota_alert_sync: tokio::sync::Mutex::new(()),
             account_mutation: tokio::sync::Mutex::new(()),
             config_mutation: tokio::sync::Mutex::new(()),
+            pool_change: tokio::sync::Mutex::new(()),
+            applied_config_text: RwLock::new(None),
+            config_drift: RwLock::new(None),
         })
     }
 
@@ -361,6 +372,47 @@ impl AppState {
     /// 记录配置重载时间。
     pub fn mark_config_reloaded(&self, at: i64) {
         self.config_reloaded_at.store(at, Ordering::Relaxed);
+        self.remember_applied_config_file();
+    }
+
+    /// Records an auth-only apply. The supplied text must merge the effective
+    /// auth into the previous applied snapshot, never into a pending disk edit.
+    /// Other settings remain unapplied, so any drift warning must stay set.
+    pub(crate) fn mark_admin_rest_auth_reloaded(&self, at: i64, applied_text: Option<String>) {
+        self.config_reloaded_at.store(at, Ordering::Relaxed);
+        *write_lock(&self.applied_config_text) = applied_text;
+    }
+
+    /// Records the on-disk text as the running configuration. Every caller of
+    /// [`Self::mark_config_reloaded`] holds the config file lock, so the file
+    /// cannot change between applying it and reading it here.
+    ///
+    /// A successful apply makes disk and runtime equal again, so any recorded
+    /// drift is cleared. A failed read forgets the snapshot instead of keeping
+    /// an older one: restoring stale text would later reapply an old config.
+    pub(crate) fn remember_applied_config_file(&self) {
+        let text = match std::fs::read_to_string(&self.paths.config_file) {
+            Ok(text) => Some(text),
+            Err(error) => {
+                warn!(%error, "could not record the applied configuration file; \
+                    a later rejected reload cannot restore it");
+                None
+            }
+        };
+        *write_lock(&self.applied_config_text) = text;
+        *write_lock(&self.config_drift) = None;
+    }
+
+    pub(crate) fn record_config_drift(&self, drift: crosslane_ipc::protocol::ConfigDriftView) {
+        *write_lock(&self.config_drift) = Some(drift);
+    }
+
+    pub(crate) fn config_drift(&self) -> Option<crosslane_ipc::protocol::ConfigDriftView> {
+        read_lock(&self.config_drift).clone()
+    }
+
+    pub(crate) fn applied_config_text(&self) -> Option<String> {
+        read_lock(&self.applied_config_text).clone()
     }
 
     /// 上次配置重载时间。
@@ -413,17 +465,17 @@ impl AppState {
         next: &AccountStore,
     ) -> Result<(), String> {
         self.with_accounts(|current| {
+            // Tag edits only move an account between pools; new requests pick
+            // up the new membership. Removing a bound account stays guarded.
             for account in current.all() {
-                let tags_changed_or_removed = next
-                    .find(&account.id)
-                    .is_none_or(|replacement| !same_account_tags(&replacement.tags, &account.tags));
-                if !tags_changed_or_removed {
+                if let Some(replacement) = next.find(&account.id) {
+                    self.log_external_membership_change(account, replacement);
                     continue;
                 }
                 let bindings = self.account_service_bindings(account);
                 if !bindings.is_empty() {
                     return Err(format!(
-                        "account {} is bound to proxy service(s) {}; unbind it before changing tags or removing it",
+                        "account {} is bound to proxy service(s) {}; unbind it before removing it",
                         account.id,
                         bindings
                             .iter()
@@ -435,6 +487,31 @@ impl AppState {
             }
             Ok(())
         })
+    }
+
+    /// External account-file edits are applied as-is; record which service
+    /// pools an account entered or left so the change stays auditable.
+    fn log_external_membership_change(&self, before: &Account, after: &Account) {
+        if same_account_tags(&before.tags, &after.tags) {
+            return;
+        }
+        let config = self.config.current();
+        let changed = |joined: bool| {
+            config
+                .proxy_service
+                .iter()
+                .filter(|service| {
+                    service.includes_account(before) != joined
+                        && service.includes_account(after) == joined
+                })
+                .map(|service| service.name.as_str())
+                .collect::<Vec<_>>()
+        };
+        let (joined, left) = (changed(true), changed(false));
+        if !joined.is_empty() || !left.is_empty() {
+            warn!(account_id = %after.id, ?joined, ?left,
+                "account tags changed outside the daemon; service pools updated");
+        }
     }
 
     pub(crate) async fn validate_or_restore_account_store(
@@ -534,6 +611,13 @@ impl AppState {
         self.config_mutation.lock().await
     }
 
+    /// Held across a pool availability check and the change it approved, so
+    /// two concurrent edits cannot each pass while together emptying a pool.
+    /// Take it before `config_mutation`, never while holding it.
+    pub(crate) async fn lock_pool_change(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.pool_change.lock().await
+    }
+
     /// Starts, stops, or replaces proxy listeners to match a config snapshot.
     pub async fn reconcile_proxy_services(
         self: &Arc<Self>,
@@ -559,7 +643,6 @@ impl AppState {
         next: &Config,
     ) -> Result<(), String> {
         let previous = self.runtime_config_snapshot();
-        validate_service_account_tag_transitions(&previous, next)?;
         let accounts = self.with_accounts(|store| store.all().to_vec());
         validate_service_account_references(next, &accounts, &self.paths.data_dir)?;
         let status_listener = self
@@ -1444,7 +1527,7 @@ fn merge_runtime_account(store: &mut AccountStore, runtime: &Account) -> bool {
     store.replace_if_changed(merged)
 }
 
-fn same_account_tags(left: &[String], right: &[String]) -> bool {
+pub(crate) fn same_account_tags(left: &[String], right: &[String]) -> bool {
     left.iter().collect::<HashSet<_>>() == right.iter().collect::<HashSet<_>>()
 }
 
@@ -1500,32 +1583,6 @@ fn validate_service_account_references(
                     service.name, service.id
                 ));
             }
-        }
-    }
-    Ok(())
-}
-
-fn validate_service_account_tag_transitions(
-    previous: &Config,
-    next: &Config,
-) -> Result<(), String> {
-    for current in &previous.proxy_service {
-        let Some(updated) = next
-            .proxy_service
-            .iter()
-            .find(|candidate| candidate.id == current.id)
-        else {
-            continue;
-        };
-        if !same_account_tags(
-            current.selected_account_tags(),
-            updated.selected_account_tags(),
-        ) && current.enabled
-        {
-            return Err(format!(
-                "proxy service {} ({}) must be disabled before changing account_tag",
-                current.name, current.id
-            ));
         }
     }
     Ok(())
@@ -1736,7 +1793,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_persistence_cannot_apply_a_bound_accounts_external_tag_change() {
+    async fn runtime_persistence_applies_external_tag_changes_but_not_bound_removal() {
         let directory = tempfile::tempdir().expect("tempdir");
         let paths = Paths::from_env_values(
             Some(directory.path().to_str().expect("utf8")),
@@ -1784,20 +1841,43 @@ mod tests {
         }));
         external.save().await.expect("external save");
 
-        let error = state
+        state
             .persist_runtime_accounts()
             .await
-            .expect_err("bound tag change must stay rejected");
-
-        assert!(error.to_string().contains("bound to proxy service"));
+            .expect("tag changes on bound accounts are allowed");
         assert_eq!(
             state.with_accounts(|store| store
                 .find("acc_00000001")
                 .expect("runtime account")
                 .tags
                 .clone()),
-            ["team-a"]
+            ["team-b"]
         );
+
+        // Move the account back into the service pool, then delete it outside
+        // the daemon: removing a bound account must still be rejected.
+        let mut external = AccountStore::load(&paths.accounts_file)
+            .await
+            .expect("external store");
+        assert!(external.update("acc_00000001", |account| {
+            account.tags = vec!["team-a".into()];
+        }));
+        external.save().await.expect("external save");
+        state
+            .persist_runtime_accounts()
+            .await
+            .expect("re-tag into the service pool");
+        let mut external = AccountStore::load(&paths.accounts_file)
+            .await
+            .expect("external store");
+        assert!(external.remove("acc_00000001").is_some());
+        external.save().await.expect("external save");
+
+        let error = state
+            .persist_runtime_accounts()
+            .await
+            .expect_err("bound account removal must stay rejected");
+        assert!(error.to_string().contains("bound to proxy service"));
         let restored = AccountStore::load(&paths.accounts_file)
             .await
             .expect("restored account store");

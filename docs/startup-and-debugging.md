@@ -224,7 +224,7 @@ require no client key or product-specific User-Agent. With no proxy services, `/
 returns `200`, while `/ready` returns `503` with reasons. For both Kiro and Copilot, health counts
 include only accounts whose own `tags` array is empty, including disabled and unavailable accounts,
 with separate counts for each health state. Shared accounts are counted once. A service without
-`account_tag` uses the global pool and can still include tagged accounts; that is a different scope.
+`account_tag` also uses only untagged accounts, matching the health scope apart from manual additions.
 Public health responses omit credits, service IDs, provider metadata, bindings, and raw errors.
 Each `services` entry contains only `name`, `enabled`, and `running`. Readiness still evaluates
 each service's actual provider scope, tags, manual bindings, and exclusions, so tagged service

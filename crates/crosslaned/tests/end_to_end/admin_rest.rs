@@ -573,7 +573,23 @@ async fn admin_rest_kiro_and_service_mutations_persist_and_respect_effective_bin
             Method::POST,
             &format!("/accounts/kiro/{first_id}/tags"),
             Some(json!({"remove":["alpha"]})),
-            409,
+            200,
+        )
+        .await;
+    // Dropping the service tag moves the bound account out of the pool;
+    // re-adding it moves the account back.
+    assert_eq!(
+        fixture
+            .api(Method::GET, &format!("{service_path}/accounts"), None, 200)
+            .await["data"]["total_accounts"],
+        1
+    );
+    fixture
+        .api(
+            Method::POST,
+            &format!("/accounts/kiro/{first_id}/tags"),
+            Some(json!({"add":["alpha"]})),
+            200,
         )
         .await;
     fixture
@@ -911,8 +927,10 @@ async fn admin_rest_force_remove_unbinds_all_kiro_services_and_persists_after_re
     assert_eq!(unchanged["data"]["enabled"], true);
     assert_eq!(unchanged["data"]["tags"], json!(["team-a"]));
     let mut services = Vec::new();
+    // The untagged service never contains these tagged accounts, so force
+    // removal leaves it without an exclusion.
     for (name, tag, remaining) in [
-        ("global", None, 1),
+        ("global", None, 0),
         ("tagged", Some("team-a"), 1),
         ("manual", Some("other"), 0),
     ] {
@@ -999,9 +1017,14 @@ async fn admin_rest_force_remove_unbinds_all_kiro_services_and_persists_after_re
                 *remaining
             );
             assert_eq!(service["data"]["service"]["running"], *name != "tagged");
+            let excluded = if *name == "global" {
+                json!([])
+            } else {
+                json!([ids[0]])
+            };
             assert_eq!(
                 service["data"]["account_pool"]["excluded_account_ids"],
-                json!([ids[0]])
+                excluded
             );
             assert_eq!(
                 service["data"]["account_pool"]["manual_account_ids"],

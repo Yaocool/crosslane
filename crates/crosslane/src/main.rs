@@ -906,8 +906,14 @@ enum ConfigCommand {
     #[command(after_help = "示例：\n  crosslane config path\n  crosslane --json config path")]
     Path,
     /// 手动触发重载。
-    #[command(after_help = "示例：\n  crosslane config reload\n  crosslane --json config reload")]
-    Reload,
+    #[command(
+        after_help = "修改启用中服务的 account_tag 后，若该服务将没有可用账号，重载会被拒绝；确认后可加 --force 强制应用。\n\n示例：\n  crosslane config reload\n  crosslane config reload --force\n  crosslane --json config reload"
+    )]
+    Reload {
+        /// 即使启用中的服务修改后没有可用账号，也强制应用。
+        #[arg(long)]
+        force: bool,
+    },
     /// 用 $VISUAL/$EDITOR 编辑完整配置或指定模块，保存后校验并重载。
     #[command(
         after_help = "admin 和 status-http 编辑入口会同时展示 [admin]/[status_http]，补齐旧配置缺少的默认字段；可以一起启停 REST 与监听。模块编辑未改设置退出时不写文件、不重载服务，仍提示待重启字段；完整配置编辑器异常退出时恢复原文件。监听启停、地址和端口均支持热重载；绑定失败保留原监听。令牌用 admin token 管理，详见 crosslane guide admin。\nKiro 上游与账号池使用 upstream/pool 等模块；请求凭证脱敏开关使用 features 模块。Copilot OAuth、endpoint、缓存优先用 provider edit <ID> 修改对应实例。不指定模块时编辑完整配置。\n\n示例：\n  crosslane config edit admin\n  crosslane config edit status-http\n  crosslane config edit upstream\n  crosslane config edit pool\n  crosslane config edit features\n  crosslane provider edit copilot --setting 'api_endpoint_fallback=\"https://api.enterprise.githubcopilot.com\"'"
@@ -915,6 +921,9 @@ enum ConfigCommand {
     Edit {
         /// 编辑指定模块；admin/status-http 同时包含关联监听和鉴权配置。
         module: Option<String>,
+        /// 即使启用中的服务修改后没有可用账号，也强制应用。
+        #[arg(long)]
+        force: bool,
     },
     /// 备份配置并重置指定模块或全部可重置的运行配置。
     #[command(
@@ -1160,10 +1169,10 @@ async fn main() -> Result<()> {
             }
         }
         Command::Config {
-            command: Some(ConfigCommand::Reload),
+            command: Some(ConfigCommand::Reload { force }),
         } => {
             let result: ConfigReloadResult =
-                crate::commands::runtime::reload_config(&mut client).await?;
+                crate::commands::runtime::reload_config(&mut client, force).await?;
             if cli.json {
                 print_json(&result)?;
             }
@@ -1181,9 +1190,10 @@ async fn main() -> Result<()> {
             }
         }
         Command::Config {
-            command: Some(ConfigCommand::Edit { module }),
+            command: Some(ConfigCommand::Edit { module, force }),
         } => {
-            crate::commands::runtime::edit_config(&mut client, module.as_deref(), cli.json).await?;
+            crate::commands::runtime::edit_config(&mut client, module.as_deref(), cli.json, force)
+                .await?;
         }
         Command::Config {
             command: Some(ConfigCommand::Reset { module, yes }),
@@ -2062,9 +2072,25 @@ fn print_status(status: &StatusResult) {
         ),
         None => println!("配置    {}", status.config_path),
     }
+    if let Some(drift) = &status.config_drift {
+        print_config_drift(drift);
+    }
     if let Some(hint) = &status.hint {
         println!("提示    {hint}");
     }
+}
+
+fn print_config_drift(drift: &crosslane_ipc::protocol::ConfigDriftView) {
+    println!(
+        "警告    配置文件与运行配置不一致（{}，发现于 {}）",
+        drift.kind,
+        format_timestamp(drift.detected_at)
+    );
+    println!("        不一致：{}", drift.detail);
+    if let Some(file) = &drift.rejected_file {
+        println!("        被拒绝的修改已备份：{file}");
+    }
+    println!("        处理：{}", drift.resolution);
 }
 
 #[cfg(test)]
@@ -2267,6 +2293,7 @@ mod tests {
             Some(Command::Config {
                 command: Some(ConfigCommand::Edit {
                     module: Some(module),
+                    ..
                 })
             }) if module == "pool"
         ));
@@ -2276,7 +2303,7 @@ mod tests {
         assert!(matches!(
             full_edit.command,
             Some(Command::Config {
-                command: Some(ConfigCommand::Edit { module: None })
+                command: Some(ConfigCommand::Edit { module: None, .. })
             })
         ));
     }

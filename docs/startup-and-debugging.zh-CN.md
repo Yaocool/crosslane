@@ -193,7 +193,7 @@ curl -i http://127.0.0.1:7651/ready
 User-Agent。没有业务服务时，`/health` 仍返回 `200`，`/ready` 返回 `503` 并说明原因。
 `/health` 对 Kiro 和 Copilot 都只统计账号自身 `tags` 为空的账号，包含其中停用或不可用
 的账号，并分别给出各健康状态的数量；账号被多个服务共用时不会重复计算。没有设置
-`account_tag` 的服务使用全局账号池，仍可能包含带标签的账号，这与 `/health` 的筛选条件不同。
+`account_tag` 的服务同样只使用未打标签的账号，与 `/health` 的统计范围一致（手工绑定的账号除外）。
 `/health` 的响应不包含 credits、service ID、来源信息、绑定关系或原始错误；`services` 每项仅包含
 `name`、`enabled`、`running`。`/ready` 继续按各服务真实的来源、标签、手工绑定和排除规则
 判断就绪，带标签的服务不会因 `/health` 只统计未打标签账号而被错误判断为不可用。

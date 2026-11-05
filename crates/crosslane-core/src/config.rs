@@ -1156,7 +1156,7 @@ pub struct ProxyServiceConfig {
     /// 允许访问此服务的 API key ID。
     #[serde(default)]
     pub api_key_ids: Vec<String>,
-    /// 作为服务基础账号池的一个或多个账号标签；未配置时使用全局账号池。
+    /// 作为服务基础账号池的一个或多个账号标签；未配置时只使用未打标签的账号。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_tag: Option<ServiceAccountTags>,
     /// 无论标签是否匹配，都手工加入服务账号池的账号 ID。
@@ -1274,7 +1274,8 @@ impl ProxyServiceConfig {
     /// Returns whether an account belongs to this service's effective pool.
     ///
     /// Exclusions override both the tag-derived base pool and explicit manual
-    /// bindings. A service without an account tag inherits the global pool.
+    /// bindings. A service without an account tag uses only untagged accounts,
+    /// so tagging an account reserves it for services selecting that tag.
     pub fn includes_account(&self, account: &Account) -> bool {
         self.includes_provider_account("kiro", &account.id, &account.tags)
     }
@@ -1294,14 +1295,16 @@ impl ProxyServiceConfig {
         if self.account_ids.iter().any(matches) {
             return true;
         }
-        self.uses_global_account_pool()
-            || self
-                .selected_account_tags()
-                .iter()
-                .any(|tag| tags.contains(tag))
+        if self.uses_global_account_pool() {
+            return tags.is_empty();
+        }
+        self.selected_account_tags()
+            .iter()
+            .any(|tag| tags.contains(tag))
     }
 
-    /// Returns true when the service inherits every non-excluded account.
+    /// Returns true when the service has no account tag and therefore uses the
+    /// shared pool of untagged, non-excluded accounts.
     pub fn uses_global_account_pool(&self) -> bool {
         self.account_tag.is_none()
     }
@@ -2746,7 +2749,8 @@ start_url = ""
 # 允许访问该服务的 API key ID；至少一个，且都必须存在于 [[api_key]]。
 # api_key_ids = ["ak_example"]
 # 可选的 Kiro 基础账号标签；一个标签用字符串，多个标签用数组（匹配任一标签即可）。
-# 不配置时继承 Kiro 全局账号池。修改已有服务的标签前必须先停用服务。
+# 不配置时只使用未打标签的账号；带标签账号需通过标签或 account_ids 加入。
+# 运行中的服务也可修改标签；修改后启用中的服务没有可用账号时会拒绝，CLI 可用 --force 强制应用。
 # account_tag = "team-a"
 # 多标签时将上面的字符串值替换为 ["team-a", "team-b"]。
 # 手工加入的 Kiro 账号 ID；即使标签不匹配也会进入该服务账号池。

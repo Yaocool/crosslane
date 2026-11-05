@@ -258,7 +258,8 @@ async fn independent_status_listener_survives_service_changes_and_checks_each_po
             .iter()
             .find(|service| service["service_name"] == "shared")
             .unwrap()["available_accounts"],
-        2
+        1,
+        "the untagged service uses only the enabled untagged account"
     );
     let unavailable = expect_ok(daemon.call("service.create", serde_json::json!({
         "name":"team-b", "host":"127.0.0.1", "port":unused_tcp_port(), "account_tag":"team-b"

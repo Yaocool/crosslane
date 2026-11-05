@@ -213,7 +213,10 @@ pub(super) async fn handle_account_services(
         .map(|service| {
             let mut binding_sources = Vec::new();
             if service.uses_global_account_pool() {
-                binding_sources.push("global".to_owned());
+                // A tagged account reaches an untagged service only manually.
+                if account.tags.is_empty() {
+                    binding_sources.push("global".to_owned());
+                }
             } else {
                 binding_sources.extend(
                     service
@@ -622,7 +625,7 @@ pub(super) async fn handle_account_remove(
             .find(&id)
             .cloned()
             .ok_or_else(|| RpcError::bad_params(format!("account not found: {id}")))?;
-        ensure_account_unbound(state, &account, "removing it")?;
+        ensure_account_unbound(state, &account)?;
         store
             .remove(&id)
             .map(|account| account.id)
@@ -709,7 +712,7 @@ pub(super) async fn handle_account_tag(
         let mut seen = std::collections::HashSet::new();
         let mut changes = Vec::with_capacity(ids.len());
         // Validate the whole batch before changing the store, so a missing or
-        // service-bound account cannot leave earlier accounts partially tagged.
+        // duplicated account cannot leave earlier accounts partially tagged.
         for id in &ids {
             let account = store
                 .find(id)
@@ -734,9 +737,6 @@ pub(super) async fn handle_account_tag(
             current_tags.sort();
             current_tags.dedup();
             let changed = next_tags != current_tags;
-            if changed {
-                ensure_account_unbound(state, &account, "changing its tags")?;
-            }
             changes.push((account.id, next_tags, changed));
         }
         let mut results = Vec::with_capacity(changes.len());
@@ -760,17 +760,13 @@ pub(super) async fn handle_account_tag(
     }
 }
 
-pub(super) fn ensure_account_unbound(
-    state: &AppState,
-    account: &Account,
-    operation: &str,
-) -> Result<(), RpcError> {
+pub(super) fn ensure_account_unbound(state: &AppState, account: &Account) -> Result<(), RpcError> {
     let bindings = state.account_service_bindings(account);
     if bindings.is_empty() {
         return Ok(());
     }
     Err(RpcError::bad_params(format!(
-        "account {} is bound to proxy service(s) {}; unbind it before {operation}",
+        "account {} is bound to proxy service(s) {}; unbind it before removing it",
         account.id,
         bindings
             .iter()

@@ -422,7 +422,7 @@
             "description": "Automatically unbind this account from every service before deleting it."
           }
         ],
-        "description": "Without force, returns 409 while any service uses this account. With force=true, unbinds every affected service (including disabled services and global/tag/manual pools), then deletes the account. Exclusions persist to protect against silent rejoining after re-import. Deletion failure restores bindings; rollback failures are reported. In-flight requests are not cancelled."
+        "description": "Without force, returns 409 while any service uses this account. With force=true, unbinds every affected service (including disabled services and untagged-default/tag/manual pools), then deletes the account. Exclusions persist to protect against silent rejoining after re-import. Deletion failure restores bindings; rollback failures are reported. In-flight requests are not cancelled."
       }
     },
     "/accounts/{provider}/{account}/enabled": {
@@ -507,6 +507,7 @@
           "Accounts"
         ],
         "summary": "Add or remove account tags",
+        "description": "Tags can change even while services use the account; new requests recompute service pools. Untagged services only use untagged accounts, so removing the last tag moves the account into them, and adding a tag moves it out. Returns 409 when the change would leave an enabled service with no available account; set force=true to apply it anyway.",
         "operationId": "accounts_post_accounts_provider_account_tags",
         "responses": {
           "200": {
@@ -3750,6 +3751,11 @@
             "items": {
               "type": "string"
             }
+          },
+          "force": {
+            "type": "boolean",
+            "default": false,
+            "description": "Apply the change even if an enabled service would be left with no available account."
           }
         },
         "additionalProperties": false
@@ -4051,7 +4057,8 @@
             "type": "string"
           },
           "uses_global_pool": {
-            "type": "boolean"
+            "type": "boolean",
+            "description": "True when the service has no account_tag. Such a service uses only untagged accounts plus manual additions, not every account."
           },
           "account_tags": {
             "type": "array",

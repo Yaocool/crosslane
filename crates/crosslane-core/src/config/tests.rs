@@ -1153,7 +1153,7 @@ fn proxy_service_pool_combines_tag_manual_binding_and_exclusion() {
 }
 
 #[test]
-fn proxy_service_without_tag_uses_global_pool_except_exclusions() {
+fn proxy_service_without_tag_uses_only_untagged_accounts_except_exclusions() {
     let service = ProxyServiceConfig {
         web_search_provider: None,
         crs_relay: None,
@@ -1172,9 +1172,21 @@ fn proxy_service_without_tag_uses_global_pool_except_exclusions() {
         created_at: 0,
     };
 
-    assert!(service.includes_account(&tagged_account("acc_any", "anything")));
-    assert!(!service.includes_account(&tagged_account("acc_excluded", "anything")));
+    let untagged = |id: &str| Account {
+        tags: Vec::new(),
+        ..tagged_account(id, "unused")
+    };
+    assert!(service.includes_account(&untagged("acc_any")));
+    assert!(!service.includes_account(&untagged("acc_excluded")));
+    assert!(!service.includes_account(&tagged_account("acc_tagged", "anything")));
     assert!(service.uses_global_account_pool());
+
+    let manual = ProxyServiceConfig {
+        account_ids: vec!["acc_manual".into()],
+        ..service
+    };
+    assert!(manual.includes_account(&tagged_account("acc_manual", "anything")));
+    assert!(!manual.includes_account(&tagged_account("acc_tagged", "anything")));
 }
 
 #[test]

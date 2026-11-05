@@ -576,6 +576,9 @@ pub struct StatusResult {
     /// 最近手工重载时间。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_reloaded_at: Option<i64>,
+    /// `config.toml` 与运行配置不一致时的说明；一致时省略。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_drift: Option<ConfigDriftView>,
     /// 面向用户的提示。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
@@ -591,6 +594,22 @@ pub struct StatusResult {
     /// Per-provider lifecycle and account counts.
     #[serde(default)]
     pub providers: Vec<ProviderStatusView>,
+}
+
+/// `config.toml` 与 daemon 运行配置不一致的原因与处理方式。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigDriftView {
+    /// 稳定的机器可读原因：`restore_failed` 或 `applied_text_unknown`。
+    pub kind: String,
+    /// 哪里不一致。
+    pub detail: String,
+    /// 推荐的处理步骤。
+    pub resolution: String,
+    /// 被拒绝修改的备份文件；备份失败时省略。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejected_file: Option<String>,
+    /// 发现不一致的 Unix 秒。
+    pub detected_at: i64,
 }
 
 /// API 代理服务运行视图。
@@ -1361,12 +1380,16 @@ mod tests {
             daily_credit_limit: 0.0,
             config_path: "/tmp/config.toml".into(),
             config_reloaded_at: None,
+            config_drift: None,
             hint: Some("empty".into()),
             ready: true,
             readiness_reasons: Vec::new(),
             provider_scope: "all".into(),
             providers: Vec::new(),
         };
+        let encoded = serde_json::to_value(&status).expect("encode status");
+        // Consistent configs omit the field so older clients see no change.
+        assert!(encoded.get("config_drift").is_none());
         let back: StatusResult =
             serde_json::from_str(&serde_json::to_string(&status).expect("serialize status"))
                 .expect("deserialize status");

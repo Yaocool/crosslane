@@ -863,6 +863,23 @@ async fn copilot_provider_routes_native_chat_models_mapping_and_usage_end_to_end
         "untagged Copilot account is included"
     );
     let account_id = imported["id"].as_str().expect("imported account ID");
+    // Tagging the only untagged account would empty the enabled untagged
+    // service, so it is rejected unless forced.
+    let rejected = daemon
+        .call(
+            "v2.account.tag",
+            serde_json::json!({
+                "provider":"copilot",
+                "id":account_id,
+                "add":["e2e","team"],
+                "remove":[]
+            }),
+        )
+        .await;
+    assert!(matches!(
+        &rejected,
+        Response::Err { error, .. } if error.message.contains("no available account")
+    ));
     let tagged = expect_ok(
         daemon
             .call(
@@ -871,12 +888,34 @@ async fn copilot_provider_routes_native_chat_models_mapping_and_usage_end_to_end
                     "provider":"copilot",
                     "id":account_id,
                     "add":["e2e","team"],
-                    "remove":[]
+                    "remove":[],
+                    "force":true
                 }),
             )
             .await,
     );
     assert_eq!(tagged["tags"], serde_json::json!(["e2e", "team"]));
+    // A tagged account leaves the untagged service pool.
+    let tagged_status = expect_ok(
+        daemon
+            .call("status", serde_json::json!({"provider":"copilot"}))
+            .await,
+    );
+    assert_eq!(tagged_status["ready"], false, "{tagged_status}");
+    let untagged = expect_ok(
+        daemon
+            .call(
+                "v2.account.tag",
+                serde_json::json!({
+                    "provider":"copilot",
+                    "id":account_id,
+                    "add":[],
+                    "remove":["e2e","team"]
+                }),
+            )
+            .await,
+    );
+    assert_eq!(untagged["tags"], serde_json::json!([]));
     let reset = expect_ok(
         daemon
             .call(
@@ -921,8 +960,9 @@ async fn copilot_provider_routes_native_chat_models_mapping_and_usage_end_to_end
         .await
         .expect("health JSON");
     status_http::assert_health_contract(&service_health);
-    assert_eq!(service_health["total_accounts"], 0);
-    assert_eq!(service_health["available_accounts"], 0);
+    // Health and the untagged service now cover the same untagged account.
+    assert_eq!(service_health["total_accounts"], 1);
+    assert_eq!(service_health["available_accounts"], 1);
     let catalog = client
         .get(format!("http://127.0.0.1:{port}/v1/models"))
         .bearer_auth(daemon.api_key.as_deref().expect("API key"))

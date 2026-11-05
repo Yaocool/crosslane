@@ -39,6 +39,7 @@ use crate::state::AppState;
 type Handled = Result<serde_json::Value, RpcError>;
 
 pub(super) mod kiro_credentials;
+mod pool_guard;
 mod providers;
 mod removal;
 pub(super) mod rest;
@@ -103,7 +104,7 @@ pub async fn dispatch(state: &Arc<AppState>, request: Request) -> Response {
         method::STATUS => handle_status(state, request.params).await,
         method::CONFIG_SHOW => handle_config_show(state).await,
         method::CONFIG_PATH => to_value(handle_config_path(state)),
-        method::CONFIG_RELOAD => handle_config_reload(state).await,
+        method::CONFIG_RELOAD => handle_config_reload(state, request.params).await,
         method::ACCOUNT_LIST => handle_account_list(state, request.params).await,
         method::ACCOUNT_SHOW => handle_account_show(state, request.params).await,
         method::ACCOUNT_SERVICES => handle_account_services(state, request.params).await,
@@ -832,6 +833,8 @@ async fn handle_status(state: &Arc<AppState>, params: serde_json::Value) -> Hand
         daily_credit_limit,
         config_path: state.paths.config_file.display().to_string(),
         config_reloaded_at: state.config_reloaded_at(),
+        // Reported beside readiness, not in it: drift does not stop serving.
+        config_drift: state.config_drift(),
         hint,
         ready,
         readiness_reasons,
@@ -872,10 +875,21 @@ fn handle_config_path(state: &Arc<AppState>) -> ConfigPathResult {
     }
 }
 
-async fn handle_config_reload(state: &Arc<AppState>) -> Handled {
+async fn handle_config_reload(state: &Arc<AppState>, params: serde_json::Value) -> Handled {
+    #[derive(serde::Deserialize, Default)]
+    struct Params {
+        #[serde(default)]
+        force: bool,
+    }
+    let Params { force } = if params.is_null() {
+        Params::default()
+    } else {
+        parse_params(params)?
+    };
     // The CLI holds the cross-process config file lock for an enclosing
     // mutation/reload transaction. Serialize before reading so an older reload
     // cannot be applied after a newer snapshot.
+    let _pool_change = state.lock_pool_change().await;
     let _mutation = state.lock_config_mutation().await;
     let next = match load_config(&state.paths.config_file).await {
         Ok(config) => config,
@@ -904,6 +918,15 @@ async fn handle_config_reload(state: &Arc<AppState>) -> Handled {
     for field in &needs_restart {
         warn!(field = %field, "configuration field requires restart");
     }
+    if !force {
+        if let Some(error) = pool_guard::service_tag_change_error(state, &current, &next).await? {
+            return to_value(ConfigReloadResult {
+                applied: false,
+                error: Some(error),
+                needs_restart,
+            });
+        }
+    }
     if let Err(error) = state.apply_config_transaction_locked(&next).await {
         warn!(%error, "configuration reload rolled back");
         return to_value(ConfigReloadResult {
@@ -918,6 +941,21 @@ async fn handle_config_reload(state: &Arc<AppState>) -> Handled {
         error: None,
         needs_restart,
     })
+}
+
+/// Pool check for daemon-initiated reloads (SIGHUP, file watcher), which have
+/// no force flag. Callers must hold [`AppState::lock_pool_change`] until the
+/// approved config is applied, and restore the running file when rejected.
+pub(crate) async fn reload_pool_guard(
+    state: &Arc<AppState>,
+    current: &crosslane_core::config::Config,
+    next: &crosslane_core::config::Config,
+) -> Result<(), String> {
+    match pool_guard::service_tag_change_error(state, current, next).await {
+        Ok(None) => Ok(()),
+        Ok(Some(error)) => Err(error),
+        Err(error) => Err(error.message),
+    }
 }
 
 fn now_secs() -> i64 {

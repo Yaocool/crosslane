@@ -56,7 +56,7 @@ pub enum ServiceCommand {
         /// 监听端口，范围 1024..=65535；省略时为现有 service 最大生效端口加 1，首个服务配置为 server.port。
         #[arg(long, value_parser = parse_service_port)]
         port: Option<u16>,
-        /// 使用一个或多个 Kiro/Copilot 账号标签的并集作为基础账号池；不指定时使用全局账号池。
+        /// 使用一个或多个 Kiro/Copilot 账号标签的并集作为基础账号池；不指定时只使用未打标签的账号。
         #[arg(long, num_args = 1.., value_delimiter = ',', value_name = "TAG")]
         account_tag: Vec<String>,
         /// 是否允许该服务的已认证请求跳过客户端 User-Agent 校验。
@@ -103,12 +103,15 @@ pub enum ServiceCommand {
         /// 设置是否允许该服务的已认证请求跳过客户端 User-Agent 校验。
         #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
         skip_user_agent_check: Option<bool>,
-        /// 修改服务的基础账号标签（可指定多个）；服务必须先停用。
+        /// 修改服务的基础账号标签（可指定多个）；运行中的服务也可修改，修改后无可用账号时会拒绝，除非指定 --force。
         #[arg(long, num_args = 1.., value_delimiter = ',', value_name = "TAG", conflicts_with = "clear_account_tag")]
         account_tag: Vec<String>,
-        /// 清除基础账号标签并恢复使用其全局账号池；服务必须先停用。
+        /// 清除基础账号标签，改为只使用未打标签的账号；修改后无可用账号时会拒绝，除非指定 --force。
         #[arg(long)]
         clear_account_tag: bool,
+        /// 即使修改后启用中的服务没有可用账号，也强制应用标签修改。
+        #[arg(long)]
+        force: bool,
         /// 增加绑定的 API key ID 或名称，可重复或逗号分隔。
         #[arg(long, value_delimiter = ',', value_name = "KEY")]
         add_api_key: Vec<String>,
@@ -1192,6 +1195,7 @@ pub async fn run_service(
             skip_user_agent_check,
             account_tag,
             clear_account_tag,
+            force,
             add_api_key,
             remove_api_key,
             providers,
@@ -1217,7 +1221,7 @@ pub async fn run_service(
             let account_tag = normalize_service_tags(&account_tag)?;
             let result_selector = rename.clone().unwrap_or_else(|| service.clone());
             let mut result_id = String::new();
-            mutate_config(client, |config| {
+            mutate_config_with(client, force, |config| {
                 // Resolve names only after the config file lock has been
                 // acquired and the latest TOML snapshot has been read. This
                 // prevents a concurrent rename/delete from leaving this edit
@@ -2150,6 +2154,15 @@ async fn mutate_config(
     client: &mut AdminClient,
     mutate: impl FnOnce(&mut toml::map::Map<String, toml::Value>) -> Result<()>,
 ) -> Result<()> {
+    mutate_config_with(client, false, mutate).await
+}
+
+/// `force` skips the daemon's "service would have no available account" check.
+async fn mutate_config_with(
+    client: &mut AdminClient,
+    force: bool,
+    mutate: impl FnOnce(&mut toml::map::Map<String, toml::Value>) -> Result<()>,
+) -> Result<()> {
     let paths: ConfigPathResult = client
         .call(method::CONFIG_PATH, serde_json::json!({}))
         .await?;
@@ -2173,12 +2186,12 @@ async fn mutate_config(
         toml::from_str(&output).context("修改后的配置无法解析")?;
     config.validate().context("修改后的配置校验失败")?;
     crosslane_store::atomic::write_bytes_atomically(&path, output.as_bytes(), Some(0o600)).await?;
-    let result = reload_config_while_locked(client).await?;
+    let result = reload_forced_while_locked(client, force).await?;
     if result.applied {
         return Ok(());
     }
     crosslane_store::atomic::write_bytes_atomically(&path, raw.as_bytes(), Some(0o600)).await?;
-    let rollback = reload_config_while_locked(client).await?;
+    let rollback = reload_rollback_while_locked(client).await?;
     if !rollback.applied {
         return Err(anyhow!(
             "配置重载失败且回滚后的配置也无法重载: {}",
@@ -2833,7 +2846,7 @@ fn merge_edited_config_module(
 
 /// Reloads the configuration while excluding concurrent `crosslane` and daemon
 /// mutations of the same file.
-pub async fn reload_config(client: &mut AdminClient) -> Result<ConfigReloadResult> {
+pub async fn reload_config(client: &mut AdminClient, force: bool) -> Result<ConfigReloadResult> {
     let paths: ConfigPathResult = client
         .call(method::CONFIG_PATH, serde_json::json!({}))
         .await?;
@@ -2841,13 +2854,27 @@ pub async fn reload_config(client: &mut AdminClient) -> Result<ConfigReloadResul
     let _config_lock = crosslane_store::atomic::lock_file_exclusive(&path)
         .await
         .with_context(|| format!("锁定配置文件 {} 失败", path.display()))?;
-    reload_config_while_locked(client).await
+    reload_forced_while_locked(client, force).await
 }
 
 async fn reload_config_while_locked(client: &mut AdminClient) -> Result<ConfigReloadResult> {
+    reload_forced_while_locked(client, false).await
+}
+
+/// `force` skips the daemon's "service would have no available account" check.
+async fn reload_forced_while_locked(
+    client: &mut AdminClient,
+    force: bool,
+) -> Result<ConfigReloadResult> {
     client
-        .call(method::CONFIG_RELOAD, serde_json::json!({}))
+        .call(method::CONFIG_RELOAD, serde_json::json!({"force": force}))
         .await
+}
+
+/// Reload after restoring the previous file. It matches what is running, so
+/// the pool check has nothing to reject and is skipped.
+async fn reload_rollback_while_locked(client: &mut AdminClient) -> Result<ConfigReloadResult> {
+    reload_forced_while_locked(client, true).await
 }
 
 pub async fn validate_config(file: Option<&str>, json: bool) -> Result<()> {
@@ -2884,14 +2911,19 @@ async fn validate_config_path(path: &Path, require_file: bool) -> Result<()> {
     Ok(())
 }
 
-pub async fn edit_config(client: &mut AdminClient, module: Option<&str>, json: bool) -> Result<()> {
+pub async fn edit_config(
+    client: &mut AdminClient,
+    module: Option<&str>,
+    json: bool,
+    force: bool,
+) -> Result<()> {
     if let Some(module) = module {
-        return edit_config_module(client, resolve_config_module(module)?, json).await;
+        return edit_config_module(client, resolve_config_module(module)?, json, force).await;
     }
-    edit_full_config(client, json).await
+    edit_full_config(client, json, force).await
 }
 
-async fn edit_full_config(client: &mut AdminClient, json: bool) -> Result<()> {
+async fn edit_full_config(client: &mut AdminClient, json: bool, force: bool) -> Result<()> {
     let paths: ConfigPathResult = client
         .call(method::CONFIG_PATH, serde_json::json!({}))
         .await?;
@@ -2913,7 +2945,7 @@ async fn edit_full_config(client: &mut AdminClient, json: bool) -> Result<()> {
         return Err(error.context("配置无效，磁盘文件已回滚"));
     }
     let changed = tokio::fs::read(&path).await? != original;
-    let result = reload_edited_config(client, &path, &original).await?;
+    let result = reload_edited_config(client, &path, &original, force).await?;
     if json {
         print_json(&serde_json::json!({
             "saved": true,
@@ -2932,6 +2964,7 @@ async fn edit_config_module(
     client: &mut AdminClient,
     module: &ConfigModule,
     json: bool,
+    force: bool,
 ) -> Result<()> {
     let paths: ConfigPathResult = client
         .call(method::CONFIG_PATH, serde_json::json!({}))
@@ -2985,7 +3018,7 @@ async fn edit_config_module(
     }
 
     crosslane_store::atomic::write_bytes_atomically(&path, output.as_bytes(), Some(0o600)).await?;
-    let result = reload_edited_config(client, &path, original.as_bytes()).await?;
+    let result = reload_edited_config(client, &path, original.as_bytes(), force).await?;
     if json {
         print_json(&serde_json::json!({
             "saved": true,
@@ -3072,14 +3105,15 @@ async fn reload_edited_config(
     client: &mut AdminClient,
     path: &Path,
     original: &[u8],
+    force: bool,
 ) -> Result<ConfigReloadResult> {
-    let reload = reload_config_while_locked(client).await;
+    let reload = reload_forced_while_locked(client, force).await;
     if matches!(&reload, Ok(result) if result.applied) {
         return reload;
     }
 
     crosslane_store::atomic::write_bytes_atomically(path, original, Some(0o600)).await?;
-    let rollback = reload_config_while_locked(client).await;
+    let rollback = reload_rollback_while_locked(client).await;
     match (reload, rollback) {
         (Ok(result), Ok(rollback)) if rollback.applied => Err(anyhow!(
             "配置重载失败，磁盘文件已回滚：{}",
@@ -3194,7 +3228,7 @@ pub async fn reset_config(
         Ok(result) => result,
         Err(reload_error) => {
             crosslane_store::atomic::write_bytes_atomically(&path, &original, Some(0o600)).await?;
-            let rollback = reload_config_while_locked(client).await;
+            let rollback = reload_rollback_while_locked(client).await;
             return match rollback {
                 Ok(rollback) if rollback.applied => Err(reload_error.context(format!(
                     "默认配置重载请求失败，磁盘文件已回滚；原配置备份位于 {}",
@@ -3225,7 +3259,7 @@ pub async fn reset_config(
     }
 
     crosslane_store::atomic::write_bytes_atomically(&path, &original, Some(0o600)).await?;
-    let rollback = reload_config_while_locked(client).await?;
+    let rollback = reload_rollback_while_locked(client).await?;
     if !rollback.applied {
         return Err(anyhow!(
             "默认配置重载失败，且回滚后的配置也无法重载；原配置备份位于 {}：{}",

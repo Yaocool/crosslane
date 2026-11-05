@@ -182,7 +182,7 @@ pub enum AccountCommand {
     },
     /// 查看 Kiro/Copilot 账号绑定的 API 代理服务。
     #[command(
-        long_about = "查看 Kiro/Copilot 账号当前属于哪些 API 代理服务，并显示全局池、标签或手工绑定来源。\n\n示例：\n  crosslane account services acc_7f3a2b1c\n  crosslane account services alice@example.com"
+        long_about = "查看 Kiro/Copilot 账号当前属于哪些 API 代理服务，并显示未打标签默认池、标签或手工绑定来源。\n\n示例：\n  crosslane account services acc_7f3a2b1c\n  crosslane account services alice@example.com"
     )]
     Services {
         /// 账号 ID 或邮箱。
@@ -331,6 +331,9 @@ pub enum AccountCommand {
         /// 提供源实例 ID；也可使用 provider/account_id。
         #[arg(long)]
         provider: Option<String>,
+        /// 即使修改后某个启用中的服务没有可用账号，也强制修改标签。
+        #[arg(long)]
+        force: bool,
     },
     /// 重新生成 Kiro 设备标识；Copilot 不使用 machine_id。
     #[command(
@@ -1643,8 +1646,13 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
             add,
             remove,
             provider,
+            force,
         } => {
-            tag_accounts(client, &ids, &add, &remove, provider.as_deref(), json).await?;
+            let selection = TagSelection {
+                provider: provider.as_deref(),
+                force,
+            };
+            tag_accounts(client, &ids, &add, &remove, selection, json).await?;
         }
         AccountCommand::RegenMachineId { id } => {
             let result: serde_json::Value = client
@@ -2055,6 +2063,13 @@ async fn remove_accounts(
     }
 }
 
+/// Provider scope and override flag for `account tag`.
+#[derive(Clone, Copy, Default)]
+struct TagSelection<'a> {
+    provider: Option<&'a str>,
+    force: bool,
+}
+
 /// Tag one or more accounts.
 ///
 /// Resolve every selector on the daemon before applying a provider-local batch.
@@ -2063,14 +2078,15 @@ async fn tag_accounts(
     ids: &[String],
     add: &[String],
     remove: &[String],
-    provider: Option<&str>,
+    selection: TagSelection<'_>,
     json: bool,
 ) -> Result<()> {
+    let TagSelection { provider, force } = selection;
     if let [id] = ids {
         let result: AccountTagResult = client
             .call(
                 method::V2_ACCOUNT_TAG,
-                serde_json::json!({"id": id, "add": add, "remove": remove, "provider": provider}),
+                serde_json::json!({"id": id, "add": add, "remove": remove, "provider": provider, "force": force}),
             )
             .await?;
         if json {
@@ -2082,7 +2098,7 @@ async fn tag_accounts(
         let result: AccountTagBatchResult = client
             .call(
                 method::V2_ACCOUNT_TAG,
-                serde_json::json!({"ids": ids, "add": add, "remove": remove, "provider": provider}),
+                serde_json::json!({"ids": ids, "add": add, "remove": remove, "provider": provider, "force": force}),
             )
             .await?;
         if json {
@@ -2234,7 +2250,7 @@ fn display_binding_sources(service: &AccountServiceBinding) -> String {
                 .strip_prefix("tag:")
                 .map(|tag| format!("标签:{tag}"))
                 .unwrap_or_else(|| match source.as_str() {
-                    "global" => "全局池".into(),
+                    "global" => "未打标签默认池".into(),
                     "manual" => "手工".into(),
                     other => other.to_owned(),
                 })
@@ -2758,7 +2774,7 @@ mod tests {
             &["acc_00000001".into(), "acc_00000002".into()],
             &["test".into()],
             &[],
-            None,
+            TagSelection::default(),
             false,
         )
         .await
@@ -2771,7 +2787,8 @@ mod tests {
                 "ids": ["acc_00000001", "acc_00000002"],
                 "add": ["test"],
                 "remove": [],
-                "provider": null
+                "provider": null,
+                "force": false
             })
         );
     }

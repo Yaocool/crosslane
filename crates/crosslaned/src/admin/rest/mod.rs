@@ -318,6 +318,7 @@ impl From<RpcError> for ApiError {
             StatusCode::NOT_FOUND
         } else if error.code == 400
             && (error.message.contains("bound to proxy service")
+                || error.message.contains("would have no available account")
                 || error.message.contains("already exists")
                 || error.message.contains("failed to start")
                 || error.message.contains("update rejected"))

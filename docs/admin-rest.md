@@ -347,9 +347,19 @@ same rule, and edit results retain the selected stable ID after a rename.
 Writes resolve the input selector inside the configuration transaction. Pool and key reads
 verify returned service IDs, returning `404` if a stale ID would match a neighbor's name.
 Detail/pool queries accept `group_by=provider|tag` and optional
-`provider`. Pools respect allowed providers, tags, manual additions, and exclusions. They do
-not inherit public health's untagged-only filter. A service without `account_tag` uses the
-global pool, including tagged accounts. Multiple service tags match any selected tag.
+`provider`. Pools respect allowed providers, tags, manual additions, and exclusions. A service
+without `account_tag` uses only untagged accounts; a tagged account joins a service only through
+a matching tag or a manual addition. Multiple service tags match any selected tag. Account tags
+can be changed or removed at any time, even while a service uses the account; new requests
+recompute the pool. Removing an account that a service still uses requires unbinding it first.
+Changing a service's tags (running services included) or an account's tags is rejected (REST
+`409`) when an enabled service would go from having an available account to having none. Pass
+`"force": true` to `POST /accounts/{provider}/{id}/tags`, or `--force` to CLI `account tag`,
+`service edit`, `config edit` and `config reload`, to apply it anyway. Reloads triggered by SIGHUP
+or the file watcher after editing `config.toml` directly have no force option. When rejected, the
+rejected file is saved as `config.toml.rejected-<unix-millis>` and `config.toml` is restored to the
+running configuration, so disk and runtime stay identical. Re-apply the edit after review with
+`crosslane config edit --force`.
 
 Service mutations use the latest on-disk configuration and preserve pending client-key
 changes. Both the running configuration and the persisted target configuration are checked;
