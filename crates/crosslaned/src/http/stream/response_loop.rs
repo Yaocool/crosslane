@@ -18,23 +18,129 @@ use super::{
     ToolLeakFilter, UpstreamStreamMetrics, Value,
 };
 
+const MAX_GUARDED_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_COALESCED_THINKING_BYTES: usize = 64 * 1024;
+pub(super) const GUARDED_OUTPUT_LIMIT_ERROR: &str =
+    "unconfirmed stream output exceeded the 16 MiB buffering limit";
+
+enum GuardedFrame {
+    Encoded(String),
+    Thinking { index: u64, text: String },
+}
+
+/// Reasoning preceding a valid tool-result answer must remain retryable.
+/// Coalesce adjacent deltas without repeatedly encoding the growing prefix;
+/// only a newly received frame is parsed, and rendering happens once at flush.
+#[derive(Default)]
+struct GuardedOutput {
+    frames: Vec<GuardedFrame>,
+    /// Charge the original wire size, including escaping and per-event
+    /// overhead, so coalescing cannot bypass the limit with tiny fragments.
+    wire_bytes: usize,
+}
+
+impl GuardedOutput {
+    fn extend(&mut self, output: Vec<String>) -> Result<(), &'static str> {
+        self.extend_limited(output, MAX_GUARDED_OUTPUT_BYTES)
+    }
+
+    fn extend_limited(&mut self, output: Vec<String>, limit: usize) -> Result<(), &'static str> {
+        for frame in output {
+            let bytes = self.wire_bytes.saturating_add(frame.len());
+            if bytes > limit {
+                return Err(GUARDED_OUTPUT_LIMIT_ERROR);
+            }
+            self.wire_bytes = bytes;
+            if let Some((index, text)) = buffered_thinking_delta(&frame) {
+                if let Some(GuardedFrame::Thinking {
+                    index: previous,
+                    text: pending,
+                }) = self.frames.last_mut()
+                {
+                    if *previous == index
+                        && pending.len().saturating_add(text.len()) <= MAX_COALESCED_THINKING_BYTES
+                    {
+                        pending.push_str(&text);
+                        continue;
+                    }
+                }
+                self.frames.push(GuardedFrame::Thinking { index, text });
+            } else {
+                self.frames.push(GuardedFrame::Encoded(frame));
+            }
+        }
+        Ok(())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+}
+
+impl IntoIterator for GuardedOutput {
+    type Item = String;
+    type IntoIter = std::vec::IntoIter<String>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.frames
+            .into_iter()
+            .map(|frame| match frame {
+                GuardedFrame::Encoded(frame) => frame,
+                GuardedFrame::Thinking { index, text } => sse(&json!({
+                    "type":"content_block_delta", "index":index,
+                    "delta":{"type":"thinking_delta", "thinking":text}
+                })),
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+}
+
+fn buffered_thinking_delta(frame: &str) -> Option<(u64, String)> {
+    let encoded = frame
+        .strip_prefix("event: content_block_delta\ndata: ")?
+        .strip_suffix("\n\n")?;
+    let value: Value = serde_json::from_str(encoded).ok()?;
+    // Preserve any unfamiliar event or extension exactly as encoded.
+    if value.as_object()?.len() != 3
+        || value["type"] != "content_block_delta"
+        || value["delta"].as_object()?.len() != 2
+        || value["delta"]["type"] != "thinking_delta"
+    {
+        return None;
+    }
+    Some((
+        value["index"].as_u64()?,
+        value["delta"]["thinking"].as_str()?.to_owned(),
+    ))
+}
+
 /// Keep empty attempts retryable without delaying valid visible output until
 /// EOF. Returning the whole prefix preserves event order.
 fn guard_tool_result_output(
+    trace_id: &str,
     guarded: &mut bool,
-    buffered: &mut Vec<String>,
+    buffered: &mut GuardedOutput,
     confirms_valid_output: bool,
     output: Vec<String>,
-) -> Vec<String> {
+) -> Result<Vec<String>, &'static str> {
     if !*guarded {
-        return output;
+        return Ok(output);
     }
-    buffered.extend(output);
     if confirms_valid_output {
         *guarded = false;
-        std::mem::take(buffered)
+        Ok(std::mem::take(buffered).into_iter().chain(output).collect())
     } else {
-        Vec::new()
+        buffered.extend(output).inspect_err(|_| {
+            tracing::warn!(
+                event = "proxy.stream.guard_limit",
+                trace_id,
+                buffered_bytes = buffered.wire_bytes,
+                limit_bytes = MAX_GUARDED_OUTPUT_BYTES,
+                "unconfirmed stream output exceeded the bounded retry buffer"
+            );
+        })?;
+        Ok(Vec::new())
     }
 }
 
@@ -285,7 +391,7 @@ pub fn response(
             // output. Empty ordinary attempts can then retry without emitting
             // duplicate boundaries or assistant blocks.
             let mut guards_tool_result_round = true;
-            let mut guarded_output = Vec::new();
+            let mut guarded_output = GuardedOutput::default();
             let mut claude_checkpoint = guards_tool_result_round.then(|| claude.clone());
             let mut pending_initial_checkpoint =
                 guards_tool_result_round.then(|| pending_initial.clone());
@@ -392,10 +498,21 @@ pub fn response(
                                                         &mut pending_initial,
                                                         output,
                                                     );
-                                                    let output = guard_tool_result_output(
+                                                    let output = match guard_tool_result_output(
+                                                        &context.trace_id,
                                                         &mut guards_tool_result_round, &mut guarded_output,
                                                         confirms_valid_text, output,
-                                                    );
+                                                    ) {
+                                                        Ok(output) => output,
+                                                        Err(message) => {
+                                                            // Keep the last observed delta in failure usage accounting.
+                                                            let _ = decoded.push(event);
+                                                            failed = Some(message.to_owned());
+                                                            stream_failure = None;
+                                                            yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &context.request_id, message)));
+                                                            break 'rounds;
+                                                        }
+                                                    };
                                                     data_started |= !output.is_empty();
                                                     for data in output {
                                                         yield Ok::<Bytes, Infallible>(Bytes::from(data));
@@ -432,10 +549,21 @@ pub fn response(
                                                         &mut pending_initial,
                                                         output,
                                                     );
-                                                    let output = guard_tool_result_output(
+                                                    let output = match guard_tool_result_output(
+                                                        &context.trace_id,
                                                         &mut guards_tool_result_round, &mut guarded_output,
                                                         confirms_valid_output, output,
-                                                    );
+                                                    ) {
+                                                        Ok(output) => output,
+                                                        Err(message) => {
+                                                            // Keep the last observed delta in failure usage accounting.
+                                                            let _ = decoded.push(event);
+                                                            failed = Some(message.to_owned());
+                                                            stream_failure = None;
+                                                            yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &context.request_id, message)));
+                                                            break 'rounds;
+                                                        }
+                                                    };
                                                     data_started |= !output.is_empty();
                                                     for data in output {
                                                         yield Ok::<Bytes, Infallible>(Bytes::from(data));
@@ -568,10 +696,21 @@ pub fn response(
                                 &context.openai_tools,
                             );
                             let output = prepend_pending_initial(&mut pending_initial, output);
-                            let output = guard_tool_result_output(
+                            let output = match guard_tool_result_output(
+                                &context.trace_id,
                                 &mut guards_tool_result_round, &mut guarded_output,
                                 confirms_valid_text, output,
-                            );
+                            ) {
+                                Ok(output) => output,
+                                Err(message) => {
+                                    // Keep the last observed delta in failure usage accounting.
+                                    let _ = decoded.push(event);
+                                    failed = Some(message.to_owned());
+                                    stream_failure = None;
+                                    yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &context.request_id, message)));
+                                    break 'rounds;
+                                }
+                            };
                             data_started |= !output.is_empty();
                             for data in output {
                                 yield Ok::<Bytes, Infallible>(Bytes::from(data));
@@ -600,10 +739,21 @@ pub fn response(
                                 &context.openai_tools,
                             );
                             let output = prepend_pending_initial(&mut pending_initial, output);
-                            let output = guard_tool_result_output(
+                            let output = match guard_tool_result_output(
+                                &context.trace_id,
                                 &mut guards_tool_result_round, &mut guarded_output,
                                 confirms_valid_output, output,
-                            );
+                            ) {
+                                Ok(output) => output,
+                                Err(message) => {
+                                    // Keep the last observed delta in failure usage accounting.
+                                    let _ = decoded.push(event);
+                                    failed = Some(message.to_owned());
+                                    stream_failure = None;
+                                    yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &context.request_id, message)));
+                                    break 'rounds;
+                                }
+                            };
                             data_started |= !output.is_empty();
                             for data in output {
                                 yield Ok::<Bytes, Infallible>(Bytes::from(data));
@@ -1256,7 +1406,14 @@ pub fn response(
             if !pending_initial.is_empty() {
                 let output = std::mem::take(&mut pending_initial);
                 if guards_tool_result_round {
-                    guarded_output.extend(output);
+                    if let Err(message) = guard_tool_result_output(
+                        &context.trace_id, &mut guards_tool_result_round, &mut guarded_output, false, output,
+                    ) {
+                        failed = Some(message.to_owned());
+                        stream_failure = None;
+                        yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &context.request_id, message)));
+                        break 'rounds;
+                    }
                 } else {
                     data_started = true;
                     for data in output {
@@ -2450,12 +2607,10 @@ pub fn response(
                 }
             }
         }
-        #[cfg(feature = "crs")]
-        {
-            // Cancellation can leave the round before its normal EOF cleanup.
-            drop(source.take());
-            drop(upstream_permit.take());
-        }
+        // Cancellation and bounded-output failures can leave the round before
+        // its normal EOF cleanup. Release the connection before accounting.
+        drop(source.take());
+        drop(upstream_permit.take());
         let trailing = stop_filter.finish();
         if failed.is_none() && !trailing.is_empty() {
             let output = stream_event(
@@ -2697,8 +2852,165 @@ pub fn response(
 
 #[cfg(test)]
 mod tests {
-    use super::retry_mapped_model;
+    use super::{
+        guard_tool_result_output, retry_mapped_model, GuardedFrame, GuardedOutput,
+        GUARDED_OUTPUT_LIMIT_ERROR,
+    };
+    use super::{json, sse, Value};
     use crosslane_core::config::{Config, ModelMappingRule};
+
+    fn thinking(index: u64, text: &str) -> String {
+        sse(
+            &json!({"type":"content_block_delta","index":index,"delta":{"type":"thinking_delta","thinking":text}}),
+        )
+    }
+
+    fn thinking_text(frame: &str) -> String {
+        let value: Value = serde_json::from_str(
+            frame
+                .strip_prefix("event: content_block_delta\ndata: ")
+                .unwrap()
+                .trim(),
+        )
+        .unwrap();
+        value["delta"]["thinking"].as_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn reasoning_guard_coalesces_content_and_releases_in_order_on_confirmation() {
+        let mut guarded = true;
+        let mut buffer = GuardedOutput::default();
+        let start = sse(&json!({"type":"message_start","message":{"id":"fixture"}}));
+        assert!(guard_tool_result_output(
+            "fixture",
+            &mut guarded,
+            &mut buffer,
+            false,
+            vec![start.clone()]
+        )
+        .unwrap()
+        .is_empty());
+        for _ in 0..8192 {
+            assert!(guard_tool_result_output(
+                "fixture",
+                &mut guarded,
+                &mut buffer,
+                false,
+                vec![thinking(0, "a\"中")]
+            )
+            .unwrap()
+            .is_empty());
+        }
+        assert_eq!(buffer.frames.len(), 2);
+        let GuardedFrame::Thinking { text, .. } = &buffer.frames[1] else {
+            panic!("not coalesced")
+        };
+        assert_eq!(text, &"a\"中".repeat(8192));
+        let visible = sse(
+            &json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"done"}}),
+        );
+        let output = guard_tool_result_output(
+            "fixture",
+            &mut guarded,
+            &mut buffer,
+            true,
+            vec![visible.clone()],
+        )
+        .unwrap();
+        assert!(!guarded);
+        assert!(buffer.is_empty());
+        assert_eq!(output.len(), 3);
+        assert_eq!(output[0], start);
+        assert_eq!(thinking_text(&output[1]), "a\"中".repeat(8192));
+        assert_eq!(output[2], visible);
+    }
+
+    #[test]
+    fn reasoning_guard_preserves_signature_boundaries_extensions_and_block_indices() {
+        let signature = sse(
+            &json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"native"}}),
+        );
+        let extension = sse(
+            &json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"extended","future":true}}),
+        );
+        let mut buffer = GuardedOutput::default();
+        buffer
+            .extend(vec![
+                thinking(0, "one"),
+                signature.clone(),
+                thinking(0, "two"),
+                extension.clone(),
+                thinking(1, "three"),
+            ])
+            .unwrap();
+        let output: Vec<_> = buffer.into_iter().collect();
+        assert_eq!(output.len(), 5);
+        assert_eq!(thinking_text(&output[0]), "one");
+        assert_eq!(output[1], signature);
+        assert_eq!(thinking_text(&output[2]), "two");
+        assert_eq!(output[3], extension);
+        assert_eq!(thinking_text(&output[4]), "three");
+    }
+
+    #[test]
+    fn reasoning_guard_limit_counts_original_wire_bytes_even_when_coalesced() {
+        let frame = thinking(0, "a");
+        let limit = frame.len() * 2;
+        let mut buffer = GuardedOutput::default();
+        buffer
+            .extend_limited(vec![frame.clone(), frame.clone()], limit)
+            .unwrap();
+        assert_eq!(buffer.frames.len(), 1);
+        assert_eq!(buffer.wire_bytes, limit);
+        assert_eq!(
+            buffer.extend_limited(vec![frame], limit),
+            Err(GUARDED_OUTPUT_LIMIT_ERROR)
+        );
+        let output: Vec<_> = buffer.into_iter().collect();
+        assert_eq!(thinking_text(&output[0]), "aa");
+    }
+
+    #[test]
+    fn reasoning_guard_bounds_coalesced_frame_size_and_can_discard_an_empty_attempt() {
+        let mut buffer = GuardedOutput::default();
+        for _ in 0..32 {
+            buffer.extend(vec![thinking(0, &"x".repeat(4096))]).unwrap();
+        }
+        assert_eq!(buffer.frames.len(), 2);
+        assert!(buffer.frames.iter().all(|frame| matches!(frame, GuardedFrame::Thinking { text, .. } if text.len() <= super::MAX_COALESCED_THINKING_BYTES)));
+        let discarded = std::mem::take(&mut buffer);
+        drop(discarded);
+        assert!(buffer.is_empty());
+        assert_eq!(buffer.wire_bytes, 0);
+    }
+
+    #[test]
+    #[ignore = "manual reasoning-buffer scaling measurement"]
+    fn performance_reasoning_guard_fragmentation() {
+        let frame = thinking(0, "text");
+        for count in [8192, 16384, 32768, 65536] {
+            let started = std::time::Instant::now();
+            let mut buffer = GuardedOutput::default();
+            for _ in 0..count {
+                buffer.extend(vec![frame.clone()]).unwrap();
+            }
+            let buffered_frames = buffer.frames.len();
+            let input_bytes = buffer.wire_bytes;
+            let rendered: Vec<_> = buffer.into_iter().collect();
+            let rendered_bytes: usize = rendered.iter().map(String::len).sum();
+            assert_eq!(
+                rendered
+                    .iter()
+                    .map(|frame| thinking_text(frame))
+                    .collect::<String>(),
+                "text".repeat(count)
+            );
+            eprintln!(
+                "PERF reasoning_guard deltas={count} elapsed_us={} original_sse_bytes={input_bytes} buffered_frames={buffered_frames} rendered_bytes={rendered_bytes}",
+                started.elapsed().as_micros()
+            );
+        }
+    }
 
     fn cross_provider_config() -> Config {
         Config {

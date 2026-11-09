@@ -609,6 +609,24 @@ pub struct ToolBuffer {
 
 const MAX_CUMULATIVE_TOOL_INPUT_BYTES: usize = 16 * 1024 * 1024;
 
+#[derive(Debug)]
+struct PendingToolXml {
+    marker: &'static str,
+    /// Only the closing-tag overlap and subsequently appended bytes need a
+    /// new search. Offsets are bytes; matching ASCII tags preserves UTF-8.
+    search_from: usize,
+}
+
+impl PendingToolXml {
+    fn closing_tag(&self) -> &'static str {
+        if self.marker == "<function_calls" {
+            "</function_calls>"
+        } else {
+            "</tool_use>"
+        }
+    }
+}
+
 /// Holds split XML-like tool calls until they can be recovered or proven to be text.
 #[derive(Debug)]
 pub struct ToolLeakFilter {
@@ -624,6 +642,9 @@ pub struct ToolLeakFilter {
     position: MarkdownPosition,
     in_tagged_thinking: bool,
     pending: String,
+    pending_xml: Option<PendingToolXml>,
+    #[cfg(test)]
+    closing_search_bytes: usize,
     recovered: Vec<KiroEvent>,
     structured: BTreeMap<String, (String, String)>,
     redaction: Option<RedactionSession>,
@@ -644,6 +665,9 @@ impl ToolLeakFilter {
             position: MarkdownPosition::default(),
             in_tagged_thinking: false,
             pending: String::new(),
+            pending_xml: None,
+            #[cfg(test)]
+            closing_search_bytes: 0,
             recovered: Vec::new(),
             structured: BTreeMap::new(),
             redaction: None,
@@ -711,6 +735,7 @@ impl ToolLeakFilter {
                 if self.native_claude_refusals {
                     self.terminal_refusal = true;
                     self.pending.clear();
+                    self.pending_xml = None;
                     self.recovered.clear();
                     self.structured.clear();
                     return vec![event];
@@ -813,23 +838,45 @@ impl ToolLeakFilter {
             // thinking parser. Native tool events still pass through/deduplicate.
             self.known_tools.clear();
             self.tool_schemas.clear();
+            self.pending_xml = None;
             self.position.advance(&self.pending);
             return vec![KiroEvent::AssistantResponse {
                 content: std::mem::take(&mut self.pending),
             }];
         }
         let mut visible = String::new();
+        let mut consumed = 0;
         loop {
-            let Some((open, marker)) = first_marker(&self.pending) else {
-                let keep = marker_prefix_suffix(&self.pending);
+            if let Some(mut candidate) = self.pending_xml.take() {
+                let close = candidate.closing_tag();
+                let closing_at = find_insensitive_from(&self.pending, close, candidate.search_from);
+                #[cfg(test)]
+                {
+                    self.closing_search_bytes += closing_at
+                        .map_or(self.pending.len(), |at| at + close.len())
+                        - candidate.search_from;
+                }
+                let Some(start) = closing_at else {
+                    candidate.search_from = self.pending.len().saturating_sub(close.len() - 1);
+                    self.pending_xml = Some(candidate);
+                    break;
+                };
+                let end = start + close.len();
+                self.complete_tool_xml(consumed, end, candidate.marker, &mut visible);
+                consumed = end;
+                continue;
+            }
+            let Some((relative, marker)) = first_marker(&self.pending[consumed..]) else {
+                let keep = marker_prefix_suffix(&self.pending[consumed..]);
                 let split = self.pending.len().saturating_sub(keep);
-                visible.push_str(&self.pending[..split]);
-                self.position.advance(&self.pending[..split]);
-                self.pending = self.pending[split..].into();
+                visible.push_str(&self.pending[consumed..split]);
+                self.position.advance(&self.pending[consumed..split]);
+                consumed = split;
                 break;
             };
-            visible.push_str(&self.pending[..open]);
-            self.position.advance(&self.pending[..open]);
+            let open = consumed + relative;
+            visible.push_str(&self.pending[consumed..open]);
+            self.position.advance(&self.pending[consumed..open]);
             self.position.finish_tick_run();
             if matches!(marker, THINKING_START_TAG | THINKING_END_TAG) {
                 let end = open + marker.len();
@@ -848,7 +895,7 @@ impl ToolLeakFilter {
                     // its content can itself contain unfinished Markdown.
                     self.in_tagged_thinking = true;
                 }
-                self.pending = self.pending[end..].into();
+                consumed = end;
                 continue;
             }
             if self.in_tagged_thinking || self.position.in_code() {
@@ -858,39 +905,39 @@ impl ToolLeakFilter {
                 let end = open + marker.len();
                 visible.push_str(&self.pending[open..end]);
                 self.position.advance(&self.pending[open..end]);
-                self.pending = self.pending[end..].into();
+                consumed = end;
                 continue;
             }
-            let close = if marker == "<function_calls" {
-                "</function_calls>"
-            } else {
-                "</tool_use>"
-            };
-            let lower = self.pending.to_ascii_lowercase();
-            let Some(relative) = lower[open..].find(close) else {
-                self.pending = self.pending[open..].into();
-                break;
-            };
-            let end = open + relative + close.len();
-            let xml = self.pending[open..end].to_string();
-            let recovered = (self.position.can_recover() && !self.in_tagged_thinking)
-                .then(|| self.recover(&xml))
-                .flatten();
-            if let Some(events) = recovered {
-                self.recovered.extend(events);
-                // Arguments are data, not Markdown in the assistant answer.
-                // The opaque call still occupies the current line.
-                self.position.advance(marker);
-            } else {
-                visible.push_str(&xml);
-                self.position.advance(&xml);
+            consumed = open;
+            self.pending_xml = Some(PendingToolXml {
+                marker,
+                search_from: open + marker.len(),
+            });
+        }
+        if consumed > 0 {
+            self.pending.drain(..consumed);
+            if let Some(candidate) = &mut self.pending_xml {
+                candidate.search_from = candidate.search_from.saturating_sub(consumed);
             }
-            self.pending = self.pending[end..].into();
         }
         if visible.is_empty() {
             Vec::new()
         } else {
             vec![KiroEvent::AssistantResponse { content: visible }]
+        }
+    }
+
+    fn complete_tool_xml(&mut self, open: usize, end: usize, marker: &str, visible: &mut String) {
+        let xml = &self.pending[open..end];
+        let recovered = (self.position.can_recover() && !self.in_tagged_thinking)
+            .then(|| self.recover(xml))
+            .flatten();
+        if let Some(events) = recovered {
+            self.recovered.extend(events);
+            self.position.advance(marker);
+        } else {
+            visible.push_str(xml);
+            self.position.advance(xml);
         }
     }
 
@@ -1061,29 +1108,31 @@ impl MarkdownPosition {
 }
 
 fn first_marker(text: &str) -> Option<(usize, &'static str)> {
-    let lower = text.to_ascii_lowercase();
-    [
+    let markers = [
         "<function_calls",
         "<tool_use",
         THINKING_START_TAG,
         THINKING_END_TAG,
-    ]
-    .into_iter()
-    .filter_map(|marker| {
-        lower.match_indices(marker).find_map(|(index, _)| {
-            (marker.ends_with('>')
-                || lower
-                    .as_bytes()
-                    .get(index + marker.len())
-                    .is_none_or(|byte| byte.is_ascii_whitespace() || *byte == b'>'))
-            .then_some((index, marker))
-        })
-    })
-    .min_by_key(|(index, _)| *index)
+    ];
+    let bytes = text.as_bytes();
+    for (index, _) in bytes.iter().enumerate().filter(|(_, byte)| **byte == b'<') {
+        for marker in markers {
+            if bytes
+                .get(index..index + marker.len())
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(marker.as_bytes()))
+                && (marker.ends_with('>')
+                    || bytes
+                        .get(index + marker.len())
+                        .is_some_and(|byte| byte.is_ascii_whitespace() || *byte == b'>'))
+            {
+                return Some((index, marker));
+            }
+        }
+    }
+    None
 }
 
 fn marker_prefix_suffix(text: &str) -> usize {
-    let lower = text.to_ascii_lowercase();
     let mut longest = 0;
     for marker in [
         "<function_calls",
@@ -1091,8 +1140,15 @@ fn marker_prefix_suffix(text: &str) -> usize {
         THINKING_START_TAG,
         THINKING_END_TAG,
     ] {
-        for length in 1..marker.len() {
-            if lower.ends_with(&marker[..length]) {
+        let maximum = if marker.ends_with('>') {
+            marker.len() - 1
+        } else {
+            marker.len()
+        };
+        for length in 1..=maximum.min(text.len()) {
+            if text.as_bytes()[text.len() - length..]
+                .eq_ignore_ascii_case(&marker.as_bytes()[..length])
+            {
                 longest = longest.max(length);
             }
         }
@@ -1101,9 +1157,10 @@ fn marker_prefix_suffix(text: &str) -> usize {
 }
 
 fn find_insensitive_from(text: &str, needle: &str, from: usize) -> Option<usize> {
-    text.get(from..)?
-        .to_ascii_lowercase()
-        .find(&needle.to_ascii_lowercase())
+    text.as_bytes()
+        .get(from..)?
+        .windows(needle.len())
+        .position(|candidate| candidate.eq_ignore_ascii_case(needle.as_bytes()))
         .map(|index| from + index)
 }
 
@@ -2665,6 +2722,101 @@ mod tests {
                 assert_eq!(repair_json(input_delta)["overwrite"], true);
             }
             other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fragmented_tool_xml_search_is_linear_and_preserves_arguments() {
+        for size in [64, 128, 256, 512].map(|kib| kib * 1024) {
+            let text = "x".repeat(size);
+            let xml = format!(
+                "<tool_use name=\"write_file\">{}</tool_use>",
+                json!({"content":text})
+            );
+            let mut filter = ToolLeakFilter::new(true, ["write_file".into()]);
+            for chunk in xml.as_bytes().chunks(256) {
+                assert!(filter
+                    .push(KiroEvent::AssistantResponse {
+                        content: String::from_utf8(chunk.to_vec()).unwrap(),
+                    })
+                    .is_empty());
+            }
+            assert!(
+                filter.closing_search_bytes
+                    <= xml.len() + xml.len().div_ceil(256) * "</tool_use>".len(),
+                "rescanned an accumulated prefix: {} bytes for {} input bytes",
+                filter.closing_search_bytes,
+                xml.len()
+            );
+            assert!(filter.pending.is_empty());
+            let recovered = filter.finish();
+            assert_eq!(recovered.len(), 1);
+            let KiroEvent::ToolUse { input_delta, .. } = &recovered[0] else {
+                panic!("missing recovered call")
+            };
+            assert_eq!(repair_json(input_delta)["content"], text);
+        }
+    }
+
+    #[test]
+    fn multiple_tool_xml_candidates_in_one_chunk_are_scanned_once() {
+        let xml = "<tool_use name=\"lookup\">{\"q\":1}</tool_use>\n".repeat(512);
+        let mut filter = ToolLeakFilter::new(true, ["lookup".into()]);
+        let visible = filter.push(KiroEvent::AssistantResponse {
+            content: xml.clone(),
+        });
+        assert_eq!(
+            visible,
+            vec![KiroEvent::AssistantResponse {
+                content: "\n".repeat(512)
+            }]
+        );
+        assert!(filter.closing_search_bytes <= xml.len());
+        assert_eq!(filter.finish().len(), 512);
+    }
+
+    #[test]
+    fn closing_tool_xml_search_handles_utf8_and_every_tag_split() {
+        let prefix = "<tool_use name=\"lookup\">{\"q\":\"中文😀\"}";
+        let close = "</ToOl_UsE>";
+        for split in 0..=close.len() {
+            let mut filter = ToolLeakFilter::new(true, ["lookup".into()]);
+            for content in [prefix, &close[..split], &close[split..]] {
+                assert!(filter
+                    .push(KiroEvent::AssistantResponse {
+                        content: content.into()
+                    })
+                    .is_empty());
+            }
+            let recovered = filter.finish();
+            let [KiroEvent::ToolUse { input_delta, .. }] = recovered.as_slice() else {
+                panic!("invalid recovery")
+            };
+            assert_eq!(repair_json(input_delta)["q"], "中文😀");
+        }
+    }
+
+    #[test]
+    #[ignore = "manual stream-parser scaling measurement"]
+    fn performance_tool_xml_fragmentation() {
+        for size in [64, 128, 256, 512].map(|kib| kib * 1024) {
+            let xml = format!(
+                "<tool_use name=\"write_file\">{}</tool_use>",
+                json!({"content":"x".repeat(size)})
+            );
+            let started = std::time::Instant::now();
+            let mut scanned = 0;
+            for _ in 0..10 {
+                let mut filter = ToolLeakFilter::new(true, ["write_file".into()]);
+                for chunk in xml.as_bytes().chunks(256) {
+                    filter.push(KiroEvent::AssistantResponse {
+                        content: String::from_utf8(chunk.to_vec()).unwrap(),
+                    });
+                }
+                scanned = filter.closing_search_bytes;
+                assert_eq!(filter.finish().len(), 1);
+            }
+            println!("PERF tool_xml kib={} chunk_bytes=256 iterations=10 elapsed_us={} closing_search_bytes={scanned}", size / 1024, started.elapsed().as_micros());
         }
     }
 

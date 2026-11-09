@@ -525,6 +525,136 @@ async fn latency_empty_tool_result_retry_reuses_a_single_stream_slot() {
 }
 
 #[tokio::test]
+async fn latency_reasoning_guard_limit_settles_usage_and_releases_single_slot() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let large_reasoning = Bytes::from(event_stream_frame(
+        "reasoningContentEvent",
+        json!({"reasoningContentEvent":{"text":"r".repeat(6 * 1024 * 1024)}}),
+    ));
+    let app = axum::Router::new()
+        .route("/ListAvailableModels", get(|| async {
+            axum::Json(json!({"models":[
+                {"modelId":"source-large", "additionalModelRequestFieldsSchema":{"properties":{"output_config":{"properties":{"effort":{"enum":["low","medium","high"]}}}}}, "tokenLimits":{"maxInputTokens":1_000_000,"maxOutputTokens":16_384}},
+                {"modelId":"mapped-small", "tokenLimits":{"maxInputTokens":128_000,"maxOutputTokens":16_384}},
+                {"modelId":"resolved-small", "tokenLimits":{"maxInputTokens":64_000,"maxOutputTokens":16_384}},
+                {"modelId":"resolved-tiny", "tokenLimits":{"maxInputTokens":500,"maxOutputTokens":16_384}},
+                {"modelId":"summary-large", "tokenLimits":{"maxInputTokens":1_000_000,"maxOutputTokens":16_384}}
+            ]}))
+        }))
+        .route("/generateAssistantResponse", post(move || {
+            let count = count.clone();
+            let large_reasoning = large_reasoning.clone();
+            async move {
+                let first = count.fetch_add(1, Ordering::SeqCst) == 0;
+                let stream = async_stream::stream! {
+                    if first {
+                        yield Ok::<_, Infallible>(Bytes::from(event_stream_frame(
+                            "messageMetadataEvent",
+                            json!({"messageMetadataEvent":{"usage":{"inputTokens":111,"outputTokens":222,"creditsConsumed":0.25}}}),
+                        )));
+                        for _ in 0..3 {
+                            yield Ok::<_, Infallible>(large_reasoning.clone());
+                        }
+                        // The limit must cancel this attempt without waiting for EOF.
+                        futures::future::pending::<()>().await;
+                    } else {
+                        yield Ok::<_, Infallible>(Bytes::from(generation_body("Slot released after guard limit.")));
+                    }
+                };
+                ([("content-type", "application/vnd.amazon.eventstream")], Body::from_stream(stream)).into_response()
+            }
+        }));
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let port = unused_tcp_port();
+    let daemon = Daemon::start_http(port, &format!("{url}/generateAssistantResponse")).await;
+    import_context_alignment_account(&daemon, 0.0).await;
+    model_policy::configure(&daemon, |config| {
+        config.upstream.pool.stream_max_connections = 1;
+        config.upstream.stream_slot_wait_timeout_ms = 100;
+    })
+    .await;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap();
+    let mut request = tool_result_request();
+    request["max_tokens"] = json!(4096);
+    request["thinking"] = json!({"type":"enabled", "budget_tokens":1024});
+    let first = client
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .bearer_auth(daemon.api_key.as_deref().unwrap())
+        .header("user-agent", "claude-cli/2.1.260 (external, e2e)")
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        first.contains("unconfirmed stream output exceeded the 16 MiB buffering limit"),
+        "{first}"
+    );
+    assert!(
+        !first.contains("thinking_delta"),
+        "failed attempt leaked reasoning"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "local limits must not retry upstream"
+    );
+    let stats = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let stats = expect_ok(
+                daemon
+                    .call("stats", json!({"detail":true,"recent":10}))
+                    .await,
+            );
+            if stats["stats"]["recent_requests"].as_array().unwrap().len() == 1 {
+                break stats;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("failed request accounting reaches the persistent stats writer");
+    let rows = stats["stats"]["recent_requests"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{stats}");
+    assert_eq!(rows[0]["input_tokens"], 111, "{stats}");
+    assert_eq!(rows[0]["output_tokens"], 222, "{stats}");
+    assert_eq!(rows[0]["credits"], 0.25, "{stats}");
+    assert_eq!(
+        rows[0]["diagnostics"]["error_code"], "response_buffer_limit",
+        "{stats}"
+    );
+    assert_eq!(rows[0]["diagnostics"]["failure_scope"], "proxy", "{stats}");
+    assert_eq!(rows[0]["diagnostics"]["account_error"], false, "{stats}");
+    let second = client
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .bearer_auth(daemon.api_key.as_deref().unwrap())
+        .header("user-agent", "claude-cli/2.1.260 (external, e2e)")
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        second.contains("Slot released after guard limit."),
+        "{second}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    daemon.stop().await;
+    task.abort();
+}
+
+#[tokio::test]
 async fn latency_tool_calls_ignore_legacy_post_eof_delay() {
     let _guard = HTTP_TEST_LOCK.lock().await;
     let mock = MockServer::start().await;

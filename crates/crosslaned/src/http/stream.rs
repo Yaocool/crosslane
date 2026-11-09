@@ -1712,6 +1712,14 @@ fn classify_stream_failure(
     message: &str,
     diagnostics: Option<&StreamFailureDiagnostics>,
 ) -> StreamFailureDetails {
+    if message == response_loop::GUARDED_OUTPUT_LIMIT_ERROR {
+        return StreamFailureDetails {
+            upstream_status: None,
+            error_code: "response_buffer_limit",
+            error_stage: "response_assembly",
+            scope: StreamFailureScope::Proxy,
+        };
+    }
     #[cfg(feature = "crs")]
     if message == CLIENT_CANCELLED_ERROR {
         return StreamFailureDetails {
