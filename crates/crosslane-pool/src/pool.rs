@@ -225,10 +225,27 @@ impl AccountPool {
         estimated_credits: f64,
         prefer_ids: &[String],
     ) -> Result<AccountLease, PoolError> {
-        if self.candidates(model, prefer_ids).await.is_empty() {
+        let allowed_ids = (!prefer_ids.is_empty()).then(|| prefer_ids.iter().cloned().collect());
+        self.acquire_selected(model, estimated_credits, allowed_ids.as_ref())
+            .await
+    }
+
+    async fn acquire_selected(
+        &self,
+        model: &str,
+        _estimated_credits: f64,
+        allowed_ids: Option<&HashSet<String>>,
+    ) -> Result<AccountLease, PoolError> {
+        // Register before inspecting capacity so a release during selection
+        // cannot be lost before this request starts waiting.
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let candidates = self.candidates(model, allowed_ids).await;
+        if candidates.is_empty() {
             return Err(PoolError::NoAvailableAccount(model.into()));
         }
-        if let Some(lease) = self.try_acquire(model, estimated_credits, prefer_ids).await {
+        if let Some(lease) = self.try_acquire_candidates(candidates).await {
             return Ok(lease);
         }
         let config = self.config();
@@ -258,13 +275,16 @@ impl AccountPool {
             if now >= deadline {
                 return Err(PoolError::QueueTimeout);
             }
-            if tokio::time::timeout(deadline - now, self.notify.notified())
+            if tokio::time::timeout(deadline - now, notified.as_mut())
                 .await
                 .is_err()
             {
                 return Err(PoolError::QueueTimeout);
             }
-            if let Some(lease) = self.try_acquire(model, estimated_credits, prefer_ids).await {
+            notified.set(self.notify.notified());
+            notified.as_mut().enable();
+            let candidates = self.candidates(model, allowed_ids).await;
+            if let Some(lease) = self.try_acquire_candidates(candidates).await {
                 return Ok(lease);
             }
         }
@@ -279,16 +299,18 @@ impl AccountPool {
         excluded_ids: &HashSet<String>,
     ) -> Result<AccountLease, PoolError> {
         let candidate_ids = self
-            .snapshot()
+            .accounts
+            .read()
             .await
-            .into_iter()
-            .filter(|account| !excluded_ids.contains(&account.id))
-            .map(|account| account.id)
-            .collect::<Vec<_>>();
+            .keys()
+            .filter(|id| !excluded_ids.contains(*id))
+            .cloned()
+            .collect::<HashSet<_>>();
         if candidate_ids.is_empty() {
             return Err(PoolError::NoAvailableAccount(model.into()));
         }
-        self.acquire(model, estimated_credits, &candidate_ids).await
+        self.acquire_selected(model, estimated_credits, Some(&candidate_ids))
+            .await
     }
 
     /// Acquires from one service's fixed account scope while excluding
@@ -304,20 +326,18 @@ impl AccountPool {
             .iter()
             .filter(|account_id| !excluded_ids.contains(*account_id))
             .cloned()
-            .collect::<Vec<_>>();
+            .collect::<HashSet<_>>();
         if candidate_ids.is_empty() {
             return Err(PoolError::NoAvailableAccount(model.into()));
         }
-        self.acquire(model, estimated_credits, &candidate_ids).await
+        self.acquire_selected(model, estimated_credits, Some(&candidate_ids))
+            .await
     }
 
-    async fn try_acquire(
+    async fn try_acquire_candidates(
         &self,
-        model: &str,
-        _estimated_credits: f64,
-        prefer_ids: &[String],
+        mut candidates: Vec<(f64, Arc<AccountState>)>,
     ) -> Option<AccountLease> {
-        let mut candidates = self.candidates(model, prefer_ids).await;
         candidates
             .sort_by(|left, right| left.0.partial_cmp(&right.0).unwrap_or(CmpOrdering::Equal));
         let maximum = self.config().max_concurrent_per_account;
@@ -341,20 +361,29 @@ impl AccountPool {
     async fn candidates(
         &self,
         model: &str,
-        prefer_ids: &[String],
+        allowed_ids: Option<&HashSet<String>>,
     ) -> Vec<(f64, Arc<AccountState>)> {
-        let accounts = self.accounts.read().await;
-        let mut output = Vec::new();
-        for state in accounts.values() {
-            if !prefer_ids.is_empty() {
-                let id = state.account.read().await.id.clone();
-                if !prefer_ids.contains(&id) {
-                    continue;
-                }
+        // Match immutable map keys before taking per-account locks, and release
+        // the pool lock before eligibility/scoring can wait on an account update.
+        let accounts = {
+            let accounts = self.accounts.read().await;
+            match allowed_ids {
+                Some(allowed) if allowed.len() < accounts.len() => allowed
+                    .iter()
+                    .filter_map(|id| accounts.get(id).map(Arc::clone))
+                    .collect::<Vec<_>>(),
+                _ => accounts
+                    .iter()
+                    .filter(|(id, _)| allowed_ids.is_none_or(|allowed| allowed.contains(*id)))
+                    .map(|(_, state)| Arc::clone(state))
+                    .collect::<Vec<_>>(),
             }
-            if self.eligible(state, model).await {
+        };
+        let mut output = Vec::new();
+        for state in accounts {
+            if self.eligible(&state, model).await {
                 let jitter = rand::thread_rng().gen_range(0.0..f64::EPSILON * 1024.0);
-                output.push((self.score(state).await.score + jitter, Arc::clone(state)));
+                output.push((self.score(&state).await.score + jitter, state));
             }
         }
         output
@@ -857,6 +886,70 @@ mod tests {
         let lease = pool.acquire("", 0.0, &[]).await.expect("account lease");
         let _write = lease.state.account.write().await;
         assert_eq!(lease.account_id(), "stable");
+    }
+
+    #[tokio::test]
+    async fn scoped_selection_does_not_wait_for_an_unrelated_account_update() {
+        let pool = AccountPool::new(
+            vec![
+                account("unrelated", 0.0, SubscriptionKind::Pro),
+                account("allowed", 0.0, SubscriptionKind::Pro),
+            ],
+            immediate_config(),
+        );
+        let unrelated = pool.get("unrelated").await.expect("unrelated account");
+        let _update = unrelated.account.write().await;
+        let allowed = HashSet::from(["allowed".to_string()]);
+        let excluded = HashSet::from(["unrelated".to_string()]);
+        let scoped = tokio::time::timeout(
+            Duration::from_secs(1),
+            pool.acquire_scoped_excluding("", 0.0, &allowed, &HashSet::new()),
+        )
+        .await
+        .expect("scope filtering must not lock unrelated accounts")
+        .expect("scoped lease");
+        assert_eq!(scoped.account_id(), "allowed");
+        drop(scoped);
+        let retry = tokio::time::timeout(
+            Duration::from_secs(1),
+            pool.acquire_excluding("", 0.0, &excluded),
+        )
+        .await
+        .expect("retry filtering must not snapshot excluded accounts")
+        .expect("retry lease");
+        assert_eq!(retry.account_id(), "allowed");
+    }
+
+    /// Run with `cargo test -p crosslane-pool scoped_acquire_profile -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "manual account scope selection profile"]
+    async fn scoped_acquire_profile() {
+        for account_count in [10, 100, 1_000, 3_000] {
+            let accounts = (0..account_count)
+                .map(|index| account(&format!("account-{index}"), 0.0, SubscriptionKind::Pro))
+                .collect::<Vec<_>>();
+            let all_ids = accounts.iter().map(|account| account.id.clone()).collect();
+            let one_id = HashSet::from(["account-0".to_string()]);
+            let pool = AccountPool::new(accounts, immediate_config());
+            for (scope, ids) in [("all", &all_ids), ("one", &one_id)] {
+                let mut micros = Vec::new();
+                for _ in 0..100 {
+                    let start = Instant::now();
+                    let lease = pool
+                        .acquire_scoped_excluding("", 0.0, ids, &HashSet::new())
+                        .await
+                        .expect("lease");
+                    micros.push(start.elapsed().as_micros());
+                    assert!(ids.contains(&lease.account_id()));
+                    drop(lease);
+                }
+                micros.sort_unstable();
+                eprintln!(
+                    "pool accounts={account_count} scope={scope} acquisitions=100 p50_us={} p99_us={}",
+                    micros[50], micros[99],
+                );
+            }
+        }
     }
 
     #[test]
@@ -1400,6 +1493,59 @@ mod tests {
         drop(held);
         let lease = waiter.await.expect("join").expect("woken");
         assert_eq!(lease.account().await.id, "a");
+    }
+
+    #[tokio::test]
+    async fn releasing_a_scoped_account_wakes_only_eligible_acquisitions() {
+        let config = PoolConfig {
+            max_concurrent_per_account: 1,
+            max_queue_size: 4,
+            max_queue_wait_ms: 2_000,
+            ..PoolConfig::default()
+        };
+        let pool = AccountPool::new(
+            vec![
+                account("a", 0.0, SubscriptionKind::Pro),
+                account("b", 0.0, SubscriptionKind::Pro),
+            ],
+            config,
+        );
+        let held_a = pool.acquire("", 0.0, &["a".into()]).await.expect("hold a");
+        let held_b = pool.acquire("", 0.0, &["b".into()]).await.expect("hold b");
+        let wait_for = |id: &str| {
+            let pool = pool.clone();
+            let allowed = HashSet::from([id.to_string()]);
+            tokio::spawn(async move {
+                pool.acquire_scoped_excluding("", 0.0, &allowed, &HashSet::new())
+                    .await
+            })
+        };
+        let waiter_a = wait_for("a");
+        let waiter_b = wait_for("b");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool.queued() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both scopes entered queue");
+
+        drop(held_b);
+        let lease_b = tokio::time::timeout(Duration::from_secs(1), waiter_b)
+            .await
+            .expect("b scope woke")
+            .expect("join b")
+            .expect("lease b");
+        assert_eq!(lease_b.account_id(), "b");
+        assert!(!waiter_a.is_finished());
+        drop(held_a);
+        let lease_a = tokio::time::timeout(Duration::from_secs(1), waiter_a)
+            .await
+            .expect("a scope woke")
+            .expect("join a")
+            .expect("lease a");
+        assert_eq!(lease_a.account_id(), "a");
+        assert_eq!(pool.queued(), 0);
     }
 
     #[tokio::test]
