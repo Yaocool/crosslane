@@ -14,7 +14,7 @@ use crosslane_translate::{
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use super::response::DecodedResponse;
+use super::super::response::DecodedResponse;
 
 const DEFAULT_TTL: Duration = Duration::from_secs(5 * 60);
 const ONE_HOUR_TTL: Duration = Duration::from_secs(60 * 60);
@@ -30,20 +30,20 @@ struct CachePoint {
 }
 
 #[derive(Debug, Clone)]
-pub struct PromptCacheProfile {
+pub struct LegacyProfile {
     model: String,
     points: Vec<CachePoint>,
     candidates: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct PromptCachePlan {
-    profile: Option<PromptCacheProfile>,
+pub struct LegacyPlan {
+    profile: Option<LegacyProfile>,
     cache_read_tokens: u64,
     cache_write_tokens: u64,
 }
 
-impl PromptCachePlan {
+impl LegacyPlan {
     pub fn usage(&self, input_tokens: u64) -> (u64, u64) {
         if self
             .profile
@@ -68,18 +68,18 @@ struct Entry {
 }
 
 #[derive(Debug, Default)]
-pub struct PromptCacheTracker {
+pub struct LegacyTracker {
     entries: Mutex<HashMap<String, HashMap<String, Entry>>>,
 }
 
-impl PromptCacheTracker {
+impl LegacyTracker {
     pub async fn claude_profile(
         &self,
         tokenizer: &TokenCountCache,
         request: &ClaudeRequest,
         total_tokens: u64,
         model: &str,
-    ) -> Option<PromptCacheProfile> {
+    ) -> Option<LegacyProfile> {
         let mut blocks = claude_prefix(request);
         for message in request
             .messages
@@ -109,7 +109,7 @@ impl PromptCacheTracker {
         request: &ClaudeRequest,
         total_tokens: u64,
         model: &str,
-    ) -> Option<PromptCacheProfile> {
+    ) -> Option<LegacyProfile> {
         build_profile(tokenizer, claude_prefix(request), total_tokens, model, None).await
     }
 
@@ -119,7 +119,7 @@ impl PromptCacheTracker {
         request: &OpenAiRequest,
         total_tokens: u64,
         model: &str,
-    ) -> Option<PromptCacheProfile> {
+    ) -> Option<LegacyProfile> {
         let mut blocks = Vec::new();
         for tool in &request.tools {
             append_tool(&mut blocks, serde_json::to_value(tool).ok()?);
@@ -194,10 +194,10 @@ impl PromptCacheTracker {
         &self,
         account_id: &str,
         model: &str,
-        profile: Option<&PromptCacheProfile>,
-    ) -> PromptCachePlan {
+        profile: Option<&LegacyProfile>,
+    ) -> LegacyPlan {
         let Some(profile) = profile.filter(|profile| profile.model == model) else {
-            return PromptCachePlan::default();
+            return LegacyPlan::default();
         };
         let mut entries = self
             .entries
@@ -219,7 +219,7 @@ impl PromptCacheTracker {
             .max()
             .unwrap_or(0)
             .min(total);
-        PromptCachePlan {
+        LegacyPlan {
             profile: Some(profile.clone()),
             cache_read_tokens: read,
             cache_write_tokens: total.saturating_sub(read),
@@ -229,7 +229,7 @@ impl PromptCacheTracker {
     /// Called only after successful EOF. Explicit upstream counters, including
     /// zero, remain authoritative. Refusals without generated output do not
     /// create local cache entries even when an upstream charge was reported.
-    pub fn commit(&self, account_id: &str, plan: &PromptCachePlan, decoded: &mut DecodedResponse) {
+    pub fn commit(&self, account_id: &str, plan: &LegacyPlan, decoded: &mut DecodedResponse) {
         let Some(profile) = &plan.profile else {
             return;
         };
@@ -243,6 +243,12 @@ impl PromptCacheTracker {
         decoded.usage.cache_read_tokens = read;
         decoded.usage.cache_write_tokens = write;
         decoded.cache_usage_estimated = true;
+        if let Some(sources) = &mut decoded.cumulative_usage_sources {
+            sources.cache |= crate::http::response::UsageSources::LOCAL;
+        }
+        if decoded.stop_sequence.is_some() {
+            return;
+        }
         let now = Instant::now();
         let mut entries = self
             .entries
@@ -527,7 +533,7 @@ async fn build_profile(
     total_tokens: u64,
     model: &str,
     cache_key: Option<&str>,
-) -> Option<PromptCacheProfile> {
+) -> Option<LegacyProfile> {
     let writes: Vec<_> = blocks
         .iter()
         .enumerate()
@@ -571,7 +577,7 @@ async fn build_profile(
             }
         }
     }
-    (!points.is_empty()).then_some(PromptCacheProfile {
+    (!points.is_empty()).then_some(LegacyProfile {
         model: model.to_owned(),
         points,
         candidates,
@@ -650,7 +656,7 @@ mod tests {
             ..Default::default()
         }
     }
-    async fn profile(tracker: &PromptCacheTracker, req: &ClaudeRequest) -> PromptCacheProfile {
+    async fn profile(tracker: &LegacyTracker, req: &ClaudeRequest) -> LegacyProfile {
         tracker
             .claude_profile(&TokenCountCache::new(64).unwrap(), req, 8000, MODEL)
             .await
@@ -659,7 +665,7 @@ mod tests {
 
     #[tokio::test]
     async fn cold_write_then_warm_read_preserves_total_input() {
-        let tracker = PromptCacheTracker::default();
+        let tracker = LegacyTracker::default();
         let p = profile(&tracker, &request()).await;
         let cold = tracker.plan("one", MODEL, Some(&p));
         let mut d = decoded();
@@ -684,7 +690,7 @@ mod tests {
 
     #[tokio::test]
     async fn growing_breakpoints_reuse_prior_prefix_without_hashing_cache_markers() {
-        let tracker = PromptCacheTracker::default();
+        let tracker = LegacyTracker::default();
         let mut req = request();
         req.system = None;
         req.messages[0].content = json!([{"type":"text","text":"stable reference ".repeat(1200),"cache_control":{"type":"ephemeral"}}]);
@@ -710,7 +716,7 @@ mod tests {
 
     #[tokio::test]
     async fn system_breakpoint_survives_growing_conversation_and_changed_tools_invalidate_it() {
-        let tracker = PromptCacheTracker::default();
+        let tracker = LegacyTracker::default();
         let req = request();
         let p = profile(&tracker, &req).await;
         tracker.commit("one", &tracker.plan("one", MODEL, Some(&p)), &mut decoded());
@@ -731,7 +737,7 @@ mod tests {
 
     #[tokio::test]
     async fn plans_are_read_only_and_refusals_do_not_seed_entries() {
-        let tracker = PromptCacheTracker::default();
+        let tracker = LegacyTracker::default();
         let p = profile(&tracker, &request()).await;
         let first = tracker.plan("one", MODEL, Some(&p));
         assert_eq!(tracker.plan("one", MODEL, Some(&p)).cache_read_tokens, 0);
@@ -746,7 +752,7 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_upstream_zero_or_positive_cache_counts_are_preserved() {
-        let tracker = PromptCacheTracker::default();
+        let tracker = LegacyTracker::default();
         let p = profile(&tracker, &request()).await;
         for count in [0, 1234] {
             let mut d = decoded();
@@ -764,7 +770,7 @@ mod tests {
 
     #[tokio::test]
     async fn ttl_expiry_and_small_prefixes_remain_cold() {
-        let tracker = PromptCacheTracker::default();
+        let tracker = LegacyTracker::default();
         let p = profile(&tracker, &request()).await;
         tracker.commit("one", &tracker.plan("one", MODEL, Some(&p)), &mut decoded());
         for entry in tracker
@@ -788,7 +794,7 @@ mod tests {
 
     #[tokio::test]
     async fn automatic_claude_and_openai_caching_work_and_keys_are_isolated() {
-        let tracker = PromptCacheTracker::default();
+        let tracker = LegacyTracker::default();
         let tokenizer = TokenCountCache::new(64).unwrap();
         let mut req = request();
         req.system.as_mut().unwrap()[0]
@@ -825,7 +831,7 @@ mod tests {
 
     #[tokio::test]
     async fn compacted_history_does_not_seed_removed_breakpoints() {
-        let tracker = PromptCacheTracker::default();
+        let tracker = LegacyTracker::default();
         let tokenizer = TokenCountCache::new(64).unwrap();
         let mut req = request();
         req.system = None;
@@ -838,7 +844,7 @@ mod tests {
 
     #[tokio::test]
     async fn attachment_tokens_use_media_overhead_and_changed_bytes_invalidate_the_prefix() {
-        let tracker = PromptCacheTracker::default();
+        let tracker = LegacyTracker::default();
         let tokenizer = TokenCountCache::new(64).unwrap();
         let mut bytes = vec![0u8; 48_000];
         let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
@@ -869,7 +875,7 @@ mod tests {
 
     #[tokio::test]
     async fn promoted_system_messages_and_nested_tool_result_markers_are_accounted_for() {
-        let tracker = PromptCacheTracker::default();
+        let tracker = LegacyTracker::default();
         let mut req = request();
         req.system = None;
         req.messages[0].content = json!([{"type":"tool_result","tool_use_id":"fixture","content":[{"type":"text","text":"stable reference ".repeat(1200),"cache_control":{"type":"ephemeral"}}]}]);

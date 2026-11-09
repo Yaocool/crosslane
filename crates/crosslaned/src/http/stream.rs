@@ -79,6 +79,8 @@ impl StreamProtocol {
 }
 
 pub struct StreamContext {
+    pub(crate) cache_snapshot: super::prompt_cache::AttemptSnapshot,
+    pub zero_fallback: bool,
     pub state: Arc<AppState>,
     /// Fixed effective account pool for the originating proxy service.
     pub account_ids: Arc<HashSet<String>>,
@@ -207,6 +209,7 @@ fn build_claude_state(context: &StreamContext) -> ClaudeState {
     claude.auto_compaction_original_input_tokens = context.auto_compaction_original_input_tokens;
     claude.compaction_iteration = context.compaction_iteration;
     claude.compaction_in_start = context.compaction_in_start;
+    claude.kiro_zero_fallback = context.zero_fallback;
     claude
         .context_edit_stats
         .clone_from(&context.context_edit_stats);
@@ -670,7 +673,10 @@ struct ClaudeState {
     openai_include_usage: bool,
     cache_creation_input_tokens: u64,
     cache_read_input_tokens: u64,
-    local_cache_plan: Option<super::prompt_cache::PromptCachePlan>,
+    local_cache_plan: Option<(super::prompt_cache::PromptCachePlan, std::time::Instant)>,
+    /// `kiro_usage_zero_policy = fallback`: explicit Kiro zeros in metadata
+    /// are placeholders and must not replace provisional counters.
+    kiro_zero_fallback: bool,
     visible_text: String,
     #[cfg(feature = "crs")]
     text_block_offsets: Vec<usize>,
@@ -703,6 +709,7 @@ impl ClaudeState {
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
             local_cache_plan: None,
+            kiro_zero_fallback: false,
             visible_text: String::new(),
             #[cfg(feature = "crs")]
             text_block_offsets: Vec::new(),
@@ -711,11 +718,21 @@ impl ClaudeState {
         }
     }
 
-    fn apply_prompt_cache_plan(&mut self, plan: &super::prompt_cache::PromptCachePlan) {
-        self.local_cache_plan = Some(plan.clone());
-        let (read, write) = plan.usage(self.input_tokens);
-        self.cache_read_input_tokens = read;
-        self.cache_creation_input_tokens = write;
+    /// Provisional cache counters for this attempt's `message_start`, from the
+    /// same allocation the round settles with after EOF.
+    fn apply_prompt_cache_plan(
+        &mut self,
+        plan: &super::prompt_cache::PromptCachePlan,
+        dispatched_at: std::time::Instant,
+    ) {
+        self.local_cache_plan = Some((plan.clone(), dispatched_at));
+        let provisional = super::prompt_cache::CacheLedger::provisional(
+            plan,
+            Some(dispatched_at),
+            self.input_tokens,
+        );
+        self.cache_read_input_tokens = provisional.read;
+        self.cache_creation_input_tokens = provisional.write();
     }
 
     fn observe_usage(&mut self, decoded: &DecodedResponse, pending_initial: &mut [String]) {
@@ -725,26 +742,26 @@ impl ClaudeState {
         if self.message_started && pending_start.is_none() {
             return;
         }
-        // Metadata may precede the first content event. Use it in message_start
-        // when available; late metadata is carried by the final message_delta.
-        // Local plans initialize the start event. Only reported metadata or
-        // finalized local accounting replaces those provisional counters.
-        if decoded.has_upstream_cache_usage() || decoded.cache_usage_estimated {
-            self.cache_creation_input_tokens = decoded.usage.cache_write_tokens;
-            self.cache_read_input_tokens = decoded.usage.cache_read_tokens;
-        } else if let Some(plan) = &self.local_cache_plan {
-            let (read, write) =
-                plan.usage(decoded.upstream_input_tokens.unwrap_or(self.input_tokens));
-            self.cache_read_input_tokens = read;
-            self.cache_creation_input_tokens = write;
-        }
-        self.input_tokens = decoded
-            .upstream_input_tokens
-            .unwrap_or(self.input_tokens)
-            .max(
-                self.cache_creation_input_tokens
-                    .saturating_add(self.cache_read_input_tokens),
+        // Metadata may precede the first content event. A positive upstream
+        // cache group replaces the provisional plan; otherwise the plan is
+        // re-run on the newest known input. Sent frames are never rewritten.
+        // Under the zero fallback policy, Kiro zero placeholders count as
+        // unreported here too, matching round settlement.
+        let (upstream_cache, upstream_input, upstream_read, upstream_write) =
+            decoded.observed_upstream_usage(self.kiro_zero_fallback);
+        if upstream_cache || decoded.cache_usage_estimated {
+            self.cache_creation_input_tokens = upstream_write;
+            self.cache_read_input_tokens = upstream_read;
+        } else if let Some((plan, dispatched_at)) = &self.local_cache_plan {
+            let provisional = super::prompt_cache::CacheLedger::provisional(
+                plan,
+                Some(*dispatched_at),
+                upstream_input.unwrap_or(self.input_tokens),
             );
+            self.cache_read_input_tokens = provisional.read;
+            self.cache_creation_input_tokens = provisional.write();
+        }
+        self.input_tokens = upstream_input.unwrap_or(self.input_tokens);
         if let Some(start) = pending_start {
             // A compaction/server-tool prelude may have created message_start
             // locally without sending it yet. Refresh that queued event too.
@@ -1189,7 +1206,8 @@ fn stream_finish(
                 "input_tokens":uncached_input_tokens,
                 "output_tokens":decoded.usage.output_tokens,
                 "cache_creation_input_tokens":decoded.usage.cache_write_tokens,
-                "cache_read_input_tokens":decoded.usage.cache_read_tokens
+                "cache_read_input_tokens":decoded.usage.cache_read_tokens,
+                "cache_creation":decoded.claude_cache_creation()
             });
             if !decoded.web_searches.is_empty() {
                 usage["server_tool_use"] = json!({

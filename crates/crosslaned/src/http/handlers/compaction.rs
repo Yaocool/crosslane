@@ -953,6 +953,7 @@ async fn generate_compaction_summary_inner(
         }
     };
     let UpstreamExecution {
+        cache_snapshot: _,
         mut lease,
         response,
         upstream_access_token: _,

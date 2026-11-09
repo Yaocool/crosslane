@@ -415,6 +415,7 @@ struct DispatchFailure {
 }
 
 struct UpstreamExecution {
+    cache_snapshot: super::prompt_cache::AttemptSnapshot,
     lease: AccountLease,
     response: KiroResponse,
     upstream_access_token: String,
@@ -1953,22 +1954,93 @@ async fn enforce_context(
     }
 }
 
+/// A short-lived accounting snapshot. Discard it before mutating the source;
+/// dispatch still prepares with the selected account's secrets independently.
+struct PreparedPayloadAccounting {
+    payload: KiroPayload,
+    bytes: usize,
+}
+
+impl PreparedPayloadAccounting {
+    fn new(payload: &KiroPayload) -> Result<Self, String> {
+        let payload = crosslane_translate::prepare_redacted_kiro_payload(payload, &[]);
+        let bytes = serialized_bytes(&payload)
+            .map_err(|error| format!("failed to serialize upstream request: {error}"))?;
+        Ok(Self { payload, bytes })
+    }
+
+    async fn input_tokens(
+        &self,
+        tokenizer: &crosslane_translate::TokenCountCache,
+    ) -> Result<u64, String> {
+        tokenizer
+            .estimate_prepared_kiro_payload(&self.payload)
+            .await
+            .map(|tokens| tokens as u64)
+    }
+
+    async fn tool_tokens(
+        &self,
+        tokenizer: &crosslane_translate::TokenCountCache,
+    ) -> Result<u64, String> {
+        tokenizer
+            .estimate_prepared_kiro_tools(&self.payload)
+            .await
+            .map(|tokens| tokens as u64)
+    }
+
+    async fn metrics(
+        &self,
+        tokenizer: &crosslane_translate::TokenCountCache,
+    ) -> Result<PayloadMetrics, String> {
+        Ok(PayloadMetrics {
+            input_tokens: self.input_tokens(tokenizer).await?,
+            tool_tokens: self.tool_tokens(tokenizer).await?,
+            bytes: self.bytes,
+        })
+    }
+}
+
+pub(super) struct PayloadMetrics {
+    pub(super) input_tokens: u64,
+    pub(super) tool_tokens: u64,
+    pub(super) bytes: usize,
+}
+
+pub(super) async fn payload_metrics(
+    tokenizer: &crosslane_translate::TokenCountCache,
+    payload: &KiroPayload,
+) -> Result<PayloadMetrics, String> {
+    PreparedPayloadAccounting::new(payload)?
+        .metrics(tokenizer)
+        .await
+}
+
+// Serde writes escaped UTF-8 and separators exactly as for `to_vec`, without
+// allocating another complete copy merely to find its byte length.
+fn serialized_bytes(value: &impl serde::Serialize) -> Result<usize, serde_json::Error> {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, value)?;
+    Ok(counter.0)
+}
+
 fn serialized_payload_bytes(
     payload: &crosslane_translate::KiroPayload,
     format: ErrorFormat,
 ) -> Result<usize, ApiError> {
-    serde_json::to_vec(&crosslane_translate::prepare_redacted_kiro_payload(
-        payload,
-        &[],
-    ))
-    .map(|payload| payload.len())
-    .map_err(|error| {
-        ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to serialize upstream request: {error}"),
-            format,
-        )
-    })
+    PreparedPayloadAccounting::new(payload)
+        .map(|accounting| accounting.bytes)
+        .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error, format))
 }
 
 #[cfg(test)]
@@ -2004,6 +2076,133 @@ fn serialized_budget_includes_redaction_expansion() {
             .is_err()
     );
     assert_eq!(serde_json::to_vec(&payload).unwrap(), raw);
+}
+
+#[cfg(test)]
+fn accounting_fixture(text_bytes: usize) -> KiroPayload {
+    let mut payload: KiroPayload = serde_json::from_value(json!({
+        "conversationState": {
+            "chatTriggerType":"MANUAL", "conversationId":"accounting-fixture",
+            "history":[{"assistantResponseMessage":{"content":"quotes: \"\\\n中文\u{0001}"}}],
+            "currentMessage":{"userInputMessage":{
+                "content":format!("password=abcd\n{}", "ordinary context ".repeat(text_bytes / 17)),
+                "modelId":"model", "origin":"CLI",
+                "userInputMessageContext":{"tools":[{"toolSpecification":{
+                    "name":"request", "description":"Make a request",
+                    "inputSchema":{"json":{"type":"object","properties":{
+                        "password":{"type":"string","maxLength":8}
+                    }}}}
+                }]}
+            }}
+        }
+    }))
+    .unwrap();
+    payload.redaction_session = Some(crosslane_translate::RedactionSession::new());
+    payload
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn accounting_snapshot_matches_wire_budgets_and_refreshes_after_mutation() {
+    let tokenizer = crosslane_translate::TokenCountCache::new(64).unwrap();
+    let mut source = accounting_fixture(8192);
+    let raw = serde_json::to_vec(&source).unwrap();
+    let accounting = PreparedPayloadAccounting::new(&source).unwrap();
+    let original = accounting.metrics(&tokenizer).await.unwrap();
+    let wire = crosslane_translate::prepare_redacted_kiro_payload(&source, &[]);
+    assert_eq!(original.bytes, serde_json::to_vec(&wire).unwrap().len());
+    assert_eq!(
+        original.input_tokens,
+        tokenizer.estimate_kiro_payload(&source).await.unwrap() as u64
+    );
+    assert_eq!(
+        original.tool_tokens,
+        tokenizer.estimate_kiro_tools(&source).await.unwrap() as u64
+    );
+    assert_eq!(serde_json::to_vec(&source).unwrap(), raw);
+
+    // Account/model preparation, tool continuation and compaction replace the
+    // source. A new snapshot must observe both text and definition changes.
+    let user = &mut source.conversation_state.current_message.user_input_message;
+    user.content.push_str(&" extra words".repeat(512));
+    let context = user.user_input_message_context.as_mut().unwrap();
+    context.tools.push(context.tools[0].clone());
+    let updated = payload_metrics(&tokenizer, &source).await.unwrap();
+    assert!(updated.input_tokens > original.input_tokens);
+    assert!(updated.tool_tokens > original.tool_tokens);
+    assert!(updated.bytes > original.bytes);
+    assert_eq!(
+        updated.input_tokens,
+        tokenizer.estimate_kiro_payload(&source).await.unwrap() as u64
+    );
+    assert_eq!(
+        updated.tool_tokens,
+        tokenizer.estimate_kiro_tools(&source).await.unwrap() as u64
+    );
+    assert_eq!(
+        updated.bytes,
+        serde_json::to_vec(&crosslane_translate::prepare_redacted_kiro_payload(
+            &source,
+            &[]
+        ))
+        .unwrap()
+        .len()
+    );
+    assert_eq!(
+        accounting.input_tokens(&tokenizer).await.unwrap(),
+        original.input_tokens
+    );
+    assert_eq!(accounting.bytes, original.bytes);
+}
+
+#[cfg(test)]
+#[tokio::test]
+#[ignore = "manual release performance measurement; no wall-clock CI threshold"]
+async fn performance_request_accounting_snapshot() {
+    for bytes in [64 * 1024, 1024 * 1024] {
+        let source = accounting_fixture(bytes);
+        let tokenizer = crosslane_translate::TokenCountCache::new(64).unwrap();
+        let expected = payload_metrics(&tokenizer, &source).await.unwrap();
+        let mut separate = Vec::new();
+        let mut shared = Vec::new();
+        for iteration in 0..12 {
+            for shared_first in [iteration % 2 == 0, iteration % 2 != 0] {
+                let started = Instant::now();
+                let measured = if shared_first {
+                    payload_metrics(&tokenizer, &source).await.unwrap()
+                } else {
+                    PayloadMetrics {
+                        input_tokens: tokenizer.estimate_kiro_payload(&source).await.unwrap()
+                            as u64,
+                        tool_tokens: tokenizer.estimate_kiro_tools(&source).await.unwrap() as u64,
+                        bytes: serde_json::to_vec(
+                            &crosslane_translate::prepare_redacted_kiro_payload(&source, &[]),
+                        )
+                        .unwrap()
+                        .len(),
+                    }
+                };
+                let elapsed = started.elapsed().as_micros();
+                assert_eq!(measured.input_tokens, expected.input_tokens);
+                assert_eq!(measured.tool_tokens, expected.tool_tokens);
+                assert_eq!(measured.bytes, expected.bytes);
+                if iteration >= 2 {
+                    if shared_first {
+                        shared.push(elapsed);
+                    } else {
+                        separate.push(elapsed);
+                    }
+                }
+            }
+        }
+        separate.sort_unstable();
+        shared.sort_unstable();
+        eprintln!(
+            "ACCOUNTING text_bytes={bytes} separate_median_us={} shared_median_us={}",
+            separate[separate.len() / 2],
+            shared[shared.len() / 2]
+        );
+    }
 }
 
 fn claude_validation_error(error: ValidationError) -> ApiError {
@@ -2066,13 +2265,10 @@ pub(super) async fn remaining_tool_search_budget(
 ) -> Result<crosslane_translate::ClaudeToolSearchBudget, String> {
     let config = state.config.current();
     let current_tools = loaded_tool_count(payload);
-    let current_tool_tokens = state.tokenizer.estimate_kiro_tools(payload).await? as u64;
-    let current_input_tokens = state.tokenizer.estimate_kiro_payload(payload).await? as u64;
-    let current_payload_bytes = serde_json::to_vec(
-        &crosslane_translate::prepare_redacted_kiro_payload(payload, &[]),
-    )
-    .map_err(|error| format!("failed to serialize Tool Search payload: {error}"))?
-    .len();
+    let metrics = payload_metrics(&state.tokenizer, payload).await?;
+    let current_tool_tokens = metrics.tool_tokens;
+    let current_input_tokens = metrics.input_tokens;
+    let current_payload_bytes = metrics.bytes;
     let model = &payload
         .conversation_state
         .current_message

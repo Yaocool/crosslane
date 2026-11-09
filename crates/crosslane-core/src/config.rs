@@ -82,6 +82,28 @@ pub enum ThinkingOutputFormat {
     Openai,
 }
 
+/// 本地 prompt cache 核算算法。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptCacheAccounting {
+    /// 与 Kiro 估算同口径计数、按比例分配、只在首轮 EOF 后发布。
+    #[default]
+    V3,
+    /// 旧版前缀投影计数，仅用于回滚。
+    Legacy,
+}
+
+/// Kiro 成功响应中显式 0 用量的解释。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KiroUsageZeroPolicy {
+    /// 0 视为未上报，交给本地估算与缓存模拟。
+    #[default]
+    Fallback,
+    /// 显式 0 视为上游报告值，仅用于回滚。
+    Legacy,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -401,6 +423,10 @@ pub struct FeaturesConfig {
     pub enable_model_fallback: bool,
     /// 是否启用 Kiro 本地缓存用量模拟，并将有效 cache_control 转换为 cachePoint；不改变实际 credits。
     pub enable_prompt_cache: bool,
+    /// 本地缓存核算算法；legacy 仅用于回滚。
+    pub prompt_cache_accounting: PromptCacheAccounting,
+    /// Kiro 显式 0 用量的解释；legacy 仅用于回滚。
+    pub kiro_usage_zero_policy: KiroUsageZeroPolicy,
     /// 是否注入增强 system prompt。
     pub enhance_system_prompt: bool,
     /// 是否缓冲工具调用。
@@ -438,6 +464,8 @@ impl Default for FeaturesConfig {
             disable_tools: false,
             enable_model_fallback: true,
             enable_prompt_cache: false,
+            prompt_cache_accounting: PromptCacheAccounting::V3,
+            kiro_usage_zero_policy: KiroUsageZeroPolicy::Fallback,
             enhance_system_prompt: true,
             buffer_tool_calls: true,
             tool_call_buffer_delay_ms: 0,
@@ -2518,6 +2546,10 @@ enable_model_fallback = true
 # 是否启用 Kiro 本地缓存用量模拟，并将有效 cache_control 转换为 cachePoint；默认关闭。
 # 缓存计数由本地 tokenizer/前缀记录估算，不代表上游命中或 credits 折扣；有上游计数时优先保留。
 enable_prompt_cache = false
+# 本地缓存核算算法："v3"（默认）或 "legacy"（仅回滚）。
+prompt_cache_accounting = "v3"
+# Kiro 显式 0 用量："fallback"（默认，视为未上报并本地估算）或 "legacy"（视为上游值）。
+kiro_usage_zero_policy = "fallback"
 # 是否向上游 system prompt 注入协议兼容和工具使用说明。
 enhance_system_prompt = true
 # 是否缓冲流式工具调用片段，降低参数 JSON 被拆碎或乱序的概率。

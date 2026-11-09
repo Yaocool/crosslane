@@ -1242,3 +1242,66 @@ fn openai_tool_chunks_keep_request_id_and_stable_per_tool_indices() {
     assert!(with_usage[1].contains("\"choices\":[]"));
     assert!(with_usage[1].contains("\"usage\""));
 }
+
+fn zero_metadata() -> DecodedResponse {
+    let mut decoded = DecodedResponse::default();
+    decoded
+        .push(KiroEvent::MessageMetadata {
+            usage: json!({"tokenUsage":{
+                "inputTokens":0,"cacheReadInputTokens":0,"cacheWriteInputTokens":0
+            }}),
+        })
+        .expect("zero usage");
+    decoded
+}
+
+#[test]
+fn zero_metadata_before_content_keeps_provisional_message_start() {
+    let mut state = ClaudeState::new("msg_zero".into(), "model".into(), 5000, replay_codec());
+    state.kiro_zero_fallback = true;
+    state.cache_read_input_tokens = 1000;
+    state.cache_creation_input_tokens = 3000;
+    state.observe_usage(&zero_metadata(), &mut []);
+    assert_eq!(state.input_tokens, 5000);
+    assert_eq!(state.cache_read_input_tokens, 1000);
+    assert_eq!(state.cache_creation_input_tokens, 3000);
+    let start = streamed_values(&[state.message_start()]);
+    let usage = &start[0]["message"]["usage"];
+    assert_eq!(usage["input_tokens"], 1000);
+    assert_eq!(usage["cache_read_input_tokens"], 1000);
+    assert_eq!(usage["cache_creation_input_tokens"], 3000);
+}
+
+#[test]
+fn zero_metadata_is_authoritative_under_the_legacy_policy() {
+    let mut state = ClaudeState::new("msg_zero".into(), "model".into(), 5000, replay_codec());
+    state.cache_creation_input_tokens = 3000;
+    state.observe_usage(&zero_metadata(), &mut []);
+    assert_eq!(
+        (
+            state.input_tokens,
+            state.cache_creation_input_tokens,
+            state.cache_read_input_tokens
+        ),
+        (0, 0, 0)
+    );
+}
+
+#[test]
+fn positive_metadata_still_replaces_provisional_counters_under_fallback() {
+    let mut state = ClaudeState::new("msg_pos".into(), "model".into(), 5000, replay_codec());
+    state.kiro_zero_fallback = true;
+    state.cache_creation_input_tokens = 3000;
+    let mut decoded = DecodedResponse::default();
+    decoded
+        .push(KiroEvent::MessageMetadata {
+            usage: json!({"tokenUsage":{
+                "inputTokens":6000,"cacheReadInputTokens":2500,"cacheWriteInputTokens":0
+            }}),
+        })
+        .expect("usage");
+    state.observe_usage(&decoded, &mut []);
+    assert_eq!(state.input_tokens, 6000);
+    assert_eq!(state.cache_read_input_tokens, 2500);
+    assert_eq!(state.cache_creation_input_tokens, 0);
+}

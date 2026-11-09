@@ -7,17 +7,17 @@ use super::{
     estimated_credits, execute_upstream, initial_compaction_decision, is_claude_user_agent,
     loaded_tool_bytes, loaded_tool_count, loaded_tool_names, logged_user_agent,
     matches_type_family, nonstream_claude, nonstream_openai, normalize_compaction_boundary,
-    openai_to_kiro, openai_tool_identities, prepare_kiro_payload, prepare_upstream,
-    prepend_attempt_logs, prepend_execute_error_attempts, reapply_compaction, reserve_credits,
-    resolved_compaction_decision, resume_tool_search_payload, resume_web_search_payload,
-    run_compaction, serialized_payload_bytes, stream, tool_search_budget_with_compaction,
-    upstream_error, upstream_overflow_compaction_decision, validate_claude,
-    validate_claude_generation, validate_openai, ApiError, AppState, Arc, Bytes, ClaudeRequest,
-    ClaudeServerEvent, ClaudeToolSearchCatalog, ClaudeWebSearchTrace, CompactionDecision,
-    CompactionReason, CompactionRequest, Duration, Engine, ErrorFormat, ExecuteError, HeaderMap,
-    Instant, IpAddr, OpenAiRequest, RequestDiagnostics, Response, ServiceHttpState, StatusCode,
-    StreamContext, StreamExt, StreamProtocol, TranslationOptions, UpstreamExecution, Url, Uuid,
-    Value,
+    openai_to_kiro, openai_tool_identities, payload_metrics, prepare_kiro_payload,
+    prepare_upstream, prepend_attempt_logs, prepend_execute_error_attempts, reapply_compaction,
+    reserve_credits, resolved_compaction_decision, resume_tool_search_payload,
+    resume_web_search_payload, run_compaction, serialized_payload_bytes, stream,
+    tool_search_budget_with_compaction, upstream_error, upstream_overflow_compaction_decision,
+    validate_claude, validate_claude_generation, validate_openai, ApiError, AppState, Arc, Bytes,
+    ClaudeRequest, ClaudeServerEvent, ClaudeToolSearchCatalog, ClaudeWebSearchTrace,
+    CompactionDecision, CompactionReason, CompactionRequest, Duration, Engine, ErrorFormat,
+    ExecuteError, HeaderMap, Instant, IpAddr, OpenAiRequest, PreparedPayloadAccounting,
+    RequestDiagnostics, Response, ServiceHttpState, StatusCode, StreamContext, StreamExt,
+    StreamProtocol, TranslationOptions, UpstreamExecution, Url, Uuid, Value,
 };
 use crosslane_core::provider::ProviderProtocol;
 use crosslane_translate::model::{map_model_for_provider, ModelMappingContext, ModelRoute};
@@ -551,7 +551,27 @@ async fn handle_claude_route_inner(
     request = next_request;
     let mut early_compaction = None;
     let mut early_compaction_iteration = None;
-    let initial_payload_bytes = serialized_payload_bytes(&payload, ErrorFormat::Claude)?;
+    let (initial_payload_bytes, mut admitted_tool_tokens) = {
+        let accounting = PreparedPayloadAccounting::new(&payload).map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error,
+                ErrorFormat::Claude,
+            )
+        })?;
+        let tools = accounting
+            .tool_tokens(&state.tokenizer)
+            .await
+            .map_err(|error| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error,
+                    ErrorFormat::Claude,
+                )
+            })?;
+        (accounting.bytes, tools)
+    };
+    let mut admitted_payload_bytes = initial_payload_bytes;
     if initial_payload_bytes > config.context.max_upstream_payload_bytes
         && config.context.auto_compact_on_overflow
         && !client_compaction
@@ -593,6 +613,25 @@ async fn handle_claude_route_inner(
         payload = run.payload;
         early_compaction_iteration = run.iteration_usage;
         early_compaction = (run.stats.removed_messages > 0).then_some(run.stats);
+        let accounting = PreparedPayloadAccounting::new(&payload).map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error,
+                ErrorFormat::Claude,
+            )
+        })?;
+        admitted_tool_tokens = accounting
+            .tool_tokens(&state.tokenizer)
+            .await
+            .map_err(|error| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error,
+                    ErrorFormat::Claude,
+                )
+            })?;
+        admitted_payload_bytes = accounting.bytes;
+        drop(accounting);
         if let Some(stats) = &early_compaction {
             tracing::info!(
                 trace_id = %trace_id,
@@ -611,9 +650,9 @@ async fn handle_claude_route_inner(
     // acquiring a search account or making that external request. The same
     // budgets are checked again after pending results and internal searches
     // have changed the payload.
-    let initial_tool_tokens = (state
+    let full_tool_tokens = state
         .tokenizer
-        .estimate_kiro_tools(&payload)
+        .estimate_claude_tools(&claude_loaded_tools(&request))
         .await
         .map_err(|error| {
             ApiError::new(
@@ -621,24 +660,12 @@ async fn handle_claude_route_inner(
                 error,
                 ErrorFormat::Claude,
             )
-        })? as u64)
-        .max(
-            state
-                .tokenizer
-                .estimate_claude_tools(&claude_loaded_tools(&request))
-                .await
-                .map_err(|error| {
-                    ApiError::new(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        error,
-                        ErrorFormat::Claude,
-                    )
-                })? as u64,
-        );
+        })? as u64;
+    let initial_tool_tokens = admitted_tool_tokens.max(full_tool_tokens);
     enforce_payload_budget(
         &state,
         initial_tool_tokens,
-        serialized_payload_bytes(&payload, ErrorFormat::Claude)?,
+        admitted_payload_bytes,
         loaded_tool_count(&payload),
         tool_search.is_some(),
         ErrorFormat::Claude,
@@ -897,9 +924,7 @@ async fn handle_claude_route_inner(
         effort = decision.effort.as_deref(),
         "adaptive thinking decision"
     );
-    let mut input_tokens = state
-        .tokenizer
-        .estimate_kiro_payload(&payload)
+    let mut metrics = payload_metrics(&state.tokenizer, &payload)
         .await
         .map_err(|error| {
             ApiError::new(
@@ -907,7 +932,8 @@ async fn handle_claude_route_inner(
                 error,
                 ErrorFormat::Claude,
             )
-        })? as u64;
+        })?;
+    let mut input_tokens = metrics.input_tokens;
     let mut compacted = compact_boundary_applied || early_compaction.is_some();
     let mut compaction_summary = early_compaction
         .as_ref()
@@ -976,6 +1002,15 @@ async fn handle_claude_route_inner(
             auto_compaction_original_input_tokens = Some(initial_input_tokens);
         }
         payload = run.payload;
+        metrics = payload_metrics(&state.tokenizer, &payload)
+            .await
+            .map_err(|error| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error,
+                    ErrorFormat::Claude,
+                )
+            })?;
         input_tokens = run.stats.compacted_tokens as u64;
         compacted |= run.stats.removed_messages > 0;
         compaction_summary = run.stats.summary.clone();
@@ -999,30 +1034,8 @@ async fn handle_claude_route_inner(
             "request context compacted"
         );
     }
-    let full_tool_tokens = state
-        .tokenizer
-        .estimate_claude_tools(&claude_loaded_tools(&request))
-        .await
-        .map_err(|error| {
-            ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                error,
-                ErrorFormat::Claude,
-            )
-        })? as u64;
-    let tool_tokens = (state
-        .tokenizer
-        .estimate_kiro_tools(&payload)
-        .await
-        .map_err(|error| {
-            ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                error,
-                ErrorFormat::Claude,
-            )
-        })? as u64)
-        .max(full_tool_tokens);
-    let payload_bytes = serialized_payload_bytes(&payload, ErrorFormat::Claude)?;
+    let tool_tokens = metrics.tool_tokens.max(full_tool_tokens);
+    let payload_bytes = metrics.bytes;
     let mut diagnostics = RequestDiagnostics {
         client_context: Some(client_context.clone()),
         original_tool_count,
@@ -1184,9 +1197,15 @@ async fn handle_claude_route_inner(
             compacted |= run.stats.removed_messages > 0;
             compaction_summary = run.stats.summary.clone();
             compaction_iteration = run.iteration_usage;
-            let replanned_tool_tokens = (state
-                .tokenizer
-                .estimate_kiro_tools(&payload)
+            let accounting = PreparedPayloadAccounting::new(&payload).map_err(|error| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error,
+                    ErrorFormat::Claude,
+                )
+            })?;
+            let replanned_tool_tokens = accounting
+                .tool_tokens(&state.tokenizer)
                 .await
                 .map_err(|error| {
                     ApiError::new(
@@ -1194,9 +1213,10 @@ async fn handle_claude_route_inner(
                         error,
                         ErrorFormat::Claude,
                     )
-                })? as u64)
+                })?
                 .max(full_tool_tokens);
-            let replanned_payload_bytes = serialized_payload_bytes(&payload, ErrorFormat::Claude)?;
+            let replanned_payload_bytes = accounting.bytes;
+            drop(accounting);
             enforce_payload_budget(
                 &state,
                 replanned_tool_tokens,
@@ -1304,32 +1324,8 @@ async fn handle_claude_route_inner(
             }
         }
     }
-    let prompt_cache = if config.features.enable_prompt_cache {
-        if compaction_summary.is_some() {
-            state
-                .prompt_cache
-                .claude_compacted_profile(
-                    &state.tokenizer,
-                    &request,
-                    input_tokens,
-                    &execution.kiro_model,
-                )
-                .await
-        } else {
-            state
-                .prompt_cache
-                .claude_profile(
-                    &state.tokenizer,
-                    &request,
-                    input_tokens,
-                    &execution.kiro_model,
-                )
-                .await
-        }
-    } else {
-        None
-    };
     let UpstreamExecution {
+        cache_snapshot,
         lease,
         response: upstream,
         upstream_access_token,
@@ -1340,6 +1336,42 @@ async fn handle_claude_route_inner(
         attempts,
         payload,
     } = execution;
+    // Built from the accepted attempt's translated payload. After compaction
+    // only the protected tools/system prefix may be read or written; the
+    // summary and current turn still count toward the full input.
+    let legacy_accounting = config.features.prompt_cache_accounting
+        == crosslane_core::config::PromptCacheAccounting::Legacy;
+    let prompt_cache = if config.features.enable_prompt_cache && legacy_accounting {
+        state
+            .prompt_cache
+            .legacy_claude_profile(
+                &state.tokenizer,
+                &request,
+                input_tokens,
+                &kiro_model,
+                compaction_summary.is_some(),
+            )
+            .await
+    } else if config.features.enable_prompt_cache {
+        state
+            .prompt_cache
+            .profile(
+                &state.tokenizer,
+                &payload,
+                super::super::prompt_cache::CacheMode::Explicit,
+                &super::super::prompt_cache::ProfileSalt {
+                    service_id: service.service.id.clone(),
+                    api_key_id: key_id.clone(),
+                    prompt_cache_key: None,
+                    tool_choice: serde_json::to_value(&request.tool_choice).ok(),
+                    parallel_tool_calls: None,
+                },
+                compaction_summary.is_some(),
+            )
+            .await
+    } else {
+        None
+    };
     let compaction_replay = if client_compaction {
         None
     } else {
@@ -1350,6 +1382,9 @@ async fn handle_claude_route_inner(
             upstream,
             StreamProtocol::Claude,
             StreamContext {
+                cache_snapshot,
+                zero_fallback: config.features.kiro_usage_zero_policy
+                    == crosslane_core::config::KiroUsageZeroPolicy::Fallback,
                 state,
                 account_ids: Arc::clone(&account_ids),
                 lease,
@@ -1435,6 +1470,9 @@ async fn handle_claude_route_inner(
         compacted,
         started,
         prompt_cache,
+        cache_snapshot,
+        config.features.kiro_usage_zero_policy
+            == crosslane_core::config::KiroUsageZeroPolicy::Fallback,
         compaction_summary,
         compaction_replay,
         compaction_iteration,
@@ -1897,9 +1935,7 @@ pub(super) async fn handle_openai_route(
             ErrorFormat::OpenAi,
         )
     })?;
-    let mut input_tokens = state
-        .tokenizer
-        .estimate_kiro_payload(&payload)
+    let mut metrics = payload_metrics(&state.tokenizer, &payload)
         .await
         .map_err(|error| {
             ApiError::new(
@@ -1907,7 +1943,8 @@ pub(super) async fn handle_openai_route(
                 error,
                 ErrorFormat::OpenAi,
             )
-        })? as u64;
+        })?;
+    let mut input_tokens = metrics.input_tokens;
     let mut prepared = None;
     let automatic_truncation = responses_options
         .as_ref()
@@ -1962,39 +1999,19 @@ pub(super) async fn handle_openai_route(
             );
         }
         selected.payload = payload.clone();
+        metrics = payload_metrics(&state.tokenizer, &payload)
+            .await
+            .map_err(|error| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error,
+                    ErrorFormat::OpenAi,
+                )
+            })?;
         prepared = Some(selected);
     }
-    // A truncated history cannot reuse cache breakpoints from the original
-    // request. A later model fallback is also checked by the cache planner.
-    let prompt_cache = if config.features.enable_prompt_cache && !automatic_truncation {
-        state
-            .prompt_cache
-            .openai_profile(
-                &state.tokenizer,
-                &request,
-                input_tokens,
-                &payload
-                    .conversation_state
-                    .current_message
-                    .user_input_message
-                    .model_id,
-            )
-            .await
-    } else {
-        None
-    };
-    let tool_tokens = state
-        .tokenizer
-        .estimate_kiro_tools(&payload)
-        .await
-        .map_err(|error| {
-            ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                error,
-                ErrorFormat::OpenAi,
-            )
-        })? as u64;
-    let payload_bytes = serialized_payload_bytes(&payload, ErrorFormat::OpenAi)?;
+    let tool_tokens = metrics.tool_tokens;
+    let payload_bytes = metrics.bytes;
     let diagnostics = RequestDiagnostics {
         client_context: Some(client_context.clone()),
         original_tool_count: request.tools.len(),
@@ -2050,6 +2067,7 @@ pub(super) async fn handle_openai_route(
         .map(|options| options.id().to_owned())
         .unwrap_or_else(|| format!("chatcmpl-{}", Uuid::new_v4().simple()));
     let UpstreamExecution {
+        cache_snapshot,
         lease,
         response: upstream,
         upstream_access_token,
@@ -2085,6 +2103,58 @@ pub(super) async fn handle_openai_route(
     )
     .await
     .map_err(|error| upstream_error(error, ErrorFormat::OpenAi))?;
+    // OpenAI caching is implicit unless the client supplied cache_control.
+    // A truncated history keeps only the tools/system prefix readable.
+    let legacy_accounting = config.features.prompt_cache_accounting
+        == crosslane_core::config::PromptCacheAccounting::Legacy;
+    let prompt_cache = if config.features.enable_prompt_cache && legacy_accounting {
+        if automatic_truncation {
+            None
+        } else {
+            state
+                .prompt_cache
+                .legacy_openai_profile(&state.tokenizer, &request, input_tokens, &kiro_model)
+                .await
+        }
+    } else if config.features.enable_prompt_cache {
+        let explicit = request.messages.iter().any(|message| {
+            message.cache_control.is_some()
+                || message
+                    .content
+                    .as_ref()
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|blocks| {
+                        blocks
+                            .iter()
+                            .any(|block| block.get("cache_control").is_some())
+                    })
+        }) || request
+            .tools
+            .iter()
+            .any(|tool| tool.body.get("cache_control").is_some());
+        state
+            .prompt_cache
+            .profile(
+                &state.tokenizer,
+                &payload,
+                if explicit {
+                    super::super::prompt_cache::CacheMode::Explicit
+                } else {
+                    super::super::prompt_cache::CacheMode::Implicit
+                },
+                &super::super::prompt_cache::ProfileSalt {
+                    service_id: service.service.id.clone(),
+                    api_key_id: key_id.clone(),
+                    prompt_cache_key: request.prompt_cache_key.clone(),
+                    tool_choice: request.tool_choice.clone(),
+                    parallel_tool_calls: Some(request.parallel_tool_calls),
+                },
+                automatic_truncation,
+            )
+            .await
+    } else {
+        None
+    };
     if automatic_truncation {
         input_tokens = state
             .tokenizer
@@ -2104,6 +2174,9 @@ pub(super) async fn handle_openai_route(
             upstream,
             StreamProtocol::OpenAi,
             StreamContext {
+                cache_snapshot,
+                zero_fallback: config.features.kiro_usage_zero_policy
+                    == crosslane_core::config::KiroUsageZeroPolicy::Fallback,
                 state,
                 account_ids: Arc::clone(&account_ids),
                 lease,
@@ -2191,6 +2264,9 @@ pub(super) async fn handle_openai_route(
         max_tokens,
         started,
         prompt_cache,
+        cache_snapshot,
+        config.features.kiro_usage_zero_policy
+            == crosslane_core::config::KiroUsageZeroPolicy::Fallback,
         diagnostics,
         openai_tools,
         responses_options,

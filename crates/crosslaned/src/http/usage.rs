@@ -48,6 +48,15 @@ pub async fn fill_missing_usage(
     decoded: &mut DecodedResponse,
     payload: &KiroPayload,
 ) {
+    fill_missing_usage_with_input(state, decoded, payload, None).await;
+}
+
+pub async fn fill_missing_usage_with_input(
+    state: &Arc<AppState>,
+    decoded: &mut DecodedResponse,
+    payload: &KiroPayload,
+    input_estimate: Option<u64>,
+) {
     #[cfg(feature = "crs")]
     if decoded.refusal_details.is_some() && !produced_output(decoded) {
         // Pure refusal metadata does not prove a generation occurred. Partial
@@ -56,11 +65,15 @@ pub async fn fill_missing_usage(
         return;
     }
     if decoded.upstream_input_tokens.is_none() && decoded.usage.input_tokens == 0 {
-        let estimated = match state.tokenizer.estimate_kiro_payload(payload).await {
-            Ok(tokens) => tokens as u64,
-            Err(error) => {
-                tracing::warn!(%error, "failed to estimate missing upstream input usage");
-                0
+        let estimated = if let Some(estimate) = input_estimate {
+            estimate
+        } else {
+            match state.tokenizer.estimate_kiro_payload(payload).await {
+                Ok(tokens) => tokens as u64,
+                Err(error) => {
+                    tracing::warn!(%error, "failed to estimate missing upstream input usage");
+                    0
+                }
             }
         };
         decoded.usage.input_tokens = estimated.max(

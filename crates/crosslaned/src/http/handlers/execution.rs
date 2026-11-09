@@ -1,7 +1,7 @@
 use super::{
     attempt_diagnostics, check_context_limit, compact_tool_search_continuation,
-    empty_tool_result_disposition, estimated_credits, fallback_credits, fill_missing_usage,
-    loaded_tool_count, loaded_tool_names, meter_error, now_secs, resolve_dynamic_model,
+    empty_tool_result_disposition, estimated_credits, fallback_credits, loaded_tool_count,
+    loaded_tool_names, meter_error, now_secs, payload_metrics, resolve_dynamic_model,
     resume_web_search_payload, sanitize_error_message, sanitize_kiro_tool_history,
     tool_search_budget_with_compaction, tool_search_continue_payload_batch, upstream_error,
     validate_kiro_tool_history, web_search_continue_payload_batch, AccountLease, ApiError,
@@ -217,6 +217,7 @@ pub(super) async fn collect_nonstream_rounds(
     resumed_server_events: Vec<ClaudeServerEvent>,
     tool_names: &super::super::tool_names::ClientToolNames,
     tool_name_trace: &super::super::tool_names::ToolNameTrace<'_>,
+    cache: &mut NonstreamCache,
     #[cfg(feature = "crs")] mut confirmed_usage: Option<
         &mut super::super::crs::ConfirmedNonstreamUsage,
     >,
@@ -248,6 +249,7 @@ pub(super) async fn collect_nonstream_rounds(
         .filter(|search| search.executed)
         .count() as u32;
     loop {
+        let dispatched_at = upstream.dispatched_at();
         let effective_thinking = thinking_enabled && upstream.thinking_enabled();
         let redaction = upstream.redaction_session().clone();
         payload.redaction_session = Some(redaction.clone());
@@ -378,13 +380,31 @@ pub(super) async fn collect_nonstream_rounds(
                 }));
             }
         }
-        let estimated_input_tokens = state
-            .tokenizer
-            .estimate_kiro_payload(&payload)
-            .await
-            .unwrap_or(0) as u64;
+        let estimated_input_tokens = if let Some(full) = cache.ledger.input_estimate(&cache.plan) {
+            full
+        } else {
+            state
+                .tokenizer
+                .estimate_kiro_payload(&payload)
+                .await
+                .unwrap_or(0) as u64
+        };
         decoded.log_context_usage(trace_id, estimated_input_tokens);
-        fill_missing_usage(state, &mut decoded, &payload).await;
+        if cache.zero_fallback {
+            decoded.normalize_kiro_zeros();
+        }
+        super::super::usage::fill_missing_usage_with_input(
+            state,
+            &mut decoded,
+            &payload,
+            Some(estimated_input_tokens),
+        )
+        .await;
+        // The collected body reached EOF; this round is settled exactly once.
+        cache
+            .ledger
+            .settle_round(&cache.plan, Some(dispatched_at), &mut decoded);
+
         #[cfg(feature = "crs")]
         super::super::usage::observe_context_pressure(
             state,
@@ -403,10 +423,10 @@ pub(super) async fn collect_nonstream_rounds(
             decoded.tool_searches = accumulated_searches;
             decoded.web_searches = accumulated_web_searches;
             decoded.claude_server_events = accumulated_server_events;
+            let last_round_output_tokens = decoded.usage.output_tokens;
             merge_round_usage(&mut decoded.usage, &accumulated_usage);
-            let total_output_tokens = decoded.usage.output_tokens;
             decoded.automatic_compaction = compaction_stats;
-            return Ok((decoded, endpoint, total_output_tokens));
+            return Ok((decoded, endpoint, last_round_output_tokens));
         }
         let output_exhausted = max_output_tokens.is_some_and(|maximum| {
             accumulated_usage
@@ -480,6 +500,21 @@ pub(super) async fn collect_nonstream_rounds(
                             u32::from(empty_tool_result_retries),
                             "empty_assistant_runtime_retry",
                         );
+                        let next_profile = if cache.ledger.is_initial() {
+                            state
+                                .prompt_cache
+                                .retry_profile(
+                                    &state.tokenizer,
+                                    cache.profile.as_ref(),
+                                    &frozen_payload,
+                                )
+                                .await
+                        } else {
+                            cache.profile.clone()
+                        };
+                        let snapshot = state
+                            .prompt_cache
+                            .snapshot_profile(&account.id, next_profile.as_ref());
                         upstream = state
                             .generate_runtime_isolated_with_client(
                                 &client,
@@ -496,6 +531,21 @@ pub(super) async fn collect_nonstream_rounds(
                                 })
                             })
                             .map_err(ExecuteError::Upstream)?;
+                        if cache.ledger.is_initial() {
+                            cache.plan = state.prompt_cache.plan_accepted(
+                                &account.id,
+                                &frozen_payload
+                                    .conversation_state
+                                    .current_message
+                                    .user_input_message
+                                    .model_id,
+                                next_profile.as_ref(),
+                                &snapshot,
+                                &upstream,
+                                &frozen_payload,
+                            );
+                        }
+                        cache.profile = next_profile;
                         continue;
                     }
                 }
@@ -548,10 +598,36 @@ pub(super) async fn collect_nonstream_rounds(
                     u32::from(empty_tool_result_retries),
                     "empty_assistant_retry",
                 );
+                let next_profile = if cache.ledger.is_initial() {
+                    state
+                        .prompt_cache
+                        .retry_profile(&state.tokenizer, cache.profile.as_ref(), &payload)
+                        .await
+                } else {
+                    cache.profile.clone()
+                };
+                let snapshot = state
+                    .prompt_cache
+                    .snapshot_profile(&account.id, next_profile.as_ref());
                 upstream = state
                     .generate(&account, &payload)
                     .await
                     .map_err(ExecuteError::Upstream)?;
+                if cache.ledger.is_initial() {
+                    cache.plan = state.prompt_cache.plan_accepted(
+                        &account.id,
+                        &payload
+                            .conversation_state
+                            .current_message
+                            .user_input_message
+                            .model_id,
+                        next_profile.as_ref(),
+                        &snapshot,
+                        &upstream,
+                        &payload,
+                    );
+                }
+                cache.profile = next_profile;
                 continue;
             }
             EmptyToolResultDisposition::Fail => {
@@ -617,10 +693,10 @@ pub(super) async fn collect_nonstream_rounds(
                         .into(),
                     );
                 }
+                let last_round_output_tokens = decoded.usage.output_tokens;
                 merge_round_usage(&mut decoded.usage, &accumulated_usage);
-                let total_output_tokens = decoded.usage.output_tokens;
                 decoded.automatic_compaction = compaction_stats;
-                return Ok((decoded, endpoint, total_output_tokens));
+                return Ok((decoded, endpoint, last_round_output_tokens));
             }
 
             // Anthropic leaves server calls pending when the same assistant
@@ -654,10 +730,10 @@ pub(super) async fn collect_nonstream_rounds(
                 if output_exhausted && decoded.tools.is_empty() {
                     decoded.stop_reason = Some("max_tokens".into());
                 }
+                let last_round_output_tokens = decoded.usage.output_tokens;
                 merge_round_usage(&mut decoded.usage, &accumulated_usage);
-                let total_output_tokens = decoded.usage.output_tokens;
                 decoded.automatic_compaction = compaction_stats;
-                return Ok((decoded, endpoint, total_output_tokens));
+                return Ok((decoded, endpoint, last_round_output_tokens));
             }
 
             let mut budget = tool_search_budget_with_compaction(state, &payload, compact)
@@ -854,9 +930,7 @@ pub(super) async fn collect_nonstream_rounds(
                 compaction_stats = Some(stats);
                 compact = true;
             }
-            let next_input_tokens = state
-                .tokenizer
-                .estimate_kiro_payload(&payload)
+            let metrics = payload_metrics(&state.tokenizer, &payload)
                 .await
                 .map_err(|message| {
                     ExecuteError::Upstream(KiroError {
@@ -864,30 +938,10 @@ pub(super) async fn collect_nonstream_rounds(
                         endpoint: endpoint.clone(),
                         message,
                     })
-                })? as u64;
-            let next_tool_tokens = (state
-                .tokenizer
-                .estimate_kiro_tools(&payload)
-                .await
-                .map_err(|message| {
-                    ExecuteError::Upstream(KiroError {
-                        status: None,
-                        endpoint: endpoint.clone(),
-                        message,
-                    })
-                })? as u64)
-                .saturating_add(documentation_tokens);
-            let next_payload_bytes = serde_json::to_vec(
-                &crosslane_translate::prepare_redacted_kiro_payload(&payload, &[]),
-            )
-            .map_err(|error| {
-                ExecuteError::Upstream(KiroError {
-                    status: None,
-                    endpoint: endpoint.clone(),
-                    message: error.to_string(),
-                })
-            })?
-            .len();
+                })?;
+            let next_input_tokens = metrics.input_tokens;
+            let next_tool_tokens = metrics.tool_tokens.saturating_add(documentation_tokens);
+            let next_payload_bytes = metrics.bytes;
             let next_loaded_tools = loaded_tool_count(&payload);
             let max_loaded_tools = config
                 .context
@@ -989,10 +1043,10 @@ pub(super) async fn collect_nonstream_rounds(
                 if output_exhausted && decoded.tools.is_empty() {
                     decoded.stop_reason = Some("max_tokens".into());
                 }
+                let last_round_output_tokens = decoded.usage.output_tokens;
                 merge_round_usage(&mut decoded.usage, &accumulated_usage);
-                let total_output_tokens = decoded.usage.output_tokens;
                 decoded.automatic_compaction = compaction_stats;
-                return Ok((decoded, endpoint, total_output_tokens));
+                return Ok((decoded, endpoint, last_round_output_tokens));
             }
 
             let mut searches = Vec::with_capacity(search_uses.len());
@@ -1118,8 +1172,8 @@ pub(super) async fn collect_nonstream_rounds(
             if output_exhausted && decoded.tools.is_empty() {
                 decoded.stop_reason = Some("max_tokens".into());
             }
+            let last_round_output_tokens = decoded.usage.output_tokens;
             merge_round_usage(&mut decoded.usage, &accumulated_usage);
-            let total_output_tokens = decoded.usage.output_tokens;
             tracing::debug!(
                 trace_id,
                 account_id = %lease.account_id(),
@@ -1132,7 +1186,7 @@ pub(super) async fn collect_nonstream_rounds(
                 "upstream non-stream round decoded"
             );
             decoded.automatic_compaction = compaction_stats;
-            return Ok((decoded, endpoint, total_output_tokens));
+            return Ok((decoded, endpoint, last_round_output_tokens));
         }
         let uses = decoded
             .tools
@@ -1371,15 +1425,15 @@ pub(in crate::http) async fn validate_internal_continuation(
 ) -> Result<u64, KiroError> {
     prepare_kiro_payload(payload, endpoint, stage)?;
     let config = state.config.current();
-    let mut input_tokens = state
-        .tokenizer
-        .estimate_kiro_payload(payload)
+    let mut metrics = payload_metrics(&state.tokenizer, payload)
         .await
         .map_err(|message| KiroError {
             status: None,
             endpoint: endpoint.into(),
             message,
-        })? as u64;
+        })?;
+    let mut input_tokens = metrics.input_tokens;
+    let original_history_len = payload.conversation_state.history.len();
     let model = payload
         .conversation_state
         .current_message
@@ -1394,25 +1448,19 @@ pub(in crate::http) async fn validate_internal_continuation(
                 endpoint: endpoint.into(),
                 message,
             })?;
-    let tool_tokens = state
-        .tokenizer
-        .estimate_kiro_tools(payload)
-        .await
-        .map_err(|message| KiroError {
-            status: None,
-            endpoint: endpoint.into(),
-            message,
-        })? as u64;
-    let payload_bytes = serde_json::to_vec(&crosslane_translate::prepare_redacted_kiro_payload(
-        payload,
-        &[],
-    ))
-    .map_err(|error| KiroError {
-        status: None,
-        endpoint: endpoint.into(),
-        message: error.to_string(),
-    })?
-    .len();
+    if payload.conversation_state.history.len() != original_history_len {
+        // Truncation replaced the source; no metrics from its old snapshot may
+        // be used for the outgoing byte/tool budgets.
+        metrics = payload_metrics(&state.tokenizer, payload)
+            .await
+            .map_err(|message| KiroError {
+                status: None,
+                endpoint: endpoint.into(),
+                message,
+            })?;
+    }
+    let tool_tokens = metrics.tool_tokens;
+    let payload_bytes = metrics.bytes;
     let loaded_tools = loaded_tool_count(payload);
     let max_loaded_tools = config
         .context
@@ -1460,6 +1508,49 @@ pub(in crate::http) async fn validate_internal_continuation(
     Ok(input_tokens)
 }
 
+/// Cache accounting threaded through non-stream rounds.
+pub(super) struct NonstreamCache {
+    pub plan: super::super::prompt_cache::PromptCachePlan,
+    pub profile: Option<PromptCacheProfile>,
+    pub ledger: super::super::prompt_cache::CacheLedger,
+    pub zero_fallback: bool,
+}
+
+/// Publish the accepted round-0 intent, unless the request ended in a
+/// refusal; refusals are accounted but never seed entries (same as streams).
+fn finish_nonstream_cache(
+    state: &Arc<AppState>,
+    trace_id: &str,
+    account_id: &str,
+    cache: &mut NonstreamCache,
+    decoded: &mut DecodedResponse,
+) {
+    if decoded.stop_sequence.is_some() {
+        cache
+            .ledger
+            .cancel_publication(super::super::prompt_cache::SkipReason::NotEof);
+        state.prompt_cache.finish_request(
+            trace_id,
+            account_id,
+            &cache.plan,
+            &mut cache.ledger,
+            decoded,
+        );
+    } else if decoded.stop_reason.as_deref() == Some("refusal") {
+        state
+            .prompt_cache
+            .abandon_request(trace_id, &cache.plan, &mut cache.ledger, decoded);
+    } else {
+        state.prompt_cache.finish_request(
+            trace_id,
+            account_id,
+            &cache.plan,
+            &mut cache.ledger,
+            decoded,
+        );
+    }
+}
+
 pub(super) fn merge_round_usage(
     total: &mut crosslane_kiro::UsageInfo,
     addition: &crosslane_kiro::UsageInfo,
@@ -1500,6 +1591,8 @@ pub(super) async fn nonstream_claude(
     compact: bool,
     started: Instant,
     prompt_cache: Option<PromptCacheProfile>,
+    cache_snapshot: super::super::prompt_cache::AttemptSnapshot,
+    zero_fallback: bool,
     mut compaction_summary: Option<String>,
     compaction_replay: Option<(
         String,
@@ -1521,10 +1614,20 @@ pub(super) async fn nonstream_claude(
     web_tool_names: std::collections::HashMap<String, String>,
     #[cfg(feature = "crs")] redaction_notice: Option<String>,
 ) -> Result<Response, ApiError> {
-    let prompt_cache_plan =
-        state
-            .prompt_cache
-            .plan(&lease.account_id(), &kiro_model, prompt_cache.as_ref());
+    let prompt_cache_plan = state.prompt_cache.plan_accepted(
+        &lease.account_id(),
+        &kiro_model,
+        prompt_cache.as_ref(),
+        &cache_snapshot,
+        &upstream,
+        &payload,
+    );
+    let mut cache = NonstreamCache {
+        plan: prompt_cache_plan,
+        profile: prompt_cache,
+        ledger: Default::default(),
+        zero_fallback,
+    };
     let tool_names = super::super::tool_names::ClientToolNames::claude(&web_tool_names);
     let tool_name_trace = super::super::tool_names::ToolNameTrace {
         trace_id: &trace_id,
@@ -1558,6 +1661,7 @@ pub(super) async fn nonstream_claude(
         resumed_server_events,
         &tool_names,
         &tool_name_trace,
+        &mut cache,
         #[cfg(feature = "crs")]
         Some(&mut confirmed_usage),
     )
@@ -1639,16 +1743,10 @@ pub(super) async fn nonstream_claude(
     tool_names
         .restore_decoded(&mut decoded, &tool_name_trace)
         .map_err(|_| ApiError::tool_name_mismatch(ErrorFormat::Claude))?;
-    let current_round_output_tokens = if current_round_output_tokens == 0 {
-        decoded.usage.output_tokens
-    } else {
-        current_round_output_tokens
-    };
     let account_id = lease.account_id();
     let account_name = lease.account().await.display_name().to_owned();
-    state
-        .prompt_cache
-        .commit(&account_id, &prompt_cache_plan, &mut decoded);
+    cache.ledger.mark_cumulative(&mut decoded);
+    finish_nonstream_cache(&state, &trace_id, &account_id, &mut cache, &mut decoded);
     let credits = credits(&state, &kiro_model, &decoded);
     lease.settle_credits(credits).await;
     reservation
@@ -1758,14 +1856,26 @@ pub(super) async fn nonstream_openai(
     max_tokens: Option<u32>,
     started: Instant,
     prompt_cache: Option<PromptCacheProfile>,
+    cache_snapshot: super::super::prompt_cache::AttemptSnapshot,
+    zero_fallback: bool,
     diagnostics: RequestDiagnostics,
     openai_tools: std::collections::HashMap<String, OpenAiToolIdentity>,
     responses_options: Option<super::super::responses::ResponsesOptions>,
 ) -> Result<Response, ApiError> {
-    let prompt_cache_plan =
-        state
-            .prompt_cache
-            .plan(&lease.account_id(), &kiro_model, prompt_cache.as_ref());
+    let prompt_cache_plan = state.prompt_cache.plan_accepted(
+        &lease.account_id(),
+        &kiro_model,
+        prompt_cache.as_ref(),
+        &cache_snapshot,
+        &upstream,
+        &payload,
+    );
+    let mut cache = NonstreamCache {
+        plan: prompt_cache_plan,
+        profile: prompt_cache,
+        ledger: Default::default(),
+        zero_fallback,
+    };
     let tool_names = super::super::tool_names::ClientToolNames::openai(&openai_tools);
     let tool_name_trace = super::super::tool_names::ToolNameTrace {
         trace_id: &trace_id,
@@ -1795,6 +1905,7 @@ pub(super) async fn nonstream_openai(
         Vec::new(),
         &tool_names,
         &tool_name_trace,
+        &mut cache,
         #[cfg(feature = "crs")]
         None,
     )
@@ -1803,16 +1914,10 @@ pub(super) async fn nonstream_openai(
     tool_names
         .restore_decoded(&mut decoded, &tool_name_trace)
         .map_err(|_| ApiError::tool_name_mismatch(ErrorFormat::OpenAi))?;
-    let current_round_output_tokens = if current_round_output_tokens == 0 {
-        decoded.usage.output_tokens
-    } else {
-        current_round_output_tokens
-    };
     let account_id = lease.account_id();
     let account_name = lease.account().await.display_name().to_owned();
-    state
-        .prompt_cache
-        .commit(&account_id, &prompt_cache_plan, &mut decoded);
+    cache.ledger.mark_cumulative(&mut decoded);
+    finish_nonstream_cache(&state, &trace_id, &account_id, &mut cache, &mut decoded);
     let credits = credits(&state, &kiro_model, &decoded);
     lease.settle_credits(credits).await;
     reservation

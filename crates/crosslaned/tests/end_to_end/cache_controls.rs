@@ -1,6 +1,123 @@
 use super::*;
 
 #[tokio::test]
+async fn failed_account_retry_keeps_original_usage_and_emits_no_candidate_usage() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/ListAvailableModels"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"models":[{"modelId":"claude-opus-5.5"}]})),
+        )
+        .mount(&mock)
+        .await;
+    let accounts_seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let observed = accounts_seen.clone();
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(move |request: &wiremock::Request| {
+            let id = if request.headers["authorization"].to_str().unwrap().ends_with("owned-retry-a") {
+                "acc_11111111"
+            } else { "acc_22222222" };
+            let mut seen = observed.lock().unwrap();
+            seen.push(id.to_owned());
+            if seen.len() == 1 {
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/vnd.amazon.eventstream")
+                    .set_body_bytes([
+                        event_stream_frame("messageMetadataEvent", json!({"tokenUsage":{"inputTokens":41,"outputTokens":3},"creditsConsumed":0.125})),
+                        event_stream_frame("serviceUnavailableError", json!({"message":"Owned initial account failure."})),
+                    ].concat())
+            } else {
+                ResponseTemplate::new(500).set_body_string("Owned candidate was not accepted.")
+            }
+        }).expect(2).mount(&mock).await;
+    let port = unused_tcp_port();
+    let daemon =
+        Daemon::start_http(port, &format!("{}/generateAssistantResponse", mock.uri())).await;
+    let accounts = [("acc_11111111", "owned-retry-a"), ("acc_22222222", "owned-retry-b")].map(|(id, token)| json!({
+        "id":id,"email":format!("{id}@example.com"),"machine_id":"1".repeat(64),
+        "credentials":{"access_token":token,"region":"us-east-1","expires_at":4_000_000_000i64,"auth_method":"idc"},
+        "usage":{"current":0.0,"limit":100.0,"percent_used":0.0,"updated_at":1},"created_at":1
+    }));
+    expect_ok(
+        daemon
+            .call("account.import", json!({"accounts":accounts}))
+            .await,
+    );
+    expect_ok(daemon.call("models", json!({})).await);
+    model_policy::configure(&daemon, |config| {
+        config.features.enable_prompt_cache = true;
+        config.features.enable_model_fallback = false;
+        config.upstream.max_retries = 1;
+        config.upstream.preferred_endpoint = Some(crosslane_core::config::Endpoint::Amazonq);
+    })
+    .await;
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .header("x-api-key", daemon.api_key.as_deref().unwrap())
+        .header("user-agent", "claude-cli/2.1.316 (external, e2e)")
+        .json(&json!({"model":"claude-opus-5.5","max_tokens":64,"stream":true,
+            "system":[{"type":"text","text":"stable retry cache fixture ".repeat(600),"cache_control":{"type":"ephemeral"}}],
+            "messages":[{"role":"user","content":"question"}]}))
+        .send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("\"type\":\"error\""), "{body}");
+    let starts: Vec<Value> = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| event["type"] == "message_start")
+        .collect();
+    assert_eq!(starts.len(), usize::from(cfg!(feature = "crs")), "{body}");
+    // CRS repairs an otherwise start-less error stream with an empty start;
+    // neither attempt's provisional cache allocation may leak into it.
+    for start in starts {
+        assert_eq!(
+            start["message"]["usage"],
+            json!({"input_tokens":0,"output_tokens":0}),
+            "{body}"
+        );
+    }
+    let seen = accounts_seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    assert_ne!(seen[0], seen[1], "must exercise cross-account takeover");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let stats = expect_ok(
+            daemon
+                .call("stats", json!({"detail":true,"recent":10}))
+                .await,
+        );
+        if let Some(row) = stats["stats"]["recent_requests"]
+            .as_array()
+            .unwrap()
+            .first()
+        {
+            assert_eq!(
+                row["account_id"], seen[0],
+                "failed candidate took over accounting: {row}"
+            );
+            assert_eq!(row["kiro_model"], "claude-opus-5.5");
+            assert_eq!(row["input_tokens"], 41, "{row}");
+            assert_eq!(row["output_tokens"], 3, "{row}");
+            assert_eq!(row["diagnostics"]["cache_read_tokens"], 0, "{row}");
+            assert_eq!(row["diagnostics"]["cache_write_tokens"], 0, "{row}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "missing failure settlement: {stats}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    mock.verify().await;
+    daemon.stop().await;
+}
+
+#[tokio::test]
 async fn protocols_report_real_cache_usage_from_split_metadata_before_or_after_content() {
     let _guard = HTTP_TEST_LOCK.lock().await;
     let mock = MockServer::start().await;
@@ -772,4 +889,275 @@ async fn failed_stream_does_not_seed_local_cache_entries() {
         }
     }
     assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn stop_does_not_seed_cache_in_either_response_mode() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/ListAvailableModels"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"models":[{"modelId":"claude-opus-5.5"}]})),
+        )
+        .mount(&mock)
+        .await;
+    let frames = [
+        event_stream_frame(
+            "assistantResponseEvent",
+            json!({"content":"before <STOP> unconsumed response"}),
+        ),
+        event_stream_frame("meteringEvent", json!({"unit":"credit","usage":0.05})),
+    ]
+    .concat();
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/vnd.amazon.eventstream")
+                .set_body_bytes(frames),
+        )
+        .expect(4)
+        .mount(&mock)
+        .await;
+    let port = unused_tcp_port();
+    let daemon =
+        Daemon::start_http(port, &format!("{}/generateAssistantResponse", mock.uri())).await;
+    expect_ok(daemon.call("account.import",json!({"accounts":[{
+        "id":"acc_77777777","email":"review@example.com","machine_id":"7".repeat(64),
+        "credentials":{"access_token":"synthetic-review","region":"us-east-1","expires_at":4_000_000_000i64,"auth_method":"idc"},
+        "usage":{"current":0.0,"limit":100.0,"percent_used":0.0,"updated_at":1},"created_at":1
+    }]})).await);
+    expect_ok(daemon.call("models", json!({})).await);
+    let path = daemon.home().join("config.toml");
+    let config = tokio::fs::read_to_string(&path)
+        .await
+        .unwrap()
+        .replace("enable_prompt_cache = false", "enable_prompt_cache = true");
+    tokio::fs::write(&path, config).await.unwrap();
+    assert_eq!(
+        expect_ok(daemon.call("config.reload", json!({})).await)["applied"],
+        true
+    );
+    let mut request = json!({
+        "model":"claude-opus-5.5","max_tokens":64,"stream":false,"stop_sequences":["<STOP>"],
+        "system":[{"type":"text","text":"stable reference ".repeat(1000),"cache_control":{"type":"ephemeral"}}],
+        "messages":[{"role":"user","content":"stop at delimiter"}]
+    });
+    let client = reqwest::Client::new();
+    let mut bodies = Vec::new();
+    for stream in [false, true] {
+        request["stream"] = json!(stream);
+        for _ in 0..2 {
+            let response = client
+                .post(format!("http://127.0.0.1:{port}/v1/messages"))
+                .header("x-api-key", daemon.api_key.as_deref().unwrap())
+                .header("anthropic-version", "2023-06-01")
+                .header("user-agent", "claude-cli/2.1.318 (external, review)")
+                .json(&request)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let text = response.text().await.unwrap();
+            assert_eq!(status, reqwest::StatusCode::OK, "response={text}");
+            let body = if stream {
+                let delta = text
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .find(|event| event["type"] == "message_delta")
+                    .unwrap();
+                json!({"stop_reason":delta["delta"]["stop_reason"],"usage":delta["usage"]})
+            } else {
+                serde_json::from_str::<Value>(&text).unwrap()
+            };
+            assert_eq!(body["stop_reason"], "stop_sequence");
+            assert_eq!(
+                body["usage"]["cache_read_input_tokens"], 0,
+                "stop must not publish: {body}"
+            );
+            bodies.push(body);
+        }
+    }
+    daemon.stop().await;
+    assert_eq!(bodies[0]["stop_reason"], "stop_sequence");
+    assert_eq!(
+        bodies[1]["usage"]["cache_read_input_tokens"],
+        0,
+        "a response cut at a stop sequence must not seed the next request: {:?}",
+        bodies.iter().map(|b| &b["usage"]).collect::<Vec<_>>()
+    );
+}
+
+/// Exercise the independent rollout switches through the public HTTP path,
+/// including a hot reload while the accepted request is awaiting its body.
+#[tokio::test]
+async fn accounting_switch_matrix_and_inflight_zero_policy_are_frozen() {
+    use crosslane_core::config::{KiroUsageZeroPolicy, PromptCacheAccounting};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/ListAvailableModels"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"models":[{"modelId":"claude-opus-5.5"}]})),
+        )
+        .mount(&mock)
+        .await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    Mock::given(method("POST")).and(path("/generateAssistantResponse"))
+        .respond_with(move |_: &wiremock::Request| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(200).insert_header("content-type", "application/vnd.amazon.eventstream")
+                .set_delay(Duration::from_millis(400))
+                .set_body_bytes([
+                    event_stream_frame("assistantResponseEvent", json!({"content":"pong"})),
+                    event_stream_frame("messageMetadataEvent", json!({"tokenUsage":{"inputTokens":0,"outputTokens":0,"cacheReadInputTokens":0,"cacheWriteInputTokens":0}})),
+                ].concat())
+        }).mount(&mock).await;
+    let port = unused_tcp_port();
+    let daemon = Daemon::start_http_with_log_level(
+        port,
+        &format!("{}/generateAssistantResponse", mock.uri()),
+        "info",
+    )
+    .await;
+    expect_ok(daemon.call("account.import", json!({"accounts":[{
+        "id":"acc_77777777","email":"switches@example.com","machine_id":"7".repeat(64),
+        "credentials":{"access_token":"synthetic-switches","region":"us-east-1","expires_at":4_000_000_000i64,"auth_method":"idc"},
+        "usage":{"current":0.0,"limit":100.0,"percent_used":0.0,"updated_at":1},"created_at":1
+    }]})).await);
+    expect_ok(daemon.call("models", json!({})).await);
+    let config_path = daemon.home().join("config.toml");
+    let mut config: Config =
+        toml::from_str(&tokio::fs::read_to_string(&config_path).await.unwrap()).unwrap();
+    let client = reqwest::Client::new();
+    let cases = [
+        (
+            true,
+            PromptCacheAccounting::V3,
+            KiroUsageZeroPolicy::Fallback,
+        ),
+        (true, PromptCacheAccounting::V3, KiroUsageZeroPolicy::Legacy),
+        (
+            true,
+            PromptCacheAccounting::Legacy,
+            KiroUsageZeroPolicy::Fallback,
+        ),
+        (
+            true,
+            PromptCacheAccounting::Legacy,
+            KiroUsageZeroPolicy::Legacy,
+        ),
+        (
+            false,
+            PromptCacheAccounting::V3,
+            KiroUsageZeroPolicy::Fallback,
+        ),
+    ];
+    for (case, (enabled, accounting, zero)) in cases.into_iter().enumerate() {
+        for stream in [false, true] {
+            config.features.enable_prompt_cache = enabled;
+            config.features.prompt_cache_accounting = accounting;
+            config.features.kiro_usage_zero_policy = zero;
+            tokio::fs::write(&config_path, toml::to_string_pretty(&config).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                expect_ok(daemon.call("config.reload", json!({})).await)["applied"],
+                true
+            );
+            let before = calls.load(Ordering::SeqCst);
+            let request = json!({"model":"claude-opus-5.5","max_tokens":64,"stream":stream,
+                "system":[{"type":"text","text":format!("switch case {case} stream {stream} stable reference ").repeat(240),"cache_control":{"type":"ephemeral"}}],
+                "messages":[{"role":"user","content":"hello"}]});
+            let pending = tokio::spawn(
+                client
+                    .post(format!("http://127.0.0.1:{port}/v1/messages"))
+                    .header("x-api-key", daemon.api_key.as_deref().unwrap())
+                    .header("anthropic-version", "2023-06-01")
+                    .header("user-agent", "claude-cli/2.1.318 (external, e2e)")
+                    .json(&request)
+                    .send(),
+            );
+            tokio::time::timeout(Duration::from_secs(30), async {
+                // CRS may return the downstream SSE headers before dispatch;
+                // completion of send() is not evidence that upstream ran.
+                while calls.load(Ordering::SeqCst) == before {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            // A policy reload cannot alter an already-admitted request.
+            config.features.kiro_usage_zero_policy = if zero == KiroUsageZeroPolicy::Fallback {
+                KiroUsageZeroPolicy::Legacy
+            } else {
+                KiroUsageZeroPolicy::Fallback
+            };
+            config.features.enable_prompt_cache = !enabled;
+            config.features.prompt_cache_accounting = if accounting == PromptCacheAccounting::V3 {
+                PromptCacheAccounting::Legacy
+            } else {
+                PromptCacheAccounting::V3
+            };
+            tokio::fs::write(&config_path, toml::to_string_pretty(&config).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                expect_ok(daemon.call("config.reload", json!({})).await)["applied"],
+                true
+            );
+            let response = pending.await.unwrap().unwrap();
+            let status = response.status();
+            let text = response.text().await.unwrap();
+            assert_eq!(status, 200, "{text}");
+            let usage = if stream {
+                text.lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .find(|event| event["type"] == "message_delta")
+                    .unwrap()["usage"]
+                    .clone()
+            } else {
+                serde_json::from_str::<Value>(&text).unwrap()["usage"].clone()
+            };
+            let read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
+            let write = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+            let input = usage["input_tokens"].as_u64().unwrap() + read + write;
+            if zero == KiroUsageZeroPolicy::Fallback {
+                assert!(
+                    input > 512 && usage["output_tokens"].as_u64().unwrap() > 0,
+                    "case {case} stream={stream}: {usage}"
+                );
+                if enabled {
+                    if write <= 512 {
+                        let files = expect_ok(daemon.call("logs.files", json!({})).await);
+                        for file in files["files"].as_array().into_iter().flatten() {
+                            if let Some(path) = file["path"].as_str() {
+                                let text =
+                                    tokio::fs::read_to_string(path).await.unwrap_or_default();
+                                for line in
+                                    text.lines().filter(|line| line.contains("prompt_cache."))
+                                {
+                                    eprintln!("{line}");
+                                }
+                            }
+                        }
+                    }
+                    assert!(write > 512, "case {case} stream={stream}: {usage}");
+                } else {
+                    assert_eq!(read + write, 0);
+                }
+            } else {
+                assert_eq!(input, 0, "case {case}: {usage}");
+                assert_eq!(usage["output_tokens"], 0);
+            }
+        }
+    }
+    daemon.stop().await;
 }

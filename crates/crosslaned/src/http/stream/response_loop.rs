@@ -7,15 +7,15 @@ use super::CLIENT_CANCELLED_ERROR;
 use super::{
     accumulate_usage, apply_stream_stop, auto_continue_payload, build_claude_state,
     classified_stream_error, classify_stream_failure, claude_initial_events, client_visible_event,
-    event_is_tool_search, event_is_web_search, event_kind, fill_missing_usage, finish_accounting,
-    header, json, now_secs, prepend_pending_initial, record_account_scoped_stream_failure,
-    repair_json, restore_tool_event_name, should_buffer_tool_event, sse, stream_error,
-    stream_event, stream_finish, tool_search_continue_payload_batch,
-    web_search_continue_payload_batch, web_search_replay_failure, Body, Bytes, BytesMut,
-    ClaudeToolSearchBudget, ClaudeWebSearchTrace, DecodedResponse, Decoder, EventStreamDecoder,
-    HashSet, HeaderValue, Infallible, KiroEvent, KiroResponse, KiroToolUse, Response, StatusCode,
-    StopSequenceFilter, StreamContext, StreamExt, StreamFailureDiagnostics, StreamFailureScope,
-    StreamProtocol, ThinkingContentFilter, ToolLeakFilter, UpstreamStreamMetrics, Value,
+    event_is_tool_search, event_is_web_search, event_kind, finish_accounting, header, json,
+    now_secs, prepend_pending_initial, record_account_scoped_stream_failure, repair_json,
+    restore_tool_event_name, should_buffer_tool_event, sse, stream_error, stream_event,
+    stream_finish, tool_search_continue_payload_batch, web_search_continue_payload_batch,
+    web_search_replay_failure, Body, Bytes, BytesMut, ClaudeToolSearchBudget, ClaudeWebSearchTrace,
+    DecodedResponse, Decoder, EventStreamDecoder, HashSet, HeaderValue, Infallible, KiroEvent,
+    KiroResponse, KiroToolUse, Response, StatusCode, StopSequenceFilter, StreamContext, StreamExt,
+    StreamFailureDiagnostics, StreamFailureScope, StreamProtocol, ThinkingContentFilter,
+    ToolLeakFilter, UpstreamStreamMetrics, Value,
 };
 
 /// Keep empty attempts retryable without delaying valid visible output until
@@ -74,6 +74,15 @@ pub fn response(
     protocol: StreamProtocol,
     mut context: StreamContext,
 ) -> Response {
+    let mut prompt_cache_plan = context.state.prompt_cache.plan_accepted(
+        &context.lease.account_id(),
+        &context.kiro_model,
+        context.prompt_cache.as_ref(),
+        &context.cache_snapshot,
+        &upstream,
+        &context.payload,
+    );
+    let mut dispatched_at = upstream.dispatched_at();
     let mut effective_thinking = upstream.thinking_enabled();
     let mut redaction = upstream.redaction_session().clone();
     #[cfg(feature = "crs")]
@@ -125,13 +134,12 @@ pub fn response(
         let mut decoded = DecodedResponse::default();
         let mut stop_filter = StopSequenceFilter::new(&context.stop_sequences);
         let mut accumulated_usage = crosslane_kiro::UsageInfo::default();
-        let mut prompt_cache_plan = context.state.prompt_cache.plan(
-            &context.lease.account_id(),
-            &context.kiro_model,
-            context.prompt_cache.as_ref(),
-        );
         let mut claude = build_claude_state(&context);
-        claude.apply_prompt_cache_plan(&prompt_cache_plan);
+        claude.apply_prompt_cache_plan(&prompt_cache_plan, dispatched_at);
+        let mut cache_ledger = crate::http::prompt_cache::CacheLedger::default();
+        let zero_fallback = context.zero_fallback;
+        // Set when the current round's transport reached EOF and decoded cleanly.
+        let mut upstream_eof_observed = false;
         let mut accumulated_searches = std::mem::take(&mut context.resumed_tool_searches);
         let mut accumulated_web_searches = std::mem::take(&mut context.resumed_web_searches);
         let mut data_started = false;
@@ -476,7 +484,9 @@ pub fn response(
                             break;
                         }
                         None => {
+                            upstream_eof_observed = true;
                             if let Err(error) = decoder.decode_eof(&mut buffer) {
+                                upstream_eof_observed = false;
                                 stream_failure = Some(
                                     StreamFailureDiagnostics::from_event_stream(
                                         "event_stream_eof",
@@ -729,12 +739,18 @@ pub fn response(
                         let account = context.lease.account().await;
                         payload.profile_arn.clone_from(&account.profile_arn);
                         pre_data_retries += 1;
+                        let next_snapshot = context.state.prompt_cache.snapshot(&account.id, &context.service_id, context.api_key_id.as_deref());
                         match active_transport!('rounds, context.state.generate(&account, &payload)) {
                             Ok(retry) => {
+                                prompt_cache_plan = context.state.prompt_cache.plan_accepted(&account.id, &context.kiro_model, context.prompt_cache.as_ref(), &next_snapshot, &retry, &payload);
+                                claude.apply_prompt_cache_plan(&prompt_cache_plan, retry.dispatched_at());
+                                context.cache_snapshot = next_snapshot;
+                                upstream_eof_observed = false;
                                 upstream_access_token = account.credentials.access_token.clone();
                                 effective_thinking = retry.thinking_enabled();
                                 redaction = retry.redaction_session().clone();
                                 payload.redaction_session = Some(redaction.clone());
+                                dispatched_at = retry.dispatched_at();
                                 #[cfg(feature = "crs")]
                                 let (next_endpoint, next_response, next_permit, next_frozen_payload) =
                                     retry.into_parts_with_payload();
@@ -854,19 +870,29 @@ pub fn response(
                                 );
                             }
                             if fits_context {
-                                context.input_tokens = fallback_input_tokens;
-                                fallback_model = Some(fallback.clone());
-                                context.mapped_model.clone_from(&fallback);
-                                context.kiro_model.clone_from(&resolved);
-                                super::super::handlers::set_payload_model(&mut payload, &resolved);
+                                let mut candidate_payload = payload.clone();
+                                super::super::handlers::set_payload_model(&mut candidate_payload, &resolved);
+                                let candidate_profile = context.state.prompt_cache.retry_profile(&context.state.tokenizer, context.prompt_cache.as_ref(), &candidate_payload).await;
                                 pre_data_retries += 1;
-                                match active_transport!('rounds, context.state.generate(&account, &payload)) {
+                                let next_snapshot = context.state.prompt_cache.snapshot(&account.id, &context.service_id, context.api_key_id.as_deref());
+                        match active_transport!('rounds, context.state.generate(&account, &candidate_payload)) {
                                     Ok(retry) => {
+                                        context.input_tokens = fallback_input_tokens;
+                                        fallback_model = Some(fallback.clone());
+                                        context.mapped_model.clone_from(&fallback);
+                                        context.kiro_model.clone_from(&resolved);
+                                        context.prompt_cache = candidate_profile;
+                                        payload = candidate_payload;
+                                prompt_cache_plan = context.state.prompt_cache.plan_accepted(&account.id, &context.kiro_model, context.prompt_cache.as_ref(), &next_snapshot, &retry, &payload);
+                                claude.apply_prompt_cache_plan(&prompt_cache_plan, retry.dispatched_at());
+                                context.cache_snapshot = next_snapshot;
+                                upstream_eof_observed = false;
                                         upstream_access_token =
                                             account.credentials.access_token.clone();
                                         effective_thinking = retry.thinking_enabled();
                                         redaction = retry.redaction_session().clone();
                                         payload.redaction_session = Some(redaction.clone());
+                                        dispatched_at = retry.dispatched_at();
                                         #[cfg(feature = "crs")]
                                         let (next_endpoint, next_response, next_permit, next_frozen_payload) =
                                             retry.into_parts_with_payload();
@@ -938,21 +964,14 @@ pub fn response(
                     // Keep the accepted round's attribution until a candidate
                     // response is accepted. A disconnect during selection or
                     // backoff still belongs to the previous account/model.
-                    #[cfg(feature = "crs")]
                     let (mut candidate_mapped_model, mut candidate_kiro_model,
                         mut candidate_input_tokens, mut candidate_payload) = (
                         context.mapped_model.clone(), context.kiro_model.clone(),
                         context.input_tokens, payload.clone(),
                     );
-                    #[cfg(feature = "crs")]
                     let (mapped_model, kiro_model, input_tokens, retry_payload) = (
                         &mut candidate_mapped_model, &mut candidate_kiro_model,
                         &mut candidate_input_tokens, &mut candidate_payload,
-                    );
-                    #[cfg(not(feature = "crs"))]
-                    let (mapped_model, kiro_model, input_tokens, retry_payload) = (
-                        &mut context.mapped_model, &mut context.kiro_model,
-                        &mut context.input_tokens, &mut payload,
                     );
                     let (new_lease, account) = loop {
                         let pool = context.state.pool();
@@ -1111,50 +1130,7 @@ pub fn response(
                         break (new_lease, account);
                     };
                     let next_input_tokens = *input_tokens;
-                    #[cfg(feature = "crs")]
                     let next_cache_model = &candidate_kiro_model;
-                    #[cfg(not(feature = "crs"))]
-                    let next_cache_model = &context.kiro_model;
-                    let next_prompt_cache_plan = context.state.prompt_cache.plan(
-                        &new_lease.account_id(), next_cache_model,
-                        context.prompt_cache.as_ref(),
-                    );
-                    #[cfg(not(feature = "crs"))]
-                    {
-                        context.lease = new_lease;
-                        prompt_cache_plan = next_prompt_cache_plan.clone();
-                    }
-                    claude = build_claude_state(&context);
-                    claude.input_tokens = next_input_tokens;
-                    claude.apply_prompt_cache_plan(&next_prompt_cache_plan);
-                    pending_initial = if matches!(protocol, StreamProtocol::Claude) {
-                        match claude_initial_events(
-                            &mut claude,
-                            context.compaction_summary.as_deref(),
-                            &context.resumed_server_events,
-                            &accumulated_searches,
-                            &accumulated_web_searches,
-                        ) {
-                            Ok(events) => events,
-                            Err(error) => {
-                                let message = web_search_replay_failure(
-                                    &context.trace_id,
-                                    &context.request_id,
-                                    &context.user_agent,
-                                    &error,
-                                );
-                                failed = Some(message.clone());
-                                yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(
-                                    &protocol,
-                                    &context.request_id,
-                                    &message,
-                                )));
-                                break 'rounds;
-                            }
-                        }
-                    } else {
-                        Vec::new()
-                    };
                     tracing::info!(
                         trace_id = %context.trace_id,
                         request_id = %context.request_id,
@@ -1170,21 +1146,63 @@ pub fn response(
                     ))
                     .await;
                     pre_data_retries += 1;
+                    let next_profile = context.state.prompt_cache.retry_profile(&context.state.tokenizer, context.prompt_cache.as_ref(), retry_payload).await;
+                    let next_snapshot = context.state.prompt_cache.snapshot_profile(&account.id, next_profile.as_ref());
+                    let next_domain_payload = retry_payload.clone();
                     match active_transport!('rounds, context.state.generate(&account, retry_payload)) {
                         Ok(retry) => {
-                            #[cfg(feature = "crs")]
+                            let next_prompt_cache_plan = context.state.prompt_cache.plan_accepted(
+                                &account.id, next_cache_model, next_profile.as_ref(), &next_snapshot, &retry, &next_domain_payload,
+                            );
+                            let mut next_claude = build_claude_state(&context);
+                            next_claude.input_tokens = next_input_tokens;
+                            next_claude.apply_prompt_cache_plan(&next_prompt_cache_plan, retry.dispatched_at());
+                            let next_pending_initial = if matches!(protocol, StreamProtocol::Claude) {
+                                match claude_initial_events(
+                                    &mut next_claude,
+                                    context.compaction_summary.as_deref(),
+                                    &context.resumed_server_events,
+                                    &accumulated_searches,
+                                    &accumulated_web_searches,
+                                ) {
+                                    Ok(events) => events,
+                                    Err(error) => {
+                                        let message = web_search_replay_failure(
+                                            &context.trace_id,
+                                            &context.request_id,
+                                            &context.user_agent,
+                                            &error,
+                                        );
+                                        failed = Some(message.clone());
+                                        yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(
+                                            &protocol,
+                                            &context.request_id,
+                                            &message,
+                                        )));
+                                        break 'rounds;
+                                    }
+                                }
+                            } else {
+                                Vec::new()
+                            };
+                            context.lease = new_lease;
+                            context.cache_snapshot = next_snapshot;
+                            context.prompt_cache = next_profile;
+                            prompt_cache_plan = next_prompt_cache_plan;
+                            claude = next_claude;
+                            pending_initial = next_pending_initial;
+                            upstream_eof_observed = false;
                             {
-                                context.lease = new_lease;
                                 context.mapped_model = candidate_mapped_model;
                                 context.kiro_model = candidate_kiro_model;
                                 context.input_tokens = candidate_input_tokens;
                                 payload = candidate_payload;
-                                prompt_cache_plan = next_prompt_cache_plan;
                             }
                             upstream_access_token = account.credentials.access_token.clone();
                             effective_thinking = retry.thinking_enabled();
                             redaction = retry.redaction_session().clone();
                             payload.redaction_session = Some(redaction.clone());
+                            dispatched_at = retry.dispatched_at();
                             #[cfg(feature = "crs")]
                             let (next_endpoint, next_response, next_permit, next_frozen_payload) =
                                 retry.into_parts_with_payload();
@@ -1251,7 +1269,16 @@ pub fn response(
             super::super::usage::observe_context_pressure(
                 &context.state, &context.lease.account_id(), &payload, &decoded, context.input_tokens,
             );
-            fill_missing_usage(&context.state, &mut decoded, &payload).await;
+            if zero_fallback {
+                decoded.normalize_kiro_zeros();
+            }
+            super::super::usage::fill_missing_usage_with_input(&context.state, &mut decoded, &payload, cache_ledger.input_estimate(&prompt_cache_plan)).await;
+            cache_ledger.settle_round(&prompt_cache_plan, Some(dispatched_at), &mut decoded);
+            if !upstream_eof_observed {
+                // A stop sequence left the body unread: account, never publish.
+                cache_ledger.cancel_publication(crate::http::prompt_cache::SkipReason::NotEof);
+            }
+            upstream_eof_observed = false;
             if stop_filter.matched().is_some() {
                 for data in std::mem::take(&mut guarded_output) {
                     yield Ok::<Bytes, Infallible>(Bytes::from(data));
@@ -1355,6 +1382,8 @@ pub fn response(
                                 u32::from(empty_tool_result_retries),
                                 "empty_assistant_runtime_retry",
                             );
+                            let next_profile = if cache_ledger.is_initial() { context.state.prompt_cache.retry_profile(&context.state.tokenizer, context.prompt_cache.as_ref(), &frozen_payload).await } else { context.prompt_cache.clone() };
+                            let next_snapshot = context.state.prompt_cache.snapshot_profile(&account.id, next_profile.as_ref());
                             match active_transport!('rounds, context.state.generate_runtime_isolated_with_client(
                                 &client, &account, &frozen_payload, endpoint_key,
                             )).unwrap_or_else(|| Err(crosslane_kiro::KiroError {
@@ -1363,6 +1392,13 @@ pub fn response(
                                 message: "isolated Runtime retry became unavailable".into(),
                             })) {
                                 Ok(next) => {
+                                    if cache_ledger.is_initial() {
+                                        prompt_cache_plan = context.state.prompt_cache.plan_accepted(&account.id, &context.kiro_model, next_profile.as_ref(), &next_snapshot, &next, &frozen_payload);
+                                        claude.apply_prompt_cache_plan(&prompt_cache_plan, next.dispatched_at());
+                                    }
+                                    context.prompt_cache = next_profile;
+                                    upstream_eof_observed = false;
+                                    dispatched_at = next.dispatched_at();
                                     upstream_access_token = account.credentials.access_token.clone();
                                     effective_thinking = next.thinking_enabled();
                                     redaction = next.redaction_session().clone();
@@ -1476,12 +1512,21 @@ pub fn response(
                         u32::from(empty_tool_result_retries),
                         "empty_assistant_retry",
                     );
+                    let next_profile = if cache_ledger.is_initial() { context.state.prompt_cache.retry_profile(&context.state.tokenizer, context.prompt_cache.as_ref(), &payload).await } else { context.prompt_cache.clone() };
+                    let next_snapshot = context.state.prompt_cache.snapshot_profile(&account.id, next_profile.as_ref());
                     match active_transport!('rounds, context.state.generate(&account, &payload)) {
                         Ok(next) => {
+                            if cache_ledger.is_initial() {
+                                prompt_cache_plan = context.state.prompt_cache.plan_accepted(&account.id, &context.kiro_model, next_profile.as_ref(), &next_snapshot, &next, &payload);
+                                claude.apply_prompt_cache_plan(&prompt_cache_plan, next.dispatched_at());
+                            }
+                            context.prompt_cache = next_profile;
+                            upstream_eof_observed = false;
                             upstream_access_token = account.credentials.access_token.clone();
                             effective_thinking = next.thinking_enabled();
                             redaction = next.redaction_session().clone();
                             payload.redaction_session = Some(redaction.clone());
+                            dispatched_at = next.dispatched_at();
                             #[cfg(feature = "crs")]
                             let (next_endpoint, next_response, next_permit, next_frozen_payload) =
                                 next.into_parts_with_payload();
@@ -1925,8 +1970,8 @@ pub fn response(
                     }
                 }
 
-                let next_input_tokens = match context.state.tokenizer.estimate_kiro_payload(&payload).await {
-                    Ok(tokens) => tokens as u64,
+                let next_metrics = match super::super::handlers::payload_metrics(&context.state.tokenizer, &payload).await {
+                    Ok(metrics) => metrics,
                     Err(error) => {
                         failed = Some(error.clone());
                         yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(
@@ -1937,30 +1982,9 @@ pub fn response(
                         break 'rounds;
                     }
                 };
-                let next_tool_tokens = match context.state.tokenizer.estimate_kiro_tools(&payload).await {
-                    Ok(tokens) => (tokens as u64).saturating_add(documentation_tokens),
-                    Err(error) => {
-                        failed = Some(error.clone());
-                        yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(
-                            &protocol,
-                            &context.request_id,
-                            &error,
-                        )));
-                        break 'rounds;
-                    }
-                };
-                let next_payload_bytes = match serde_json::to_vec(&crosslane_translate::prepare_redacted_kiro_payload(&payload, &[])) {
-                    Ok(payload) => payload.len(),
-                    Err(error) => {
-                        failed = Some(error.to_string());
-                        yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(
-                            &protocol,
-                            &context.request_id,
-                            &error.to_string(),
-                        )));
-                        break 'rounds;
-                    }
-                };
+                let next_input_tokens = next_metrics.input_tokens;
+                let next_tool_tokens = next_metrics.tool_tokens.saturating_add(documentation_tokens);
+                let next_payload_bytes = next_metrics.bytes;
                 let config = context.state.config.current();
                 let max_loaded_tools = config
                     .context
@@ -2037,6 +2061,7 @@ pub fn response(
                         effective_thinking = next.thinking_enabled();
                         redaction = next.redaction_session().clone();
                         payload.redaction_session = Some(redaction.clone());
+                        dispatched_at = next.dispatched_at();
                         #[cfg(feature = "crs")]
                         let (next_endpoint, next_response, next_permit, next_frozen_payload) =
                             next.into_parts_with_payload();
@@ -2259,6 +2284,7 @@ pub fn response(
                         effective_thinking = next.thinking_enabled();
                         redaction = next.redaction_session().clone();
                         payload.redaction_session = Some(redaction.clone());
+                        dispatched_at = next.dispatched_at();
                         #[cfg(feature = "crs")]
                         let (next_endpoint, next_response, next_permit, next_frozen_payload) =
                             next.into_parts_with_payload();
@@ -2381,6 +2407,7 @@ pub fn response(
                     effective_thinking = next.thinking_enabled();
                     redaction = next.redaction_session().clone();
                     payload.redaction_session = Some(redaction.clone());
+                    dispatched_at = next.dispatched_at();
                     #[cfg(feature = "crs")]
                     let (next_endpoint, next_response, next_permit, next_frozen_payload) =
                         next.into_parts_with_payload();
@@ -2450,9 +2477,10 @@ pub fn response(
         decoded.reasoning = accumulated_reasoning;
         decoded.tool_searches = accumulated_searches;
         decoded.web_searches = accumulated_web_searches;
-        accumulate_usage(&mut decoded.usage, &accumulated_usage);
-        apply_stream_stop(&mut decoded, &stop_filter);
         let current_round_output_tokens = decoded.usage.output_tokens;
+        accumulate_usage(&mut decoded.usage, &accumulated_usage);
+        cache_ledger.mark_cumulative(&mut decoded);
+        apply_stream_stop(&mut decoded, &stop_filter);
         context.prompt_cache = None;
         if failed.is_none()
             && matches!(protocol, StreamProtocol::Claude)
@@ -2541,9 +2569,16 @@ pub fn response(
                     yield Ok::<Bytes, Infallible>(Bytes::from(data));
                 }
             }
-            context.state.prompt_cache.commit(
-                &context.lease.account_id(), &prompt_cache_plan, &mut decoded,
-            );
+            if failed.is_some() || decoded.stop_reason.as_deref() == Some("refusal") {
+                context.state.prompt_cache.abandon_request(
+                    &context.trace_id, &prompt_cache_plan, &mut cache_ledger, &decoded,
+                );
+            } else {
+                context.state.prompt_cache.finish_request(
+                    &context.trace_id, &context.lease.account_id(), &prompt_cache_plan,
+                    &mut cache_ledger, &mut decoded,
+                );
+            }
             for data in stream_finish(
                 &protocol,
                 &mut claude,

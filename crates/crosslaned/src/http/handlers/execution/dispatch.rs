@@ -522,6 +522,12 @@ async fn dispatch_upstream(
             attempt + 1,
             "initial",
         );
+        let cache_snapshot = state.prompt_cache.snapshot_payload(
+            &account.id,
+            service_id.unwrap_or_default(),
+            key_id,
+            &request_payload,
+        );
         #[cfg(feature = "crs")]
         let generated = generate_with_summary_budget(
             state,
@@ -557,6 +563,7 @@ async fn dispatch_upstream(
                 );
                 pool.record_success(&account.id).await;
                 return Ok(DispatchOutcome::Generated(Box::new(UpstreamExecution {
+                    cache_snapshot,
                     lease,
                     response,
                     upstream_access_token: account.credentials.access_token.clone(),
@@ -620,6 +627,12 @@ async fn dispatch_upstream(
                         attempt + 1,
                         "refreshed_account",
                     );
+                    let cache_snapshot = state.prompt_cache.snapshot_payload(
+                        &refreshed.id,
+                        service_id.unwrap_or_default(),
+                        key_id,
+                        &request_payload,
+                    );
                     #[cfg(feature = "crs")]
                     let generated = generate_with_summary_budget(
                         state,
@@ -647,6 +660,7 @@ async fn dispatch_upstream(
                             );
                             pool.record_success(&refreshed.id).await;
                             return Ok(DispatchOutcome::Generated(Box::new(UpstreamExecution {
+                                cache_snapshot,
                                 lease,
                                 upstream_access_token: refreshed.credentials.access_token.clone(),
                                 mapped_model,
@@ -853,6 +867,12 @@ async fn dispatch_upstream(
                                     attempt + 1,
                                     "model_fallback",
                                 );
+                                let cache_snapshot = state.prompt_cache.snapshot_payload(
+                                    &account.id,
+                                    service_id.unwrap_or_default(),
+                                    key_id,
+                                    &request_payload,
+                                );
                                 #[cfg(feature = "crs")]
                                 let generated = generate_with_summary_budget(
                                     state,
@@ -882,6 +902,7 @@ async fn dispatch_upstream(
                                         pool.record_success(&account.id).await;
                                         return Ok(DispatchOutcome::Generated(Box::new(
                                             UpstreamExecution {
+                                                cache_snapshot,
                                                 lease,
                                                 upstream_access_token: account
                                                     .credentials
@@ -1126,6 +1147,12 @@ async fn dispatch_upstream(
                         attempt_logs.len() as u32 + 1,
                         "client_summary_recovery",
                     );
+                    let cache_snapshot = state.prompt_cache.snapshot_payload(
+                        &account.id,
+                        service_id.unwrap_or_default(),
+                        key_id,
+                        &frozen.payload,
+                    );
                     let response = state
                         .generate_at_endpoint_isolated_with_client(
                             &frozen.client,
@@ -1134,11 +1161,11 @@ async fn dispatch_upstream(
                             retry_endpoint,
                         )
                         .await;
-                    Some((lease, account, response))
+                    Some((lease, account, response, cache_snapshot))
                 })
                 .await;
                 match recovered {
-                    Ok(Some((lease, account, Ok(response)))) => {
+                    Ok(Some((lease, account, Ok(response), cache_snapshot))) => {
                         recovery_pool.record_success(&account.id).await;
                         tracing::info!(
                             event = "proxy.compaction.client_summary_recovered",
@@ -1148,6 +1175,7 @@ async fn dispatch_upstream(
                             "client summary accepted after one bounded same-request recovery"
                         );
                         return Ok(DispatchOutcome::Generated(Box::new(UpstreamExecution {
+                            cache_snapshot,
                             lease,
                             response,
                             upstream_access_token: account.credentials.access_token,
@@ -1159,7 +1187,7 @@ async fn dispatch_upstream(
                             payload: frozen.payload,
                         })));
                     }
-                    Ok(Some((lease, _, Err(error))))
+                    Ok(Some((lease, _, Err(error), _)))
                         if error.endpoint == "isolated-endpoint-policy" =>
                     {
                         // A local endpoint/profile guard sent no POST. Keep
@@ -1172,7 +1200,7 @@ async fn dispatch_upstream(
                             "client summary recovery was inapplicable to the frozen endpoint"
                         );
                     }
-                    Ok(Some((lease, account, Err(error)))) => {
+                    Ok(Some((lease, account, Err(error), _))) => {
                         attempt_logs.push(upstream_attempt_log(
                             attempt_logs.len() as u32 + 1,
                             &account,

@@ -8,6 +8,10 @@ use crosslane_translate::{
 };
 use serde_json::{json, Value};
 
+mod usage_observations;
+pub(crate) use usage_observations::UsageSources;
+use usage_observations::{NormalizedUsage, SuccessUsage};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenAiToolIdentity {
     pub kind: String,
@@ -45,6 +49,11 @@ pub struct DecodedResponse {
     /// Kiro normally omits token/cache statistics. Local cache accounting uses
     /// the same tokenizer basis as input/output estimates, separately from credits.
     pub(super) cache_usage_estimated: bool,
+    /// Local 1h share of `usage.cache_write_tokens`, for Claude's
+    /// `cache_creation` breakdown. Zero when upstream reported the cache.
+    pub(super) cache_write_1h_tokens: u64,
+    pub(super) input_usage_adjusted: bool,
+    pub(super) cumulative_usage_sources: Option<UsageSources>,
     pub upstream_context_usage_percentage: Option<f64>,
     /// Explicit Claude stop reason for proxy-managed server loops (for example
     /// `pause_turn`). When absent the ordinary tool/max/end inference applies.
@@ -64,13 +73,78 @@ pub(super) struct UpstreamUsage {
     total_tokens: Option<u64>,
     pub(super) output_tokens: Option<u64>,
     cache_reported: bool,
+    success: SuccessUsage,
 }
 
 impl DecodedResponse {
     pub fn has_upstream_cache_usage(&self) -> bool {
-        self.upstream_usage.cache_reported
-            || (!self.cache_usage_estimated
-                && (self.usage.cache_read_tokens > 0 || self.usage.cache_write_tokens > 0))
+        !self.cache_usage_estimated
+            && (self.upstream_usage.cache_reported
+                || self.usage.cache_read_tokens > 0
+                || self.usage.cache_write_tokens > 0)
+    }
+
+    /// Claude's per-TTL breakdown of cache writes. Present whenever the cache
+    /// write count is local or non-zero; the two parts sum to the total.
+    pub fn claude_cache_creation(&self) -> Value {
+        let long = self
+            .cache_write_1h_tokens
+            .min(self.usage.cache_write_tokens);
+        json!({
+            "ephemeral_5m_input_tokens": self.usage.cache_write_tokens - long,
+            "ephemeral_1h_input_tokens": long,
+        })
+    }
+
+    /// Kiro success-path policy (D1): explicit zero input/output/cache values
+    /// are placeholders, not measurements. The parser keeps raw observations
+    /// for error ledgers; this only rewrites the normalized success view.
+    /// A legitimate `uncachedInputTokens = 0` with positive cache is kept.
+    pub fn normalize_kiro_zeros(&mut self) {
+        if !self.upstream_usage.success.observed {
+            return;
+        }
+        let usage = self.success_usage();
+        self.upstream_input_tokens = usage.input;
+        self.upstream_usage.output_tokens = usage.output;
+        self.usage.input_tokens = usage.input.unwrap_or_default();
+        self.usage.output_tokens = usage.output.unwrap_or_default();
+        self.usage.cache_read_tokens = usage.read;
+        self.usage.cache_write_tokens = usage.write;
+        self.upstream_usage.cache_reported = usage.read > 0 || usage.write > 0;
+        self.input_usage_adjusted = usage.adjusted;
+    }
+
+    fn success_usage(&self) -> NormalizedUsage {
+        self.upstream_usage
+            .success
+            .normalized(self.has_generated_content())
+    }
+
+    /// Read-only view of `(has_upstream_cache_usage, upstream_input_tokens)`
+    /// as they will be after `normalize_kiro_zeros` when `zero_fallback` is
+    /// set. Lets streaming code inspect mid-round metadata without mutating
+    /// or cloning the response.
+    pub fn observed_upstream_usage(&self, zero_fallback: bool) -> (bool, Option<u64>, u64, u64) {
+        if !zero_fallback || !self.upstream_usage.success.observed {
+            return (
+                self.has_upstream_cache_usage(),
+                self.upstream_input_tokens,
+                self.usage.cache_read_tokens,
+                self.usage.cache_write_tokens,
+            );
+        }
+        let usage = self.success_usage();
+        (
+            !self.cache_usage_estimated && (usage.read > 0 || usage.write > 0),
+            usage.input,
+            usage.read,
+            usage.write,
+        )
+    }
+
+    fn has_generated_content(&self) -> bool {
+        !self.text.is_empty() || !self.reasoning.is_empty() || !self.tools.is_empty()
     }
 
     pub fn has_generated_output(&self) -> bool {
@@ -81,9 +155,18 @@ impl DecodedResponse {
     }
 
     pub fn token_usage_source(&self) -> &'static str {
+        if let Some(sources) = self.cumulative_usage_sources {
+            return if sources.input == UsageSources::UPSTREAM
+                && sources.output == UsageSources::UPSTREAM
+            {
+                "server"
+            } else {
+                "estimated"
+            };
+        }
         if self.upstream_input_tokens.is_some()
             && self.upstream_usage.output_tokens.is_some()
-            && !self.cache_usage_estimated
+            && !self.input_usage_adjusted
         {
             "server"
         } else {
@@ -92,6 +175,13 @@ impl DecodedResponse {
     }
 
     pub fn cache_usage_source(&self) -> &'static str {
+        if let Some(sources) = self.cumulative_usage_sources {
+            return match sources.cache {
+                UsageSources::UPSTREAM => "server",
+                0 | UsageSources::UNREPORTED => "unreported",
+                _ => "estimated",
+            };
+        }
         if self.has_upstream_cache_usage() {
             "server"
         } else if self.cache_usage_estimated {
@@ -99,6 +189,43 @@ impl DecodedResponse {
         } else {
             "unreported"
         }
+    }
+
+    pub(crate) fn usage_sources(&self) -> UsageSources {
+        UsageSources {
+            input: if self.input_usage_adjusted {
+                UsageSources::ADJUSTED
+            } else if self.upstream_input_tokens.is_some() {
+                UsageSources::UPSTREAM
+            } else if self.usage.input_tokens > 0 {
+                UsageSources::LOCAL
+            } else {
+                UsageSources::UNREPORTED
+            },
+            output: if self.upstream_usage.output_tokens.is_some() {
+                UsageSources::UPSTREAM
+            } else if self.usage.output_tokens > 0 || self.has_generated_content() {
+                UsageSources::LOCAL
+            } else {
+                UsageSources::UNREPORTED
+            },
+            cache: if self.cache_usage_estimated {
+                UsageSources::LOCAL
+            } else if self.has_upstream_cache_usage() {
+                UsageSources::UPSTREAM
+            } else {
+                UsageSources::UNREPORTED
+            },
+        }
+    }
+
+    pub(crate) fn usage_field_states(&self) -> (u8, u8, u8) {
+        let usage = &self.upstream_usage.success;
+        (
+            usage.present_fields,
+            usage.zero_fields,
+            usage.positive_fields,
+        )
     }
 
     pub fn log_usage_accounting(&self, trace_id: &str) {
@@ -1476,7 +1603,8 @@ impl DecodedResponse {
                 "input_tokens":uncached_input_tokens,
                 "output_tokens":self.usage.output_tokens,
                 "cache_creation_input_tokens":self.usage.cache_write_tokens,
-                "cache_read_input_tokens":self.usage.cache_read_tokens
+                "cache_read_input_tokens":self.usage.cache_read_tokens,
+                "cache_creation":self.claude_cache_creation()
             }
         });
         #[cfg(feature = "crs")]
@@ -1794,6 +1922,14 @@ fn merge_usage(output: &mut UsageInfo, upstream: &mut UpstreamUsage, value: &Val
             "cache_creation_input_tokens",
             "cache_write_tokens",
         ],
+    );
+    upstream.success.observe(
+        find_number(value, &["inputTokens", "input_tokens"]),
+        find_number(value, &["uncachedInputTokens"]),
+        find_number(value, &["totalTokens", "total_tokens"]),
+        find_number(value, &["outputTokens", "output_tokens"]),
+        cache_read,
+        cache_write,
     );
     output.cache_read_tokens = cache_read.unwrap_or(output.cache_read_tokens);
     output.cache_write_tokens = cache_write.unwrap_or(output.cache_write_tokens);
@@ -3157,6 +3293,84 @@ mod tests {
     }
 
     #[test]
+    fn kiro_zero_placeholders_are_unreported_on_the_success_path() {
+        let mut decoded = DecodedResponse {
+            text: "answer".into(),
+            ..Default::default()
+        };
+        decoded
+            .push(KiroEvent::Usage {
+                usage: json!({"inputTokens":0,"outputTokens":0,
+                    "cacheReadInputTokens":0,"cacheWriteInputTokens":0}),
+            })
+            .expect("zeros");
+        // The parser keeps the raw observation for error ledgers.
+        assert_eq!(decoded.upstream_input_tokens, Some(0));
+        assert!(decoded.has_upstream_cache_usage());
+        decoded.normalize_kiro_zeros();
+        assert_eq!(decoded.upstream_input_tokens, None);
+        assert!(!decoded.has_upstream_cache_usage());
+        assert_eq!(decoded.upstream_usage.output_tokens, None);
+    }
+
+    #[test]
+    fn positive_upstream_values_survive_zero_normalization() {
+        let mut decoded = DecodedResponse::default();
+        for usage in [
+            json!({"inputTokens":6000,"outputTokens":20}),
+            json!({"cacheReadInputTokens":0,"cacheWriteInputTokens":5000}),
+        ] {
+            decoded.push(KiroEvent::Usage { usage }).expect("usage");
+        }
+        decoded.normalize_kiro_zeros();
+        assert_eq!(decoded.upstream_input_tokens, Some(6000));
+        assert!(
+            decoded.has_upstream_cache_usage(),
+            "one positive side keeps the group"
+        );
+        assert_eq!(decoded.usage.cache_write_tokens, 5000);
+
+        let mut legitimate = DecodedResponse::default();
+        legitimate
+            .push(KiroEvent::Usage {
+                usage: json!({"uncachedInputTokens":0,"cacheReadInputTokens":800}),
+            })
+            .expect("usage");
+        legitimate.normalize_kiro_zeros();
+        assert_eq!(legitimate.upstream_input_tokens, Some(800));
+        assert!(legitimate.has_upstream_cache_usage());
+    }
+
+    #[test]
+    fn claude_usage_carries_a_cache_creation_breakdown_that_sums_to_the_total() {
+        let mut decoded = DecodedResponse {
+            text: "answer".into(),
+            ..Default::default()
+        };
+        decoded.usage.input_tokens = 5000;
+        decoded.usage.cache_write_tokens = 4000;
+        decoded.cache_write_1h_tokens = 3000;
+        let response = decoded.claude_json("msg", "model", 100, 20, None, &replay_codec());
+        let usage = &response["usage"];
+        assert_eq!(usage["cache_creation_input_tokens"], 4000);
+        assert_eq!(usage["cache_creation"]["ephemeral_1h_input_tokens"], 3000);
+        assert_eq!(usage["cache_creation"]["ephemeral_5m_input_tokens"], 1000);
+        assert_eq!(usage["input_tokens"], 1000);
+    }
+
+    #[test]
+    fn output_zero_without_content_is_kept() {
+        let mut decoded = DecodedResponse::default();
+        decoded
+            .push(KiroEvent::Usage {
+                usage: json!({"inputTokens":100,"outputTokens":0}),
+            })
+            .expect("usage");
+        decoded.normalize_kiro_zeros();
+        assert_eq!(decoded.upstream_usage.output_tokens, Some(0));
+    }
+
+    #[test]
     fn usage_preserves_total_input_across_separate_cache_events() {
         let mut decoded = DecodedResponse::default();
         for usage in [
@@ -3493,6 +3707,48 @@ mod tests {
         assert_eq!(
             decoded.tools.keys().map(String::as_str).collect::<Vec<_>>(),
             ["call_a"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod review_regression_probes {
+    use super::*;
+    #[test]
+    fn review_zero_tail_preserves_prior_positive_usage() {
+        let mut response = DecodedResponse {
+            text: "answer".into(),
+            ..Default::default()
+        };
+        response.push(KiroEvent::Usage {usage:json!({"inputTokens":100,"outputTokens":20,"cacheReadInputTokens":40,"cacheWriteInputTokens":0})}).unwrap();
+        response.push(KiroEvent::Usage {usage:json!({"inputTokens":0,"outputTokens":0,"cacheReadInputTokens":0,"cacheWriteInputTokens":0})}).unwrap();
+        response.normalize_kiro_zeros();
+        assert_eq!(
+            (
+                response.upstream_input_tokens,
+                response.usage.output_tokens,
+                response.usage.cache_read_tokens
+            ),
+            (Some(100), 20, 40),
+            "late zero placeholders must not erase confirmed positive usage"
+        );
+    }
+    #[test]
+    fn review_zero_input_does_not_hide_valid_total() {
+        let mut response = DecodedResponse {
+            text: "answer".into(),
+            ..Default::default()
+        };
+        response
+            .push(KiroEvent::Usage {
+                usage: json!({"inputTokens":0,"totalTokens":120,"outputTokens":20}),
+            })
+            .unwrap();
+        response.normalize_kiro_zeros();
+        assert_eq!(
+            response.upstream_input_tokens,
+            Some(100),
+            "zero input must fall through to valid total minus output before local estimates"
         );
     }
 }
