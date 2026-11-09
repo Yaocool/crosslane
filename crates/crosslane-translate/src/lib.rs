@@ -36,8 +36,8 @@ pub use responses::{
 };
 pub use tokenizer::{
     compaction_summary_payload, estimated_binary_document_tokens, estimated_image_tokens,
-    prepare_compaction_source_history, ContextCompactionStats, ContextTokenBreakdown,
-    KiroCompactionPlan, TokenCountCache, TokenCountStats,
+    prefix_units, prepare_compaction_source_history, ContextCompactionStats, ContextTokenBreakdown,
+    KiroCompactionPlan, PrefixUnit, PrefixUnitKind, TokenCountCache, TokenCountStats,
 };
 pub use tool_history::{
     sanitize_kiro_tool_history, validate_kiro_tool_history, KiroToolHistoryStats,

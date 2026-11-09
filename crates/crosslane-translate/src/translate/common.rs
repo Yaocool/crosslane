@@ -154,7 +154,11 @@ pub fn kiro_cache_point(control: Option<&Value>) -> Option<KiroCachePoint> {
     // Kiro's request contract only defines `type: default`. Claude's TTL is
     // still available to proxy-local accounting, but is never sent upstream.
     // Null and unrecognized client cache hints do not request a native marker.
-    (control.get("type").and_then(Value::as_str) == Some("ephemeral")).then(KiroCachePoint::new)
+    (control.get("type").and_then(Value::as_str) == Some("ephemeral")).then(|| {
+        KiroCachePoint::with_local(crate::LocalCachePoint {
+            one_hour: control.get("ttl").and_then(Value::as_str) == Some("1h"),
+        })
+    })
 }
 
 /// Preserve client document context as message text from the first request;
@@ -658,6 +662,7 @@ pub fn kiro_tool_named(
     description: &str,
     schema: &Value,
 ) -> (KiroTool, Option<String>) {
+    let client_description = description.to_owned();
     let (description, documentation) = if description.chars().count() > MAX_KIRO_DESCRIPTION {
         (
             format!("[Full documentation in system prompt under '## Tool: {original_name}']"),
@@ -673,6 +678,9 @@ pub fn kiro_tool_named(
     (
         KiroTool::Specification {
             tool_specification: KiroToolSpecification {
+                local_documentation: documentation.as_ref().map(|_| client_description.clone()),
+                local_description_is_injected: documentation.is_some()
+                    || client_description.trim().is_empty(),
                 name: kiro_name.to_owned(),
                 description,
                 input_schema: crate::KiroInputSchema {

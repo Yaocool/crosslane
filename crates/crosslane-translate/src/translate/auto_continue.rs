@@ -36,6 +36,7 @@ pub fn tool_search_continue_payload_batch(
     next.conversation_state.history.push(KiroHistoryMessage {
         user_input_message: None,
         assistant_response_message: Some(KiroAssistantMessage {
+            local_sources: None,
             content: tail_chars(assistant_content, 48_000),
             cache_point: None,
             tool_uses: searches
@@ -180,6 +181,7 @@ pub fn auto_continue_payload(
     next.conversation_state.history.push(KiroHistoryMessage {
         user_input_message: None,
         assistant_response_message: Some(KiroAssistantMessage {
+            local_sources: None,
             content: tail_chars(assistant_content, 48_000),
             cache_point: None,
             tool_uses: tool_uses.clone(),
@@ -290,6 +292,7 @@ mod tests {
                 conversation_id: "conversation".into(),
                 current_message: KiroCurrentMessage {
                     user_input_message: KiroUserInputMessage {
+                        local_sources: None,
                         content: "do it".into(),
                         model_id: "model".into(),
                         origin: "CLI".into(),
@@ -457,6 +460,7 @@ mod tests {
                 conversation_id: "conversation".into(),
                 current_message: KiroCurrentMessage {
                     user_input_message: KiroUserInputMessage {
+                        local_sources: None,
                         content: "find issues".into(),
                         model_id: "model".into(),
                         origin: "CLI".into(),
@@ -491,6 +495,8 @@ mod tests {
             .user_input_message_context = Some(KiroMessageContext {
             tools: vec![KiroTool::Specification {
                 tool_specification: KiroToolSpecification {
+                    local_documentation: None,
+                    local_description_is_injected: false,
                     name: "tool_search_tool_regex".into(),
                     description: "search".into(),
                     input_schema: KiroInputSchema {
@@ -520,6 +526,8 @@ mod tests {
             },
             tools: vec![KiroTool::Specification {
                 tool_specification: KiroToolSpecification {
+                    local_documentation: None,
+                    local_description_is_injected: false,
                     name: "mcp__github__list_issues".into(),
                     description: "List issues".into(),
                     input_schema: KiroInputSchema {

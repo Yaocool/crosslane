@@ -4,6 +4,7 @@ mod auto_continue;
 mod claude;
 pub(crate) mod common;
 mod openai;
+mod sources;
 mod tool_search;
 mod web_search;
 

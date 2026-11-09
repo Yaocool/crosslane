@@ -276,6 +276,7 @@ pub fn web_search_continue_payload_batch(
     next.conversation_state.history.push(KiroHistoryMessage {
         user_input_message: None,
         assistant_response_message: Some(KiroAssistantMessage {
+            local_sources: None,
             content: tail_chars(assistant_content, 48_000),
             cache_point: None,
             tool_uses: searches
@@ -423,6 +424,7 @@ mod tests {
                 conversation_id: "conversation".into(),
                 current_message: KiroCurrentMessage {
                     user_input_message: KiroUserInputMessage {
+                        local_sources: None,
                         content: "latest news".into(),
                         model_id: "model".into(),
                         origin: "CLI".into(),
@@ -547,6 +549,7 @@ mod tests {
         let mut history = vec![
             KiroHistoryMessage {
                 user_input_message: Some(KiroUserInputMessage {
+                    local_sources: None,
                     content: "protected system".into(),
                     model_id: "model".into(),
                     origin: "CLI".into(),
@@ -561,6 +564,7 @@ mod tests {
             KiroHistoryMessage {
                 user_input_message: None,
                 assistant_response_message: Some(KiroAssistantMessage {
+                    local_sources: None,
                     content: super::super::SYSTEM_PROMPT_ACKNOWLEDGEMENT.into(),
                     cache_point: None,
                     tool_uses: vec![],
@@ -570,6 +574,7 @@ mod tests {
         for index in 0..15 {
             history.push(KiroHistoryMessage {
                 user_input_message: Some(KiroUserInputMessage {
+                    local_sources: None,
                     content: format!("user {index}"),
                     model_id: "model".into(),
                     origin: "CLI".into(),
@@ -584,6 +589,7 @@ mod tests {
             history.push(KiroHistoryMessage {
                 user_input_message: None,
                 assistant_response_message: Some(KiroAssistantMessage {
+                    local_sources: None,
                     content: format!("assistant {index}"),
                     cache_point: None,
                     tool_uses: vec![],
@@ -598,6 +604,7 @@ mod tests {
                 conversation_id: "conversation".into(),
                 current_message: KiroCurrentMessage {
                     user_input_message: KiroUserInputMessage {
+                        local_sources: None,
                         content: "search".into(),
                         model_id: "model".into(),
                         origin: "CLI".into(),

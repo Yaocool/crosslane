@@ -126,6 +126,11 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
             translated
         })
         .collect::<Vec<_>>();
+    let mut system_blocks = request
+        .system
+        .as_ref()
+        .map(|content| super::sources::blocks(content, None))
+        .unwrap_or_default();
     let mut system = system_text(request.system.as_ref());
     let mut system_cache_point = options
         .enable_prompt_cache
@@ -136,6 +141,10 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
         .iter()
         .filter(|message| message.role == "system")
     {
+        system_blocks.extend(super::sources::blocks(
+            &message.content,
+            message.cache_control.as_ref(),
+        ));
         system = join_nonempty(&system, &content_text(&message.content));
         if options.enable_prompt_cache {
             system_cache_point = merged_cache_point(
@@ -179,6 +188,7 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
     }
     let mut history = Vec::new();
     let mut current = KiroUserInputMessage {
+        local_sources: None,
         content: "Continue".into(),
         model_id: options.model_id.clone(),
         origin: options.origin.clone(),
@@ -201,17 +211,25 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
                 let documents = extract_documents(&message.content);
                 let results = extract_tool_results(&message.content, &tool_names);
                 let cache_point = message_cache_point(message, options.enable_prompt_cache);
+                let mut translated =
+                    user_message(text, images, documents, results, cache_point, options);
+                if options.enable_prompt_cache {
+                    translated.local_sources = Some(super::sources::user(
+                        &message.content,
+                        message.cache_control.as_ref(),
+                        &translated,
+                        false,
+                        false,
+                    ));
+                }
                 if last {
-                    current.content = nonempty(text, !results.is_empty());
-                    current.images = images;
-                    current.documents = documents;
-                    current.cache_point = cache_point;
-                    current.user_input_message_context = context(tools.clone(), results);
+                    current = translated;
+                    current
+                        .user_input_message_context
+                        .get_or_insert_with(Default::default)
+                        .tools = tools.clone();
                 } else {
-                    push_user(
-                        &mut history,
-                        user_message(text, images, documents, results, cache_point, options),
-                    );
+                    push_user(&mut history, translated);
                 }
             }
             "assistant" => {
@@ -222,14 +240,20 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
                     &tool_names,
                     official_web_tools,
                 );
-                push_assistant(
-                    &mut history,
-                    KiroAssistantMessage {
-                        content: text,
-                        cache_point: message_cache_point(message, options.enable_prompt_cache),
-                        tool_uses: uses,
-                    },
-                );
+                let mut translated = KiroAssistantMessage {
+                    local_sources: None,
+                    content: text,
+                    cache_point: message_cache_point(message, options.enable_prompt_cache),
+                    tool_uses: uses,
+                };
+                if options.enable_prompt_cache {
+                    translated.local_sources = Some(super::sources::assistant(
+                        &message.content,
+                        message.cache_control.as_ref(),
+                        &translated,
+                    ));
+                }
+                push_assistant(&mut history, translated);
             }
             _ => {}
         }
@@ -256,6 +280,29 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
     let protected_history_messages =
         inject_system(&mut history, &system, system_cache_point, options);
 
+    if options.enable_prompt_cache {
+        if let Some(user) = history
+            .first_mut()
+            .filter(|_| protected_history_messages > 0)
+            .and_then(|message| message.user_input_message.as_mut())
+        {
+            user.local_sources = Some(super::sources::user(
+                &Value::Array(system_blocks),
+                None,
+                user,
+                false,
+                true,
+            ));
+        }
+        if let (Some(sources), Some(point)) = (
+            &mut current.local_sources,
+            kiro_cache_point(request.cache_control.as_ref()),
+        ) {
+            if let Some(last) = std::sync::Arc::make_mut(sources).blocks.last_mut() {
+                last.cache_point = Some(point.local);
+            }
+        }
+    }
     let inference_config = inference(
         Some(request.max_tokens),
         !tools.is_empty(),
@@ -625,7 +672,13 @@ fn message_cache_point(
 
 fn normalized_non_system_messages(messages: &[crate::ClaudeMessage]) -> Vec<crate::ClaudeMessage> {
     let mut normalized: Vec<crate::ClaudeMessage> = Vec::new();
-    for message in messages.iter().filter(|message| message.role != "system") {
+    for original in messages.iter().filter(|message| message.role != "system") {
+        let mut message = original.clone();
+        message.content = Value::Array(super::sources::blocks(
+            &message.content,
+            message.cache_control.as_ref(),
+        ));
+        message.cache_control = None;
         if let Some(previous) = normalized
             .last_mut()
             .filter(|previous| previous.role == message.role)
@@ -845,6 +898,7 @@ fn user_message(
     options: &TranslationOptions,
 ) -> KiroUserInputMessage {
     KiroUserInputMessage {
+        local_sources: None,
         content: nonempty(text, !results.is_empty()),
         model_id: options.model_id.clone(),
         origin: options.origin.clone(),
@@ -924,6 +978,7 @@ fn inject_system(
             KiroHistoryMessage {
                 user_input_message: None,
                 assistant_response_message: Some(KiroAssistantMessage {
+                    local_sources: None,
                     content: SYSTEM_PROMPT_ACKNOWLEDGEMENT.into(),
                     cache_point: None,
                     tool_uses: Vec::new(),

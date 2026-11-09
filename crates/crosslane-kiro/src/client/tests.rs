@@ -116,6 +116,7 @@ fn payload() -> KiroPayload {
             conversation_id: "conversation".into(),
             current_message: KiroCurrentMessage {
                 user_input_message: KiroUserInputMessage {
+                    local_sources: None,
                     content: "hello".into(),
                     model_id: "claude-sonnet-4".into(),
                     origin: "AI_EDITOR".into(),

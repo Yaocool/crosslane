@@ -103,6 +103,18 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
         .flatten()
         .collect::<Vec<_>>();
 
+    let system_blocks = request
+        .messages
+        .iter()
+        .filter(|message| matches!(message.role.as_str(), "system" | "developer"))
+        .flat_map(|message| {
+            message
+                .content
+                .as_ref()
+                .map(|content| super::sources::blocks(content, message.cache_control.as_ref()))
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
     let mut system = request
         .messages
         .iter()
@@ -142,6 +154,7 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
         .collect::<Vec<_>>();
     let mut history = Vec::new();
     let mut current_text = String::new();
+    let mut current_blocks = Vec::new();
     let mut current_results = Vec::new();
     let mut current_images = Vec::new();
     let mut current_documents = Vec::new();
@@ -168,22 +181,35 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
                     .map(extract_documents)
                     .unwrap_or_default();
                 current_cache_point = openai_message_cache_point(message);
+                let source_blocks = message
+                    .content
+                    .as_ref()
+                    .map(|content| super::sources::blocks(content, message.cache_control.as_ref()))
+                    .unwrap_or_default();
                 if last {
+                    current_blocks = source_blocks;
                     current_text = text;
                     current_images = images;
                     current_documents = documents;
                 } else {
-                    push_user(
-                        &mut history,
-                        make_user(
-                            text,
-                            images,
-                            documents,
-                            Vec::new(),
-                            current_cache_point.take(),
-                            options,
-                        ),
+                    let mut user = make_user(
+                        text,
+                        images,
+                        documents,
+                        Vec::new(),
+                        current_cache_point.take(),
+                        options,
                     );
+                    if options.enable_prompt_cache {
+                        user.local_sources = Some(super::sources::user(
+                            &Value::Array(source_blocks),
+                            None,
+                            &user,
+                            true,
+                            false,
+                        ));
+                    }
+                    push_user(&mut history, user);
                 }
             }
             "assistant" => push_assistant(
@@ -202,6 +228,7 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
                     openai_message_cache_point(message),
                 );
                 if let Some(id) = &message.tool_call_id {
+                    current_blocks.push(json!({"type":"tool_result", "tool_use_id":id, "content":message.content, "cache_control":message.cache_control}));
                     let text = message
                         .content
                         .as_ref()
@@ -217,17 +244,24 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
                     .get(index + 1)
                     .is_some_and(|next| next.role == "tool");
                 if !last && !next_is_tool {
-                    push_user(
-                        &mut history,
-                        make_user(
-                            "Tool results provided.".into(),
-                            std::mem::take(&mut current_images),
-                            std::mem::take(&mut current_documents),
-                            current_results.split_off(0),
-                            current_result_cache_point.take(),
-                            options,
-                        ),
+                    let mut user = make_user(
+                        "Tool results provided.".into(),
+                        std::mem::take(&mut current_images),
+                        std::mem::take(&mut current_documents),
+                        current_results.split_off(0),
+                        current_result_cache_point.take(),
+                        options,
                     );
+                    if options.enable_prompt_cache {
+                        user.local_sources = Some(super::sources::user(
+                            &Value::Array(std::mem::take(&mut current_blocks)),
+                            None,
+                            &user,
+                            true,
+                            false,
+                        ));
+                    }
+                    push_user(&mut history, user);
                 }
             }
             _ => {}
@@ -241,7 +275,8 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
             "Tool results provided.".into()
         };
     }
-    let current = KiroUserInputMessage {
+    let mut current = KiroUserInputMessage {
+        local_sources: None,
         content: current_text,
         model_id: options.model_id.clone(),
         origin: options.origin.clone(),
@@ -251,6 +286,15 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
         client_cache_config: None,
         user_input_message_context: context(tools.clone(), current_results),
     };
+    if options.enable_prompt_cache {
+        current.local_sources = Some(super::sources::user(
+            &Value::Array(current_blocks),
+            None,
+            &current,
+            true,
+            false,
+        ));
+    }
     let protected_history_messages = if system.trim().is_empty() {
         0
     } else {
@@ -271,6 +315,7 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
                 KiroHistoryMessage {
                     user_input_message: None,
                     assistant_response_message: Some(KiroAssistantMessage {
+                        local_sources: None,
                         content: SYSTEM_PROMPT_ACKNOWLEDGEMENT.into(),
                         cache_point: None,
                         tool_uses: Vec::new(),
@@ -281,6 +326,21 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
         2
     };
 
+    if options.enable_prompt_cache {
+        if let Some(user) = history
+            .first_mut()
+            .filter(|_| protected_history_messages > 0)
+            .and_then(|message| message.user_input_message.as_mut())
+        {
+            user.local_sources = Some(super::sources::user(
+                &Value::Array(system_blocks),
+                None,
+                user,
+                true,
+                true,
+            ));
+        }
+    }
     let mut payload = KiroPayload {
         conversation_state: KiroConversationState {
             agent_continuation_id: Some(random_id()),
@@ -436,13 +496,31 @@ fn assistant_message(
     if content.trim().is_empty() && tool_uses.is_empty() {
         content = "I understand.".into();
     }
-    KiroAssistantMessage {
+    let mut translated = KiroAssistantMessage {
+        local_sources: None,
         content,
         cache_point: prompt_cache_enabled
             .then(|| openai_message_cache_point(message))
             .flatten(),
         tool_uses,
+    };
+    if prompt_cache_enabled {
+        let mut blocks = message
+            .content
+            .as_ref()
+            .map(|content| super::sources::blocks(content, None))
+            .unwrap_or_default();
+        if let Some(refusal) = &message.refusal {
+            blocks.push(json!({"type":"refusal","refusal":refusal}));
+        }
+        blocks.extend(translated.tool_uses.iter().map(|tool| json!({"type":"tool_use", "id":tool.tool_use_id, "name":tool.name, "input":tool.input})));
+        translated.local_sources = Some(super::sources::assistant(
+            &Value::Array(blocks),
+            message.cache_control.as_ref(),
+            &translated,
+        ));
     }
+    translated
 }
 
 fn make_user(
@@ -454,6 +532,7 @@ fn make_user(
     options: &TranslationOptions,
 ) -> KiroUserInputMessage {
     KiroUserInputMessage {
+        local_sources: None,
         content: if text.trim().is_empty() {
             "Continue".into()
         } else {

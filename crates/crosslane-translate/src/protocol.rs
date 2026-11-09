@@ -507,6 +507,10 @@ pub struct KiroCurrentMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KiroUserInputMessage {
+    /// Physical client blocks, retained only for local accounting.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub local_sources: Option<std::sync::Arc<LocalSources>>,
     pub content: String,
     pub model_id: String,
     pub origin: String,
@@ -555,12 +559,65 @@ pub struct KiroCitationsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct KiroCachePoint {
     pub r#type: String,
+    /// Proxy-local accounting only: the client's breakpoint TTL and where the
+    /// breakpoint ends inside a merged text segment. Never serialized to Kiro.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub local: LocalCachePoint,
+}
+
+/// Request-local provenance. Synthetic text and structural overhead have no
+/// source block and are always allocated to uncached input.
+#[derive(Clone, Default)]
+pub struct LocalSources {
+    pub blocks: Vec<LocalSourceBlock>,
+    /// Detect edits after translation. Unknown/synthetic replacements must
+    /// never inherit a former client's cache boundary.
+    pub(crate) translated_digest: [u8; 32],
+    /// One request-local copy for exact, cheap validation after cloning or
+    /// rewriting a payload. Never stored in the cache tracker or serialized.
+    pub(crate) media_sources: Vec<std::sync::Arc<str>>,
+}
+
+impl std::fmt::Debug for LocalSources {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalSources")
+            .field("blocks", &self.blocks)
+            .field("media_count", &self.media_sources.len())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalSourceBlock {
+    pub identity: Value,
+    pub cache_point: Option<LocalCachePoint>,
+    pub fragments: Vec<String>,
+    pub media_tokens: u64,
+    pub tool_turn: bool,
+}
+
+/// Client breakpoint metadata retained by translation for local accounting.
+/// Kiro cache points are message-level on the wire, so the local boundary is
+/// the end of the translated message that carries the point.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LocalCachePoint {
+    /// `true` for an explicit `ttl: "1h"` breakpoint.
+    pub one_hour: bool,
 }
 
 impl KiroCachePoint {
     pub fn new() -> Self {
         Self {
             r#type: "default".into(),
+            local: LocalCachePoint::default(),
+        }
+    }
+
+    pub fn with_local(local: LocalCachePoint) -> Self {
+        Self {
+            local,
+            ..Self::new()
         }
     }
 }
@@ -669,6 +726,12 @@ impl KiroTool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KiroToolSpecification {
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub local_documentation: Option<String>,
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub local_description_is_injected: bool,
     pub name: String,
     pub description: String,
     pub input_schema: KiroInputSchema,
@@ -691,6 +754,10 @@ pub struct KiroHistoryMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KiroAssistantMessage {
+    /// Physical client blocks, retained only for local accounting.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub local_sources: Option<std::sync::Arc<LocalSources>>,
     /// Preserve the actual assistant text, including an empty string for a
     /// tool-only turn. Natural-language filler here pollutes replayed history.
     pub content: String,
@@ -784,6 +851,8 @@ mod tests {
     fn kiro_tool_variants_match_the_wire_shape() {
         let specification = KiroTool::Specification {
             tool_specification: KiroToolSpecification {
+                local_documentation: None,
+                local_description_is_injected: false,
                 name: "lookup".into(),
                 description: "Lookup a value".into(),
                 input_schema: KiroInputSchema {

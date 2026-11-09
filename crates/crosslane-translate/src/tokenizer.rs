@@ -2,7 +2,11 @@
 
 mod compaction;
 mod context;
+mod prefix;
+mod source_digest;
+
 pub use context::ContextTokenBreakdown;
+pub use prefix::{prefix_units, PrefixUnit, PrefixUnitKind};
 
 use std::num::NonZeroUsize;
 use std::ops::Range;
@@ -97,25 +101,41 @@ impl TokenCountCache {
     }
 
     pub async fn count(&self, text: String) -> Result<usize, String> {
-        let cacheable = text.chars().count() >= MIN_CACHE_CHARS;
-        let key = cacheable.then(|| Sha256::digest(text.as_bytes()).into());
-        if let Some(key) = key {
-            let mut state = lock(&self.state);
-            if let Some(count) = state.cache.get(&key).copied() {
-                state.hits += 1;
-                return Ok(count);
-            }
+        if let Some(count) = self.cached_count(&text) {
+            return Ok(count);
+        }
+        let tokenizer = Arc::clone(&self.tokenizer);
+        let (text, count) = tokio::task::spawn_blocking(move || {
+            let count = estimated_text_tokens(&tokenizer, &text);
+            (text, count)
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+        self.store_count(&text, count);
+        Ok(count)
+    }
+
+    fn cache_key(text: &str) -> Option<[u8; 32]> {
+        (text.chars().count() >= MIN_CACHE_CHARS).then(|| Sha256::digest(text.as_bytes()).into())
+    }
+
+    /// LRU lookup for long segments; short segments are always recomputed.
+    fn cached_count(&self, text: &str) -> Option<usize> {
+        let key = Self::cache_key(text)?;
+        let mut state = lock(&self.state);
+        let count = state.cache.get(&key).copied();
+        if count.is_some() {
+            state.hits += 1;
+        } else {
             state.misses += 1;
         }
+        count
+    }
 
-        let tokenizer = Arc::clone(&self.tokenizer);
-        let count = tokio::task::spawn_blocking(move || estimated_text_tokens(&tokenizer, &text))
-            .await
-            .map_err(|error| error.to_string())?;
-        if let Some(key) = key {
+    fn store_count(&self, text: &str, count: usize) {
+        if let Some(key) = Self::cache_key(text) {
             lock(&self.state).cache.put(key, count);
         }
-        Ok(count)
     }
 
     pub fn stats(&self) -> TokenCountStats {
@@ -136,7 +156,13 @@ impl TokenCountCache {
         self.estimate_prepared_kiro_payload(&prepared).await
     }
 
-    async fn estimate_prepared_kiro_payload(&self, payload: &KiroPayload) -> Result<usize, String> {
+    /// Count an immutable snapshot already returned by
+    /// `prepare_redacted_kiro_payload`. Callers measuring several budgets can
+    /// share that snapshot instead of cloning and redacting for each metric.
+    pub async fn estimate_prepared_kiro_payload(
+        &self,
+        payload: &KiroPayload,
+    ) -> Result<usize, String> {
         let mut segments = Vec::new();
         let mut fixed = CONVERSATION_OVERHEAD_TOKENS;
         for message in &payload.conversation_state.history {
@@ -165,8 +191,37 @@ impl TokenCountCache {
     /// Estimates only loaded tool definitions as serialized in the Kiro
     /// request. Deferred Claude tools are intentionally absent from this value.
     pub async fn estimate_kiro_tools(&self, payload: &KiroPayload) -> Result<usize, String> {
+        // Preparation cannot introduce a tool definition. In particular, a
+        // text/media-only request need not clone its context for this budget.
+        if !payload
+            .conversation_state
+            .history
+            .iter()
+            .filter_map(|message| message.user_input_message.as_ref())
+            .chain(std::iter::once(
+                &payload
+                    .conversation_state
+                    .current_message
+                    .user_input_message,
+            ))
+            .any(|message| {
+                message
+                    .user_input_message_context
+                    .as_ref()
+                    .is_some_and(|context| !context.tools.is_empty())
+            })
+        {
+            return Ok(0);
+        }
         let prepared = crate::prepare_redacted_kiro_payload(payload, &[]);
-        let payload = &prepared;
+        self.estimate_prepared_kiro_tools(&prepared).await
+    }
+
+    /// Count only tool definitions from an already prepared immutable snapshot.
+    pub async fn estimate_prepared_kiro_tools(
+        &self,
+        payload: &KiroPayload,
+    ) -> Result<usize, String> {
         let mut segments = Vec::new();
         let mut fixed = 0usize;
         for message in &payload.conversation_state.history {
@@ -695,6 +750,7 @@ pub fn compaction_summary_payload(
             conversation_id: format!("{}-compact", source.conversation_state.conversation_id),
             current_message: KiroCurrentMessage {
                 user_input_message: KiroUserInputMessage {
+                    local_sources: None,
                     content: prompt.to_owned(),
                     model_id: model.to_owned(),
                     origin: source
@@ -755,6 +811,7 @@ fn visible_summary_records(
             (
                 "assistant",
                 KiroUserInputMessage {
+                    local_sources: None,
                     content: assistant.content,
                     model_id: current.model_id.clone(),
                     origin: current.origin.clone(),
@@ -780,6 +837,7 @@ fn visible_summary_records(
         records.push(KiroHistoryMessage {
             user_input_message: None,
             assistant_response_message: Some(KiroAssistantMessage {
+                local_sources: None,
                 content: "Source record received.".into(),
                 cache_point: None,
                 tool_uses: Vec::new(),
@@ -797,6 +855,7 @@ fn compaction_summary_pair(
     [
         KiroHistoryMessage {
             user_input_message: Some(KiroUserInputMessage {
+                local_sources: None,
                 content: summary,
                 model_id: model_id.to_owned(),
                 origin: origin.to_owned(),
@@ -811,6 +870,7 @@ fn compaction_summary_pair(
         KiroHistoryMessage {
             user_input_message: None,
             assistant_response_message: Some(KiroAssistantMessage {
+                local_sources: None,
                 content: "Conversation checkpoint loaded as background context.".into(),
                 cache_point: None,
                 tool_uses: Vec::new(),
@@ -884,6 +944,7 @@ fn preserve_removed_documents(history: &[KiroHistoryMessage]) -> Vec<KiroHistory
         };
         preserved.push(KiroHistoryMessage {
             user_input_message: Some(KiroUserInputMessage {
+                local_sources: None,
                 content,
                 model_id: user.model_id.clone(),
                 origin: user.origin.clone(),
@@ -898,6 +959,7 @@ fn preserve_removed_documents(history: &[KiroHistoryMessage]) -> Vec<KiroHistory
         preserved.push(KiroHistoryMessage {
             user_input_message: None,
             assistant_response_message: Some(KiroAssistantMessage {
+                local_sources: None,
                 content: "Historical document attachments retained as background context.".into(),
                 cache_point: None,
                 tool_uses: Vec::new(),
@@ -1078,6 +1140,7 @@ fn summary_history_message(message: &KiroHistoryMessage) -> Option<KiroHistoryMe
     if let Some(user) = &message.user_input_message {
         return Some(KiroHistoryMessage {
             user_input_message: Some(KiroUserInputMessage {
+                local_sources: None,
                 content: render_user_message_full(user, true),
                 model_id: user.model_id.clone(),
                 origin: user.origin.clone(),
@@ -1096,6 +1159,7 @@ fn summary_history_message(message: &KiroHistoryMessage) -> Option<KiroHistoryMe
         .map(|assistant| KiroHistoryMessage {
             user_input_message: None,
             assistant_response_message: Some(KiroAssistantMessage {
+                local_sources: None,
                 content: render_assistant_message_full(assistant),
                 cache_point: assistant.cache_point.clone(),
                 tool_uses: Vec::new(),
@@ -1280,7 +1344,7 @@ pub fn estimated_binary_document_tokens(encoded: &str) -> usize {
     )
 }
 
-fn collect_user_message(
+pub(crate) fn collect_user_message(
     message: &KiroUserInputMessage,
     segments: &mut Vec<String>,
     fixed: &mut usize,
@@ -1359,7 +1423,7 @@ fn collect_tools(message: &KiroUserInputMessage, segments: &mut Vec<String>, fix
     }
 }
 
-fn collect_assistant_message(
+pub(crate) fn collect_assistant_message(
     message: &KiroAssistantMessage,
     segments: &mut Vec<String>,
     fixed: &mut usize,

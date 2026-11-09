@@ -456,6 +456,7 @@ fn normalize_roles(
         ConversationMessage::Assistant(_) => None,
     });
     let template = template.unwrap_or_else(|| KiroUserInputMessage {
+        local_sources: None,
         content: "Continue.".into(),
         model_id: String::new(),
         origin: String::new(),
@@ -655,6 +656,7 @@ fn synthetic_user(
     results: Vec<KiroToolResult>,
 ) -> KiroUserInputMessage {
     KiroUserInputMessage {
+        local_sources: None,
         content: content.into(),
         model_id: template.model_id.clone(),
         origin: template.origin.clone(),
@@ -672,6 +674,7 @@ fn synthetic_user(
 
 fn synthetic_assistant() -> KiroAssistantMessage {
     KiroAssistantMessage {
+        local_sources: None,
         content: "Continue.".into(),
         cache_point: None,
         tool_uses: Vec::new(),
@@ -721,6 +724,7 @@ mod tests {
         tools: Vec<KiroTool>,
     ) -> KiroUserInputMessage {
         KiroUserInputMessage {
+            local_sources: None,
             content: content.into(),
             model_id: "model".into(),
             origin: "AI_EDITOR".into(),
@@ -741,6 +745,8 @@ mod tests {
     fn tool(name: &str) -> KiroTool {
         KiroTool::Specification {
             tool_specification: KiroToolSpecification {
+                local_documentation: None,
+                local_description_is_injected: false,
                 name: name.into(),
                 description: String::new(),
                 input_schema: KiroInputSchema {
@@ -792,6 +798,7 @@ mod tests {
         KiroHistoryMessage {
             user_input_message: None,
             assistant_response_message: Some(KiroAssistantMessage {
+                local_sources: None,
                 content: "calling".into(),
                 cache_point: None,
                 tool_uses: uses,

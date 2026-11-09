@@ -169,6 +169,30 @@ impl RedactionSession {
         redact_text_with_session(text, &known, Some(self))
     }
 
+    /// Reuse an exact source transformation for accounting fragments. This is
+    /// only a projection onto the already-redacted payload, never a transport
+    /// redaction shortcut: unmatched fragments still go through the rules.
+    pub(crate) fn accounting_text(&self, text: &str) -> String {
+        {
+            let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            if (state.by_marker.is_empty() || !self.enabled)
+                && !text.contains("__CROSSLANE_CHECKPOINT_")
+            {
+                return text.to_owned();
+            }
+            if self.enabled {
+                if let Some((safe, _)) = state
+                    .source_texts
+                    .iter()
+                    .find(|(_, original)| original.as_str() == text)
+                {
+                    return safe.clone();
+                }
+            }
+        }
+        self.redact_text(text, &[])
+    }
+
     /// Restore a model's parsed tool input so JSON escaping and scalar types
     /// remain correct. Exact marker values recover their original scalar type.
     pub fn restore_tool_input(&self, input: &mut Value) {
