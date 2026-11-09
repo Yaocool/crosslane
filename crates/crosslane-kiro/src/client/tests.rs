@@ -509,11 +509,19 @@ async fn generation_times_out_when_waiting_for_a_stream_slot() {
     upstream.stream_slot_wait_timeout_ms = 20;
     let client = KiroClient::new(upstream, EndpointOverrides::default()).expect("client");
     let _held = client.stream_slots.acquire().await.expect("held slot");
+    let session = crosslane_translate::RedactionSession::new();
+    let mut queued_payload = payload();
+    queued_payload.redaction_session = Some(session.clone());
+    queued_payload
+        .conversation_state
+        .current_message
+        .user_input_message
+        .content = "password=queuedSecretFixture123456789".repeat(4096);
 
     let error = match client
         .send_generation(
             &account(AuthMethod::Idc),
-            &payload(),
+            &queued_payload,
             generation_endpoint(&server),
         )
         .await
@@ -525,14 +533,24 @@ async fn generation_times_out_when_waiting_for_a_stream_slot() {
     assert!(error
         .message
         .contains("waiting for an upstream stream slot"));
+    assert!(
+        session.is_empty(),
+        "queued requests must not prepare/redact context before acquiring a slot"
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn generation_times_out_when_upstream_sends_no_response() {
     let server = MockServer::start().await;
+    let accepted_at = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let observed_at = accepted_at.clone();
     Mock::given(method("POST"))
         .and(path("/amazon/generateAssistantResponse"))
-        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(500)))
+        .respond_with(move |_: &wiremock::Request| {
+            *observed_at.lock().unwrap() = Some(Instant::now());
+            ResponseTemplate::new(200).set_delay(Duration::from_millis(500))
+        })
         .mount(&server)
         .await;
     let upstream = UpstreamConfig {
@@ -541,7 +559,6 @@ async fn generation_times_out_when_upstream_sends_no_response() {
     };
     let client = KiroClient::new(upstream, EndpointOverrides::default()).expect("client");
 
-    let started = Instant::now();
     let error = match client
         .send_generation(
             &account(AuthMethod::Idc),
@@ -555,7 +572,13 @@ async fn generation_times_out_when_upstream_sends_no_response() {
     };
 
     assert!(error.status.is_none());
-    assert!(started.elapsed() < Duration::from_millis(300));
+    // Bound the silent upstream wait, excluding cold initialization of the
+    // redaction regexes before the request is dispatched.
+    let accepted = accepted_at
+        .lock()
+        .unwrap()
+        .expect("upstream received the request");
+    assert!(accepted.elapsed() < Duration::from_millis(300));
 }
 
 #[tokio::test]

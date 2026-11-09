@@ -246,6 +246,9 @@ pub struct KiroResponse {
     pub response: Response,
     permit: tokio::sync::OwnedSemaphorePermit,
     stream_slot_wait_ms: u64,
+    /// Client dispatch start of this accepted attempt: after both permits,
+    /// immediately before `send`. Not a network or server receive time.
+    dispatched_at: Instant,
     thinking_enabled: bool,
     redaction_session: crosslane_translate::RedactionSession,
     redaction_report: crosslane_translate::RedactionReport,
@@ -285,6 +288,11 @@ impl KiroResponse {
     /// Thinking requested by this actual attempt, after model-specific preparation.
     pub fn thinking_enabled(&self) -> bool {
         self.thinking_enabled
+    }
+
+    /// Dispatch start of the attempt that produced this response.
+    pub fn dispatched_at(&self) -> Instant {
+        self.dispatched_at
     }
 
     /// Time spent waiting for an upstream streaming connection slot.
@@ -1388,6 +1396,27 @@ impl KiroClient {
         payload: &KiroPayload,
         mut endpoint: EndpointDefinition,
     ) -> Result<KiroResponse, KiroError> {
+        // Profile discovery uses the short-request pool. Resolve only this
+        // small routing value before taking generation capacity.
+        let runtime_profile = if endpoint.key == EndpointKey::Runtime
+            && account.credentials.auth_method != AuthMethod::ApiKey
+        {
+            Some(self.resolve_profile_arn(account).await?)
+        } else {
+            None
+        };
+        // Wait using the caller's borrowed payload. Queued requests must not
+        // retain additional full-context copies or run transport redaction
+        // before an upstream stream slot is available.
+        let slot_wait_started = Instant::now();
+        let permit = tokio::time::timeout(
+            Duration::from_millis(self.upstream.stream_slot_wait_timeout_ms),
+            Arc::clone(&self.stream_slots).acquire_owned(),
+        )
+        .await
+        .map_err(|_| KiroError::stream_slot_timeout(self.upstream.stream_slot_wait_timeout_ms))?
+        .map_err(build_error)?;
+        let stream_slot_wait_ms = slot_wait_started.elapsed().as_millis() as u64;
         // Protocol capabilities are resolved before dispatch. A 400 describes
         // this request, not temporary account health: do not probe by removing
         // fields or learn time-limited capabilities from error message text.
@@ -1399,7 +1428,7 @@ impl KiroClient {
                 payload.conversation_state.agent_continuation_id = None;
                 payload.profile_arn = None;
             } else {
-                payload.profile_arn = Some(self.resolve_profile_arn(account).await?);
+                payload.profile_arn = runtime_profile;
             }
             let mut routed_account = account.clone();
             routed_account.profile_arn.clone_from(&payload.profile_arn);
@@ -1426,15 +1455,6 @@ impl KiroClient {
                 "Kiro payload reached the transport without prepared tool history: {message}"
             ),
         })?;
-        let slot_wait_started = Instant::now();
-        let permit = tokio::time::timeout(
-            Duration::from_millis(self.upstream.stream_slot_wait_timeout_ms),
-            Arc::clone(&self.stream_slots).acquire_owned(),
-        )
-        .await
-        .map_err(|_| KiroError::stream_slot_timeout(self.upstream.stream_slot_wait_timeout_ms))?
-        .map_err(build_error)?;
-        let stream_slot_wait_ms = slot_wait_started.elapsed().as_millis() as u64;
         let mut wire = serde_json::to_value(&payload).map_err(build_error)?;
         if endpoint.key == EndpointKey::Runtime
             && account.credentials.auth_method != AuthMethod::ApiKey
@@ -1470,6 +1490,7 @@ impl KiroClient {
         let redaction_report =
             redaction_session.outgoing_redaction_report(&wire, payload.protected_history_len());
         log_redaction_report("generation", endpoint.name, &redaction_report);
+        let dispatched_at = Instant::now();
         let response = self
             .stream
             .post(&endpoint.url)
@@ -1502,6 +1523,7 @@ impl KiroClient {
                 response,
                 permit,
                 stream_slot_wait_ms,
+                dispatched_at,
                 thinking_enabled: payload.thinking_enabled(),
                 redaction_session,
                 redaction_report,

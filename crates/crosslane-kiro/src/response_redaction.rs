@@ -114,6 +114,316 @@ struct ToolInput {
     input: String,
     last_frame: usize,
     stopped: bool,
+    boundary: JsonBoundary,
+    validated: Option<(ValidationKey, bool)>,
+    #[cfg(test)]
+    validated_bytes: usize,
+}
+
+/// A conservative completion gate, not a JSON parser. Inspect each incoming
+/// byte once and leave validation to serde_json when a structured value closes.
+/// Metadata between fragments must not repeatedly parse a growing open string.
+#[derive(Default)]
+struct JsonBoundary {
+    started: bool,
+    structured: bool,
+    depth: usize,
+    in_string: bool,
+    escaped: bool,
+    closed: bool,
+    invalid: bool,
+    primitive: Option<PrimitiveBoundary>,
+}
+
+impl JsonBoundary {
+    fn append(&mut self, delta: &str) {
+        for byte in delta.bytes() {
+            if self.closed {
+                // A complete value can only be followed by JSON whitespace.
+                // Interleaved calls may hold it here for many later frames.
+                self.invalid |= !json_whitespace(byte);
+                continue;
+            }
+            if !self.started {
+                if json_whitespace(byte) {
+                    continue;
+                }
+                self.started = true;
+                self.structured = matches!(byte, b'{' | b'[' | b'"');
+                if !self.structured {
+                    self.primitive = Some(PrimitiveBoundary::new(byte));
+                    continue;
+                }
+            }
+            if let Some(primitive) = &mut self.primitive {
+                primitive.append(byte);
+                continue;
+            }
+            if self.in_string {
+                if self.escaped {
+                    self.escaped = false;
+                } else if byte == b'\\' {
+                    self.escaped = true;
+                } else if byte == b'"' {
+                    self.in_string = false;
+                    self.closed = self.depth == 0;
+                }
+            } else {
+                match byte {
+                    b'"' => self.in_string = true,
+                    b'{' | b'[' => self.depth += 1,
+                    b'}' | b']' => {
+                        self.depth = self.depth.saturating_sub(1);
+                        self.closed = self.depth == 0;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+fn json_whitespace(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum ValidationKey {
+    Structured,
+    Literal,
+    FiniteNumber,
+    OverflowingNumber,
+    NumberBoundary(Vec<u8>),
+}
+
+struct PrimitiveBoundary {
+    kind: PrimitiveKind,
+    ended: bool,
+    invalid: bool,
+}
+
+enum PrimitiveKind {
+    Literal {
+        expected: &'static [u8],
+        matched: usize,
+    },
+    Number(NumberBoundary),
+    Invalid,
+}
+
+impl PrimitiveBoundary {
+    fn new(first: u8) -> Self {
+        let kind = match first {
+            b't' => PrimitiveKind::Literal {
+                expected: b"true",
+                matched: 1,
+            },
+            b'f' => PrimitiveKind::Literal {
+                expected: b"false",
+                matched: 1,
+            },
+            b'n' => PrimitiveKind::Literal {
+                expected: b"null",
+                matched: 1,
+            },
+            b'-' | b'0'..=b'9' => {
+                let mut number = NumberBoundary::default();
+                number.append(first);
+                PrimitiveKind::Number(number)
+            }
+            _ => PrimitiveKind::Invalid,
+        };
+        Self {
+            kind,
+            ended: false,
+            invalid: false,
+        }
+    }
+
+    fn complete(&self) -> bool {
+        match &self.kind {
+            PrimitiveKind::Literal { expected, matched } => *matched == expected.len(),
+            PrimitiveKind::Number(number) => number.complete(),
+            PrimitiveKind::Invalid => false,
+        }
+    }
+
+    fn append(&mut self, byte: u8) {
+        if self.invalid {
+            return;
+        }
+        if self.ended {
+            self.invalid = !json_whitespace(byte);
+        } else if json_whitespace(byte) {
+            self.invalid = !self.complete();
+            self.ended = true;
+        } else {
+            match &mut self.kind {
+                PrimitiveKind::Literal { expected, matched } => {
+                    if expected.get(*matched) == Some(&byte) {
+                        *matched += 1;
+                    } else {
+                        self.invalid = true;
+                    }
+                }
+                PrimitiveKind::Number(number) => number.append(byte),
+                PrimitiveKind::Invalid => self.invalid = true,
+            }
+        }
+    }
+
+    fn validation_key(&self) -> Option<ValidationKey> {
+        if self.invalid || !self.complete() {
+            return None;
+        }
+        Some(match &self.kind {
+            PrimitiveKind::Literal { .. } => ValidationKey::Literal,
+            PrimitiveKind::Number(number) => number.validation_key(),
+            PrimitiveKind::Invalid => return None,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+enum NumberState {
+    #[default]
+    Start,
+    Sign,
+    Zero,
+    Integer,
+    Point,
+    Fraction,
+    Exponent,
+    ExponentSign,
+    ExponentDigits,
+    Invalid,
+}
+
+/// Track lexical completeness and the decimal order of magnitude. The parser
+/// still validates the actual number, but appending digits to an overflowing
+/// integer cannot make it finite until a negative exponent is supplied.
+#[derive(Default)]
+struct NumberBoundary {
+    state: NumberState,
+    integer_digits: i64,
+    mantissa_digits: i64,
+    first_significant: Option<i64>,
+    significant_prefix: Vec<u8>,
+    exponent_negative: bool,
+    exponent: i64,
+}
+
+impl NumberBoundary {
+    fn append(&mut self, byte: u8) {
+        use NumberState::*;
+        self.state = match (self.state, byte) {
+            (Start, b'-') => Sign,
+            (Start | Sign, b'0') => {
+                self.mantissa_digit(byte, true);
+                Zero
+            }
+            (Start | Sign, b'1'..=b'9') | (Integer, b'0'..=b'9') => {
+                self.mantissa_digit(byte, true);
+                Integer
+            }
+            (Zero | Integer, b'.') => Point,
+            (Point | Fraction, b'0'..=b'9') => {
+                self.mantissa_digit(byte, false);
+                Fraction
+            }
+            (Zero | Integer | Fraction, b'e' | b'E') => Exponent,
+            (Exponent, b'+' | b'-') => {
+                self.exponent_negative = byte == b'-';
+                ExponentSign
+            }
+            (Exponent | ExponentSign | ExponentDigits, b'0'..=b'9') => {
+                // The stream is capped at 16 MiB. Larger exponents cannot be
+                // cancelled by its mantissa; saturation also bounds work.
+                self.exponent = (self.exponent * 10 + i64::from(byte - b'0')).min(1_000_000_000);
+                ExponentDigits
+            }
+            _ => Invalid,
+        };
+    }
+
+    fn mantissa_digit(&mut self, byte: u8, integer: bool) {
+        if integer {
+            self.integer_digits += 1;
+        }
+        if byte != b'0' && self.first_significant.is_none() {
+            self.first_significant = Some(self.mantissa_digits);
+        }
+        if self.first_significant.is_some() && self.significant_prefix.len() < 310 {
+            self.significant_prefix.push(byte);
+        }
+        self.mantissa_digits += 1;
+    }
+
+    fn complete(&self) -> bool {
+        matches!(
+            self.state,
+            NumberState::Zero
+                | NumberState::Integer
+                | NumberState::Fraction
+                | NumberState::ExponentDigits
+        )
+    }
+
+    fn validation_key(&self) -> ValidationKey {
+        let Some(first) = self.first_significant else {
+            return ValidationKey::FiniteNumber;
+        };
+        let exponent = self.integer_digits - first - 1
+            + if self.exponent_negative {
+                -self.exponent
+            } else {
+                self.exponent
+            };
+        if exponent < 308 {
+            ValidationKey::FiniteNumber
+        } else if exponent > 308 {
+            ValidationKey::OverflowingNumber
+        } else {
+            // Only 10^308 can straddle f64::MAX. Its exact finite/infinity
+            // rounding boundary is an integer with 309 decimal digits, so
+            // later digits cannot change which side a 310-digit prefix is on.
+            ValidationKey::NumberBoundary(self.significant_prefix.clone())
+        }
+    }
+}
+
+impl ToolInput {
+    fn append(&mut self, delta: &str) {
+        self.boundary.append(delta);
+        self.input.push_str(delta);
+    }
+
+    fn valid_input(&mut self) -> bool {
+        let key = if !self.boundary.started || self.boundary.invalid {
+            return false;
+        } else if let Some(primitive) = &self.boundary.primitive {
+            let Some(key) = primitive.validation_key() else {
+                return false;
+            };
+            key
+        } else if self.boundary.closed {
+            ValidationKey::Structured
+        } else {
+            return false;
+        };
+        if let Some((validated_key, valid)) = &self.validated {
+            if *validated_key == key {
+                return *valid;
+            }
+        }
+        #[cfg(test)]
+        {
+            self.validated_bytes += self.input.len();
+        }
+        let valid = serde_json::from_str::<Value>(&self.input).is_ok();
+        self.validated = Some((key, valid));
+        valid
+    }
 }
 
 impl RestoreState {
@@ -185,7 +495,7 @@ impl RestoreState {
             if tool.name.is_empty() {
                 tool.name = name;
             }
-            tool.input.push_str(&input_delta);
+            tool.append(&input_delta);
             tool.last_frame = self.pending.len();
             tool.stopped |= stop;
             self.enqueue(bytes, Some(key))?;
@@ -203,7 +513,7 @@ impl RestoreState {
             // existing protocol. Release it before following text or metadata.
             // Invalid arguments stay pending until a terminal boundary, where
             // they are released unchanged for existing refusal/error handling.
-            if terminal || self.tools.values().all(|tool| valid_input(&tool.input)) {
+            if terminal || self.tools.values_mut().all(ToolInput::valid_input) {
                 self.flush()?;
                 self.ready.push_back(bytes);
             } else {
@@ -302,10 +612,6 @@ impl RestoreState {
         self.pending_bytes = 0;
         Ok(())
     }
-}
-
-fn valid_input(input: &str) -> bool {
-    serde_json::from_str::<Value>(input).is_ok()
 }
 
 /// Preserve upstream read activity while arguments await complete JSON. This
@@ -507,6 +813,277 @@ mod tests {
 
     #[derive(Clone, Debug, PartialEq)]
     struct RequestExtension(u32);
+
+    #[test]
+    fn fragmented_tool_json_is_parsed_once_after_completion() {
+        let mut tool = ToolInput::default();
+        tool.append("{\"text\":\"");
+        for _ in 0..8192 {
+            tool.append("part");
+            assert!(!tool.valid_input());
+            assert!(
+                !tool.valid_input(),
+                "repeated metadata cannot restart parsing"
+            );
+        }
+        assert_eq!(tool.validated_bytes, 0);
+        tool.append("\"}");
+        assert!(tool.valid_input());
+        assert!(tool.valid_input());
+        assert_eq!(tool.validated_bytes, tool.input.len());
+    }
+
+    #[test]
+    fn completion_gate_matches_json_parser_across_unicode_and_escapes() {
+        for input in [
+            r#" {"nested":[{"value":"\\\" } 中文"}],"flag":true} "#,
+            r#""a\"b\\c""#,
+            r#"[1,{"x":null}]"#,
+            "true",
+            "false",
+            "null",
+            "-12.5e+3",
+            "",
+            "{]",
+            "{\"x\":}",
+            "{\"x\":\"unterminated",
+            "[1,2]garbage",
+        ] {
+            let mut tool = ToolInput::default();
+            for ch in input.chars() {
+                tool.append(&ch.to_string());
+                assert_eq!(
+                    tool.valid_input(),
+                    serde_json::from_str::<Value>(&tool.input).is_ok(),
+                    "prefix {:?}",
+                    tool.input
+                );
+            }
+            assert_eq!(
+                tool.valid_input(),
+                serde_json::from_str::<Value>(input).is_ok(),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn primitive_gate_matches_parser_at_numeric_boundaries() {
+        let mut inputs = vec![
+            "-",
+            "-0",
+            "01",
+            "-01",
+            "1.",
+            "1.e0",
+            "1e",
+            "1e+",
+            "1e-",
+            "1e01",
+            "1e+309",
+            "1e-9999999999999999999999",
+            "0e99999999999999999999",
+            "nullx",
+            "tru e",
+            "1 2",
+            "0.1\u{000b}",
+            "\u{000c}true",
+            "1.7976931348623157e308",
+            "1.7976931348623158e308",
+            "1.7976931348623159e308",
+            "-1.7976931348623159e308",
+            "2.2250738585072014e-308",
+            "4.9406564584124654e-324",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        inputs.push(format!("{}e-1023", "1".repeat(1024)));
+        inputs.push(format!("0.{}1e1024", "0".repeat(1023)));
+        inputs.push(format!(
+            "{}{}.{}e-1",
+            "17976931348623157",
+            "0".repeat(292),
+            "0".repeat(512)
+        ));
+        for input in inputs {
+            let mut tool = ToolInput::default();
+            for byte in input.bytes() {
+                tool.append(std::str::from_utf8(&[byte]).unwrap());
+                assert_eq!(
+                    tool.valid_input(),
+                    serde_json::from_str::<Value>(&tool.input).is_ok(),
+                    "numeric prefix {:?}",
+                    tool.input
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn numeric_completion_cache_matches_parser_for_large_boundary_prefixes() {
+        // Exact midpoint between f64::MAX and infinity: 2^1024 - 2^970,
+        // with decimal offsets -100, -1, 0, 1, 100. Keep the integer fixtures
+        // independent of the completion gate's own range calculations.
+        let near_overflow = [
+            "179769313486231580793728971405303415079934132710037826936173778980444968292764750946649017977587207096330286416692887910946555547851940402630657488671505820681908902000708383676273854845817711531764475730270069855571366959622842914819860834936475292719074168444365510704342711559699508093042880177904174497692",
+            "179769313486231580793728971405303415079934132710037826936173778980444968292764750946649017977587207096330286416692887910946555547851940402630657488671505820681908902000708383676273854845817711531764475730270069855571366959622842914819860834936475292719074168444365510704342711559699508093042880177904174497791",
+            "179769313486231580793728971405303415079934132710037826936173778980444968292764750946649017977587207096330286416692887910946555547851940402630657488671505820681908902000708383676273854845817711531764475730270069855571366959622842914819860834936475292719074168444365510704342711559699508093042880177904174497792",
+            "179769313486231580793728971405303415079934132710037826936173778980444968292764750946649017977587207096330286416692887910946555547851940402630657488671505820681908902000708383676273854845817711531764475730270069855571366959622842914819860834936475292719074168444365510704342711559699508093042880177904174497793",
+            "179769313486231580793728971405303415079934132710037826936173778980444968292764750946649017977587207096330286416692887910946555547851940402630657488671505820681908902000708383676273854845817711531764475730270069855571366959622842914819860834936475292719074168444365510704342711559699508093042880177904174497892"
+        ];
+        let mut corpus = Vec::new();
+        for value in near_overflow {
+            corpus.extend([
+                value.to_owned(),
+                format!("{value}.{}1", "0".repeat(400)),
+                format!("{value}0e-1"),
+                format!("0.{}{value}e659", "0".repeat(350)),
+            ]);
+        }
+        for prefix in [
+            "1",
+            "17976931348623157",
+            "17976931348623158",
+            "17976931348623159",
+            "1844674407370955161",
+            "9999999999999999999",
+        ] {
+            for zeros in [20, 309, 310, 512, 1024] {
+                let mantissa = format!("{prefix}{}", "0".repeat(zeros));
+                for exponent in [
+                    0,
+                    -(zeros as i64),
+                    309 - mantissa.len() as i64,
+                    308 - mantissa.len() as i64,
+                ] {
+                    corpus.push(format!("{mantissa}e{exponent}"));
+                }
+            }
+        }
+        assert_eq!(corpus.len(), 140);
+        for input in corpus {
+            let mut tool = ToolInput::default();
+            for byte in input.bytes() {
+                tool.append(std::str::from_utf8(&[byte]).unwrap());
+                assert_eq!(
+                    tool.valid_input(),
+                    serde_json::from_str::<Value>(&tool.input).is_ok(),
+                    "large boundary prefix {:?}",
+                    tool.input
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn overflowing_primitive_parsing_is_bounded_and_negative_exponent_can_repair_it() {
+        let mut tool = ToolInput::default();
+        tool.append(&"1".repeat(1024));
+        assert!(!tool.valid_input());
+        for _ in 0..8192 {
+            tool.append("1111");
+            assert!(!tool.valid_input());
+        }
+        assert_eq!(
+            tool.validated_bytes, 1024,
+            "overflowing digits must not restart validation"
+        );
+        let exponent = tool.input.len() - 1;
+        tool.append("e-");
+        assert!(!tool.valid_input());
+        for byte in exponent.to_string().bytes() {
+            tool.append(std::str::from_utf8(&[byte]).unwrap());
+            assert_eq!(
+                tool.valid_input(),
+                serde_json::from_str::<Value>(&tool.input).is_ok()
+            );
+        }
+        assert!(
+            tool.valid_input(),
+            "a negative exponent restores a finite number"
+        );
+        assert!(tool.validated_bytes <= 1024 + 2 * tool.input.len());
+        let parsed = tool.validated_bytes;
+        for _ in 0..8192 {
+            tool.append(" \t\n\r");
+            assert!(tool.valid_input());
+        }
+        assert_eq!(tool.validated_bytes, parsed);
+        tool.append("\u{000b}");
+        assert!(!tool.valid_input(), "vertical tab is not JSON whitespace");
+    }
+
+    #[test]
+    fn completed_tool_keeps_cached_validation_while_another_call_is_open() {
+        let mut tools = [ToolInput::default(), ToolInput::default()];
+        tools[0].append(&json!({"text":"body".repeat(8192)}).to_string());
+        tools[1].append("{\"open\":\"");
+        let original = tools[0].input.len();
+        for _ in 0..8192 {
+            tools[0].append(" \t\n\r");
+            assert!(!tools.iter_mut().all(ToolInput::valid_input));
+        }
+        assert_eq!(tools[0].validated_bytes, original + 4);
+        assert_eq!(tools[1].validated_bytes, 0);
+        tools[1].append("done\"}");
+        assert!(tools.iter_mut().all(ToolInput::valid_input));
+        tools[0].append("x");
+        assert!(!tools[0].valid_input());
+        assert_eq!(tools[0].validated_bytes, original + 4);
+    }
+
+    #[test]
+    #[ignore = "manual release performance measurement"]
+    fn performance_fragmented_primitive_and_completed_json() {
+        for fragments in [512, 2048, 8192, 32768] {
+            let started = std::time::Instant::now();
+            let mut primitive = ToolInput::default();
+            primitive.append(&"1".repeat(1024));
+            assert!(!primitive.valid_input());
+            let mut structured = ToolInput::default();
+            structured.append(&json!({"text":"body".repeat(8192)}).to_string());
+            assert!(structured.valid_input());
+            for _ in 0..fragments {
+                primitive.append("1111");
+                assert!(!primitive.valid_input());
+                structured.append(" \t\n\r");
+                assert!(structured.valid_input());
+            }
+            assert_eq!(primitive.validated_bytes, 1024);
+            assert_eq!(
+                structured.validated_bytes,
+                json!({"text":"body".repeat(8192)}).to_string().len()
+            );
+            eprintln!(
+                "TOOL_JSON_PRIMITIVE fragments={fragments} elapsed_us={} parsed_bytes={}",
+                started.elapsed().as_micros(),
+                primitive.validated_bytes + structured.validated_bytes
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release performance measurement"]
+    fn performance_fragmented_tool_json() {
+        for fragments in [512, 2048, 8192, 32768] {
+            let started = std::time::Instant::now();
+            let mut tool = ToolInput::default();
+            tool.append("{\"text\":\"");
+            for _ in 0..fragments {
+                tool.append("part");
+                assert!(!tool.valid_input());
+            }
+            tool.append("\"}");
+            assert!(tool.valid_input());
+            assert_eq!(tool.validated_bytes, tool.input.len());
+            eprintln!(
+                "TOOL_JSON fragments={fragments} elapsed_us={} parsed_bytes={}",
+                started.elapsed().as_micros(),
+                tool.validated_bytes
+            );
+        }
+    }
 
     #[test]
     fn malformed_summary_reference_has_bounded_buffering() {
@@ -746,6 +1323,63 @@ mod tests {
                 Some(KiroEvent::ToolUse { stop: false, .. })
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn missing_stop_scalars_and_exponent_repair_keep_metadata_order() {
+        for input in ["null", "true", "-12.5e+3", "\"ordinary string\""] {
+            let session = RedactionSession::new();
+            marker(&session, json!("unused-secret"));
+            let frames = vec![
+                tool("scalar", "verify", input, false),
+                frame("messageMetadataEvent", json!({"usage":{"outputTokens":7}})),
+                tool("", "", "", true),
+            ];
+            let bytes = restore_tool_response(response(&frames, 7), session, false)
+                .bytes()
+                .await
+                .unwrap();
+            let events = decode(&bytes);
+            assert_eq!(
+                tool_inputs(&events)["scalar"],
+                serde_json::from_str::<Value>(input).unwrap()
+            );
+            let tool_index = events.iter().position(|event| matches!(event, KiroEvent::ToolUse { input_delta, .. } if !input_delta.is_empty())).unwrap();
+            let metadata_index = events
+                .iter()
+                .position(|event| matches!(event, KiroEvent::MessageMetadata { .. }))
+                .unwrap();
+            assert!(tool_index < metadata_index);
+            assert!(
+                matches!(events.last(), Some(KiroEvent::ToolUse { id, stop: true, .. }) if id == "scalar")
+            );
+        }
+
+        let session = RedactionSession::new();
+        marker(&session, json!("unused-secret"));
+        let integer = "1".repeat(1024);
+        let frames = vec![
+            tool("number", "verify", &integer, false),
+            frame("messageMetadataEvent", json!({"usage":{"outputTokens":7}})),
+            tool("number", "", "e-1023", false),
+            frame("messageMetadataEvent", json!({"usage":{"outputTokens":8}})),
+        ];
+        let bytes = restore_tool_response(response(&frames, 11), session, false)
+            .bytes()
+            .await
+            .unwrap();
+        let events = decode(&bytes);
+        assert_eq!(
+            tool_inputs(&events)["number"],
+            serde_json::from_str::<Value>(&format!("{integer}e-1023")).unwrap()
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, KiroEvent::MessageMetadata { .. }))
+                .count(),
+            2
+        );
     }
 
     #[tokio::test]
