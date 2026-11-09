@@ -399,9 +399,8 @@ Claim 事件的 `sourceIPAddress` 为 `q.amazonaws.com`
 说明，经公网端点发起的请求，其源 IP 会保留到后续转发访问会话（FAS）中；通过 VPC 端点的请求需按文档
 另行处理网络条件。
 
-### 上游协议与验证范围
+### 上游协议
 
 Kiro 的套餐操作及 claim 查询采用 Console 后端协议，并非稳定公开的 AWS SDK 服务模型；
 参考 [Kiro 官方仓库的调用记录](https://github.com/kirodotdev/Kiro/issues/10166)。
 所有 AWS 请求使用 SigV4，目标域名由已验证的区域生成，不接受调用方指定任意 endpoint。
-该实现通过本地模拟协议测试；未在真实 AWS 账号上执行开通、取消或计费变更验证。

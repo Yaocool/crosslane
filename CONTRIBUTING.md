@@ -47,11 +47,16 @@ change depends on them.
 
 ## Documentation and review
 
-Keep README files focused on setup and navigation. Put operational instructions
-in the paired English and Chinese guides. Document user-visible commands,
-configuration, API behavior, and limitations; keep investigations and
-implementation notes in the code review or Git history. Update paired guides
-together, and check local links, examples, and commands before submitting.
+Keep README files focused on setup and navigation. Keep `docs/` for maintained
+English and Chinese guides covering user-visible commands, configuration, API
+behavior, operations, and limitations. Update paired guides together, and check
+local links, examples, and commands before submitting.
+
+Store temporary design plans, investigations, review notes, validation reports,
+and benchmark results under `.crosslane-dev/docs/`, which is already ignored by
+Git. Keep implementation details and check results in commit or review descriptions;
+move lasting user-visible behavior and migration notes into the relevant guide.
+Check the staged file list before committing documentation.
 
 Do not commit credentials, raw requests, or unsanitized test captures. Account
 exports are redacted by default; only include secrets in a protected backup.

@@ -16,17 +16,35 @@ Kiro 通常只报告 credits，不报告 token 和缓存计数，因此 Crosslan
 折扣；上游实际报告的 credits 仍单独结算。
 
 Claude 请求需在内容块或请求根部提供 `cache_control: {"type":"ephemeral"}`。
-OpenAI Chat/Responses 会进行隐式前缀核算，无需这个 Anthropic 扩展；有效的显式
-标记也会转换为 Kiro `cachePoint`。本地记录按上游账号、实际模型及可选的 OpenAI
-`prompt_cache_key` 隔离，默认保留 5 分钟，显式 `ttl=1h` 则保留 1 小时，读取时续期；
-daemon 重启会清空记录。这是本地策略，不保证上游保留时长。
+OpenAI Chat/Responses 没有显式标记时进行隐式前缀核算：只写入工具与 system 末尾、
+最新消息末尾两个锚点，查找时按最长前缀匹配，不受回看位置限制；有效的显式标记也会转换为
+Kiro `cachePoint`，并改用 Anthropic 规则（最多 4 个断点，每个断点回看 20 个位置，
+连续的工具调用或工具结果轮次共用一个位置）。
 
-成功完成的首次请求计为缓存创建。后续请求在断点前最多回看 20 个块，读取最长的
-已记录前缀，仅将新增部分计为创建。缓存标记移动不会破坏已有前缀；前置工具定义、
-角色或内容变化则会影响匹配。失败、取消以及未产生输出的拒绝不会建立缓存记录。
-本地最小前缀长度为：Opus 5/5.5、Sonnet/Haiku 5.5 为 512 token；Opus 4.7 为
-2,048；Opus 4.5/4.6、Haiku 4.5 为 4,096；其他模型为 1,024。这些是 Crosslane 的
-本地核算规则。上游如有明确缓存计数（包括 0），优先保留上游值。
+本地记录按上游账号、服务、API Key 隔离，未配置 Key 的请求只在同一服务和账号内共享。
+解析后的实际模型、OpenAI `prompt_cache_key`、`tool_choice`、thinking/effort 设置也参与前缀
+身份，任一变化都不会命中。默认保留 5 分钟，显式 `ttl=1h` 保留 1 小时，两种 TTL 分别记录；
+有效期从实际发出上游请求的时刻计算，命中时只续期被读取的条目。daemon 重启会清空记录。
+这是本地策略，不保证上游保留时长。
+
+缓存计数与输入估算使用同一套分段和固定开销，完整输入与上下文估算一致。最后一个断点之后
+的内容以及代理注入的提示计为未缓存输入，因此命中后 `input_tokens` 不会被算成 0。
+多轮请求中只有首轮生成参与本地模拟，工具续写和自动续写的输入计为未缓存。只有读完上游
+响应（EOF）且成功的首轮会建立缓存记录；失败、取消、拒绝以及被 stop sequence 提前截断的
+流式请求不会建立记录。压缩或截断历史后只读写仍然存在的工具与 system 前缀。
+Claude Code 在 system 开头注入的 `x-anthropic-billing-header` 元数据行不参与前缀身份，
+升级客户端版本不会使缓存失效。
+
+本地最小前缀长度：Fable 5/5.1、Mythos 5/5.1、Opus 5/5.5、Sonnet 5.5、Haiku 5.5 为
+512 token；Opus 4.7、Mythos Preview、Haiku 3.5 为 2,048；Opus 4.5/4.6、Haiku 4.5 为
+4,096；GPT-5.6 及其他模型为 1,024。上游报告正数缓存计数时整组使用上游值；Kiro 成功响应中
+显式为 0 的输入、输出或缓存计数视为未上报，改用本地估算。
+`features.prompt_cache_accounting = "legacy"` 和 `features.kiro_usage_zero_policy = "legacy"`
+可分别回滚到旧的核算算法和旧的零值解释。
+
+默认零值兜底策略下，成功响应中的零占位 token 会触发本地估算，用量可能变为非零。
+上游没有报告正数 credits 时，这也会改变本地 credits 兜底计算。上游报告的正数
+credits 始终优先；本地模拟的缓存命中不会给 Kiro credits 套用 Anthropic 或 OpenAI 的折扣。
 
 Claude Code 和 `/v1/messages` 的 `cache_read_input_tokens`、
 `cache_creation_input_tokens` 都是输入的一部分，`input_tokens` 表示剩余未缓存输入，

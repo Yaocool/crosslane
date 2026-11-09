@@ -19,23 +19,50 @@ its backend cache or discounted its credits. Actual reported credit charges
 remain independent of these token estimates.
 
 Claude requests require an explicit `cache_control: {"type":"ephemeral"}`
-breakpoint or the same control at the request root. OpenAI Chat/Responses use
-implicit prefix accounting without requiring this Anthropic extension. Valid
-explicit controls are also translated into native Kiro `cachePoint` blocks.
-Local entries are isolated by upstream account, resolved model and optional
-OpenAI `prompt_cache_key`. They expire after 5 minutes (or 1 hour for an explicit
-`ttl=1h` control), refresh on reuse and are lost when crosslaned restarts.
-Client TTL values are local policy, not an upstream retention guarantee.
+breakpoint or the same control at the request root. Without explicit controls,
+OpenAI Chat/Responses use implicit prefix accounting: two anchors are written
+(the end of tools and system, and the latest message), and lookups match the
+longest recorded prefix without a lookback limit. Valid explicit controls are
+also translated into native Kiro `cachePoint` blocks and use Anthropic rules: at
+most 4 breakpoints, each looking back 20 positions, where consecutive tool-call
+or tool-result turns share one position.
 
-A completed cold request records cache creation. A later request can read the
-longest matching prefix within 20 blocks of a breakpoint and creates only the
-new suffix. Moving cache markers does not invalidate unchanged content; changing
-preceding tools, roles or content does. Failed/cancelled generations and empty
-refusals do not seed entries. Prefixes below the local model threshold are
-ignored: 512 tokens for Opus 5/5.5 and Sonnet/Haiku 5.5; 2,048 for Opus 4.7;
-4,096 for Opus 4.5/4.6 and Haiku 4.5; 1,024 otherwise. These are Crosslane's local
-accounting rules. Explicit upstream cache counters, including zero, take
-precedence when present.
+Local entries are isolated by upstream account, service and API key; requests
+without a key share entries only within the same service and account. The
+resolved model, OpenAI `prompt_cache_key`, `tool_choice` and thinking/effort
+settings are part of the prefix identity, so changing any of them misses. Entries
+expire after 5 minutes, or 1 hour for an explicit `ttl=1h` control, with separate
+slots for each TTL. Lifetimes start when the upstream request is dispatched, and
+only the entry that was read is refreshed. Entries are lost when crosslaned
+restarts. Client TTL values are local policy, not an upstream retention guarantee.
+
+Cache accounting uses the same segments and fixed overheads as the input
+estimate, so the full input equals the context estimate. Content after the last
+breakpoint and proxy-injected instructions are uncached, so a cache hit never
+reports `input_tokens` as 0. In multi-round requests only the initial generation
+is simulated locally; tool and automatic continuations count as uncached. Only a
+successful initial round that read the upstream response to EOF seeds entries.
+Failed, cancelled and refused requests, and streams cut short by a stop sequence,
+do not. After compaction or history truncation, only the surviving tools and
+system prefix can be read or written. The `x-anthropic-billing-header` metadata
+line that Claude Code adds to the start of the system prompt is excluded from
+the prefix identity, so client upgrades do not invalidate the cache.
+
+Prefixes below the local model threshold are ignored: 512 tokens for Fable 5/5.1,
+Mythos 5/5.1, Opus 5/5.5, Sonnet 5.5 and Haiku 5.5; 2,048 for Opus 4.7, Mythos
+Preview and Haiku 3.5; 4,096 for Opus 4.5/4.6 and Haiku 4.5; 1,024 for GPT-5.6
+and all other models. A positive upstream cache counter makes the whole reported
+cache group authoritative. Explicit zero input, output or cache counters in a Kiro
+success response are treated as unreported and estimated locally.
+`features.prompt_cache_accounting = "legacy"` and
+`features.kiro_usage_zero_policy = "legacy"` roll back the accounting algorithm
+and the zero interpretation independently.
+
+With the default zero fallback policy, a successful response containing zero
+placeholder tokens can produce nonzero local usage estimates. When Kiro reports
+no positive credits, this also changes the fallback credit calculation. Positive
+upstream credits remain authoritative; locally estimated cache hits do not apply
+Anthropic or OpenAI discounts to Kiro credits.
 
 For Claude Code and `/v1/messages`, `cache_read_input_tokens` and
 `cache_creation_input_tokens` are input subsets. `input_tokens` is the remaining

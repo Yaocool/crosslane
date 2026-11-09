@@ -27,7 +27,8 @@ Thumbs.db
 .vscode/
 
 # AI-assisted development: local settings, indexes, caches, and session state.
-# Keep CONTRIBUTING.md and docs/ tracked as project guidance.
+# Keep CONTRIBUTING.md and maintained docs/ guides tracked; temporary notes go
+# under the ignored .crosslane-dev/docs/ directory.
 .claude/*
 .cursor/
 .windsurf/

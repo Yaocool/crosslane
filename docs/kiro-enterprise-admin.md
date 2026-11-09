@@ -421,10 +421,9 @@ condition failed: [AWS documents](https://docs.aws.amazon.com/IAM/latest/UserGui
 that forward access sessions following a public endpoint request retain its original source IP.
 Requests through VPC endpoints require separate handling of the documented network conditions.
 
-### Backend protocol and validation scope
+### Backend protocol
 
 Subscription/claim operations use Kiro Console backend protocols rather than a versioned public
 AWS SDK service contract; see the [Kiro repository request example](https://github.com/kirodotdev/Kiro/issues/10166).
 Requests use SigV4 and fixed hosts derived from validated regions. Arbitrary endpoints are not
-accepted. Local mock protocol tests cover this implementation; no real AWS activation,
-cancellation or billing change was used to validate it.
+accepted.
