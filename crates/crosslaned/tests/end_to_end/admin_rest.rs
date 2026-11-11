@@ -385,6 +385,42 @@ async fn admin_rest_authentication_is_independent_rotatable_and_audited_without_
             "admin log leaked a fixture credential"
         );
     }
+    let log_directory = fixture.daemon.home().join("logs");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let admin_file_logs = loop {
+        let files = std::fs::read_dir(&log_directory).unwrap();
+        let logs = files
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("crosslaned-admin-")
+            })
+            .map(|entry| std::fs::read_to_string(entry.path()).unwrap())
+            .collect::<String>();
+        if logs.contains("admin.http.request") {
+            break logs;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Admin event was not written to its own file"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(admin_file_logs.contains("admin.http.request"));
+    let general_logs = std::fs::read_dir(&log_directory)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("crosslaned-") && !name.starts_with("crosslaned-admin-")
+        })
+        .map(|entry| std::fs::read_to_string(entry.path()).unwrap())
+        .collect::<String>();
+    assert!(general_logs.contains("status HTTP listening"));
+    assert!(!general_logs.contains("admin.http.request"));
     assert!(fixture
         .upstream
         .received_requests()

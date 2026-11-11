@@ -28,6 +28,7 @@ static DROPPED_LOG_RECORDS: AtomicU64 = AtomicU64::new(0);
 struct RuntimeLogConfig {
     json: Arc<AtomicBool>,
     file: ReconfigurableFileWriter,
+    admin_file: ReconfigurableFileWriter,
 }
 
 pub fn init(config: &LogConfig, default_file_path: PathBuf) -> Result<()> {
@@ -35,7 +36,11 @@ pub fn init(config: &LogConfig, default_file_path: PathBuf) -> Result<()> {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.level));
     let (filter, filter_handle) = tracing_subscriber::reload::Layer::new(filter);
     let file = ReconfigurableFileWriter::new(config, default_file_path)?;
-    let buffered_file = BufferedMakeWriter::file(file.clone())?;
+    let admin_file = ReconfigurableFileWriter::new_admin(config, &file.default_path)?;
+    let buffered_file = RoutedFileWriter {
+        daemon: BufferedMakeWriter::file(file.clone())?,
+        admin: BufferedMakeWriter::file(admin_file.clone())?,
+    };
     let buffered_stdout = BufferedMakeWriter::stdout()?;
     let json = Arc::new(AtomicBool::new(config.format != "pretty"));
     let pretty_switch = Arc::clone(&json);
@@ -73,7 +78,11 @@ pub fn init(config: &LogConfig, default_file_path: PathBuf) -> Result<()> {
         .try_init()
         .context("initialize tracing")?;
     let _result = FILTER_HANDLE.set(filter_handle);
-    let _result = LOG_RUNTIME.set(RuntimeLogConfig { json, file });
+    let _result = LOG_RUNTIME.set(RuntimeLogConfig {
+        json,
+        file,
+        admin_file,
+    });
     Ok(())
 }
 
@@ -87,11 +96,14 @@ pub fn reload_level(level: &str) -> Result<()> {
 
 /// Atomically switches level, formatter, and the partitioned file destination.
 pub fn reload_config(config: &LogConfig) -> Result<()> {
-    reload_level(&config.level)?;
     let runtime: &RuntimeLogConfig = LOG_RUNTIME
         .get()
         .ok_or_else(|| anyhow::anyhow!("runtime log configuration is unavailable"))?;
-    runtime.file.reconfigure(config)?;
+    let next_file = runtime.file.next_state(config)?;
+    let next_admin_file = runtime.admin_file.next_state(config)?;
+    reload_level(&config.level)?;
+    runtime.file.replace_state(next_file);
+    runtime.admin_file.replace_state(next_admin_file);
     runtime
         .json
         .store(config.format != "pretty", Ordering::Release);
@@ -175,6 +187,32 @@ impl<'a> MakeWriter<'a> for BufferedMakeWriter {
     }
 }
 
+#[derive(Clone)]
+struct RoutedFileWriter {
+    daemon: BufferedMakeWriter,
+    admin: BufferedMakeWriter,
+}
+
+impl<'a> MakeWriter<'a> for RoutedFileWriter {
+    type Writer = BufferedWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.daemon.make_writer()
+    }
+
+    fn make_writer_for(&'a self, metadata: &Metadata<'_>) -> Self::Writer {
+        if is_admin_target(metadata.target()) {
+            self.admin.make_writer_for(metadata)
+        } else {
+            self.daemon.make_writer_for(metadata)
+        }
+    }
+}
+
+fn is_admin_target(target: &str) -> bool {
+    target == "crosslaned::admin" || target.starts_with("crosslaned::admin::")
+}
+
 struct BufferedWriter {
     sender: std::sync::mpsc::SyncSender<BufferedRecord>,
     level: Level,
@@ -208,11 +246,20 @@ impl Write for BufferedWriter {
 struct ReconfigurableFileWriter {
     state: Arc<Mutex<DatedLogFiles>>,
     default_path: Arc<PathBuf>,
+    admin: bool,
 }
 
 impl ReconfigurableFileWriter {
     fn new(config: &LogConfig, default_path: PathBuf) -> Result<Self> {
-        let path = configured_log_path(config, &default_path);
+        Self::new_inner(config, default_path, false)
+    }
+
+    fn new_admin(config: &LogConfig, default_path: &Path) -> Result<Self> {
+        Self::new_inner(config, default_path.to_path_buf(), true)
+    }
+
+    fn new_inner(config: &LogConfig, default_path: PathBuf, admin: bool) -> Result<Self> {
+        let path = Self::path(config, &default_path, admin);
         Ok(Self {
             state: Arc::new(Mutex::new(DatedLogFiles::new(
                 path,
@@ -221,21 +268,39 @@ impl ReconfigurableFileWriter {
                 config.max_files_per_day,
             )?)),
             default_path: Arc::new(default_path),
+            admin,
         })
     }
 
+    #[cfg(test)]
     fn reconfigure(&self, config: &LogConfig) -> Result<()> {
-        let next = DatedLogFiles::new(
-            configured_log_path(config, &self.default_path),
+        self.replace_state(self.next_state(config)?);
+        Ok(())
+    }
+
+    fn next_state(&self, config: &LogConfig) -> Result<DatedLogFiles> {
+        DatedLogFiles::new(
+            Self::path(config, &self.default_path, self.admin),
             maximum_bytes(config),
             config.retention_days,
             config.max_files_per_day,
-        )?;
+        )
+    }
+
+    fn replace_state(&self, next: DatedLogFiles) {
         *self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = next;
-        Ok(())
+    }
+
+    fn path(config: &LogConfig, default_path: &Path, admin: bool) -> PathBuf {
+        let base = configured_log_path(config, default_path);
+        if admin {
+            admin_log_path(&base)
+        } else {
+            base
+        }
     }
 
     fn write_batch(&self, records: &[BufferedRecord]) -> io::Result<()> {
@@ -265,6 +330,19 @@ pub(crate) fn configured_log_path(config: &LogConfig, default_path: &Path) -> Pa
     } else {
         PathBuf::from(&config.file_path)
     }
+}
+
+pub(crate) fn admin_log_path(base_path: &Path) -> PathBuf {
+    let stem = base_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("crosslaned");
+    let extension = base_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| format!(".{value}"))
+        .unwrap_or_default();
+    base_path.with_file_name(format!("{stem}-admin{extension}"))
 }
 
 #[derive(Debug)]
@@ -635,6 +713,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn admin_file_path_and_target_routing_are_distinct() {
+        assert_eq!(
+            admin_log_path(Path::new("/var/log/crosslaned.log")),
+            PathBuf::from("/var/log/crosslaned-admin.log")
+        );
+        assert_eq!(
+            admin_log_path(Path::new("/tmp/custom.jsonl")),
+            PathBuf::from("/tmp/custom-admin.jsonl")
+        );
+        assert!(is_admin_target("crosslaned::admin::rest"));
+        assert!(is_admin_target("crosslaned::admin::handlers::tokens"));
+        assert!(!is_admin_target("crosslaned::http"));
+        assert!(!is_admin_target("crosslaned::administration"));
+    }
+
+    #[test]
     fn full_log_queue_drops_without_blocking_the_caller() {
         let (sender, _receiver) = std::sync::mpsc::sync_channel(1);
         sender
@@ -758,17 +852,30 @@ mod tests {
             ..LogConfig::default()
         };
         let writer = ReconfigurableFileWriter::new(&config, first.clone()).expect("writer");
+        let admin_writer =
+            ReconfigurableFileWriter::new_admin(&config, &first).expect("admin writer");
         writer
             .write_at(Level::INFO, b"first\n", day)
             .expect("first write");
+        admin_writer
+            .write_at(Level::INFO, b"admin first\n", day)
+            .expect("first admin write");
         config.file_path = second.display().to_string();
         writer.reconfigure(&config).expect("reconfigure");
+        admin_writer
+            .reconfigure(&config)
+            .expect("reconfigure admin");
         writer
             .write_at(Level::INFO, b"second\n", day)
             .expect("second write");
+        admin_writer
+            .write_at(Level::INFO, b"admin second\n", day)
+            .expect("second admin write");
 
         assert!(dated_path(&first, &date, "info", 0).exists());
         assert!(dated_path(&second, &date, "info", 0).exists());
+        assert!(dated_path(&admin_log_path(&first), &date, "info", 0).exists());
+        assert!(dated_path(&admin_log_path(&second), &date, "info", 0).exists());
     }
 
     #[test]
