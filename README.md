@@ -31,6 +31,10 @@ extent permitted by applicable law, the maintainers are not liable for account
 restrictions, service interruption, or related losses arising from use of this
 project.
 
+## Architecture
+
+![Crosslane architecture diagram](docs/assets/crosslane-architecture.png)
+
 ## Quick start
 
 Run these commands from a checkout of this repository. Docker requires Docker

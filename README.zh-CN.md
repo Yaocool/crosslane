@@ -24,6 +24,10 @@ OpenAI Chat Completions、OpenAI Responses 和模型列表接口。使用 `cross
 持续具有访问权限。使用者须自行管理凭证并对上游服务的使用负责。在适用法律允许的范围内，
 维护者不对使用本项目引起的账号限制、服务中断或相关损失承担责任。
 
+## 架构
+
+![Crosslane 架构图](docs/assets/crosslane-architecture.zh-CN.png)
+
 ## 快速开始
 
 以下命令在仓库根目录执行。Linux 主机使用 Docker 时需要 Docker Engine 和 Compose：
