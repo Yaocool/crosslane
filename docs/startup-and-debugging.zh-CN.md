@@ -305,9 +305,19 @@ Kiro overage 默认关闭。
 crosslane logs show --tail 100
 crosslane logs follow --level warn
 crosslane logs trace TRACE_ID
+crosslane logs admin show --tail 100
+crosslane logs admin show --request-id admin_0123456789abcdef0123456789abcdef
+crosslane logs files --admin
 crosslane status --since 30m
 crosslane stats --detail --since 1h
 ```
+
+Admin 管理面事件写入独立的 `crosslaned-admin-日期-级别.log` 文件，Service 与其他 daemon
+事件保留在 `crosslaned-日期-级别.log` 文件。`[log].file_path` 自定义基础路径时，Admin
+文件在同一目录，以 `-admin` 后缀区分；两类文件都使用相同的日志级别、轮转和保留配置。
+`logs admin show` 直接查询 Admin 文件中的最近日志，`logs admin` 保留相同查询。
+两者都可按响应头 `x-request-id` 中的 `admin_...` 精确过滤；
+`logs files/path --admin` 显示它们的位置。历史版本已写入普通日志文件的 Admin 事件不会迁移。
 
 业务请求日志会记录客户端提供的 `user_agent`。可用响应头 `x-trace-id` 或 `request-id`
 查找请求日志。排查失败时同时看响应状态、错误码和 Trace。流式响应也可能在 HTTP 200 后失败，

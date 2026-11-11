@@ -427,6 +427,10 @@ Kiro 订阅写入受理返回 `202`，以对应接口契约为准。OpenAPI 文�
 响应带 `Cache-Control: no-store` 和 `x-request-id: admin_...`。
 审计日志事件为 `admin.http.request`，包含请求 ID、HTTP 方法、路由模板、权限角色、
 状态码与耗时；不记录 Bearer token、请求正文、查询字符串或原始账号路径参数。
+Admin 事件写入独立日志文件。运行 `crosslane logs admin show --tail 100` 查询最近的 Admin 日志；
+用 `crosslane logs admin show --request-id admin_...` 按响应头中的请求 ID 查询，
+`crosslane logs files --admin` 查看文件位置。
+HTTP 调用审计固定写入 `info` 级别文件，响应为 4xx/5xx 时也一样。
 
 ## 保存与排查 JSON 响应
 

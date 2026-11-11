@@ -362,9 +362,21 @@ already in progress can still affect final usage.
 crosslane logs show --tail 100
 crosslane logs follow --level warn
 crosslane logs trace TRACE_ID
+crosslane logs admin show --tail 100
+crosslane logs admin show --request-id admin_0123456789abcdef0123456789abcdef
+crosslane logs files --admin
 crosslane status --since 30m
 crosslane stats --detail --since 1h
 ```
+
+Admin events go to separate `crosslaned-admin-DATE-LEVEL.log` files; Service and
+other daemon events remain in `crosslaned-DATE-LEVEL.log`. A custom `[log].file_path`
+keeps both files in the same directory and adds `-admin` to the Admin base name.
+Both use the same level, rotation, and retention settings. `logs admin show`
+reads recent records from the Admin files; `logs admin` retains the same query. Both
+can filter by the response's `x-request-id` (`admin_...`);
+`logs files/path --admin` shows their locations. Admin events already written to
+ordinary files by older versions are not migrated.
 
 Business request logs include the client `user_agent` when supplied. Use the
 `x-trace-id` response header or `request-id` to find request logs. Check the

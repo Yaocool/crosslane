@@ -467,6 +467,10 @@ Bodies are limited to 2 MiB and authenticated concurrency to 16 requests; overfl
 `503`. Responses include `Cache-Control: no-store` and `x-request-id: admin_...`.
 The `admin.http.request` audit event records request ID, method, route template, role, status,
 and duration. It excludes Bearer tokens, bodies, query strings, and raw account path parameters.
+Admin events are written to separate log files. Run `crosslane logs admin show --tail 100`
+to query recent Admin logs, `crosslane logs admin show --request-id admin_...` to filter by
+the response header, or `crosslane logs files --admin` to locate the files.
+HTTP call audit records use the `info` file even for 4xx/5xx responses.
 
 ## Save and inspect JSON responses
 
