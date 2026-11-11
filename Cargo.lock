@@ -533,7 +533,7 @@ checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
 
 [[package]]
 name = "crosslane"
-version = "2.5.0"
+version = "2.5.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -559,7 +559,7 @@ dependencies = [
 
 [[package]]
 name = "crosslane-copilot"
-version = "2.5.0"
+version = "2.5.1"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -584,7 +584,7 @@ dependencies = [
 
 [[package]]
 name = "crosslane-core"
-version = "2.5.0"
+version = "2.5.1"
 dependencies = [
  "rand 0.8.5",
  "serde",
@@ -596,7 +596,7 @@ dependencies = [
 
 [[package]]
 name = "crosslane-ipc"
-version = "2.5.0"
+version = "2.5.1"
 dependencies = [
  "crosslane-core",
  "serde",
@@ -606,7 +606,7 @@ dependencies = [
 
 [[package]]
 name = "crosslane-kiro"
-version = "2.5.0"
+version = "2.5.1"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -647,7 +647,7 @@ dependencies = [
 
 [[package]]
 name = "crosslane-notify"
-version = "2.5.0"
+version = "2.5.1"
 dependencies = [
  "base64 0.22.1",
  "crosslane-core",
@@ -665,7 +665,7 @@ dependencies = [
 
 [[package]]
 name = "crosslane-pool"
-version = "2.5.0"
+version = "2.5.1"
 dependencies = [
  "crosslane-core",
  "crosslane-kiro",
@@ -685,7 +685,7 @@ dependencies = [
 
 [[package]]
 name = "crosslane-provider"
-version = "2.5.0"
+version = "2.5.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -700,7 +700,7 @@ dependencies = [
 
 [[package]]
 name = "crosslane-store"
-version = "2.5.0"
+version = "2.5.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -725,7 +725,7 @@ dependencies = [
 
 [[package]]
 name = "crosslane-translate"
-version = "2.5.0"
+version = "2.5.1"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
@@ -750,7 +750,7 @@ dependencies = [
 
 [[package]]
 name = "crosslaned"
-version = "2.5.0"
+version = "2.5.1"
 dependencies = [
  "anyhow",
  "async-stream",
