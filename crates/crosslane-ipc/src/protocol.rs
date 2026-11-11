@@ -161,6 +161,8 @@ pub mod method {
     pub const LOG_FILES: &str = "logs.files";
     /// Search physical daemon log files for one request trace.
     pub const LOG_TRACE: &str = "logs.trace";
+    /// Query physical administration log files.
+    pub const LOG_ADMIN: &str = "logs.admin";
     /// 动态模型列表。
     pub const MODELS: &str = "models";
     /// 解析客户端模型 ID 到账号实际模型。
@@ -277,6 +279,7 @@ pub mod method {
         LOGS,
         LOG_FILES,
         LOG_TRACE,
+        LOG_ADMIN,
         MODELS,
         MODEL_RESOLVE,
         APIKEY_LIST,
@@ -1034,7 +1037,7 @@ pub struct LogFilesResult {
     pub files: Vec<LogFileView>,
 }
 
-/// One physical log record associated with a trace ID.
+/// One physical daemon or Admin log record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogTraceEntry {
     /// Physical log file containing the record.
@@ -1054,6 +1057,23 @@ pub struct LogTraceEntry {
 pub struct LogTraceResult {
     /// Exact trace ID used for the search.
     pub trace_id: String,
+    /// Matching records ordered by timestamp.
+    pub entries: Vec<LogTraceEntry>,
+    /// Number of physical shards scanned.
+    pub files_scanned: usize,
+    /// Number of bytes read from physical shards.
+    pub bytes_scanned: u64,
+    /// Total matching records encountered before the tail limit.
+    pub matched_records: usize,
+    /// Whether safety or tail limits truncated the result.
+    pub truncated: bool,
+}
+
+/// `logs.admin` result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogAdminResult {
+    /// Optional exact Admin REST request ID used for the search.
+    pub request_id: Option<String>,
     /// Matching records ordered by timestamp.
     pub entries: Vec<LogTraceEntry>,
     /// Number of physical shards scanned.

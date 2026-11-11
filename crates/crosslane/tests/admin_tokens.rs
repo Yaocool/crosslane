@@ -149,6 +149,69 @@ async fn cli_lists_shows_and_changes_state_without_printing_secrets_or_hashes() 
     }
 }
 
+#[tokio::test]
+async fn cli_queries_admin_logs_and_their_separate_files() {
+    let request_id = "admin_0123456789abcdef0123456789abcdef";
+    let output = run(
+        &[
+            "--json",
+            "logs",
+            "admin",
+            "--request-id",
+            request_id,
+            "--level",
+            "info",
+            "--tail",
+            "25",
+        ],
+        method::LOG_ADMIN,
+        json!({"request_id":request_id,"level":"info","tail":25}),
+        json!({
+            "request_id":request_id,
+            "entries":[{"path":"/tmp/crosslaned-admin-2026-11-10-info.log","level":"info","date":"2026-11-10","line":1,
+                "record":{"timestamp":"2026-11-10T00:00:00Z","fields":{"event":"admin.http.request","request_id":request_id}}}],
+            "files_scanned":1,"bytes_scanned":128,"matched_records":1,"truncated":false
+        }),
+    )
+    .await;
+    let result: Value = serde_json::from_slice(&output.stdout).expect("JSON output");
+    assert_eq!(
+        result["entries"][0]["record"]["fields"]["request_id"],
+        request_id
+    );
+
+    let show = run(
+        &["--json", "logs", "admin", "show", "--tail", "25"],
+        method::LOG_ADMIN,
+        json!({"request_id":null,"level":null,"tail":25}),
+        json!({
+            "request_id":null,
+            "entries":[{"path":"/tmp/crosslaned-admin-2026-11-10-info.log","level":"info","date":"2026-11-10","line":1,
+                "record":{"timestamp":"2026-11-10T00:00:00Z","fields":{"event":"admin.token.changed"}}}],
+            "files_scanned":1,"bytes_scanned":128,"matched_records":1,"truncated":false
+        }),
+    )
+    .await;
+    let result: Value = serde_json::from_slice(&show.stdout).expect("JSON output");
+    assert_eq!(
+        result["entries"][0]["record"]["fields"]["event"],
+        "admin.token.changed"
+    );
+
+    let files = run(
+        &["--json", "logs", "files", "--admin"],
+        method::LOG_FILES,
+        json!({"admin":true}),
+        json!({
+            "base_path":"/tmp/crosslaned-admin.log","directory":"/tmp",
+            "format":"json","level_filter":"info","files":[]
+        }),
+    )
+    .await;
+    let result: Value = serde_json::from_slice(&files.stdout).expect("JSON output");
+    assert_eq!(result["base_path"], "/tmp/crosslaned-admin.log");
+}
+
 #[test]
 fn nested_token_help_is_local_and_rejects_provider_scope() {
     let home = tempfile::tempdir().unwrap();

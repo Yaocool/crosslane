@@ -2,6 +2,7 @@ use super::{
     anyhow, format_credits, format_timestamp, method, print_json, render_table, AdminClient,
     Context, LogFilesResult, LogTraceResult, Path, PathBuf, Paths, Result,
 };
+use crosslane_ipc::protocol::{LogAdminResult, LogTraceEntry};
 
 pub async fn show_stats(
     client: &mut AdminClient,
@@ -644,10 +645,11 @@ pub async fn show_log_files(
     client: &mut AdminClient,
     level: Option<&str>,
     paths_only: bool,
+    admin: bool,
     json: bool,
 ) -> Result<()> {
     let mut result: LogFilesResult = client
-        .call(method::LOG_FILES, serde_json::json!({}))
+        .call(method::LOG_FILES, serde_json::json!({ "admin": admin }))
         .await?;
     let host_data_dir = std::env::var_os(WRAPPER_HOST_DATA_DIR_ENV)
         .filter(|value| !value.is_empty())
@@ -751,11 +753,60 @@ pub async fn show_trace_logs(
     if result.truncated {
         println!("提示：结果受 --tail 或安全扫描上限限制，只显示最近的匹配记录。");
     }
+    print_log_entries(result.entries)
+}
+
+pub async fn show_admin_logs(
+    client: &mut AdminClient,
+    request_id: Option<&str>,
+    tail: usize,
+    level: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let result: LogAdminResult = client
+        .call(
+            method::LOG_ADMIN,
+            serde_json::json!({
+                "request_id": request_id,
+                "tail": tail,
+                "level": level,
+            }),
+        )
+        .await?;
+    if json {
+        return print_json(&result);
+    }
+
+    println!(
+        "admin{}  命中={}  显示={}  扫描={} 个文件 / {}",
+        result
+            .request_id
+            .as_deref()
+            .map(|id| format!(" request_id={id}"))
+            .unwrap_or_default(),
+        result.matched_records,
+        result.entries.len(),
+        result.files_scanned,
+        format_bytes(result.bytes_scanned),
+    );
+    if result.entries.is_empty() {
+        println!(
+            "未找到匹配的 Admin 日志；可用 `crosslane logs files --admin` 确认文件和保留范围。"
+        );
+        return Ok(());
+    }
+    if result.truncated {
+        println!("提示：结果受 --tail 或安全扫描上限限制，只显示最近的匹配记录。");
+    }
+    print_log_entries(result.entries)
+}
+
+fn print_log_entries(entries: Vec<LogTraceEntry>) -> Result<()> {
     let host_data_dir = std::env::var_os(WRAPPER_HOST_DATA_DIR_ENV)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from);
     let container_data_dir = Paths::from_env().data_dir;
-    for entry in result.entries {
+    for entry in entries {
         let timestamp = entry.record["timestamp"].as_str().unwrap_or(&entry.date);
         let level = entry
             .record

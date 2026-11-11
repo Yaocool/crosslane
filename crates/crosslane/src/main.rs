@@ -216,9 +216,9 @@ enum Command {
         #[arg(long)]
         provider: Option<String>,
     },
-    /// 查看 Kiro/Copilot 请求日志和全局日志文件。
+    /// 查看 Service 请求日志、Admin 日志和 daemon 日志文件。
     #[command(
-        after_help = "show/follow 可用 --provider 过滤 Kiro 或 Copilot 请求；trace/files/path 是全局日志操作。\n\n示例：\n  crosslane logs show --provider kiro --tail 100\n  crosslane logs follow --provider copilot --level error\n  crosslane logs files\n\n操作说明：crosslane guide logs"
+        after_help = "show/follow 可用 --provider 过滤 Service 请求；admin show 查询独立的 Admin 日志文件。\n\n示例：\n  crosslane logs show --provider kiro --tail 100\n  crosslane logs admin show --tail 100\n  crosslane logs admin show --request-id admin_0123456789abcdef0123456789abcdef\n  crosslane logs files --admin\n\n操作说明：crosslane guide logs"
     )]
     Logs {
         #[command(subcommand)]
@@ -566,6 +566,23 @@ enum LogsCommand {
         after_help = "示例：\n  crosslane logs follow --provider kiro\n  crosslane logs follow --provider copilot --level error"
     )]
     Follow(RequestLogArgs),
+    /// 查询独立的 Admin 日志文件，包括 HTTP 审计和管理面事件。
+    #[command(
+        after_help = "show 与不带 show 均查询独立的 Admin 日志文件。\n\n示例：\n  crosslane logs admin show --tail 100\n  crosslane logs admin show --request-id admin_0123456789abcdef0123456789abcdef\n  crosslane logs admin --level warn --tail 200"
+    )]
+    Admin {
+        #[command(subcommand)]
+        command: Option<AdminLogsCommand>,
+        /// 只显示指定 HTTP Admin 请求 ID 的日志。
+        #[arg(long, global = true)]
+        request_id: Option<String>,
+        /// 最多显示最近多少条记录（1～1000）。
+        #[arg(long, global = true, default_value_t = 100, value_parser = parse_log_tail)]
+        tail: usize,
+        /// 只查询一个精确级别的物理分片。
+        #[arg(long, global = true, value_enum)]
+        level: Option<LogFileLevel>,
+    },
     /// 按 trace ID 跨日期、跨级别查询完整请求链路。
     #[command(
         after_help = "默认查询 info/warn/error/debug/trace 的所有物理分片。\n\n示例：\n  crosslane logs trace trace_0123456789abcdef0123456789abcdef\n  crosslane logs trace trace_0123456789abcdef0123456789abcdef --level error --tail 500"
@@ -588,10 +605,28 @@ enum LogsCommand {
         /// 只列出指定级别的日志文件。
         #[arg(long, value_enum)]
         level: Option<LogFileLevel>,
+        /// 列出独立的 Admin 日志文件。
+        #[arg(long)]
+        admin: bool,
     },
     /// 显示日志目录、基础路径、格式和过滤级别。
-    #[command(after_help = "示例：\n  crosslane logs path\n  crosslane --json logs path")]
-    Path,
+    #[command(
+        after_help = "示例：\n  crosslane logs path\n  crosslane logs path --admin\n  crosslane --json logs path"
+    )]
+    Path {
+        /// 显示独立的 Admin 日志基础路径。
+        #[arg(long)]
+        admin: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AdminLogsCommand {
+    /// 显示独立 Admin 日志文件中的最近记录。
+    #[command(
+        after_help = "HTTP Admin API 审计事件写入 info 级别文件，包括 4xx/5xx 响应。\n\n示例：\n  crosslane logs admin show --request-id admin_0123456789abcdef0123456789abcdef"
+    )]
+    Show,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1394,6 +1429,21 @@ async fn main() -> Result<()> {
                 )
                 .await?;
             }
+            Some(LogsCommand::Admin {
+                request_id,
+                tail,
+                level,
+                ..
+            }) => {
+                crate::commands::runtime::show_admin_logs(
+                    &mut client,
+                    request_id.as_deref(),
+                    tail,
+                    level.map(LogFileLevel::as_str),
+                    cli.json,
+                )
+                .await?;
+            }
             Some(LogsCommand::Trace {
                 trace_id,
                 tail,
@@ -1408,17 +1458,19 @@ async fn main() -> Result<()> {
                 )
                 .await?;
             }
-            Some(LogsCommand::Files { level }) => {
+            Some(LogsCommand::Files { level, admin }) => {
                 crate::commands::runtime::show_log_files(
                     &mut client,
                     level.map(LogFileLevel::as_str),
                     false,
+                    admin,
                     cli.json,
                 )
                 .await?;
             }
-            Some(LogsCommand::Path) => {
-                crate::commands::runtime::show_log_files(&mut client, None, true, cli.json).await?;
+            Some(LogsCommand::Path { admin }) => {
+                crate::commands::runtime::show_log_files(&mut client, None, true, admin, cli.json)
+                    .await?;
             }
             None => unreachable!("empty logs group returned before runtime setup"),
         },
@@ -2662,7 +2714,8 @@ mod tests {
             files.command,
             Some(Command::Logs {
                 command: Some(LogsCommand::Files {
-                    level: Some(LogFileLevel::Error)
+                    level: Some(LogFileLevel::Error),
+                    admin: false,
                 }),
                 ..
             })
@@ -2689,6 +2742,67 @@ mod tests {
                 }),
                 ..
             }) if parsed == trace_id
+        ));
+
+        let admin_id = "admin_0123456789abcdef0123456789abcdef";
+        let admin = Cli::try_parse_from([
+            "crosslane",
+            "logs",
+            "admin",
+            "--request-id",
+            admin_id,
+            "--level",
+            "info",
+        ])
+        .expect("admin log command");
+        assert!(matches!(
+            admin.command,
+            Some(Command::Logs {
+                command: Some(LogsCommand::Admin {
+                    command: None,
+                    request_id: Some(parsed),
+                    tail: 100,
+                    level: Some(LogFileLevel::Info),
+                }),
+                ..
+            }) if parsed == admin_id
+        ));
+        let quick = Cli::try_parse_from(["crosslane", "logs", "admin", "show"])
+            .expect("quick HTTP Admin log command");
+        assert!(matches!(
+            quick.command,
+            Some(Command::Logs {
+                command: Some(LogsCommand::Admin {
+                    command: Some(AdminLogsCommand::Show),
+                    request_id: None,
+                    tail: 100,
+                    level: None,
+                }),
+                ..
+            })
+        ));
+        let show = Cli::try_parse_from([
+            "crosslane",
+            "logs",
+            "admin",
+            "show",
+            "--request-id",
+            admin_id,
+            "--tail",
+            "20",
+        ])
+        .expect("HTTP Admin log command");
+        assert!(matches!(
+            show.command,
+            Some(Command::Logs {
+                command: Some(LogsCommand::Admin {
+                    command: Some(AdminLogsCommand::Show),
+                    request_id: Some(parsed),
+                    tail: 20,
+                    level: None,
+                }),
+                ..
+            }) if parsed == admin_id
         ));
         assert!(Cli::try_parse_from(["crosslane", "logs", "--tail", "10"]).is_err());
         assert!(Cli::try_parse_from(["crosslane", "logs", "-f"]).is_err());

@@ -8,7 +8,6 @@ use super::discover_log_files;
 
 const MAX_TRACE_FILES: usize = 256;
 const MAX_TRACE_SCAN_BYTES: u64 = 512 * 1024 * 1024;
-const MAX_TRACE_MATCHES: usize = 10_000;
 
 #[derive(Debug)]
 pub(crate) struct TraceLogRecord {
@@ -34,6 +33,33 @@ pub(crate) fn scan_trace_logs(
     level: Option<&str>,
     tail: usize,
 ) -> io::Result<TraceLogScan> {
+    scan_log_records(base_path, level, tail, |parsed, line| {
+        parsed.is_some_and(|record| json_has_id(record, "trace_id", trace_id))
+            || parsed.is_none() && line.contains(trace_id)
+    })
+}
+
+pub(crate) fn scan_admin_logs(
+    base_path: &Path,
+    request_id: Option<&str>,
+    level: Option<&str>,
+    tail: usize,
+) -> io::Result<TraceLogScan> {
+    scan_log_records(base_path, level, tail, |parsed, line| {
+        request_id.is_none_or(|request_id| {
+            parsed.is_some_and(|record| json_has_id(record, "request_id", request_id))
+                || parsed.is_none() && line.contains(request_id)
+        })
+    })
+}
+
+fn scan_log_records(
+    base_path: &Path,
+    level: Option<&str>,
+    tail: usize,
+    matches_record: impl Fn(Option<&Value>, &str) -> bool,
+) -> io::Result<TraceLogScan> {
+    let tail = tail.clamp(1, 1_000);
     let mut entries = Vec::new();
     let mut files_scanned = 0usize;
     let mut bytes_scanned = 0u64;
@@ -71,18 +97,10 @@ pub(crate) fn scan_trace_logs(
             line_number = line_number.saturating_add(1);
             let line = buffer.trim_end_matches(['\r', '\n']);
             let parsed = serde_json::from_str::<Value>(line).ok();
-            let matches = parsed
-                .as_ref()
-                .is_some_and(|record| json_has_trace_id(record, trace_id))
-                || parsed.is_none() && line.contains(trace_id);
-            if !matches {
+            if !matches_record(parsed.as_ref(), line) {
                 continue;
             }
             matched_records = matched_records.saturating_add(1);
-            if entries.len() >= MAX_TRACE_MATCHES {
-                truncated = true;
-                break;
-            }
             entries.push(TraceLogRecord {
                 path: file.path.clone(),
                 level: file.level.clone(),
@@ -90,9 +108,10 @@ pub(crate) fn scan_trace_logs(
                 line: line_number,
                 record: parsed.unwrap_or_else(|| Value::String(line.to_owned())),
             });
-        }
-        if entries.len() >= MAX_TRACE_MATCHES {
-            break;
+            if entries.len() >= tail * 2 {
+                sort_records(&mut entries);
+                entries.drain(..tail);
+            }
         }
         if bytes_scanned >= MAX_TRACE_SCAN_BYTES && file.size_bytes > remaining {
             truncated = true;
@@ -100,19 +119,12 @@ pub(crate) fn scan_trace_logs(
         }
     }
 
-    entries.sort_by(|left, right| {
-        record_timestamp(&left.record)
-            .unwrap_or(&left.date)
-            .cmp(record_timestamp(&right.record).unwrap_or(&right.date))
-            .then_with(|| left.path.cmp(&right.path))
-            .then_with(|| left.line.cmp(&right.line))
-    });
-    let tail = tail.clamp(1, 1_000);
+    sort_records(&mut entries);
     if entries.len() > tail {
         let remove = entries.len() - tail;
         entries.drain(..remove);
-        truncated = true;
     }
+    truncated |= matched_records > tail;
 
     Ok(TraceLogScan {
         entries,
@@ -123,15 +135,22 @@ pub(crate) fn scan_trace_logs(
     })
 }
 
-fn json_has_trace_id(value: &Value, trace_id: &str) -> bool {
+fn sort_records(entries: &mut [TraceLogRecord]) {
+    entries.sort_by(|left, right| {
+        record_timestamp(&left.record)
+            .unwrap_or(&left.date)
+            .cmp(record_timestamp(&right.record).unwrap_or(&right.date))
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.line.cmp(&right.line))
+    });
+}
+
+fn json_has_id(value: &Value, key_name: &str, id: &str) -> bool {
     match value {
         Value::Object(object) => object.iter().any(|(key, value)| {
-            key == "trace_id" && value.as_str() == Some(trace_id)
-                || json_has_trace_id(value, trace_id)
+            key == key_name && value.as_str() == Some(id) || json_has_id(value, key_name, id)
         }),
-        Value::Array(values) => values
-            .iter()
-            .any(|value| json_has_trace_id(value, trace_id)),
+        Value::Array(values) => values.iter().any(|value| json_has_id(value, key_name, id)),
         _ => false,
     }
 }
@@ -204,6 +223,31 @@ mod tests {
         assert_eq!(scan.entries.len(), 2);
         assert_eq!(scan.entries[0].record["fields"]["message"], "event 1");
         assert_eq!(scan.entries[1].record["fields"]["message"], "event 2");
+        assert!(scan.truncated);
+    }
+
+    #[test]
+    fn admin_scan_keeps_the_latest_records_in_a_busy_shard() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let base = directory.path().join("crosslaned-admin.log");
+        let info = directory
+            .path()
+            .join("crosslaned-admin-2026-08-31-info.log");
+        let records = (0..10_050)
+            .map(|index| {
+                format!(
+                    "{{\"timestamp\":\"{index:05}\",\"fields\":{{\"event\":\"admin.http.request\"}}}}"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(info, format!("{records}\n")).expect("Admin logs");
+
+        let scan = scan_admin_logs(&base, None, Some("info"), 3).expect("scan Admin logs");
+        assert_eq!(scan.matched_records, 10_050);
+        assert_eq!(scan.entries.len(), 3);
+        assert_eq!(scan.entries[0].record["timestamp"], "10047");
+        assert_eq!(scan.entries[2].record["timestamp"], "10049");
         assert!(scan.truncated);
     }
 }

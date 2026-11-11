@@ -605,6 +605,15 @@ async fn log_files_reports_resolved_paths_and_physical_partitions() {
     assert!(result.files.iter().any(|file| {
         file.path == error.display().to_string() && file.level == "error" && file.size_bytes == 8
     }));
+    let legacy: LogFilesResult = serde_json::from_value(expect_ok(
+        dispatch(
+            &state,
+            Request::new(3, method::LOG_FILES, serde_json::Value::Null),
+        )
+        .await,
+    ))
+    .expect("legacy log files result");
+    assert_eq!(legacy.base_path, result.base_path);
 
     let paths: ConfigPathResult = serde_json::from_value(expect_ok(
         dispatch(
@@ -659,6 +668,94 @@ async fn trace_logs_searches_across_exact_severity_partitions() {
     assert_eq!(result.entries[0].level, "info");
     assert_eq!(result.entries[1].level, "error");
     assert!(!result.truncated);
+}
+
+#[tokio::test]
+async fn admin_logs_query_only_admin_files_and_filter_request_id() {
+    let (_directory, state) = state_with(vec![]).await;
+    let log_directory = state.paths.data_dir.join("logs");
+    std::fs::create_dir_all(&log_directory).expect("log directory");
+    let requested = "admin_0123456789abcdef0123456789abcdef";
+    let other = "admin_abcdef0123456789abcdef0123456789";
+    let info = log_directory.join("crosslaned-admin-2026-08-23-info.log");
+    let warn = log_directory.join("crosslaned-admin-2026-08-23-warn.log");
+    let general = log_directory.join("crosslaned-2026-08-23-info.log");
+    std::fs::write(
+        &info,
+        format!(
+            "{}\n{}\n",
+            serde_json::json!({"timestamp":"2026-08-23T01:00:00Z","fields":{"event":"admin.http.request","request_id":requested}}),
+            serde_json::json!({"timestamp":"2026-08-23T01:00:01Z","fields":{"event":"admin.http.request","request_id":other}})
+        ),
+    )
+    .expect("admin info log");
+    std::fs::write(
+        &warn,
+        format!("{}\n", serde_json::json!({"timestamp":"2026-08-23T01:00:02Z","fields":{"message":"admin warning"}})),
+    )
+    .expect("admin warn log");
+    std::fs::write(&general, b"service event\n").expect("general log");
+
+    let files: LogFilesResult = serde_json::from_value(expect_ok(
+        dispatch(
+            &state,
+            Request::new(1, method::LOG_FILES, serde_json::json!({"admin":true})),
+        )
+        .await,
+    ))
+    .expect("admin files");
+    assert_eq!(
+        files.base_path,
+        log_directory
+            .join("crosslaned-admin.log")
+            .display()
+            .to_string()
+    );
+    assert_eq!(files.files.len(), 2);
+    assert!(files
+        .files
+        .iter()
+        .all(|file| file.path != general.display().to_string()));
+
+    let logs: LogAdminResult = serde_json::from_value(expect_ok(
+        dispatch(
+            &state,
+            Request::new(2, method::LOG_ADMIN, serde_json::json!({"tail":10})),
+        )
+        .await,
+    ))
+    .expect("Admin logs");
+    assert_eq!(logs.matched_records, 3);
+    assert_eq!(logs.files_scanned, 2);
+
+    let filtered: LogAdminResult = serde_json::from_value(expect_ok(
+        dispatch(
+            &state,
+            Request::new(
+                3,
+                method::LOG_ADMIN,
+                serde_json::json!({"request_id":requested,"level":"info"}),
+            ),
+        )
+        .await,
+    ))
+    .expect("filtered Admin logs");
+    assert_eq!(filtered.request_id.as_deref(), Some(requested));
+    assert_eq!(filtered.files_scanned, 1);
+    assert_eq!(filtered.matched_records, 1);
+    assert_eq!(
+        filtered.entries[0].record["fields"]["request_id"],
+        requested
+    );
+
+    assert!(matches!(
+        dispatch(
+            &state,
+            Request::new(4, method::LOG_ADMIN, serde_json::json!({"request_id":"trace_bad"})),
+        )
+        .await,
+        Response::Err { error, .. } if error.code == 400
+    ));
 }
 
 #[tokio::test]

@@ -2,7 +2,7 @@
 
 mod trace_log;
 
-pub(crate) use trace_log::scan_trace_logs;
+pub(crate) use trace_log::{scan_admin_logs, scan_trace_logs};
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};

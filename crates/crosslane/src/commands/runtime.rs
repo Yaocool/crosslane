@@ -1040,7 +1040,8 @@ use observability::{
     host_log_path, log_account, log_model_route, populate_host_log_paths, LogModelRoute,
 };
 pub use observability::{
-    parse_duration, parse_timestamp, show_log_files, show_logs, show_stats, show_trace_logs,
+    parse_duration, parse_timestamp, show_admin_logs, show_log_files, show_logs, show_stats,
+    show_trace_logs,
 };
 
 mod alert;

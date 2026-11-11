@@ -15,8 +15,8 @@ use crosslane_ipc::protocol::{
     AccountListParams, AccountListResult, AccountRefParams, AccountServiceBinding,
     AccountServicesResult, AccountSetEnabledParams, AccountSummary, AccountTagBatchParams,
     AccountTagBatchResult, AccountTagParams, AccountTagResult, ConfigPathResult,
-    ConfigReloadResult, ConfigShowResult, CreatedApiKey, LogFileView, LogFilesResult,
-    LogTraceEntry, LogTraceResult, ModelResolutionAccount, ModelResolutionResult,
+    ConfigReloadResult, ConfigShowResult, CreatedApiKey, LogAdminResult, LogFileView,
+    LogFilesResult, LogTraceEntry, LogTraceResult, ModelResolutionAccount, ModelResolutionResult,
     ProviderAccountListResult, ProviderStatusView, ProxyServiceAccountChangeParams,
     ProxyServiceAccountsParams, ProxyServiceAccountsResult, ProxyServiceApiKeyView,
     ProxyServiceApiKeysParams, ProxyServiceApiKeysResult, ProxyServiceCreateParams,
@@ -129,8 +129,9 @@ pub async fn dispatch(state: &Arc<AppState>, request: Request) -> Response {
         method::TASK_RUN => handle_task_run(state, request.params).await,
         method::STATS => handle_stats(state, request.params).await,
         method::LOGS => handle_logs(state, request.params).await,
-        method::LOG_FILES => handle_log_files(state).await,
+        method::LOG_FILES => handle_log_files(state, request.params).await,
         method::LOG_TRACE => handle_log_trace(state, request.params).await,
+        method::LOG_ADMIN => handle_log_admin(state, request.params).await,
         method::MODELS => handle_models(state).await,
         method::MODEL_RESOLVE => handle_model_resolve(state, request.params).await,
         method::APIKEY_LIST => handle_apikey_list(state, request.params).await,
@@ -187,9 +188,24 @@ async fn handle_logs(state: &Arc<AppState>, params: serde_json::Value) -> Handle
     to_value(serde_json::json!({"entries":entries}))
 }
 
-async fn handle_log_files(state: &Arc<AppState>) -> Handled {
+async fn handle_log_files(state: &Arc<AppState>, params: serde_json::Value) -> Handled {
+    #[derive(serde::Deserialize, Default)]
+    struct Params {
+        #[serde(default)]
+        admin: bool,
+    }
+    let params: Params = if params.is_null() {
+        Params::default()
+    } else {
+        parse_params(params)?
+    };
     let config = state.config.current();
     let base_path = resolved_log_base_path(state, &config.log);
+    let base_path = if params.admin {
+        crate::logging::admin_log_path(&base_path)
+    } else {
+        base_path
+    };
     let scan_path = base_path.clone();
     let files = tokio::task::spawn_blocking(move || crate::logging::discover_log_files(&scan_path))
         .await
@@ -216,6 +232,62 @@ async fn handle_log_files(state: &Arc<AppState>) -> Handled {
         format: config.log.format.clone(),
         level_filter: config.log.level.clone(),
         files,
+    })
+}
+
+async fn handle_log_admin(state: &Arc<AppState>, params: serde_json::Value) -> Handled {
+    #[derive(serde::Deserialize)]
+    struct Params {
+        request_id: Option<String>,
+        #[serde(default = "default_tail")]
+        tail: usize,
+        level: Option<String>,
+    }
+    fn default_tail() -> usize {
+        100
+    }
+
+    let params: Params = parse_params(params)?;
+    if let Some(request_id) = params.request_id.as_deref() {
+        validate_log_id(request_id, "admin_", "request_id")?;
+    }
+    let level = params
+        .level
+        .as_deref()
+        .map(normalize_log_level)
+        .transpose()?;
+    let config = state.config.current();
+    let base_path = crate::logging::admin_log_path(&resolved_log_base_path(state, &config.log));
+    let request_id = params.request_id;
+    let scan_request_id = request_id.clone();
+    let scan = tokio::task::spawn_blocking(move || {
+        crate::logging::scan_admin_logs(
+            &base_path,
+            scan_request_id.as_deref(),
+            level.as_deref(),
+            params.tail,
+        )
+    })
+    .await
+    .map_err(|error| RpcError::internal(format!("admin log scan failed: {error}")))?
+    .map_err(|error| RpcError::internal(format!("admin log scan failed: {error}")))?;
+    to_value(LogAdminResult {
+        request_id,
+        entries: scan
+            .entries
+            .into_iter()
+            .map(|entry| LogTraceEntry {
+                path: entry.path.display().to_string(),
+                level: entry.level,
+                date: entry.date,
+                line: entry.line,
+                record: entry.record,
+            })
+            .collect(),
+        files_scanned: scan.files_scanned,
+        bytes_scanned: scan.bytes_scanned,
+        matched_records: scan.matched_records,
+        truncated: scan.truncated,
     })
 }
 
@@ -269,17 +341,21 @@ async fn handle_log_trace(state: &Arc<AppState>, params: serde_json::Value) -> H
 }
 
 fn validate_trace_id(trace_id: &str) -> Result<(), RpcError> {
-    let suffix = trace_id
-        .strip_prefix("trace_")
-        .ok_or_else(|| RpcError::bad_params("trace_id must start with trace_"))?;
+    validate_log_id(trace_id, "trace_", "trace_id")
+}
+
+fn validate_log_id(id: &str, prefix: &str, parameter: &str) -> Result<(), RpcError> {
+    let suffix = id
+        .strip_prefix(prefix)
+        .ok_or_else(|| RpcError::bad_params(format!("{parameter} must start with {prefix}")))?;
     if suffix.len() != 32
         || !suffix
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
-        return Err(RpcError::bad_params(
-            "trace_id must be trace_ followed by 32 lowercase hexadecimal characters",
-        ));
+        return Err(RpcError::bad_params(format!(
+            "{parameter} must be {prefix} followed by 32 lowercase hexadecimal characters"
+        )));
     }
     Ok(())
 }

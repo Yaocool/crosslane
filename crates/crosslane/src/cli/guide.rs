@@ -286,7 +286,7 @@ Copilot API 地址优先使用账号 token 返回的 endpoint；仅当缺失且�
             "`crosslane stats` 默认聚合 Kiro/Copilot 的持久化请求统计；`--provider <ID>` 限定来源，`--detail --by provider` 比较来源分组。可用 `--since 1h` 或带时区的 `--start/--end` 查询时间段；`--by model|account|apikey|endpoint` 查看其他维度。"
         }
         "logs" => {
-            "`crosslane logs show/follow --provider <ID>` 查看对应来源的结构化请求日志；省略来源时显示全部，并可配合 --account、--level 和 --tail。`logs trace <TRACE_ID>` 按 trace ID 跨全部来源和日志分片查询，不提供来源参数；`logs files/path` 管理全局日志文件和路径。"
+            "`crosslane logs show/follow --provider <ID>` 查看 Service 结构化请求日志；省略来源时显示全部，并可配合 --account、--level 和 --tail。`logs trace <TRACE_ID>` 按 Service trace ID 查询。`logs admin show [--request-id admin_...] [--tail 100]` 查询独立 Admin 文件中的最近日志；`logs admin` 保留相同查询。`logs files/path --admin` 查看 Admin 物理文件及路径。普通 `logs files/path` 显示 daemon/Service 日志文件。"
         }
         "alert" => {
             "`crosslane alert events` 当前列出的额度保护、额度耗尽、服务额度耗尽和 token 刷新失败事件来自 Kiro 账号池；不能作为 Copilot Enterprise 席位、授权或额度监控。`alert platforms/config` 和 `add/edit/delete/list/test/logs` 管理这些事件的通知目标；通知平台本身是共享机制，但当前没有 Copilot 专项告警事件。通知目标通过名称定位，不接受 --provider；CROSSLANE_PROVIDER 不影响告警操作。"
