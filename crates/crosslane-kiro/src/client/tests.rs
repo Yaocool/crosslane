@@ -141,7 +141,10 @@ fn payload() -> KiroPayload {
 
 fn test_client(server: &MockServer) -> KiroClient {
     KiroClient::new(
-        UpstreamConfig::default(),
+        UpstreamConfig {
+            preferred_endpoint: None,
+            ..UpstreamConfig::default()
+        },
         EndpointOverrides {
             amazonq_url: Some(format!("{}/amazon/generateAssistantResponse", server.uri())),
             codewhisperer_url: Some(format!(

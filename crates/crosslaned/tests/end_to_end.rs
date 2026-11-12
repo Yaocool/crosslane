@@ -178,6 +178,16 @@ impl Daemon {
     async fn start_http_with_log_level(port: u16, upstream_url: &str, log_level: &str) -> Self {
         let home = tempfile::tempdir().expect("tempdir");
         let socket = home.path().join("admin.sock");
+        // The shared mock serves the legacy model catalog and generation protocol.
+        let mut config = Config::default();
+        config.admin.socket = socket.display().to_string();
+        config.upstream.preferred_endpoint = None;
+        tokio::fs::write(
+            home.path().join("config.toml"),
+            toml::to_string_pretty(&config).expect("serialize fixture config"),
+        )
+        .await
+        .expect("write fixture config");
         let child = Command::new(env!("CARGO_BIN_EXE_crosslaned"))
             .env("CROSSLANE_HOME", home.path())
             .env("CROSSLANE_CODEWHISPERER_URL", upstream_url)

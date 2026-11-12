@@ -2,7 +2,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::{Deserialize, Serialize};
+use serde::de::IntoDeserializer;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 use crate::account::Account;
@@ -56,7 +57,7 @@ pub enum Endpoint {
     Codewhisperer,
     /// Amazon Q。
     Amazonq,
-    /// Regional Kiro CLI runtime.
+    /// Regional Kiro runtime.
     Runtime,
 }
 
@@ -249,7 +250,11 @@ impl Default for UpstreamPoolConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UpstreamConfig {
-    /// 首选上游端点；空值按账号类型推断。
+    /// 首选上游端点，默认 Runtime。显式 `auto` 按账号类型和端点缓存选择。
+    #[serde(
+        serialize_with = "serialize_preferred_endpoint",
+        deserialize_with = "deserialize_preferred_endpoint"
+    )]
     pub preferred_endpoint: Option<Endpoint>,
     /// Kiro agent mode。
     pub agent_mode: AgentMode,
@@ -273,7 +278,7 @@ pub struct UpstreamConfig {
 impl Default for UpstreamConfig {
     fn default() -> Self {
         Self {
-            preferred_endpoint: None,
+            preferred_endpoint: Some(Endpoint::Runtime),
             agent_mode: AgentMode::Vibe,
             max_retries: 3,
             token_refresh_before_expiry: 900,
@@ -283,6 +288,29 @@ impl Default for UpstreamConfig {
             stream_slot_wait_timeout_ms: 30_000,
             stream_read_timeout_ms: 600_000,
         }
+    }
+}
+
+fn serialize_preferred_endpoint<S>(
+    endpoint: &Option<Endpoint>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match endpoint {
+        Some(endpoint) => endpoint.serialize(serializer),
+        None => serializer.serialize_str("auto"),
+    }
+}
+
+fn deserialize_preferred_endpoint<'de, D>(deserializer: D) -> Result<Option<Endpoint>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Option::<String>::deserialize(deserializer)?.as_deref() {
+        None | Some("auto") => Ok(None),
+        Some(endpoint) => Endpoint::deserialize(endpoint.into_deserializer()).map(Some),
     }
 }
 
@@ -2451,10 +2479,10 @@ overload_error_rate = 0.05
 # Kiro 上游请求与连接池
 # ----------------------------------------------------------------------------
 [upstream]
-# 强制首选 Kiro 上游端点；可选值："codewhisperer"、"amazonq"、"runtime"。
-# 不配置时按账号类型和已探测结果自动选择；API key / GovCloud 使用区域化 runtime。
-# preferred_endpoint = "amazonq"
-# Kiro agent mode；可选值："auto"、"vibe"、"spec"。
+# 默认优先使用 "runtime"。可设为 "auto" 按账号类型和端点缓存选择，
+# 也可指定 "amazonq" 或 "codewhisperer"。API key / GovCloud 使用区域化 Runtime。
+preferred_endpoint = "runtime"
+# Kiro 上游任务模式，默认 "vibe"。可选 "auto" 按协议选择，或 "spec" 发送规范任务标识。
 agent_mode = "vibe"
 # 一次请求失败后允许的重试次数；实际总尝试次数还受可用账号数限制。
 max_retries = 3

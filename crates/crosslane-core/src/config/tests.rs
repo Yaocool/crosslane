@@ -57,6 +57,7 @@ fn defaults_match_the_spec() {
     assert!(config.features.enable_tool_search);
     assert_eq!(config.features.web_search_max_rounds, 20);
 
+    assert_eq!(config.upstream.preferred_endpoint, Some(Endpoint::Runtime));
     assert_eq!(config.upstream.pool.stream_pipelining, 1);
     assert_eq!(config.upstream.pool.http_pipelining, 5);
     assert_eq!(config.upstream.pool.stream_max_connections, 256);
@@ -322,6 +323,30 @@ fn default_toml_parses_into_default_config() {
         parsed.upstream.pool.stream_pipelining,
         expected.upstream.pool.stream_pipelining
     );
+}
+
+#[test]
+fn endpoint_preference_defaults_to_runtime_and_preserves_explicit_choices() {
+    let existing: Config =
+        toml::from_str("[upstream]\nagent_mode = \"spec\"\n").expect("existing configuration");
+    assert_eq!(
+        existing.upstream.preferred_endpoint,
+        Some(Endpoint::Runtime)
+    );
+
+    for (value, expected) in [
+        ("auto", None),
+        ("runtime", Some(Endpoint::Runtime)),
+        ("amazonq", Some(Endpoint::Amazonq)),
+        ("codewhisperer", Some(Endpoint::Codewhisperer)),
+    ] {
+        let config: UpstreamConfig = toml::from_str(&format!("preferred_endpoint = \"{value}\""))
+            .expect("explicit endpoint preference");
+        assert_eq!(config.preferred_endpoint, expected);
+        let saved = toml::to_string(&config).expect("serialize preference");
+        let loaded: UpstreamConfig = toml::from_str(&saved).expect("reload preference");
+        assert_eq!(loaded.preferred_endpoint, expected);
+    }
 }
 
 #[test]

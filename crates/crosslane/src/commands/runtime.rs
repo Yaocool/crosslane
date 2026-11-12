@@ -2725,34 +2725,35 @@ fn render_config_module_editor(
         }
         body = document.to_string();
     }
-    if module.key == "features" {
-        let mut document = body.parse::<DocumentMut>().context("配置模块 TOML 无效")?;
-        let features = document[module.key]
-            .as_table_like_mut()
-            .ok_or_else(|| anyhow!("配置模块 features 必须是 TOML table"))?;
-        for setting in [
+    let settings: &[&str] = match module.key {
+        "features" => &[
             "enable_request_redaction",
             "enable_request_redaction_notice",
             "request_redaction_notice_text",
-        ] {
-            if features.get(setting).is_some() {
-                continue;
-            }
-            // Make new redaction settings discoverable in legacy configs.
-            // Clone its default item so the same explanation appears here and
-            // in fresh installations without rewriting unrelated settings.
-            let defaults = crosslane_core::config::DEFAULT_CONFIG_TOML
-                .parse::<DocumentMut>()
-                .context("默认配置 TOML 无效")?;
-            let defaults = defaults["features"]
-                .as_table()
-                .ok_or_else(|| anyhow!("默认 features 配置必须是 TOML table"))?;
+        ],
+        "upstream" => &["preferred_endpoint"],
+        _ => &[],
+    };
+    if !settings.is_empty() {
+        let mut document = body.parse::<DocumentMut>().context("配置模块 TOML 无效")?;
+        let item = &mut document[module.key];
+        if let Some(inline) = item.as_inline_table() {
+            *item = toml_edit::Item::Table(inline.clone().into_table());
+        }
+        let table = item
+            .as_table_like_mut()
+            .ok_or_else(|| anyhow!("配置模块 {} 必须是 TOML table", module.key))?;
+        let defaults = crosslane_core::config::DEFAULT_CONFIG_TOML
+            .parse::<DocumentMut>()
+            .context("默认配置 TOML 无效")?;
+        let defaults = defaults[module.key]
+            .as_table()
+            .ok_or_else(|| anyhow!("默认 {} 配置必须是 TOML table", module.key))?;
+        for &setting in settings {
             let key = defaults
                 .key(setting)
-                .ok_or_else(|| anyhow!("默认配置缺少请求脱敏开关"))?;
-            features
-                .entry_format(key)
-                .or_insert(defaults[setting].clone());
+                .ok_or_else(|| anyhow!("默认配置缺少 {}.{setting}", module.key))?;
+            table.entry_format(key).or_insert(defaults[setting].clone());
         }
         body = document.to_string();
     }

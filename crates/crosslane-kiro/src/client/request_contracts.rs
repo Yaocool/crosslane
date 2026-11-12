@@ -57,16 +57,16 @@ async fn oauth_runtime_uses_agent_rpc_without_mutating_cli_or_source_payloads() 
             .mount(&server)
             .await;
         let mut client = test_client(&server);
-        client.upstream.agent_mode = AgentMode::Spec;
+        client.upstream = UpstreamConfig {
+            agent_mode: AgentMode::Spec,
+            ..UpstreamConfig::default()
+        };
         let mut account = account(auth);
         account.profile_arn = Some(PROFILE.into());
         let mut payload = payload();
         payload.conversation_state.agent_continuation_id = Some("same-human-turn".into());
         let before = serde_json::to_value(&payload).unwrap();
-        client
-            .generate(&account, &payload, Some(EndpointKey::Runtime))
-            .await
-            .unwrap();
+        client.generate(&account, &payload, None).await.unwrap();
         assert_eq!(serde_json::to_value(&payload).unwrap(), before);
     }
 }

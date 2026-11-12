@@ -802,6 +802,21 @@ fn sso_editor_exposes_the_timeout_in_legacy_configs() {
 }
 
 #[test]
+fn upstream_editor_exposes_endpoint_preference_in_legacy_configs() {
+    let original = "[upstream]\nmax_retries = 2\n\n[upstream.pool]\nhttp_max_connections = 10\n";
+    let module = resolve_config_module("upstream").unwrap();
+    let editor = render_config_module_editor(original, module).unwrap();
+    assert!(editor.contains("preferred_endpoint = \"runtime\""));
+    let edited = editor.replace(
+        "preferred_endpoint = \"runtime\"",
+        "preferred_endpoint = \"auto\"",
+    );
+    let merged = merge_edited_config_module(original, module, &edited).unwrap();
+    let config: crosslane_core::config::Config = toml::from_str(&merged).unwrap();
+    assert_eq!(config.upstream.preferred_endpoint, None);
+}
+
+#[test]
 fn features_editor_exposes_request_redaction_in_legacy_configs() {
     let original = "# server settings\n[server]\nport = 6200\n\n[features]\n# keep web tools\nenable_web_tools = false\n";
     let features = resolve_config_module("features").expect("features module");

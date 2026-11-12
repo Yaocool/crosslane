@@ -181,21 +181,25 @@ OAuth Runtime 生成、ControlPlane 模型目录和 extension 管理 REST 使用
 
 默认网页搜索使用 Runtime 根路径的原生 `KiroRuntimeService.InvokeMCP`。需要使用该协议时，
 两个显式搜索 URL 都应留空；在其中填写根 URL 仍会选择旧协议。缺失 Profile 的成功发现
-结果按账号、token、区域隔离缓存 15 分钟，最多 500 项，失败不缓存。显式选择原生 OAuth
-生成可配置：
+结果按账号、token、区域隔离缓存 15 分钟，最多 500 项，失败不缓存。
+生成请求默认优先使用 Runtime，省略 `preferred_endpoint` 也会使用以下设置：
 
 ```toml
 [upstream]
 preferred_endpoint = "runtime"
 ```
 
+设为 `"auto"` 可按账号类型和端点缓存选择，也可显式首选 `"amazonq"` 或 `"codewhisperer"`。
+`agent_mode` 独立设置发往 Kiro 的任务模式，默认 `"vibe"`。该字段设为 `"auto"` 时，
+Runtime 使用 `vibe`，旧 AmazonQ 和 CodeWhisperer 请求头使用 `spec`。
+
 以上覆盖项用于代理账号请求，不改变 [Kiro 企业订阅管理](kiro-enterprise-admin.zh-CN.md)
 按已验证 AWS 区域生成的管理端点。
 
 ### 拒绝与空回复
 
-启用 `crs` 且自动选择端点时，符合条件的 Claude 5 OAuth 工具请求可使用原生 Runtime
-取得终止元数据；显式端点、API key 认证及其他请求仍遵循各自策略。Kiro 的
+原生 Runtime 可提供 Claude 5 OAuth 工具请求的终止元数据。启用 `crs` 并配置
+`preferred_endpoint = "auto"` 时，符合条件的请求也可直接使用原生 Runtime。Kiro 的
 `CONTENT_FILTERED` 元数据转换为 Messages 的 `stop_reason: "refusal"` 和
 `stop_details`，上游报告时包含 `reasoning_extraction`。尚未提交的工具调用会取消，
 已经收到的用量继续结算。Claude 5 工具调用会等待终止确认，即使设置了

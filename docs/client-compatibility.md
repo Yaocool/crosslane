@@ -232,21 +232,27 @@ Default web search uses native `KiroRuntimeService.InvokeMCP` at the Runtime roo
 Leave both explicit search URL overrides unset to select it; setting a root URL
 there still selects the legacy protocol. Successful missing-Profile discovery is
 cached per account/token/region for 15 minutes, up to 500 entries; failures are not cached.
-To explicitly select native OAuth generation, use:
+Generation prefers Runtime by default, including when `preferred_endpoint` is omitted:
 
 ```toml
 [upstream]
 preferred_endpoint = "runtime"
 ```
 
+Set `"auto"` to select by account type and cached endpoint results, or set
+`"amazonq"` or `"codewhisperer"` to prefer a legacy endpoint.
+`agent_mode` controls the task mode sent to Kiro and defaults to `"vibe"`.
+Its `"auto"` setting uses `vibe` on Runtime and sends `spec` in the header for
+legacy AmazonQ and CodeWhisperer requests.
+
 These overrides apply to proxy-account traffic. They do not change the fixed,
 validated AWS endpoints used by [Kiro Enterprise administration](kiro-enterprise-admin.md).
 
 ### Refusals and empty output
 
-In `crs` builds, eligible Claude 5 OAuth tool requests can select native Runtime
-under automatic endpoint policy so terminal metadata is available. Explicit endpoint
-choices, API-key authentication, and unrelated requests retain their own policy.
+Native Runtime provides terminal metadata for Claude 5 OAuth tool requests. In
+`crs` builds with `preferred_endpoint = "auto"`, eligible requests can also select
+native Runtime directly.
 Kiro `CONTENT_FILTERED` metadata becomes native Messages `stop_reason: "refusal"`
 and `stop_details`, including `reasoning_extraction` when reported. Uncommitted tool
 calls are cancelled; received usage still settles. Claude 5 tool calls wait for
