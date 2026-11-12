@@ -53,7 +53,8 @@ crosslane ready
 
 ## 命令导航与归属
 
-`-h`、`--help` 和 `help` 都显示完整参数及示例，帮助不需要运行 daemon：
+`-h`、`--help` 和 `help` 显示命令参数及示例。查看帮助无需启动 daemon，
+Docker wrapper 仍需 Docker 和本地部署镜像。
 
 ```bash
 crosslane service edit -h
@@ -62,6 +63,9 @@ crosslane service help edit
 crosslane help --all
 crosslane help account --all
 ```
+
+`help --all` 列出命令路径、别名和适用范围。查看具体操作的参数可用
+`crosslane help service edit` 这样的命令路径。
 
 | 命令组 | 管理对象 |
 | --- | --- |
@@ -73,9 +77,9 @@ crosslane help account --all
 | `admin` | 管理令牌与 Kiro 企业 AWS 凭证、用户和订阅 |
 | `tasks` / `alert` | 周期任务 / 共享通知目标及当前 Kiro 告警事件 |
 
-无参数的顶层命令组显示帮助；自动化中使用 `--json` 时必须指定操作。`account overage`
-兼容旧版默认 `show` 行为。`tasks list` 标明可手工运行的任务，`tasks run` 的帮助和
-Shell 补全仅列出可手工运行项；watcher 和 adaptive_admission 由调度器运行。
+需要子命令的命令组在省略子命令时显示帮助。对这些命令组使用 `--json` 时必须指定操作。
+`account overage` 和 `logs admin` 默认执行 `show`。`tasks list` 标明可手工运行的任务，
+`tasks run` 的帮助和 Shell 补全会列出这些任务。watcher 和 adaptive_admission 由调度器运行。
 
 查询中的 `--provider` 选择实例，创建/编辑 service、apikey、model-map 时则设置或替换
 来源权限。权限编辑必须显式传参，`CROSSLANE_PROVIDER` 不会覆盖已有资源的权限。
@@ -315,10 +319,14 @@ crosslane stats --detail --since 1h
 Admin 管理面事件写入独立的 `crosslaned-admin-日期-级别.log` 文件，Service 与其他 daemon
 事件保留在 `crosslaned-日期-级别.log` 文件。`[log].file_path` 自定义基础路径时，Admin
 文件在同一目录，以 `-admin` 后缀区分；两类文件都使用相同的日志级别、轮转和保留配置。
-`logs admin show` 直接查询 Admin 文件中的最近日志，`logs admin` 保留相同查询。
-两者都可按响应头 `x-request-id` 中的 `admin_...` 精确过滤；
-`logs files/path --admin` 显示它们的位置。历史版本已写入普通日志文件的 Admin 事件不会迁移。
+`logs admin show` 和 `logs admin` 都可按响应头 `x-request-id` 中的 `admin_...` 精确筛选。
+`--level` 筛选对应级别的文件。HTTP 审计事件记录在 `info` 文件中，包括 4xx 和 5xx 响应。
+`logs files --admin` 和 `logs path --admin` 可查看 Admin 文件的位置。
+旧版本写入的 Admin 事件保留在原日志文件中。
 
+`logs show` 和 `logs follow` 可按实例 ID、日志中的 `account_id` 及 HTTP 状态筛选近期 Service
+请求。查看全部来源时省略 `--provider` 并取消设置 `CROSSLANE_PROVIDER`。
+使用 `--json` 时，每条请求输出一行 JSON（NDJSON），其中的 `account_id` 可用于 `--account` 精确筛选。
 业务请求日志会记录客户端提供的 `user_agent`。可用响应头 `x-trace-id` 或 `request-id`
 查找请求日志。排查失败时同时看响应状态、错误码和 Trace。流式响应也可能在 HTTP 200 后失败，
 应检查最终事件。

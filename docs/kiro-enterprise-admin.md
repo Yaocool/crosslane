@@ -49,7 +49,8 @@ encoding. Plans are `pro`, `pro-plus`, `pro-max`, and `power`. Scope selectors
 `--legacy` follow the action; `profiles` accepts only region/legacy. Omitted values
 use saved defaults and discovery. Legacy mode supports only `us-east-1`, requires
 explicit `--mode immediate` for cancellation, and is never selected automatically.
-Use `crosslane help admin kiro subscription --all` for aliases and full options.
+Use `crosslane help admin kiro subscription --all` to list actions and aliases.
+For options and examples, select an action such as `crosslane admin kiro subscription cancel --help`.
 
 Mutations write by default. A dry run checks discovery and operation conditions,
 not AWS write permissions. CLI and REST share user locks, eight mutation slots,

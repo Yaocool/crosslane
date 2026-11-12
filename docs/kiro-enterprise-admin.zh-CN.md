@@ -47,7 +47,8 @@ crosslane admin kiro subscription cancel user@example.com --dry-run
 `--application-arn`、`--identity-center-region`、`--legacy` 放在动作后，`profiles`
 只接受 region/legacy；省略时使用保存的默认值和自动发现。Legacy 仅支持 `us-east-1`，
 取消时必须显式指定 `--mode immediate`，不会自动启用。
-别名与完整参数见 `crosslane help admin kiro subscription --all`。
+用 `crosslane help admin kiro subscription --all` 列出操作与别名。
+参数和示例见各操作的帮助，例如 `crosslane admin kiro subscription cancel --help`。
 
 写命令默认实际提交。`--dry-run` 检查发现过程和操作条件，不能验证 AWS 写权限。
 CLI 与 REST 共用用户锁、8 个写操作名额和完成审计，CLI 日志标记 `source=unix_socket`。

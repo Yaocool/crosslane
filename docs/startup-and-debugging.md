@@ -60,7 +60,8 @@ removing it.
 
 ## Command navigation and ownership
 
-`-h`, `--help`, and `help` show complete options and examples without a running daemon:
+`-h`, `--help`, and `help` show command options and examples without a running daemon.
+The Docker wrapper still needs Docker and the local deployment image.
 
 ```bash
 crosslane service edit -h
@@ -69,6 +70,9 @@ crosslane service help edit
 crosslane help --all
 crosslane help account --all
 ```
+
+`help --all` lists command paths, aliases, and scopes. To see the options for a
+specific action, use its path with `help`, such as `crosslane help service edit`.
 
 | Command group | Managed resources |
 | --- | --- |
@@ -80,9 +84,10 @@ crosslane help account --all
 | `admin` | Admin tokens and Kiro enterprise AWS credentials, users, and subscriptions |
 | `tasks` / `alert` | Scheduled tasks / shared notification targets and current Kiro events |
 
-Bare top-level groups display help; scripts using `--json` must select an action.
-`account overage` retains its legacy default `show` behavior. `tasks list` identifies
-manually runnable tasks; `tasks run` help and Shell completion list only those tasks.
+Command groups that require an action display help when invoked on their own.
+Scripts using `--json` must select an action in those groups. `account overage`
+and `logs admin` default to `show`. `tasks list` identifies manually runnable tasks.
+`tasks run` help and Shell completion list those tasks.
 The watcher and adaptive admission tasks run only under the scheduler.
 
 Queries use `--provider` to select an instance. Creating or editing a service, client
@@ -374,10 +379,15 @@ other daemon events remain in `crosslaned-DATE-LEVEL.log`. A custom `[log].file_
 keeps both files in the same directory and adds `-admin` to the Admin base name.
 Both use the same level, rotation, and retention settings. `logs admin show`
 reads recent records from the Admin files; `logs admin` retains the same query. Both
-can filter by the response's `x-request-id` (`admin_...`);
-`logs files/path --admin` shows their locations. Admin events already written to
-ordinary files by older versions are not migrated.
+can filter by the response's `x-request-id` (`admin_...`). Admin's `--level` selects
+the physical log level, and HTTP audit entries, including 4xx/5xx responses, are
+written at `info`. `logs files --admin` and `logs path --admin` show their locations.
+Earlier versions' Admin events remain in their original files.
 
+`logs show` and `logs follow` filter recent Service requests by exact provider
+instance ID, exact `account_id`, and HTTP status. To see all providers, leave
+`--provider` and `CROSSLANE_PROVIDER` unset. With `--json` they emit one JSON object
+per request (NDJSON), including the `account_id` value to use with `--account`.
 Business request logs include the client `user_agent` when supplied. Use the
 `x-trace-id` response header or `request-id` to find request logs. Check the
 response status, error code, and trace when investigating failures. A stream can fail after
