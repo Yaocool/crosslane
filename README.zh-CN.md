@@ -26,7 +26,7 @@ OpenAI Chat Completions、OpenAI Responses 和模型列表接口。使用 `cross
 
 ## 架构
 
-![Crosslane 架构图](docs/assets/crosslane-architecture.zh-CN.png)
+[![Crosslane 架构与功能开关](docs/assets/crosslane-architecture.zh-CN.png)](docs/assets/crosslane-architecture.zh-CN.png)
 
 ## 快速开始
 

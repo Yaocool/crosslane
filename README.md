@@ -33,7 +33,7 @@ project.
 
 ## Architecture
 
-![Crosslane architecture diagram](docs/assets/crosslane-architecture.png)
+[![Crosslane architecture and feature flags](docs/assets/crosslane-architecture.png)](docs/assets/crosslane-architecture.png)
 
 ## Quick start
 
