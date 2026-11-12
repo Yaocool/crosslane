@@ -43,6 +43,7 @@ pub struct SsoLoginRequest {
     pub start_url: String,
     pub region: String,
     pub headful: bool,
+    pub login_timeout_secs: u64,
 }
 
 impl std::fmt::Debug for SsoLoginRequest {
@@ -53,6 +54,7 @@ impl std::fmt::Debug for SsoLoginRequest {
             .field("start_url", &self.start_url)
             .field("region", &self.region)
             .field("headful", &self.headful)
+            .field("login_timeout_secs", &self.login_timeout_secs)
             .finish()
     }
 }
@@ -116,14 +118,10 @@ async fn login_full(request: SsoLoginRequest) -> Result<Credentials> {
     let failure = session
         .take_kiro_failure()
         .context("Kiro SSO browser did not initialize its login observer")?;
-    let callback_result = tokio::time::timeout(
-        Duration::from_secs(120),
-        wait_for_login_outcome(listener, &state, failure),
-    )
-    .await;
+    let callback_result =
+        wait_for_login_outcome(listener, &state, failure, request.login_timeout_secs).await;
     session.close().await;
-    let callback =
-        callback_result.map_err(|_| anyhow!("SSO login timed out after 120 seconds"))??;
+    let callback = callback_result?;
     tracing::info!(region = %request.region, "SSO authorization callback received");
     let tokens = exchange_code(
         &client,
@@ -151,14 +149,19 @@ async fn wait_for_login_outcome(
     listener: TcpListener,
     state: &str,
     failure: tokio::sync::oneshot::Receiver<browser::LoginFailure>,
+    timeout_secs: u64,
 ) -> Result<String> {
-    tokio::select! {
-        callback = wait_for_callback(listener, state) => callback,
-        failure = failure => match failure {
-            Ok(reason) => Err(anyhow!(reason.message())),
-            Err(_) => Err(anyhow!("Kiro SSO browser automation stopped before sign-in completed")),
+    tokio::time::timeout(Duration::from_secs(timeout_secs), async {
+        tokio::select! {
+            callback = wait_for_callback(listener, state) => callback,
+            failure = failure => match failure {
+                Ok(reason) => Err(anyhow!(reason.message())),
+                Err(_) => Err(anyhow!("Kiro SSO browser automation stopped before sign-in completed")),
+            }
         }
-    }
+    })
+    .await
+    .map_err(|_| anyhow!("SSO login timed out after {timeout_secs} seconds"))?
 }
 
 #[cfg(feature = "sso")]
@@ -361,10 +364,26 @@ mod tests {
             start_url: "https://example.awsapps.com/start".into(),
             region: "us-east-1".into(),
             headful: false,
+            login_timeout_secs: 120,
         };
         let debug = format!("{request:?}");
         assert!(!debug.contains(&request.password));
         assert!(debug.contains("<redacted>"));
+    }
+
+    #[cfg(feature = "sso")]
+    #[tokio::test]
+    async fn kiro_callback_wait_uses_the_configured_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (_sender, receiver) = tokio::sync::oneshot::channel();
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for_login_outcome(listener, "state", receiver, 1),
+        )
+        .await
+        .expect("configured callback timeout must expire")
+        .unwrap_err();
+        assert_eq!(error.to_string(), "SSO login timed out after 1 seconds");
     }
 
     #[cfg(feature = "sso")]
@@ -377,7 +396,7 @@ mod tests {
             .unwrap();
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            wait_for_login_outcome(listener, "state", receiver),
+            wait_for_login_outcome(listener, "state", receiver, 120),
         )
         .await
         .expect("terminal login errors must not wait for an OAuth callback");
@@ -393,7 +412,12 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (_sender, receiver) = tokio::sync::oneshot::channel();
-        let outcome = tokio::spawn(wait_for_login_outcome(listener, "fixture-state", receiver));
+        let outcome = tokio::spawn(wait_for_login_outcome(
+            listener,
+            "fixture-state",
+            receiver,
+            120,
+        ));
         let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
         stream.write_all(b"GET /oauth/callback?state=fixture-state&code=fixture-code HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await.unwrap();
         let mut response = String::new();

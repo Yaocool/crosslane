@@ -3,6 +3,7 @@
 use anyhow::{anyhow, Context, Result};
 use clap::Subcommand;
 use crosslane_core::account::Account;
+use crosslane_core::config::SsoConfig;
 use crosslane_core::ids::{new_account_id, new_machine_id};
 use crosslane_ipc::copilot::{enrich_account, CopilotQuotaSummary, CopilotQuotaUnit};
 use crosslane_ipc::protocol::{
@@ -10,6 +11,7 @@ use crosslane_ipc::protocol::{
     AccountTagBatchResult, AccountTagResult, ConfigShowResult, CopilotBrowserCredentials,
     ProviderAccountListResult, ProviderAccountSummary,
 };
+use serde::Deserialize;
 
 use crate::client::AdminClient;
 use crate::output::{format_timestamp, print_json, render_table};
@@ -1591,20 +1593,25 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
             tags,
         } => {
             let tags = normalize_cli_tags(tags)?;
-            let start_url = resolve_start_url(client, start_url.as_deref()).await?;
-            if let Some(file) = batch {
-                let concurrency = concurrency.unwrap_or(1);
+            let batch_rows = match batch {
+                Some(file) => Some(kiro_sso::parse_csv(&read_batch_source(&file).await?)?),
+                None => None,
+            };
+            let sso = resolve_sso_config(client, start_url.as_deref()).await?;
+            let login = kiro_sso::LoginOptions {
+                start_url: &sso.start_url,
+                region: &region,
+                headful,
+                tags: &tags,
+                login_timeout_secs: sso.login_timeout_secs,
+            };
+            if let Some(rows) = batch_rows {
                 kiro_sso::run_batch(
                     client,
-                    &file,
+                    rows,
                     kiro_sso::BatchOptions {
-                        login: kiro_sso::LoginOptions {
-                            start_url: &start_url,
-                            region: &region,
-                            headful,
-                            tags: &tags,
-                        },
-                        concurrency,
+                        login,
+                        concurrency: concurrency.unwrap_or(1),
                         json,
                     },
                 )
@@ -1616,18 +1623,7 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
             }
             let email = email.ok_or_else(|| anyhow!("单账号登录需提供 --email"))?;
             let password = read_password_line().await?;
-            let result = kiro_sso::add(
-                client,
-                &email,
-                &password,
-                kiro_sso::LoginOptions {
-                    start_url: &start_url,
-                    region: &region,
-                    headful,
-                    tags: &tags,
-                },
-            )
-            .await?;
+            let result = kiro_sso::add(client, &email, &password, login).await?;
             if json {
                 print_json(&result)?;
             } else {
@@ -1966,22 +1962,34 @@ fn fail_provider_account_batch(value: &serde_json::Value, operation: &str) -> Re
     }
 }
 
-async fn resolve_start_url(client: &mut AdminClient, explicit: Option<&str>) -> Result<String> {
-    if let Some(url) = explicit.map(str::trim).filter(|url| !url.is_empty()) {
-        return validate_start_url(url);
-    }
+async fn resolve_sso_config(client: &mut AdminClient, explicit: Option<&str>) -> Result<SsoConfig> {
+    let explicit = explicit
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(validate_start_url)
+        .transpose()?;
     let show: ConfigShowResult = client
         .call(method::CONFIG_SHOW, serde_json::json!({}))
         .await?;
-    let config: crosslane_core::config::Config =
-        serde_json::from_value(show.effective_json).context("daemon 返回的生效配置无效")?;
-    let configured = config.sso.start_url.trim();
-    if configured.is_empty() {
-        return Err(anyhow!(
-            "需提供 --start-url，或在配置文件中设置 [sso].start_url"
-        ));
+    let mut sso = show
+        .effective_json
+        .get("sso")
+        .map(SsoConfig::deserialize)
+        .transpose()
+        .context("daemon 返回的 SSO 配置无效")?
+        .unwrap_or_default();
+    if let Some(url) = explicit {
+        sso.start_url = url;
+    } else {
+        let configured = sso.start_url.trim();
+        if configured.is_empty() {
+            return Err(anyhow!(
+                "需提供 --start-url，或在配置文件中设置 [sso].start_url"
+            ));
+        }
+        sso.start_url = validate_start_url(configured)?;
     }
-    validate_start_url(configured)
+    Ok(sso)
 }
 
 fn normalize_cli_tags(tags: Vec<String>) -> Result<Vec<String>> {

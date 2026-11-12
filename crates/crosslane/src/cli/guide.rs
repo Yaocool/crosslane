@@ -253,6 +253,7 @@ Copilot API 地址优先使用账号 token 返回的 endpoint；仅当缺失且�
         }
         "sso" => {
             r#"本主题仅适用于 Kiro 的 IAM Identity Center SSO；GitHub Copilot（即使组织登录经过 Azure SSO）请使用 `crosslane guide copilot` 和 Device Flow，不使用 `account add-sso`。先在配置中设置 `[sso] start_url = "https://..."`。单账号：`printf '%s\n' "$PASSWORD" | crosslane account add-sso --email user@example.com --password-stdin`。
+用 `crosslane config edit sso` 设置 `login_timeout_secs`。它是等待浏览器授权回调的秒数，须为正整数，默认 120。保存后热重载，用 `crosslane config show sso --effective` 查看生效值。
 批量：CSV 仅含 email,password 两列，运行 `crosslane account add-sso --batch accounts.csv -c 1 --tag team-a`；也可用 `--batch - < accounts.csv` 从 stdin 读取。可重复的 `--tag` 应用于本批全部账号；`--start-url` 可覆盖全局值，`--headful` 可手工完成额外验证。默认/full 构建包含 SSO。"#
         }
         "service" => {

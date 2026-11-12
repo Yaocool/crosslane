@@ -92,6 +92,7 @@ fn defaults_match_the_spec() {
     assert_eq!(providers[0].kind, "kiro");
     assert!(providers[0].enabled);
     assert!(config.sso.start_url.is_empty());
+    assert_eq!(config.sso.login_timeout_secs, 120);
     assert!(config.webhook.is_empty());
     assert!(config.api_key.is_empty());
     assert!(config.proxy_service.is_empty());
@@ -301,6 +302,10 @@ fn default_toml_parses_into_default_config() {
     let parsed: Config = toml::from_str(DEFAULT_CONFIG_TOML).expect("default toml must parse");
     let expected = Config::default();
     assert_eq!(parsed.server.port, expected.server.port);
+    assert_eq!(
+        parsed.sso.login_timeout_secs,
+        expected.sso.login_timeout_secs
+    );
     assert_eq!(
         parsed.pool.balance.weight_active,
         expected.pool.balance.weight_active
@@ -841,6 +846,28 @@ fn sso_start_url_requires_https_when_configured() {
 
     config.sso.start_url = "https://example.awsapps.com/start".into();
     config.validate().expect("HTTPS SSO URL must be accepted");
+}
+
+#[test]
+fn sso_login_timeout_defaults_for_legacy_configs_and_must_be_positive() {
+    let legacy: Config =
+        toml::from_str("[sso]\nstart_url = 'https://example.awsapps.com/start'\n").unwrap();
+    assert_eq!(legacy.sso.login_timeout_secs, 120);
+
+    let configured: Config = toml::from_str("[sso]\nlogin_timeout_secs = 600\n").unwrap();
+    configured.validate().unwrap();
+    assert_eq!(configured.sso.login_timeout_secs, 600);
+
+    let zero: Config = toml::from_str("[sso]\nlogin_timeout_secs = 0\n").unwrap();
+    let error = zero.validate().unwrap_err();
+    assert!(
+        error.to_string().contains("sso.login_timeout_secs"),
+        "{error}"
+    );
+    for invalid in ["-1", "1.5", "'120'"] {
+        let source = format!("[sso]\nlogin_timeout_secs = {invalid}\n");
+        assert!(toml::from_str::<Config>(&source).is_err());
+    }
 }
 
 #[test]

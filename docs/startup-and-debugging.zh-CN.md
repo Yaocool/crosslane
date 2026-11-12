@@ -98,15 +98,20 @@ crosslane account add-api-key --email ci@example.com --region us-east-1
 crosslane account add-api-key --email ci@example.com --region us-east-1 --key-stdin < /secure/kiro-key
 ```
 
-第一条命令读取 CLI 环境中的 `KIRO_API_KEY`。企业 SSO 需先设置组织的登录入口，再添加账号：
+第一条命令读取 CLI 环境中的 `KIRO_API_KEY`。使用企业 SSO 时，运行
+`crosslane config edit sso` 设置组织的登录入口。
 
 ```toml
 [sso]
 start_url = "https://example.awsapps.com/start"
+login_timeout_secs = 120
 ```
 
+`login_timeout_secs` 控制等待浏览器授权回调的时间，单位为秒，须为正整数，默认 120。
+通过 CLI 编辑器保存后会热重载，对后续登录生效。
+
 ```bash
-crosslane config reload
+crosslane config show sso --effective
 crosslane account add-sso --email user@example.com --password-stdin < /secure/kiro-sso-password
 ```
 

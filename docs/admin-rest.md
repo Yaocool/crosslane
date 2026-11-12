@@ -222,9 +222,10 @@ and a `credentials` object:
 `auth_method` is `idc` or `social`; refresh support depends on valid, complete credentials.
 This imports credentials rather than starting an interactive OAuth flow. Builds with `sso`
 also accept `auth: "sso"`, `email`, `password`, HTTPS `start_url`, optional `region` and `tags`.
-Omitted `start_url` uses `[sso]` defaults. The request waits for the existing SSO flow; allow
-time for login. Builds without `sso` return `501`. Account creation/deletion updates existing
-durable storage and the running account pool.
+Omitted `start_url` uses `[sso]` defaults. The request waits for login, including up to
+`[sso].login_timeout_secs` (120 seconds by default) for the browser's authorization callback.
+Builds without `sso` return `501`. Account creation/deletion updates existing durable storage
+and the running account pool.
 
 ### Filters and grouping
 

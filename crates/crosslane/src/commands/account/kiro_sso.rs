@@ -4,7 +4,7 @@ use anyhow::{anyhow, Result};
 use crosslane_ipc::protocol::{method, AccountAddSsoParams, AccountSummary};
 use futures::{stream, StreamExt};
 
-use crate::client::AdminClient;
+use crate::client::{sso_response_timeout, AdminClient};
 use crate::output::print_json;
 
 #[derive(Clone, Copy)]
@@ -13,6 +13,7 @@ pub(super) struct LoginOptions<'a> {
     pub region: &'a str,
     pub headful: bool,
     pub tags: &'a [String],
+    pub login_timeout_secs: u64,
 }
 
 pub(super) struct BatchOptions<'a> {
@@ -37,21 +38,22 @@ pub(super) async fn add(
         tags: options.tags.to_vec(),
     };
     client
-        .call(method::ACCOUNT_ADD_SSO, serde_json::to_value(params)?)
+        .call_with_response_timeout(
+            method::ACCOUNT_ADD_SSO,
+            serde_json::to_value(params)?,
+            sso_response_timeout(options.login_timeout_secs),
+        )
         .await
 }
 
 pub(super) async fn run_batch(
     client: &AdminClient,
-    file: &str,
+    rows: Vec<(String, String)>,
     options: BatchOptions<'_>,
 ) -> Result<()> {
     if !(1..=8).contains(&options.concurrency) {
         return Err(anyhow!("并发数必须在 1..=8 之间"));
     }
-    // Validate every row before starting any account login.
-    let raw = super::read_batch_source(file).await?;
-    let rows = parse_csv(&raw)?;
     let count = rows.len();
     let socket = client.socket_path();
     let login = options.login;

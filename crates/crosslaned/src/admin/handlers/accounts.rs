@@ -483,6 +483,7 @@ pub(super) async fn handle_account_add_sso(
         start_url: params.start_url,
         region: params.region,
         headful: params.headful,
+        login_timeout_secs: state.config.current().sso.login_timeout_secs,
     })
     .await
     .map_err(|error| RpcError::internal(error.to_string()))?;

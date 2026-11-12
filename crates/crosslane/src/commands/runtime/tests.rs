@@ -785,6 +785,23 @@ fn config_module_edit_changes_only_the_selected_module() {
 }
 
 #[test]
+fn sso_editor_exposes_the_timeout_in_legacy_configs() {
+    let original = "[sso]\nstart_url = 'https://example.awsapps.com/start'\n";
+    let sso = resolve_config_module("sso").unwrap();
+    let editor = render_config_module_editor(original, sso).unwrap();
+    assert!(editor.contains("login_timeout_secs = 120"));
+
+    let edited = editor.replace("login_timeout_secs = 120", "login_timeout_secs = 600");
+    let merged = merge_edited_config_module(original, sso, &edited).unwrap();
+    let config: crosslane_core::config::Config = toml::from_str(&merged).unwrap();
+    assert_eq!(config.sso.login_timeout_secs, 600);
+    assert_eq!(config.sso.start_url, "https://example.awsapps.com/start");
+    assert!(render_config_module_editor(&merged, sso)
+        .unwrap()
+        .contains("login_timeout_secs = 600"));
+}
+
+#[test]
 fn features_editor_exposes_request_redaction_in_legacy_configs() {
     let original = "# server settings\n[server]\nport = 6200\n\n[features]\n# keep web tools\nenable_web_tools = false\n";
     let features = resolve_config_module("features").expect("features module");

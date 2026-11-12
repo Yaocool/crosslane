@@ -2488,7 +2488,7 @@ const CONFIG_MODULES: &[ConfigModule] = &[
         key: "sso",
         category: "来源参数",
         scope: "kiro",
-        description: "Kiro IAM Identity Center SSO 默认入口",
+        description: "Kiro IAM Identity Center SSO 默认入口与登录超时",
         preferred_command: "-",
         aliases: &[],
         is_array: false,
@@ -2707,7 +2707,7 @@ fn render_config_module_editor(
 ) -> Result<String> {
     let mut body = render_config_module_document(raw, module)?;
     let editor_keys = module.editor_keys();
-    if editor_keys.len() > 1 {
+    if editor_keys.len() > 1 || module.key == "sso" {
         let source = raw.parse::<DocumentMut>().context("配置文件 TOML 无效")?;
         let defaults = crosslane_store::bootstrap::render_default_config(admin_socket)
             .parse::<DocumentMut>()

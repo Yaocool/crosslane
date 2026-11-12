@@ -966,7 +966,7 @@ enum ConfigCommand {
     },
     /// 用 $VISUAL/$EDITOR 编辑完整配置或指定模块，保存后校验并重载。
     #[command(
-        after_help = "admin 和 status-http 编辑入口会同时展示 [admin]/[status_http]，补齐旧配置缺少的默认字段；可以一起启停 REST 与监听。模块编辑未改设置退出时不写文件、不重载服务，仍提示待重启字段；完整配置编辑器异常退出时恢复原文件。监听启停、地址和端口均支持热重载；绑定失败保留原监听。令牌用 admin token 管理，详见 crosslane guide admin。\nKiro 上游与账号池使用 upstream/pool 等模块；请求凭证脱敏开关使用 features 模块。Copilot OAuth、endpoint、缓存优先用 provider edit <ID> 修改对应实例。不指定模块时编辑完整配置。\n\n示例：\n  crosslane config edit admin\n  crosslane config edit status-http\n  crosslane config edit upstream\n  crosslane config edit pool\n  crosslane config edit features\n  crosslane provider edit copilot --setting 'api_endpoint_fallback=\"https://api.enterprise.githubcopilot.com\"'"
+        after_help = "admin 和 status-http 编辑入口会同时展示 [admin]/[status_http]，补齐旧配置缺少的默认字段；可以一起启停 REST 与监听。模块编辑未改设置退出时不写文件、不重载服务，仍提示待重启字段；完整配置编辑器异常退出时恢复原文件。监听启停、地址和端口均支持热重载；绑定失败保留原监听。令牌用 admin token 管理，详见 crosslane guide admin。\nKiro 上游与账号池使用 upstream/pool 等模块；请求凭证脱敏开关使用 features 模块。sso 模块可设置 Kiro 登录入口和 login_timeout_secs，默认 120 秒。Copilot OAuth、endpoint、缓存优先用 provider edit <ID> 修改对应实例。不指定模块时编辑完整配置。\n\n示例：\n  crosslane config edit admin\n  crosslane config edit status-http\n  crosslane config edit upstream\n  crosslane config edit pool\n  crosslane config edit features\n  crosslane config edit sso\n  crosslane provider edit copilot --setting 'api_endpoint_fallback=\"https://api.enterprise.githubcopilot.com\"'"
     )]
     Edit {
         /// 编辑指定模块；admin/status-http 同时包含关联监听和鉴权配置。

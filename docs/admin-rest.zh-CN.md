@@ -199,8 +199,9 @@ Kiro OAuth 导入使用 `auth: "oauth"` 和以下 `credentials`，还可提供 `
 
 `auth_method` 可为 `idc` 或 `social`，刷新能力取决于所导入凭证是否完整有效。
 启用 `sso` feature 的构建还接受 `auth: "sso"`，配合 `email`、`password`、HTTPS
-`start_url`、可选 `region` 和 `tags`；省略 `start_url` 时使用 `[sso]` 默认值。该操作
-同步等待现有 SSO 流程，客户端应预留登录等待时间。无 `sso` feature 时返回 `501`。
+`start_url`、可选 `region` 和 `tags`。省略 `start_url` 时使用 `[sso]` 默认值。该操作
+同步等待登录，其中浏览器授权回调的等待上限由 `[sso].login_timeout_secs` 控制，默认 120 秒。
+无 `sso` feature 时返回 `501`。
 新增或删除账号会写入既有账号存储并应用到运行时。
 
 ### 筛选与分组

@@ -10,6 +10,12 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::process::Command;
 
+const KIRO_SSO_START_URL: &str = "https://configured.awsapps.com/start";
+
+fn kiro_sso_config() -> Value {
+    json!({"path":"", "raw":"", "effective_json":{"sso":{"start_url":KIRO_SSO_START_URL}}})
+}
+
 fn kiro_login_summary(email: &str) -> Value {
     json!({
         "id":"acc_fixture", "email":email, "enabled":true,
@@ -60,16 +66,33 @@ async fn kiro_single_legacy_and_csv_inputs_use_the_same_single_password_rpc() {
                 .to_owned(),
         ),
     ];
-    for (mut args, input) in cases {
-        args.extend(["--start-url", "https://example.awsapps.com/start"]);
-        let (output, request) =
-            run_with_secret_input(&args, &input, kiro_login_summary("test@example.invalid")).await;
+    for (index, (mut args, input)) in cases.into_iter().enumerate() {
+        let start_url = if index == 0 {
+            KIRO_SSO_START_URL
+        } else {
+            args.extend(["--start-url", "https://example.awsapps.com/start"]);
+            "https://example.awsapps.com/start"
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let (output, requests) = run_with_secret_input_in_workspace(
+            workspace.path(),
+            &args,
+            &input,
+            vec![
+                kiro_sso_config(),
+                kiro_login_summary("test@example.invalid"),
+            ],
+            None,
+        )
+        .await;
+        assert_eq!(requests[0].method, method::CONFIG_SHOW);
+        let request = &requests[1];
         assert_eq!(request.method, method::ACCOUNT_ADD_SSO);
         assert_eq!(
             request.params,
             json!({
                 "email":"test@example.invalid", "password":password,
-                "start_url":"https://example.awsapps.com/start", "region":"us-east-1",
+                "start_url":start_url, "region":"us-east-1",
                 "headful":false, "tags":[]
             })
         );
@@ -102,14 +125,18 @@ async fn kiro_batch_file_stays_separate_from_copilot_credentials() {
     let (output, requests) = run_in_workspace(
         workspace.path(),
         &args,
-        vec![kiro_login_summary("test@example.invalid")],
+        vec![
+            kiro_sso_config(),
+            kiro_login_summary("test@example.invalid"),
+        ],
     )
     .await;
     assert_success(&output);
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].method, method::ACCOUNT_ADD_SSO);
-    assert_eq!(requests[0].params["password"], "fixture-secret");
-    assert!(requests[0].params.get("browser").is_none());
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].method, method::CONFIG_SHOW);
+    assert_eq!(requests[1].method, method::ACCOUNT_ADD_SSO);
+    assert_eq!(requests[1].params["password"], "fixture-secret");
+    assert!(requests[1].params.get("browser").is_none());
 
     fs::remove_file(workspace.path().join("admin.sock")).unwrap();
     fs::write(
@@ -139,7 +166,7 @@ async fn kiro_batch_reports_a_failure_before_later_rows_finish_and_keeps_json_at
     let server = tokio::spawn(async move {
         let mut second_seen = Some(second_seen);
         let mut wait_release = Some(wait_release);
-        for index in 0..2 {
+        for index in 0..3 {
             let (stream, _) = listener.accept().await.unwrap();
             let (read, mut write) = stream.into_split();
             let raw = BufReader::new(read)
@@ -149,16 +176,24 @@ async fn kiro_batch_reports_a_failure_before_later_rows_finish_and_keeps_json_at
                 .unwrap()
                 .unwrap();
             let request: Request = decode_line(&raw).unwrap();
-            assert_eq!(request.method, method::ACCOUNT_ADD_SSO);
-            let response = if index == 0 {
-                Response::err(
-                    request.id,
-                    crosslane_ipc::protocol::RpcError::internal("fixture login rejected"),
-                )
-            } else {
-                second_seen.take().unwrap().send(()).unwrap();
-                wait_release.take().unwrap().await.unwrap();
-                Response::ok(request.id, kiro_login_summary("second@example.invalid"))
+            let response = match index {
+                0 => {
+                    assert_eq!(request.method, method::CONFIG_SHOW);
+                    Response::ok(request.id, kiro_sso_config())
+                }
+                1 => {
+                    assert_eq!(request.method, method::ACCOUNT_ADD_SSO);
+                    Response::err(
+                        request.id,
+                        crosslane_ipc::protocol::RpcError::internal("fixture login rejected"),
+                    )
+                }
+                _ => {
+                    assert_eq!(request.method, method::ACCOUNT_ADD_SSO);
+                    second_seen.take().unwrap().send(()).unwrap();
+                    wait_release.take().unwrap().await.unwrap();
+                    Response::ok(request.id, kiro_login_summary("second@example.invalid"))
+                }
             };
             write
                 .write_all(encode_line(&response).unwrap().as_bytes())
@@ -1446,37 +1481,43 @@ async fn run_with_secret_input(
     result: Value,
 ) -> (std::process::Output, Request) {
     let directory = tempfile::tempdir().unwrap();
-    run_with_secret_input_in_workspace(directory.path(), args, input, result, None).await
+    let (output, mut requests) =
+        run_with_secret_input_in_workspace(directory.path(), args, input, vec![result], None).await;
+    (output, requests.pop().unwrap())
 }
 
 async fn run_with_secret_input_in_workspace(
     workspace: &Path,
     args: &[&str],
     input: &str,
-    result: Value,
+    results: Vec<Value>,
     provider: Option<&str>,
-) -> (std::process::Output, Request) {
+) -> (std::process::Output, Vec<Request>) {
     let socket = workspace.join("admin.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let (read, mut write) = stream.into_split();
-        let raw = BufReader::new(read)
-            .lines()
-            .next_line()
-            .await
-            .unwrap()
-            .unwrap();
-        let request: Request = decode_line(&raw).unwrap();
-        write
-            .write_all(
-                encode_line(&Response::ok(request.id, result))
-                    .unwrap()
-                    .as_bytes(),
-            )
-            .await
-            .unwrap();
-        request
+        let mut requests = Vec::new();
+        for result in results {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let raw = BufReader::new(read)
+                .lines()
+                .next_line()
+                .await
+                .unwrap()
+                .unwrap();
+            let request: Request = decode_line(&raw).unwrap();
+            write
+                .write_all(
+                    encode_line(&Response::ok(request.id, result))
+                        .unwrap()
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            requests.push(request);
+        }
+        requests
     });
     let mut command = Command::new(env!("CARGO_BIN_EXE_crosslane"));
     command
@@ -1504,11 +1545,11 @@ async fn run_with_secret_input_in_workspace(
         .unwrap()
         .unwrap();
     assert_success(&output);
-    let request = tokio::time::timeout(Duration::from_secs(5), server)
+    let requests = tokio::time::timeout(Duration::from_secs(5), server)
         .await
         .unwrap()
         .unwrap();
-    (output, request)
+    (output, requests)
 }
 
 #[tokio::test]
@@ -1546,15 +1587,16 @@ async fn dotenv_provider_reaches_auth_rpc_and_respects_override_precedence() {
             if let Some(provider) = explicit_provider {
                 args.extend(["--provider", provider]);
             }
-            let (output, request) = run_with_secret_input_in_workspace(
+            let (output, requests) = run_with_secret_input_in_workspace(
                 workspace.path(),
                 &args,
                 input,
-                json!({"ok":true}),
+                vec![json!({"ok":true})],
                 shell_provider,
             )
             .await;
             assert_success(&output);
+            let request = &requests[0];
             assert_eq!(request.method, rpc);
             assert_eq!(request.params["provider"], expected);
             let field = if rpc == method::V2_ACCOUNT_IMPORT_TOKEN {

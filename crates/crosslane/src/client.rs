@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use crosslane_core::config::SsoConfig;
 use crosslane_ipc::protocol::{decode_line, encode_line, method, Request, Response};
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -46,7 +47,7 @@ impl AdminClient {
             .await
     }
 
-    async fn call_with_response_timeout<T: DeserializeOwned>(
+    pub(crate) async fn call_with_response_timeout<T: DeserializeOwned>(
         &mut self,
         method: &str,
         params: serde_json::Value,
@@ -134,6 +135,12 @@ fn response_timeout(method_name: &str) -> Duration {
     }
 }
 
+pub(crate) fn sso_response_timeout(login_timeout_secs: u64) -> Duration {
+    // Preserve the IPC budget for browser setup and account validation.
+    let extra_secs = login_timeout_secs.saturating_sub(SsoConfig::default().login_timeout_secs);
+    response_timeout(method::ACCOUNT_ADD_SSO).saturating_add(Duration::from_secs(extra_secs))
+}
+
 /// 解析 socket 路径：命令行参数、配置文件、默认值。
 pub async fn resolve_socket(explicit: Option<String>) -> PathBuf {
     if let Some(path) = explicit {
@@ -154,7 +161,6 @@ mod tests {
 
     #[test]
     fn interactive_login_and_batch_probes_get_longer_response_windows() {
-        assert!(response_timeout(method::ACCOUNT_ADD_SSO) > Duration::from_secs(120));
         assert!(response_timeout(method::ACCOUNT_REFRESH) > Duration::from_secs(120));
         assert!(response_timeout(method::DIAGNOSE_ACCOUNT) > Duration::from_secs(300));
         // Kiro Enterprise operations have a 120-second daemon deadline.
@@ -171,6 +177,13 @@ mod tests {
         ] {
             assert!(response_timeout(method) > Duration::from_secs(120));
         }
+    }
+
+    #[test]
+    fn sso_response_window_extends_with_the_login_timeout() {
+        assert_eq!(sso_response_timeout(60), Duration::from_secs(300));
+        assert_eq!(sso_response_timeout(120), Duration::from_secs(300));
+        assert_eq!(sso_response_timeout(600), Duration::from_secs(780));
     }
 
     #[tokio::test]

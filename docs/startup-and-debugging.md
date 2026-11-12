@@ -111,15 +111,20 @@ crosslane account add-api-key --email ci@example.com --region us-east-1 --key-st
 ```
 
 The first command reads `KIRO_API_KEY` from the CLI environment. For enterprise
-SSO, configure your organization's start URL and use the SSO account command:
+SSO, run `crosslane config edit sso` and set your organization's start URL.
 
 ```toml
 [sso]
 start_url = "https://example.awsapps.com/start"
+login_timeout_secs = 120
 ```
 
+`login_timeout_secs` sets how long to wait for the browser's authorization
+callback. It takes a positive integer in seconds and defaults to 120. Saving in
+the CLI editor reloads the setting for subsequent login attempts.
+
 ```bash
-crosslane config reload
+crosslane config show sso --effective
 crosslane account add-sso --email user@example.com --password-stdin < /secure/kiro-sso-password
 ```
 

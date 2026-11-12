@@ -863,11 +863,22 @@ impl std::fmt::Debug for AdminRestConfig {
 }
 
 /// IAM Identity Center SSO defaults.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SsoConfig {
     /// Default IAM Identity Center start URL used by manual account login.
     pub start_url: String,
+    /// Time in seconds to wait for the browser's authorization callback.
+    pub login_timeout_secs: u64,
+}
+
+impl Default for SsoConfig {
+    fn default() -> Self {
+        Self {
+            start_url: String::new(),
+            login_timeout_secs: 120,
+        }
+    }
 }
 
 fn default_socket_path() -> String {
@@ -1812,6 +1823,9 @@ impl Config {
         {
             return invalid_config("sso.start_url", "must use https://");
         }
+        if self.sso.login_timeout_secs == 0 {
+            return invalid_config("sso.login_timeout_secs", "must be greater than zero");
+        }
         if self.log.max_file_size_mb == 0
             || self.log.retention_days == 0
             || self.log.max_files_per_day == 0
@@ -2727,6 +2741,8 @@ token_sha256 = ""
 # `account add-sso` 未传 --start-url 时使用的默认入口；必须是 https:// URL。
 # 留空表示每次命令都必须显式传入 --start-url。
 start_url = ""
+# 等待浏览器授权回调的超时时间（秒），须为正整数，支持热重载。
+login_timeout_secs = 120
 
 # ----------------------------------------------------------------------------
 # Kiro 模型级 thinking 开关
