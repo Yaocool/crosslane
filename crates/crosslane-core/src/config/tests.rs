@@ -319,10 +319,7 @@ fn default_toml_parses_into_default_config() {
         parsed.features.enable_request_redaction,
         expected.features.enable_request_redaction
     );
-    assert_eq!(
-        parsed.upstream.pool.stream_pipelining,
-        expected.upstream.pool.stream_pipelining
-    );
+    assert_eq!(parsed.upstream, expected.upstream);
 }
 
 #[test]
@@ -346,6 +343,23 @@ fn endpoint_preference_defaults_to_runtime_and_preserves_explicit_choices() {
         let saved = toml::to_string(&config).expect("serialize preference");
         let loaded: UpstreamConfig = toml::from_str(&saved).expect("reload preference");
         assert_eq!(loaded.preferred_endpoint, expected);
+    }
+}
+
+#[test]
+fn kiro_client_versions_default_independently_and_reject_malformed_values() {
+    let mut config: Config = toml::from_str("[upstream]\nide_version = \"1.4.154\"\n")
+        .expect("existing upstream configuration with one override");
+    assert_eq!(config.upstream.ide_version, "1.4.154");
+    assert_eq!(config.upstream.cli_version, DEFAULT_KIRO_CLI_VERSION);
+    config.validate().expect("valid override");
+
+    for invalid in ["", "3.2", "3.2.1.0", "3.2.+1", "3.2.1\n"] {
+        config.upstream.cli_version = invalid.into();
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidValue { field, .. }) if field == "upstream.cli_version"
+        ));
     }
 }
 

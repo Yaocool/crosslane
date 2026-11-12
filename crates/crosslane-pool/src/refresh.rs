@@ -4,6 +4,7 @@ use std::future::{ready, Future};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crosslane_core::account::{Account, AuthMethod, Credentials};
+use crosslane_core::config::DEFAULT_KIRO_IDE_VERSION;
 use crosslane_kiro::identity::ide_auth_user_agent;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -100,6 +101,7 @@ impl RefreshRequestFailure {
 pub struct TokenRefresher {
     client: Client,
     before_expiry_secs: i64,
+    ide_version: String,
     endpoint_override: Option<String>,
 }
 
@@ -112,8 +114,14 @@ impl TokenRefresher {
                 .build()
                 .map_err(|error| RefreshError::Upstream(error.to_string()))?,
             before_expiry_secs,
+            ide_version: DEFAULT_KIRO_IDE_VERSION.into(),
             endpoint_override: None,
         })
+    }
+
+    pub fn configure(&mut self, before_expiry_secs: i64, ide_version: &str) {
+        self.before_expiry_secs = before_expiry_secs;
+        self.ide_version = ide_version.to_owned();
     }
 
     pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
@@ -352,7 +360,7 @@ impl TokenRefresher {
                     .post(endpoint)
                     .header(
                         reqwest::header::USER_AGENT,
-                        ide_auth_user_agent(&snapshot.machine_id),
+                        ide_auth_user_agent(&snapshot.machine_id, &self.ide_version),
                     )
                     .json(&SocialRefreshRequest { refresh_token })
             }
@@ -642,7 +650,7 @@ mod tests {
     #[tokio::test]
     async fn social_refresh_persists_rotated_credentials_and_uses_current_user_agent() {
         let server = MockServer::start().await;
-        let expected_user_agent = format!("KiroIDE-1.2.56-{}", "a".repeat(64));
+        let expected_user_agent = format!("KiroIDE-1.4.154-{}", "a".repeat(64));
         Mock::given(method("POST"))
             .and(path("/refresh"))
             .and(header("user-agent", expected_user_agent.as_str()))
@@ -658,9 +666,10 @@ mod tests {
         let pool = AccountPool::new(vec![account()], PoolConfig::default());
         let persisted = Arc::new(AtomicUsize::new(0));
         let callback_count = Arc::clone(&persisted);
-        let refresher = TokenRefresher::new(300)
+        let mut refresher = TokenRefresher::new(300)
             .expect("refresher")
             .with_endpoint(format!("{}/refresh", server.uri()));
+        refresher.configure(300, "1.4.154");
 
         assert!(
             refresher

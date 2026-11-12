@@ -24,6 +24,21 @@ Docker 部署需要 Docker Engine 和 Compose。本地编译支持 Linux、macOS
 将 `CROSSLANE_HOME` 设为绝对路径。使用 `crosslane config path` 查找当前配置，
 编辑后运行 `crosslane config reload`。不要把账号凭证写进命令参数、日志或版本库。
 
+### Kiro 客户端版本
+
+`[upstream]` 中的两个字段设置 Crosslane 在上游请求头里声明的 Kiro 应用版本。
+省略字段时使用以下默认值。
+
+```toml
+[upstream]
+ide_version = "1.2.56"
+cli_version = "2.21.4"
+```
+
+用 `crosslane config edit upstream` 修改，保存后热重载。手工编辑后可执行
+`crosslane config reload`。用 `crosslane config show upstream --effective` 查看生效值。
+修改版本后，可用实际请求验证上游协议兼容性。
+
 ## Docker
 
 构建当前源码并安装宿主机 CLI 命令：

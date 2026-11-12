@@ -24,8 +24,8 @@ use crate::endpoint::{
 };
 use crate::event_stream::{EventStreamDecoder, KiroEvent};
 use crate::identity::{
-    cli_amz_user_agent, cli_user_agent, ide_amz_user_agent, ide_service_amz_user_agent,
-    ide_service_user_agent, ide_user_agent, CliService, IdeService,
+    cli_amz_user_agent, cli_user_agent, ide_service_amz_user_agent, ide_service_user_agent,
+    CliService, IdeService,
 };
 
 const KIRO_BUILDER_ID_PROFILE_ARN: &str =
@@ -1083,7 +1083,7 @@ impl KiroClient {
                 let response = self
                     .short
                     .post(url.clone())
-                    .headers(profile_headers(account)?)
+                    .headers(profile_headers(account, &self.upstream.ide_version)?)
                     .json(&request)
                     .timeout(Duration::from_secs(10))
                     .send()
@@ -1265,7 +1265,7 @@ impl KiroClient {
         let response = self
             .mcp
             .post(url.clone())
-            .headers(mcp_headers(account, native)?)
+            .headers(mcp_headers(account, native, &self.upstream.ide_version)?)
             .json(&request)
             .send()
             .await
@@ -1494,7 +1494,7 @@ impl KiroClient {
         let response = self
             .stream
             .post(&endpoint.url)
-            .headers(headers(account, &endpoint, self.upstream.agent_mode)?)
+            .headers(headers(account, &endpoint, &self.upstream)?)
             .json(&wire)
             .send()
             .await
@@ -1595,7 +1595,7 @@ impl KiroClient {
             let response = self
                 .short
                 .get(url)
-                .headers(profile_headers(account)?)
+                .headers(profile_headers(account, &self.upstream.ide_version)?)
                 .send()
                 .await
                 .map_err(|error| KiroError {
@@ -1773,6 +1773,7 @@ impl KiroClient {
                             account,
                             IdeService::ControlPlane,
                             "KiroControlPlaneBearerService.ListAvailableModels",
+                            &self.upstream.ide_version,
                         )?)
                         .json(&body)
                 } else {
@@ -1783,7 +1784,7 @@ impl KiroClient {
                     self.short.get(url).headers(metadata_headers(
                         account,
                         &endpoint,
-                        self.upstream.agent_mode,
+                        &self.upstream,
                     )?)
                 };
                 let _permit = tokio::time::timeout_at(
@@ -1922,7 +1923,7 @@ impl KiroClient {
         let response = match self
             .short
             .post(operation_url(&base, "listAvailableSubscriptions")?)
-            .headers(profile_headers(account)?)
+            .headers(profile_headers(account, &self.upstream.ide_version)?)
             .json(&serde_json::json!({}))
             .send()
             .await
@@ -1986,7 +1987,7 @@ fn content_secrets(account: &Account) -> [&str; 3] {
 fn headers(
     account: &Account,
     endpoint: &EndpointDefinition,
-    mode: AgentMode,
+    upstream: &UpstreamConfig,
 ) -> Result<reqwest::header::HeaderMap, KiroError> {
     if endpoint.key == EndpointKey::Runtime && account.credentials.auth_method != AuthMethod::ApiKey
     {
@@ -1994,6 +1995,7 @@ fn headers(
             account,
             IdeService::Runtime,
             "KiroRuntimeService.GenerateAssistantResponse",
+            &upstream.ide_version,
         );
     }
     use reqwest::header::{
@@ -2001,17 +2003,19 @@ fn headers(
     };
     let mut headers = HeaderMap::new();
     let cli = matches!(endpoint.origin, "CLI" | "KIRO_CLI");
-    let user_agent = if cli {
-        cli_user_agent(CliService::Streaming)
+    let (user_agent, amz_user_agent) = if cli {
+        (
+            cli_user_agent(CliService::Streaming, &upstream.cli_version),
+            cli_amz_user_agent(CliService::Streaming),
+        )
     } else {
-        ide_user_agent(&account.machine_id)
+        let service = IdeService::LegacyStreaming;
+        (
+            ide_service_user_agent(service, &account.machine_id, &upstream.ide_version),
+            ide_service_amz_user_agent(service, &account.machine_id, &upstream.ide_version),
+        )
     };
-    let amz_user_agent = if cli {
-        cli_amz_user_agent(CliService::Streaming)
-    } else {
-        ide_amz_user_agent(&account.machine_id)
-    };
-    let mode = match mode {
+    let mode = match upstream.agent_mode {
         AgentMode::Auto if cli => "vibe",
         AgentMode::Auto => "spec",
         AgentMode::Vibe => "vibe",
@@ -2062,9 +2066,12 @@ fn native_rpc_headers(
     account: &Account,
     service: IdeService,
     target: &'static str,
+    ide_version: &str,
 ) -> Result<reqwest::header::HeaderMap, KiroError> {
     use reqwest::header::HeaderValue;
-    let mut headers = profile_headers(account)?;
+    let mut headers = profile_headers(account, ide_version)?;
+    let user_agent = ide_service_user_agent(service, &account.machine_id, ide_version);
+    let amz_user_agent = ide_service_amz_user_agent(service, &account.machine_id, ide_version);
     headers.insert(
         "content-type",
         HeaderValue::from_static("application/x-amz-json-1.0"),
@@ -2073,13 +2080,11 @@ fn native_rpc_headers(
     headers.insert("x-amz-target", HeaderValue::from_static(target));
     headers.insert(
         "user-agent",
-        HeaderValue::from_str(&ide_service_user_agent(service, &account.machine_id))
-            .map_err(build_error)?,
+        HeaderValue::from_str(&user_agent).map_err(build_error)?,
     );
     headers.insert(
         "x-amz-user-agent",
-        HeaderValue::from_str(&ide_service_amz_user_agent(service, &account.machine_id))
-            .map_err(build_error)?,
+        HeaderValue::from_str(&amz_user_agent).map_err(build_error)?,
     );
     if account.credentials.auth_method == AuthMethod::Idc {
         headers.insert("tokentype", HeaderValue::from_static("SSO_OIDC"));
@@ -2094,9 +2099,18 @@ fn native_rpc_headers(
     Ok(headers)
 }
 
-fn mcp_headers(account: &Account, native: bool) -> Result<reqwest::header::HeaderMap, KiroError> {
+fn mcp_headers(
+    account: &Account,
+    native: bool,
+    ide_version: &str,
+) -> Result<reqwest::header::HeaderMap, KiroError> {
     if native {
-        return native_rpc_headers(account, IdeService::Runtime, "KiroRuntimeService.InvokeMCP");
+        return native_rpc_headers(
+            account,
+            IdeService::Runtime,
+            "KiroRuntimeService.InvokeMCP",
+            ide_version,
+        );
     }
     use reqwest::header::{
         HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT,
@@ -2104,7 +2118,9 @@ fn mcp_headers(account: &Account, native: bool) -> Result<reqwest::header::Heade
 
     let mut headers = HeaderMap::new();
     let authorization = format!("Bearer {}", account.credentials.access_token);
-    let user_agent = ide_user_agent(&account.machine_id);
+    let service = IdeService::LegacyStreaming;
+    let user_agent = ide_service_user_agent(service, &account.machine_id, ide_version);
+    let amz_user_agent = ide_service_amz_user_agent(service, &account.machine_id, ide_version);
     for (name, value) in [
         (CONTENT_TYPE, "application/json"),
         (ACCEPT, "application/json"),
@@ -2139,7 +2155,7 @@ fn mcp_headers(account: &Account, native: bool) -> Result<reqwest::header::Heade
     }
     headers.insert(
         reqwest::header::HeaderName::from_static("x-amz-user-agent"),
-        HeaderValue::from_str(&ide_amz_user_agent(&account.machine_id)).map_err(build_error)?,
+        HeaderValue::from_str(&amz_user_agent).map_err(build_error)?,
     );
     headers.insert(
         reqwest::header::HeaderName::from_static("amz-sdk-invocation-id"),
@@ -2152,15 +2168,19 @@ fn mcp_headers(account: &Account, native: bool) -> Result<reqwest::header::Heade
     Ok(headers)
 }
 
-fn profile_headers(account: &Account) -> Result<reqwest::header::HeaderMap, KiroError> {
+fn profile_headers(
+    account: &Account,
+    ide_version: &str,
+) -> Result<reqwest::header::HeaderMap, KiroError> {
     use reqwest::header::{
         HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT,
     };
 
     let mut headers = HeaderMap::new();
     let authorization = format!("Bearer {}", account.credentials.access_token);
-    let user_agent = ide_service_user_agent(IdeService::Management, &account.machine_id);
-    let amz_user_agent = ide_service_amz_user_agent(IdeService::Management, &account.machine_id);
+    let service = IdeService::Management;
+    let user_agent = ide_service_user_agent(service, &account.machine_id, ide_version);
+    let amz_user_agent = ide_service_amz_user_agent(service, &account.machine_id, ide_version);
     for (name, value) in [
         (CONTENT_TYPE, "application/json"),
         (ACCEPT, "application/json"),
@@ -2186,9 +2206,9 @@ fn profile_headers(account: &Account) -> Result<reqwest::header::HeaderMap, Kiro
 fn metadata_headers(
     account: &Account,
     endpoint: &EndpointDefinition,
-    mode: AgentMode,
+    upstream: &UpstreamConfig,
 ) -> Result<reqwest::header::HeaderMap, KiroError> {
-    let mut output = headers(account, endpoint, mode)?;
+    let mut output = headers(account, endpoint, upstream)?;
     output.remove("x-amz-target");
     Ok(output)
 }

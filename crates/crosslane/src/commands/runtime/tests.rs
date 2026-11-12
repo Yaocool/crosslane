@@ -817,6 +817,24 @@ fn upstream_editor_exposes_endpoint_preference_in_legacy_configs() {
 }
 
 #[test]
+fn upstream_editor_exposes_kiro_versions_in_legacy_configs() {
+    let original = "[upstream]\nmax_retries = 2\n\n[upstream.pool]\nhttp_max_connections = 10\n";
+    let module = resolve_config_module("upstream").unwrap();
+    let editor = render_config_module_editor(original, module).unwrap();
+    assert!(editor.contains("ide_version = \"1.2.56\""));
+    assert!(editor.contains("cli_version = \"2.21.4\""));
+    let edited = editor
+        .replace("1.2.56", "1.4.154")
+        .replace("2.21.4", "3.2.1");
+    let merged = merge_edited_config_module(original, module, &edited).unwrap();
+    let config: crosslane_core::config::Config = toml::from_str(&merged).unwrap();
+    assert_eq!(config.upstream.ide_version, "1.4.154");
+    assert_eq!(config.upstream.cli_version, "3.2.1");
+    assert_eq!(config.upstream.max_retries, 2);
+    assert_eq!(config.upstream.pool.http_max_connections, 10);
+}
+
+#[test]
 fn features_editor_exposes_request_redaction_in_legacy_configs() {
     let original = "# server settings\n[server]\nport = 6200\n\n[features]\n# keep web tools\nenable_web_tools = false\n";
     let features = resolve_config_module("features").expect("features module");

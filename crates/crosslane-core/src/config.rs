@@ -15,6 +15,9 @@ pub const MAX_LOADED_TOOLS: usize = 512;
 /// Public OAuth client ID used by the built-in GitHub Copilot Device Flow.
 pub const DEFAULT_COPILOT_OAUTH_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
 
+pub const DEFAULT_KIRO_IDE_VERSION: &str = "1.2.56";
+pub const DEFAULT_KIRO_CLI_VERSION: &str = "2.21.4";
+
 /// 配置校验错误。
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -216,7 +219,7 @@ impl Default for StatusHttpConfig {
 }
 
 /// 双连接池配置。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UpstreamPoolConfig {
     /// 非流式连接数。
@@ -247,7 +250,7 @@ impl Default for UpstreamPoolConfig {
 }
 
 /// 上游请求配置。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UpstreamConfig {
     /// 首选上游端点，默认 Runtime。显式 `auto` 按账号类型和端点缓存选择。
@@ -258,6 +261,10 @@ pub struct UpstreamConfig {
     pub preferred_endpoint: Option<Endpoint>,
     /// Kiro agent mode。
     pub agent_mode: AgentMode,
+    /// Kiro IDE application version sent in upstream headers.
+    pub ide_version: String,
+    /// Kiro CLI application version sent in upstream headers.
+    pub cli_version: String,
     /// 最大重试次数。
     pub max_retries: u32,
     /// 期望提前刷新 token 的秒数。实际值还会受定时扫描间隔的安全下限约束。
@@ -280,6 +287,8 @@ impl Default for UpstreamConfig {
         Self {
             preferred_endpoint: Some(Endpoint::Runtime),
             agent_mode: AgentMode::Vibe,
+            ide_version: DEFAULT_KIRO_IDE_VERSION.into(),
+            cli_version: DEFAULT_KIRO_CLI_VERSION.into(),
             max_retries: 3,
             token_refresh_before_expiry: 900,
             pool: UpstreamPoolConfig::default(),
@@ -1769,6 +1778,21 @@ impl Config {
                 "must be non-negative",
             );
         }
+        for (field, version) in [
+            ("upstream.ide_version", &self.upstream.ide_version),
+            ("upstream.cli_version", &self.upstream.cli_version),
+        ] {
+            let mut parts = version.splitn(4, '.');
+            if parts.clone().count() != 3
+                || !parts.all(|part| {
+                    part.len() <= 10
+                        && part.bytes().all(|byte| byte.is_ascii_digit())
+                        && part.parse::<u32>().is_ok()
+                })
+            {
+                return invalid_config(field, "must be a numeric MAJOR.MINOR.PATCH version");
+            }
+        }
         if self.pool.cooldown.max_error_count == 0 || self.pool.cooldown.quota_error_threshold == 0
         {
             return invalid_config(
@@ -2484,6 +2508,9 @@ overload_error_rate = 0.05
 preferred_endpoint = "runtime"
 # Kiro 上游任务模式，默认 "vibe"。可选 "auto" 按协议选择，或 "spec" 发送规范任务标识。
 agent_mode = "vibe"
+# 上游请求头声明的 Kiro 客户端版本，格式为 "主版本.次版本.补丁版本"，支持热重载。
+ide_version = "1.2.56"
+cli_version = "2.21.4"
 # 一次请求失败后允许的重试次数；实际总尝试次数还受可用账号数限制。
 max_retries = 3
 # 期望在 token 到期前多少秒刷新。运行时至少取扫描间隔的 2 倍和 10 分钟。

@@ -2,6 +2,128 @@ use super::*;
 use serde_json::{json, Value};
 
 #[tokio::test]
+async fn kiro_client_versions_hot_reload_on_both_generation_paths() {
+    let _http_guard = HTTP_TEST_LOCK.lock().await;
+    for (auth_method, token, default_identity, updated_identity) in [
+        (
+            "idc",
+            "version-test-oauth",
+            "KiroIDE 1.2.56",
+            "KiroIDE 1.4.154",
+        ),
+        (
+            "api_key",
+            "ksk_version-test",
+            "md/appVersion-2.21.4",
+            "md/appVersion-3.2.1",
+        ),
+    ] {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/generateAssistantResponse"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/vnd.amazon.eventstream")
+                    .set_body_bytes(generation_body("pong")),
+            )
+            .expect(3)
+            .mount(&mock)
+            .await;
+        let port = unused_tcp_port();
+        let upstream = format!("{}/generateAssistantResponse", mock.uri());
+        let daemon = Daemon::start_http(port, &upstream).await;
+        let account = json!({
+            "id":"acc_77777777", "email":"versions@example.com", "machine_id":"7".repeat(64),
+            "credentials":{"access_token":token,"region":"us-east-1",
+                "expires_at":4_000_000_000i64,"auth_method":auth_method},
+            "subscription":{"kind":"pro"}, "created_at":1
+        });
+        assert_eq!(
+            expect_ok(
+                daemon
+                    .call("account.import", json!({"accounts":[account]}))
+                    .await
+            )["imported"],
+            1
+        );
+
+        let config_path = daemon.home().join("config.toml");
+        let mut config: Config =
+            toml::from_str(&tokio::fs::read_to_string(&config_path).await.unwrap()).unwrap();
+        let client = reqwest::Client::new();
+        for (update, expected_identity) in [
+            (None, default_identity),
+            (Some(("1.4.154", "3.2.1", true)), updated_identity),
+            (Some(("invalid", "3.2.2", false)), updated_identity),
+        ] {
+            if let Some((ide_version, cli_version, applied)) = update {
+                config.upstream.ide_version = ide_version.into();
+                config.upstream.cli_version = cli_version.into();
+                crosslane_store::atomic::write_bytes_atomically(
+                    &config_path,
+                    toml::to_string(&config).unwrap().as_bytes(),
+                    Some(0o600),
+                )
+                .await
+                .unwrap();
+                let result = expect_ok(daemon.call("config.reload", json!({})).await);
+                assert_eq!(result["applied"], applied, "{result}");
+                assert_eq!(result["needs_restart"], json!([]));
+                if !applied {
+                    assert!(result["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("upstream.ide_version"));
+                }
+                let effective = expect_ok(daemon.call("config.show", json!({})).await);
+                assert_eq!(
+                    effective["effective_json"]["upstream"]["ide_version"],
+                    "1.4.154"
+                );
+                assert_eq!(
+                    effective["effective_json"]["upstream"]["cli_version"],
+                    "3.2.1"
+                );
+            }
+
+            let response = client
+                .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+                .header("user-agent", "codex_cli_rs/0.147.0 (e2e)")
+                .bearer_auth(daemon.api_key.as_deref().unwrap())
+                .json(&json!({"model":"opus5","max_tokens":32,
+                    "messages":[{"role":"user","content":"Reply pong"}]}))
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = response.text().await.unwrap();
+            assert_eq!(status, 200, "{auth_method}: {body}");
+            assert!(body.contains("pong"), "{body}");
+
+            let requests = mock.received_requests().await.unwrap();
+            let request = requests
+                .iter()
+                .rev()
+                .find(|request| {
+                    request.url.path() == "/generateAssistantResponse" && request.method == "POST"
+                })
+                .unwrap();
+            let user_agent = request.headers["user-agent"].to_str().unwrap();
+            assert!(user_agent.contains(expected_identity), "{user_agent}");
+            if auth_method == "idc" {
+                let amz_user_agent = request.headers["x-amz-user-agent"].to_str().unwrap();
+                assert!(
+                    amz_user_agent.contains(expected_identity),
+                    "{amz_user_agent}"
+                );
+            }
+        }
+        mock.verify().await;
+        daemon.stop().await;
+    }
+}
+
+#[tokio::test]
 async fn xml_tool_recovery_keeps_reasoning_and_string_parameters_safe_in_http_modes() {
     let _http_guard = HTTP_TEST_LOCK.lock().await;
     let mock = MockServer::start().await;

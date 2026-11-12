@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use crosslane_core::account::{Account, AuthMethod, Usage};
-use crosslane_core::config::Config;
+use crosslane_core::config::{Config, UpstreamConfig};
 use crosslane_core::paths::Paths;
 use crosslane_kiro::endpoint::EndpointOverrides;
 use crosslane_kiro::{KiroClient, KiroError, KiroResponse, ModelInfo};
@@ -285,19 +285,13 @@ impl AppState {
         meter.set_daily_limit(current.pool.daily_credit_limit);
         accounts.set_compression_threshold(current.storage.compression_threshold);
         accounts.set_incremental_write(current.storage.incremental_write);
-        let overrides = EndpointOverrides {
-            codewhisperer_url: std::env::var("CROSSLANE_CODEWHISPERER_URL").ok(),
-            amazonq_url: std::env::var("CROSSLANE_AMAZONQ_URL").ok(),
-            mcp_url: std::env::var("CROSSLANE_MCP_URL").ok(),
-            runtime_url: std::env::var("CROSSLANE_RUNTIME_URL").ok(),
-            management_url: std::env::var("CROSSLANE_MANAGEMENT_URL").ok(),
-        };
         let model_policy = Arc::new(crosslane_provider::ModelPolicy::new(current.models.clone()));
-        let kiro = KiroClient::new(current.upstream.clone(), overrides)
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?
-            .with_model_policy(Arc::clone(&model_policy));
-        let refresher = TokenRefresher::new(current.effective_token_refresh_before_expiry())
+        let kiro = build_kiro_client(&current.upstream, &model_policy)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let before_expiry = current.effective_token_refresh_before_expiry();
+        let mut refresher = TokenRefresher::new(before_expiry)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        refresher.configure(before_expiry, &current.upstream.ide_version);
         let pool = AccountPool::new(accounts.all().to_vec(), current.pool.clone());
         let notifier = Notifier::persistent(
             current.webhook.clone(),
@@ -645,18 +639,23 @@ impl AppState {
         let previous = self.runtime_config_snapshot();
         let accounts = self.with_accounts(|store| store.all().to_vec());
         validate_service_account_references(next, &accounts, &self.paths.data_dir)?;
+        let next_kiro = (previous.upstream != next.upstream)
+            .then(|| build_kiro_client(&next.upstream, &self.model_policy))
+            .transpose()
+            .map_err(|error| format!("Kiro upstream prepare failed: {error}"))?;
         let status_listener = self
             .status_http
             .prepare(&next.status_http)
             .await
             .map_err(|error| format!("status HTTP prepare failed: {error}"))?;
-        // Keep the old control plane usable until all fallible work succeeds.
-        // New authentication must never be published on the previous address.
+        // Keep the committed listener authentication and Kiro client settings
+        // until all fallible work succeeds.
         let mut applying = next.clone();
         applying.status_http = previous.status_http.clone();
         applying.admin.rest = previous.admin.rest.clone();
-        self.config.replace(applying);
-        self.apply_runtime_config(next).await;
+        applying.upstream = previous.upstream.clone();
+        self.config.replace(applying.clone());
+        self.apply_runtime_config(&applying).await;
         if let Err(error) = self.providers.reconcile(next, &self.paths.data_dir).await {
             self.config.replace(previous.clone());
             self.apply_runtime_config(&previous).await;
@@ -680,7 +679,7 @@ impl AppState {
                 .await
             {
                 Ok(()) => {
-                    self.config.replace(next.clone());
+                    self.commit_runtime_config(&previous, next, next_kiro);
                     crate::alerts::sync_quota_incidents(self).await;
                     return Ok(());
                 }
@@ -709,6 +708,27 @@ impl AppState {
                 format_service_failures(&rollback_failures),
                 provider_rollback_error.unwrap_or_else(|| "ok".into())
             ))
+        }
+    }
+
+    fn commit_runtime_config(&self, previous: &Config, next: &Config, kiro: Option<KiroClient>) {
+        let mut runtime = write_lock(&self.runtime_config);
+        if let Some(kiro) = kiro {
+            *write_lock(&self.kiro) = kiro;
+        }
+        let before_expiry = next.effective_token_refresh_before_expiry();
+        let ide_changed = previous.upstream.ide_version != next.upstream.ide_version;
+        if ide_changed || previous.effective_token_refresh_before_expiry() != before_expiry {
+            write_lock(&self.refresher).configure(before_expiry, &next.upstream.ide_version);
+        }
+        *runtime = next.clone();
+        self.config.replace(next.clone());
+        if ide_changed || previous.upstream.cli_version != next.upstream.cli_version {
+            tracing::info!(
+                ide_version = %next.upstream.ide_version,
+                cli_version = %next.upstream.cli_version,
+                "Kiro upstream client identity"
+            );
         }
     }
 
@@ -1275,7 +1295,7 @@ impl AppState {
     }
 
     /// 将文件热重载同步到依赖配置构造的运行时组件。
-    pub async fn apply_runtime_config(&self, next: &Config) {
+    async fn apply_runtime_config(&self, next: &Config) {
         let previous = read_lock(&self.runtime_config).clone();
         if previous.models.disabled != next.models.disabled {
             self.model_policy.replace(&next.models).await;
@@ -1305,29 +1325,6 @@ impl AppState {
         }
         if serde_json::to_string(&previous.pool).ok() != serde_json::to_string(&next.pool).ok() {
             self.pool().update_config(next.pool.clone());
-        }
-        let upstream_changed = serde_json::to_string(&previous.upstream).ok()
-            != serde_json::to_string(&next.upstream).ok();
-        if upstream_changed {
-            let overrides = EndpointOverrides {
-                codewhisperer_url: std::env::var("CROSSLANE_CODEWHISPERER_URL").ok(),
-                amazonq_url: std::env::var("CROSSLANE_AMAZONQ_URL").ok(),
-                mcp_url: std::env::var("CROSSLANE_MCP_URL").ok(),
-                runtime_url: std::env::var("CROSSLANE_RUNTIME_URL").ok(),
-                management_url: std::env::var("CROSSLANE_MANAGEMENT_URL").ok(),
-            };
-            if let Ok(client) = KiroClient::new(next.upstream.clone(), overrides) {
-                *write_lock(&self.kiro) = client.with_model_policy(Arc::clone(&self.model_policy));
-            }
-        }
-        if previous.upstream.token_refresh_before_expiry
-            != next.upstream.token_refresh_before_expiry
-            || previous.tasks.token_refresh_interval_ms != next.tasks.token_refresh_interval_ms
-        {
-            if let Ok(refresher) = TokenRefresher::new(next.effective_token_refresh_before_expiry())
-            {
-                *write_lock(&self.refresher) = refresher;
-            }
         }
         if previous.server.tls.enabled
             && next.server.tls.enabled
@@ -1497,6 +1494,20 @@ async fn load_or_regenerate_replay_key(path: &std::path::Path) -> WebSearchRepla
         );
     }
     WebSearchReplayCodec::from_key(key)
+}
+
+fn build_kiro_client(
+    upstream: &UpstreamConfig,
+    model_policy: &Arc<crosslane_provider::ModelPolicy>,
+) -> Result<KiroClient, KiroError> {
+    let overrides = EndpointOverrides {
+        codewhisperer_url: std::env::var("CROSSLANE_CODEWHISPERER_URL").ok(),
+        amazonq_url: std::env::var("CROSSLANE_AMAZONQ_URL").ok(),
+        mcp_url: std::env::var("CROSSLANE_MCP_URL").ok(),
+        runtime_url: std::env::var("CROSSLANE_RUNTIME_URL").ok(),
+        management_url: std::env::var("CROSSLANE_MANAGEMENT_URL").ok(),
+    };
+    Ok(KiroClient::new(upstream.clone(), overrides)?.with_model_policy(Arc::clone(model_policy)))
 }
 
 /// Merges only fields owned by runtime probes and health tracking. In

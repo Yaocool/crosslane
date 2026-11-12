@@ -2388,7 +2388,7 @@ const CONFIG_MODULES: &[ConfigModule] = &[
         key: "upstream",
         category: "来源参数",
         scope: "kiro",
-        description: "Kiro 上游请求、重试、超时与连接池",
+        description: "Kiro 上游客户端版本、重试、超时与连接池",
         preferred_command: "-",
         aliases: &[],
         is_array: false,
@@ -2731,7 +2731,7 @@ fn render_config_module_editor(
             "enable_request_redaction_notice",
             "request_redaction_notice_text",
         ],
-        "upstream" => &["preferred_endpoint"],
+        "upstream" => &["preferred_endpoint", "ide_version", "cli_version"],
         _ => &[],
     };
     if !settings.is_empty() {

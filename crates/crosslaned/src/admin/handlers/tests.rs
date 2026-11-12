@@ -2763,6 +2763,7 @@ async fn config_reload_rolls_back_when_proxy_listener_cannot_start() {
     let occupied = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("occupied port");
     let port = occupied.local_addr().expect("address").port();
     let mut next = state.config.current().as_ref().clone();
+    next.upstream.ide_version = "1.4.154".into();
     next.api_key.push(ApiKeyConfig {
         id: Some("ak_reload".into()),
         name: "reload".into(),
@@ -2810,4 +2811,8 @@ async fn config_reload_rolls_back_when_proxy_listener_cannot_start() {
         .is_some_and(|error| error.contains("svc_reload")));
     assert!(state.config.current().proxy_service.is_empty());
     assert!(state.config.current().api_key.is_empty());
+    assert_eq!(
+        state.config.current().upstream.ide_version,
+        crosslane_core::config::DEFAULT_KIRO_IDE_VERSION
+    );
 }

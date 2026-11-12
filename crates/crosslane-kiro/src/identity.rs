@@ -1,12 +1,13 @@
 //! Shared Kiro client identities for upstream requests and token refresh.
 //!
-//! Keep application, SDK and generated service versions together when updating
-//! this baseline, and validate the emitted upstream headers after rebuilding.
-//! These are the existing desktop/CLI platform profiles, not the proxy host OS.
+//! Application versions come from upstream configuration. SDK, service, and
+//! platform metadata describe the desktop and CLI protocols used by Crosslane.
 
-pub const IDE_VERSION: &str = "1.2.56";
+pub use crosslane_core::config::{
+    DEFAULT_KIRO_CLI_VERSION as CLI_VERSION, DEFAULT_KIRO_IDE_VERSION as IDE_VERSION,
+};
+
 pub const KAS_VERSION: &str = "0.66.32";
-pub const CLI_VERSION: &str = "2.21.4";
 
 const IDE_SDK_VERSION: &str = "1.0.39";
 const IDE_NODE_VERSION: &str = "22.21.1";
@@ -30,16 +31,8 @@ impl CliService {
     }
 }
 
-pub fn ide_auth_user_agent(machine_id: &str) -> String {
-    format!("KiroIDE-{IDE_VERSION}-{machine_id}")
-}
-
-pub fn ide_user_agent(machine_id: &str) -> String {
-    ide_service_user_agent(IdeService::LegacyStreaming, machine_id)
-}
-
-pub fn ide_amz_user_agent(machine_id: &str) -> String {
-    ide_service_amz_user_agent(IdeService::LegacyStreaming, machine_id)
+pub fn ide_auth_user_agent(machine_id: &str, ide_version: &str) -> String {
+    format!("KiroIDE-{ide_version}-{machine_id}")
 }
 
 /// Agent RPC clients and extension REST clients have distinct identities.
@@ -62,8 +55,8 @@ impl IdeService {
         }
     }
 
-    fn custom_user_agent(self, machine_id: &str) -> String {
-        let app = format!("KiroIDE {IDE_VERSION} {machine_id}");
+    fn custom_user_agent(self, machine_id: &str, ide_version: &str) -> String {
+        let app = format!("KiroIDE {ide_version} {machine_id}");
         if matches!(self, Self::Runtime | Self::ControlPlane) {
             format!("{app} KAS/{KAS_VERSION}")
         } else {
@@ -72,23 +65,27 @@ impl IdeService {
     }
 }
 
-pub fn ide_service_user_agent(service: IdeService, machine_id: &str) -> String {
-    let app = service.custom_user_agent(machine_id);
+pub fn ide_service_user_agent(service: IdeService, machine_id: &str, ide_version: &str) -> String {
+    let app = service.custom_user_agent(machine_id, ide_version);
     let api = service.api_name();
     format!(
         "aws-sdk-js/{IDE_SDK_VERSION} ua/2.1 os/win32#10.0.19044 lang/js md/nodejs#{IDE_NODE_VERSION} api/{api}#{IDE_SDK_VERSION} m/E {app}"
     )
 }
 
-pub fn ide_service_amz_user_agent(service: IdeService, machine_id: &str) -> String {
-    let app = service.custom_user_agent(machine_id);
+pub fn ide_service_amz_user_agent(
+    service: IdeService,
+    machine_id: &str,
+    ide_version: &str,
+) -> String {
+    let app = service.custom_user_agent(machine_id, ide_version);
     format!("aws-sdk-js/{IDE_SDK_VERSION} {app}")
 }
 
-pub fn cli_user_agent(service: CliService) -> String {
+pub fn cli_user_agent(service: CliService, cli_version: &str) -> String {
     let api = service.api_name();
     format!(
-        "aws-sdk-rust/{CLI_SDK_VERSION} ua/2.1 api/{api}/{CLI_API_VERSION} os/macos lang/rust/{CLI_RUST_VERSION} md/appVersion-{CLI_VERSION} app/AmazonQ-For-CLI"
+        "aws-sdk-rust/{CLI_SDK_VERSION} ua/2.1 api/{api}/{CLI_API_VERSION} os/macos lang/rust/{CLI_RUST_VERSION} md/appVersion-{cli_version} app/AmazonQ-For-CLI"
     )
 }
 

@@ -27,6 +27,22 @@ Use `crosslane config path` to find the active configuration, then
 `crosslane config reload` after editing it. Keep account credentials out of
 shell arguments, logs, and source control.
 
+### Kiro client versions
+
+Set the Kiro application versions that Crosslane sends in upstream request
+headers under `[upstream]`. Omitted fields use these defaults.
+
+```toml
+[upstream]
+ide_version = "1.2.56"
+cli_version = "2.21.4"
+```
+
+Save changes with `crosslane config edit upstream` to hot-reload them. For manual
+edits, run `crosslane config reload`. Check the active values with
+`crosslane config show upstream --effective` and verify upstream compatibility with
+a request after changing the versions.
+
 ## Docker
 
 Build the current checkout and install the host CLI command:

@@ -240,7 +240,7 @@ async fn api_key_generation_uses_runtime_without_oauth_profile_or_refresh() {
         "API keys must not trigger profile/catalog discovery"
     );
     assert!(!account.is_token_expiring(1_000_000, 300));
-    let headers = mcp_headers(&account, false).unwrap();
+    let headers = mcp_headers(&account, false, &UpstreamConfig::default().ide_version).unwrap();
     assert_eq!(headers["tokentype"], "API_KEY");
     assert!(!headers.contains_key("x-amzn-kiro-profile-arn"));
 }
@@ -251,7 +251,9 @@ async fn runtime_catalog_uses_management_rpc_and_oauth_profile() {
     Mock::given(method("POST")).and(path("/management"))
         .respond_with(|request: &wiremock::Request| {
             assert!(request.headers["user-agent"].to_str().unwrap().contains("api/kiro-controlplane-bearer#"));
-            assert!(request.headers["user-agent"].to_str().unwrap().ends_with("KAS/0.66.32"));
+            let identity = format!("KiroIDE 1.4.154 {} KAS/0.66.32", "a".repeat(64));
+            assert!(request.headers["user-agent"].to_str().unwrap().ends_with(&identity));
+            assert!(request.headers["x-amz-user-agent"].to_str().unwrap().ends_with(&identity));
             assert_eq!(request.headers["authorization"], "Bearer access-token");
             assert_eq!(request.headers["content-type"], "application/x-amz-json-1.0");
             assert!(request.headers.contains_key("amz-sdk-invocation-id"));
@@ -268,6 +270,7 @@ async fn runtime_catalog_uses_management_rpc_and_oauth_profile() {
         }).expect(1).mount(&server).await;
     let mut client = test_client(&server);
     client.upstream.preferred_endpoint = Some(crosslane_core::config::Endpoint::Runtime);
+    client.upstream.ide_version = "1.4.154".into();
     client.overrides.management_url = Some(format!("{}/management", server.uri()));
     let models = client
         .list_models(&power_account(AuthMethod::Idc))

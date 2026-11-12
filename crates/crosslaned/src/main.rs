@@ -71,8 +71,8 @@ async fn main() -> Result<()> {
     )?;
 
     info!(
-        ide_version = crosslane_kiro::identity::IDE_VERSION,
-        cli_version = crosslane_kiro::identity::CLI_VERSION,
+        ide_version = %config.upstream.ide_version,
+        cli_version = %config.upstream.cli_version,
         "Kiro upstream client identity"
     );
 
