@@ -81,7 +81,7 @@ const TOPICS: &[(&str, &str)] = &[
     ("subscriptions", "Kiro 订阅计划查询"),
     ("tasks", "Kiro/Copilot/全局周期任务"),
     ("stats", "持久化统计与时间范围"),
-    ("logs", "结构化日志、文件和 Trace ID"),
+    ("logs", "Service 请求、Admin 审计与日志文件"),
     ("alert", "Kiro 异常事件和通知目标"),
     ("models", "动态模型发现与解析"),
     ("model-map", "模型映射匹配规则"),
@@ -277,7 +277,7 @@ Copilot API 地址优先使用账号 token 返回的 endpoint；仅当缺失且�
             "`crosslane diagnose all/endpoints/account` 是 Kiro 上游专项诊断：检查 CodeWhisperer/AmazonQ/OIDC 端点，并对 Kiro 账号发起真实推理。Copilot 请用 `crosslane account probe --provider copilot <ACCOUNT_ID>` 和 `crosslane models list --provider copilot --refresh` 检查账号与模型；不要把 Kiro 端点诊断结果当成 Copilot 可用性。"
         }
         "subscriptions" => {
-            "`crosslane subscriptions --provider kiro [账号]` 查询 Kiro 上游企业订阅计划；省略账号时使用可调度 Kiro 账号。此命令不执行订阅写入。通过 AWS 管理员凭证管理企业订阅请用 `crosslane admin kiro subscription`：plans/profiles/scope/users/list/show 查询，add/upgrade/downgrade/cancel 写入，四个写命令均支持 --dry-run；取消默认周期结束。详见 `crosslane guide admin`。Copilot 不提供权威订阅/席位数据，`--provider copilot` 或 `all` 中该来源返回 supported=false；Copilot 可用性请用 `account probe --provider copilot` 和 `models list --provider copilot` 检查。"
+            "`crosslane subscriptions --provider kiro [账号]` 用已启用的 Kiro 账号查询上游提供的订阅计划。省略账号时自动选择一个已启用账号。通过 AWS 管理凭证按用户查询或管理企业订阅，请用 `crosslane admin kiro subscription`。写命令支持 --dry-run，取消默认在周期结束。Copilot 来源返回 supported=false。"
         }
         "tasks" => {
             "`crosslane tasks list` 查看全部任务及可手工运行列；`tasks run --help` 列出接受的任务名，Shell 补全也提供这些名称。account_file_watcher/adaptive_admission 仅由调度器运行。`token_refresh/status_check/health_recheck` 操作 Kiro 账号池；`model_cache_refresh` 可用 `tasks run model_cache_refresh --provider <ID>` 按来源刷新；`stats_persist/daily_reset/proxy_service_reconcile` 为全局任务。Kiro 任务只接受 --provider kiro；全局任务不接受 --provider。Copilot API token 在其 provider 内独立按需刷新，不使用 Kiro 的 token_refresh 任务。"
@@ -286,7 +286,7 @@ Copilot API 地址优先使用账号 token 返回的 endpoint；仅当缺失且�
             "`crosslane stats` 默认聚合 Kiro/Copilot 的持久化请求统计；`--provider <ID>` 限定来源，`--detail --by provider` 比较来源分组。可用 `--since 1h` 或带时区的 `--start/--end` 查询时间段；`--by model|account|apikey|endpoint` 查看其他维度。"
         }
         "logs" => {
-            "`crosslane logs show/follow --provider <ID>` 查看 Service 结构化请求日志；省略来源时显示全部，并可配合 --account、--level 和 --tail。`logs trace <TRACE_ID>` 按 Service trace ID 查询。`logs admin show [--request-id admin_...] [--tail 100]` 查询独立 Admin 文件中的最近日志；`logs admin` 保留相同查询。`logs files/path --admin` 查看 Admin 物理文件及路径。普通 `logs files/path` 显示 daemon/Service 日志文件。"
+            "`crosslane logs show` 和 `crosslane logs follow` 查看近期 Service 请求。--provider 精确匹配实例 ID，--account 精确匹配日志中的 account_id。查看全部来源时省略 --provider 并取消设置 CROSSLANE_PROVIDER。--level 按 HTTP 状态筛选，--json 每条请求输出一行 JSON。\n`crosslane logs trace TRACE_ID` 从已保留的 Service/daemon 文件查链路，TRACE_ID 来自 x-trace-id 响应头。\n`crosslane logs admin show --request-id ADMIN_ID` 查询独立的 Admin 日志，ADMIN_ID 来自 HTTP Admin 的 x-request-id 响应头。也可直接运行 `crosslane logs admin`。Admin 的 --level 按文件级别筛选，HTTP 审计事件记录在 info 文件中。`logs files` 和 `logs path` 加 --admin 可定位 Admin 文件。"
         }
         "alert" => {
             "`crosslane alert events` 当前列出的额度保护、额度耗尽、服务额度耗尽和 token 刷新失败事件来自 Kiro 账号池；不能作为 Copilot Enterprise 席位、授权或额度监控。`alert platforms/config` 和 `add/edit/delete/list/test/logs` 管理这些事件的通知目标；通知平台本身是共享机制，但当前没有 Copilot 专项告警事件。通知目标通过名称定位，不接受 --provider；CROSSLANE_PROVIDER 不影响告警操作。"
@@ -295,7 +295,7 @@ Copilot API 地址优先使用账号 token 返回的 endpoint；仅当缺失且�
             "`crosslane models list` 默认聚合全部来源；`--provider kiro --refresh` 和 `--provider copilot --refresh` 分别刷新并查看 Kiro、Copilot 的模型、输入上下文和输出上限，`-` 表示上游未返回对应元数据。`--mapped` 同时显示显式映射结果。`crosslane models resolve <MODEL_ID> --provider <ID>` 显示指定来源中的映射与最终模型；还可配合 `--api-key` 和 `--refresh`。`model` 与 `models` 等价。`model disable/enable <MODEL_ID...>` 全局禁用/启用模型（跨全部 provider，使用不带来源前缀的 ID；若有 CROSSLANE_PROVIDER 请覆盖 --provider all）。禁用规则保存在 models.disabled，热更新生效，配置重置保留。CLI 列表标记不可用，公共列表隐藏；直接请求、映射、默认模型、回退、重试和内部探测均在发送前拦截。已发送请求无法撤回。"
         }
         "docker" => {
-            "使用 `./deploy/docker-setup.sh --build` 构建 runtime-full，默认启用全部 Cargo feature（包括 sso 和 crs）并包含 Chromium SSO 运行时。数据保存在 crosslane-data 命名卷。"
+            "使用 `./deploy/docker-setup.sh --build` 构建 runtime-full，默认启用全部 Cargo feature（包括 sso 和 crs）并包含 Chromium SSO 运行时。数据保存在 crosslane-data 命名卷。\nDocker 宿主机 wrapper 提供 `crosslane restart`、`crosslane stop` 和 `crosslane uninstall`。卸载先备份数据，默认保留备份。可用 `crosslane uninstall --help` 查看确认方式和备份参数。\n容器停止后，wrapper 可用该容器对应的镜像显示 CLI 帮助，仍需 Docker 和本地镜像。"
         }
         _ => {
             return Err(anyhow!(

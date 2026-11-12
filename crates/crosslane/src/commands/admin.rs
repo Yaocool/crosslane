@@ -36,7 +36,7 @@ pub enum AdminTokenCommand {
     /// 创建独立管理令牌；明文只返回一次。
     #[command(
         visible_alias = "add",
-        after_help = "--enable-rest 只开启 REST 鉴权路由；需先用 crosslane config edit admin 开启 [status_http] 并保存重载。已有令牌时可直接在同一编辑器中开启 [admin.rest]，无需再建令牌。\n\n示例：\n  crosslane admin token create --name ops --enable-rest\n  crosslane admin token create --name monitor --role read-only\n  crosslane --json admin token create --name ci"
+        after_help = "--enable-rest 开启 REST 鉴权路由，要求 [status_http] 监听已启用并重载。可用 crosslane config edit admin 编辑这两项配置。令牌明文只在本次结果中返回，--json 时位于 secret 字段。\n\n示例：\n  crosslane admin token create --name ops --enable-rest\n  crosslane admin token create --name monitor --role read-only\n  crosslane --json admin token create --name ci"
     )]
     Create {
         /// 令牌的唯一可读名称。
@@ -64,7 +64,7 @@ pub enum AdminTokenCommand {
     },
     /// 轮换令牌并返回新明文，旧令牌对后续请求立即失效；保留原权限与启停状态。
     #[command(
-        after_help = "示例：\n  crosslane admin token rotate ops\n  crosslane --json admin token rotate ops"
+        after_help = "新令牌明文只在本次结果中返回，--json 时位于 secret 字段。\n\n示例：\n  crosslane admin token rotate ops\n  crosslane --json admin token rotate ops"
     )]
     Rotate {
         /// 令牌 ID 或名称，见 admin token list。

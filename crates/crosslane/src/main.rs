@@ -21,10 +21,19 @@ use crate::output::{format_relative, format_timestamp, print_json, render_table}
     disable_help_subcommand = true,
     about = "Kiro 与 GitHub Copilot 模型代理管理工具",
     long_about = "查看 Kiro、GitHub Copilot 提供源及服务状态，管理账号、模型、API key 与配置。\n\n示例：\n  crosslane provider list\n  crosslane account list --provider kiro\n  crosslane account list --provider copilot\n  crosslane models list --provider all\n  crosslane guide kiro\n  crosslane guide copilot",
-    after_help = "命令归属：\n  provider：上游实例及驱动设置；account：上游登录账号与凭证\n  service：业务监听、来源范围和账号池；apikey：访问业务接口的客户端 Key\n  admin token：独立管理 REST 的访问令牌；admin kiro：AWS 管理凭证与企业订阅\n  models：模型目录、解析和全局禁用；model-map：客户端模型名的映射规则\n  status/health/ready/stats/pool/logs：运行观测；tasks：周期任务\n  config：运行配置；alert：告警通知目标；diagnose/subscriptions：Kiro 专项\n  restart/stop/uninstall：Docker 宿主机操作\n\n帮助入口：crosslane <命令路径> --help、crosslane help <命令路径>\n完整命令树：crosslane help --all；局部命令树：crosslane help account --all\n接入说明：crosslane guide kiro、crosslane guide copilot"
+    after_help = r#"查看参数和示例
+  crosslane help logs admin show
+  crosslane logs admin show --help
+
+列出公开命令和别名
+  crosslane help --all
+  crosslane help admin kiro subscription --all
+
+用 crosslane guide 列出指南主题，用 crosslane guide provider 查看来源与命令的对应关系。
+省略命令或只输入需要子命令的命令组时，显示该层帮助。自动化调用命令组时请指定具体操作。"#
 )]
 struct Cli {
-    /// 提供源实例 ID（见 provider list）；可放在任意子命令前后，也可用 CROSSLANE_PROVIDER。
+    /// 提供源实例 ID（见 provider list）。可放在支持此参数的命令前后。
     #[arg(
         short = 'p',
         long,
@@ -34,7 +43,7 @@ struct Cli {
         value_delimiter = ','
     )]
     provider: Vec<String>,
-    /// 管理面 socket 路径，默认读取配置文件。
+    /// 管理面 Unix socket。省略时使用环境变量、[admin].socket 或内置默认路径。
     #[arg(
         long,
         global = true,
@@ -42,7 +51,7 @@ struct Cli {
         env = "CROSSLANE_ADMIN_SOCKET"
     )]
     socket: Option<String>,
-    /// 以 JSON 输出业务数据。
+    /// 以 JSON 输出业务结果。
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
@@ -51,7 +60,7 @@ struct Cli {
 
 #[derive(Debug, Clone, Default, Args)]
 struct TimeRangeArgs {
-    /// 相对当前时间的窗口，例如 30m、1h、7d。
+    /// 相对当前时间的窗口，例如 30（秒）、30s、10m、1h、7d。与 --start 和 --end 互斥。
     #[arg(long, value_name = "DURATION", conflicts_with_all = ["start", "end"])]
     since: Option<String>,
     /// 起始时间（含）；使用 Unix 秒或带时区的 RFC 3339 时间。
@@ -66,7 +75,7 @@ struct TimeRangeArgs {
 enum Command {
     /// 管理 Admin REST 令牌、Kiro 官方管理凭证与企业订阅；通过 Unix socket 执行。
     #[command(
-        after_help = "REST 首次启用：crosslane config edit admin 同时编辑 [status_http] 和 [admin.rest]，先开启监听并保存重载，再创建 --enable-rest 令牌。\n\n示例：\n  crosslane admin token create --name ops --enable-rest\n  crosslane admin token list\n  crosslane admin token rotate ops\n  crosslane admin token revoke ops\n  crosslane admin kiro configure\n  crosslane admin kiro show\n  crosslane admin kiro subscription add user@example.com --plan power\n  crosslane admin kiro subscription show user@example.com\n\nKiro 订阅 CLI 无需开启 REST 或 Admin token。Kiro AK/SK 独立加密保存，CLI 修改后热生效，不写 config.toml。操作说明：crosslane guide admin"
+        after_help = "通过 crosslane config edit admin 开启 [status_http] 监听。保存并重载成功后，使用 --enable-rest 创建令牌并开启 Admin REST。Kiro 企业订阅 CLI 通过 Unix socket 执行，可独立使用。\n\n示例：\n  crosslane admin token create --name ops --enable-rest\n  crosslane admin token list\n  crosslane admin token rotate ops\n  crosslane admin token revoke ops\n  crosslane admin kiro configure\n  crosslane admin kiro show\n  crosslane admin kiro subscription profiles\n  crosslane admin kiro subscription add user@example.com --plan power --dry-run\n  crosslane admin kiro subscription show user@example.com\n\n操作说明：crosslane guide admin"
     )]
     Admin {
         #[command(subcommand)]
@@ -82,7 +91,7 @@ enum Command {
     },
     /// Kiro/Copilot 服务总览；可按提供源过滤。
     #[command(
-        after_help = "--json 与 --watch 同时使用时，每次刷新输出一行 JSON（NDJSON）。\n\n示例：\n  crosslane status\n  crosslane status --provider kiro\n  crosslane status --provider copilot\n  crosslane status --since 30m --watch"
+        after_help = "请求统计的起点最早为本次 crosslaned 启动时间。查询跨重启的历史统计请用 crosslane stats。--json --watch 每次刷新输出一行 JSON（NDJSON）。\n\n示例：\n  crosslane status\n  crosslane status --provider kiro\n  crosslane status --provider copilot\n  crosslane status --since 30m --watch"
     )]
     Status {
         /// 每 2 秒刷新。
@@ -90,16 +99,18 @@ enum Command {
         watch: bool,
         #[command(flatten)]
         range: TimeRangeArgs,
-        /// 仅显示一个提供源实例；省略时聚合全部。
+        /// 指定提供源实例。默认查看全部，可用 all 覆盖环境默认值。
         #[arg(long)]
         provider: Option<String>,
     },
-    /// 全局 daemon 健康检查；不代表任一来源的账号可用。
-    #[command(after_help = "示例：\n  crosslane health\n  crosslane --json health")]
+    /// 检查 daemon 管理面是否可响应。
+    #[command(
+        after_help = "通过管理面 Unix socket 检查 crosslaned。检查业务监听和账号是否可用请用 crosslane ready。\n\n示例：\n  crosslane health\n  crosslane --json health"
+    )]
     Health,
     /// 检查业务代理就绪状态；可按 Kiro/Copilot 提供源过滤。
     #[command(
-        after_help = "示例：\n  crosslane ready\n  crosslane ready --provider copilot\n  crosslane --json ready"
+        after_help = "业务未就绪时返回非零退出码。--json 输出 ready、reasons 和 status，可用于自动化。\n\n示例：\n  crosslane ready\n  crosslane ready --provider copilot\n  crosslane --json ready"
     )]
     Ready {
         /// 只检查引用该提供源的服务及账号。
@@ -107,25 +118,29 @@ enum Command {
         provider: Option<String>,
     },
     /// 显示版本与 Kiro 默认上游端点；Copilot API 地址按账号动态选择。
-    #[command(after_help = "示例：\n  crosslane version\n  crosslane --json version")]
+    #[command(
+        after_help = "此命令读取本地 CLI 的版本。daemon 版本见 crosslane status。\n\n示例：\n  crosslane --version\n  crosslane version\n  crosslane --json version"
+    )]
     Version,
     /// 重启 crosslaned（Docker 宿主机命令）。
-    #[command(after_help = "示例：\n  crosslane restart")]
+    #[command(
+        after_help = "容器已停止时会启动它。随后等待容器通过健康检查，超时返回失败。\n\n示例：\n  crosslane restart"
+    )]
     Restart,
     /// 停止 crosslaned（Docker 宿主机命令）。
     #[command(
         after_help = "示例：\n  crosslane stop\n\n停止后可用 `crosslane restart` 重新启动。"
     )]
     Stop,
-    /// 完全卸载 Docker 服务、数据卷、专用镜像和宿主机 wrapper。
+    /// 备份后移除 Docker 部署、数据卷及受管宿主机 wrapper。
     #[command(
-        after_help = "示例：\n  crosslane uninstall\n  crosslane uninstall --backup-dir /srv/backups\n  crosslane uninstall --yes --keep-backup\n  crosslane uninstall --yes --delete-backup\n\n卸载前必定先备份数据。默认备份目录为 ~/.crosslane/backups；会永久删除配置、账号、统计和日志，但不删除源码目录。"
+        after_help = "备份成功后才移除容器和包含配置、账号、统计及日志的数据卷。镜像在没有其他容器使用时一并删除。\n交互模式需输入 Compose 项目名确认。默认保留备份，--yes 同样默认保留。\n\n示例：\n  crosslane uninstall\n  crosslane uninstall --backup-dir /srv/backups\n  crosslane uninstall --yes --keep-backup\n  crosslane uninstall --yes --delete-backup"
     )]
     Uninstall {
         /// 跳过交互确认，用于自动化。
         #[arg(short = 'y', long)]
         yes: bool,
-        /// 宿主机备份根目录；默认 ~/.crosslane/backups。
+        /// 宿主机备份根目录。默认 ~/.crosslane/backups。没有 HOME 时用 ./crosslane-backups。
         #[arg(long, value_name = "PATH", env = "CROSSLANE_BACKUP_DIR")]
         backup_dir: Option<String>,
         /// 卸载成功后保留备份。
@@ -145,7 +160,7 @@ enum Command {
     },
     /// 账号管理。
     #[command(
-        after_help = "统一入口：account add --provider <ID>；Kiro 使用 --auth sso/api-key，Copilot 使用 --auth device-flow。兼容命令 account add-sso / add-api-key 仅适用于 Kiro。\n\n示例：\n  crosslane account list --provider kiro\n  crosslane account list --provider copilot\n  crosslane account probe --provider copilot <ACCOUNT_ID>\n  crosslane account overage\n\n操作说明：crosslane guide kiro、crosslane guide copilot、crosslane guide account"
+        after_help = "统一入口为 account add --provider <ID>。Kiro 使用 --auth sso 或 --auth api-key，也可用 account add-sso 或 account add-api-key。Copilot 使用 --auth device-flow 登录，或用 --token-stdin 导入已有 GitHub token。\n\n示例：\n  crosslane account list --provider kiro\n  crosslane account list --provider copilot\n  crosslane account probe --provider copilot ACCOUNT_ID\n  crosslane account overage show\n\n操作说明：crosslane guide kiro、crosslane guide copilot、crosslane guide account"
     )]
     Account {
         #[command(subcommand)]
@@ -153,7 +168,7 @@ enum Command {
     },
     /// Kiro 查看调度评分；Copilot 查看账号及模型支持。
     #[command(
-        after_help = "Kiro 显示排队、额度与选号评分；Copilot 显示账号认证和模型支持，--explain 的评分明细不适用于 Copilot。省略来源显示全部账号，省略模型展示已发现模型；按单个模型检查时使用 --model。--json 与 --watch 同时使用时，每次刷新输出一行 JSON（NDJSON）。\n\n示例：\n  crosslane pool --provider kiro --model claude-sonnet-4 --explain\n  crosslane pool --provider copilot --model <已授权模型ID> --watch"
+        after_help = "Kiro 显示排队、额度与选号评分；Copilot 显示账号认证和模型支持，--explain 的评分明细不适用于 Copilot。省略来源显示全部账号，省略模型展示已发现模型；按单个模型检查时使用 --model。--json 与 --watch 同时使用时，每次刷新输出一行 JSON（NDJSON）。\n\n示例：\n  crosslane pool --provider kiro --model claude-sonnet-4 --explain\n  crosslane pool --provider copilot --model MODEL_ID --watch"
     )]
     Pool {
         /// 查看指定提供源的账号池；默认全部来源。
@@ -179,10 +194,10 @@ enum Command {
     },
     /// 查询 Kiro 订阅计划；Copilot 不提供权威订阅数据。
     #[command(
-        after_help = "此命令只查询计划；开通企业订阅使用 admin kiro subscription add <USER> --plan power。仅 Kiro 返回权威订阅计划；Copilot 返回 supported=false。Copilot 账号授权与可用模型请用 account probe/models list 检查。\n\n示例：\n  crosslane subscriptions --provider kiro\n  crosslane subscriptions --provider all\n  crosslane account probe --provider copilot <ACCOUNT_ID>"
+        after_help = "使用代理账号查询 Kiro 上游提供的订阅计划。Copilot 返回 supported=false。按 Identity Center 用户查询或管理企业订阅请用 crosslane admin kiro subscription。\n\n示例：\n  crosslane subscriptions --provider kiro\n  crosslane subscriptions user@example.com\n  crosslane subscriptions --provider all"
     )]
     Subscriptions {
-        /// Kiro 账号 ID 或邮箱；省略时使用可调度账号查询订阅计划。
+        /// 已启用的 Kiro 账号 ID 或邮箱。省略时自动选择一个已启用账号。
         id: Option<String>,
         /// 查询指定提供源；`all` 汇总并标明不支持订阅查询的来源。
         #[arg(long, default_value = "kiro")]
@@ -198,10 +213,10 @@ enum Command {
     },
     /// 显示 Kiro/Copilot 请求统计；可按提供源过滤。
     #[command(
-        after_help = "省略 --provider 时聚合 Kiro 与 Copilot；--by provider 可查看来源分组。\n\n示例：\n  crosslane stats --since 1h --provider kiro\n  crosslane stats --since 1h --provider copilot\n  crosslane stats --detail --by provider --recent 20"
+        after_help = "省略时间条件时显示跨重启的持久化累计统计。指定时间窗口时按分钟聚合，覆盖范围取决于已保留的历史数据。--by 和 --recent 需搭配 --detail。\n\n示例：\n  crosslane stats --since 1h --provider kiro\n  crosslane stats --start 2026-10-01T08:00:00+08:00 --end 2026-10-01T10:00:00+08:00\n  crosslane stats --detail --by provider --recent 20"
     )]
     Stats {
-        /// 显示分组和最近请求明细。
+        /// 显示最近请求明细，并允许用 --by 分组。
         #[arg(long)]
         detail: bool,
         /// 最近请求条数，范围 0..=1000；0 表示不显示最近请求，默认 20。
@@ -218,7 +233,7 @@ enum Command {
     },
     /// 查看 Service 请求日志、Admin 日志和 daemon 日志文件。
     #[command(
-        after_help = "show/follow 可用 --provider 过滤 Service 请求；admin show 查询独立的 Admin 日志文件。\n\n示例：\n  crosslane logs show --provider kiro --tail 100\n  crosslane logs admin show --tail 100\n  crosslane logs admin show --request-id admin_0123456789abcdef0123456789abcdef\n  crosslane logs files --admin\n\n操作说明：crosslane guide logs"
+        after_help = "用 show 或 follow 查看近期 Service 请求，可按来源、账号和 HTTP 状态过滤。用 trace 从物理文件按 Service trace ID 查链路。用 admin show 从独立的 Admin 文件按管理请求 ID 查询，files 和 path 加 --admin 可定位这些文件。\n\n示例：\n  crosslane logs show --provider kiro --tail 100\n  crosslane logs trace trace_0123456789abcdef0123456789abcdef\n  crosslane logs admin show --request-id admin_0123456789abcdef0123456789abcdef\n  crosslane logs files --admin\n\n操作说明：crosslane guide logs"
     )]
     Logs {
         #[command(subcommand)]
@@ -254,7 +269,7 @@ enum Command {
     /// 查看、解析及全局禁用/启用 Kiro/Copilot 模型。
     #[command(
         visible_alias = "model",
-        after_help = "示例：\n  crosslane models list --provider kiro --refresh\n  crosslane models list --provider copilot --refresh\n  crosslane models list --provider all --mapped\n  crosslane models resolve <MODEL_ID> --provider copilot\n\n操作说明：crosslane guide models"
+        after_help = "示例：\n  crosslane models list --provider kiro --refresh\n  crosslane models list --provider copilot --refresh\n  crosslane models list --provider all --mapped\n  crosslane models resolve MODEL_ID --provider copilot\n\n操作说明：crosslane guide models"
     )]
     Models {
         #[command(subcommand)]
@@ -263,7 +278,7 @@ enum Command {
     /// 按提供源管理 Kiro/Copilot 模型映射规则。
     #[command(
         name = "model-map",
-        after_help = "add 省略 --provider 时仅作用于 Kiro；edit 省略时保留规则原有范围。--below-credits-percent 仅能用于 Kiro。\n\n示例：\n  crosslane model-map list --provider kiro\n  crosslane model-map list --provider copilot\n  crosslane model-map test <MODEL_ID> --provider copilot\n\n操作说明：crosslane guide model-map"
+        after_help = "add 省略 --provider 时仅作用于 Kiro；edit 省略时保留规则原有范围。--below-credits-percent 仅能用于 Kiro。\n\n示例：\n  crosslane model-map list --provider kiro\n  crosslane model-map list --provider copilot\n  crosslane model-map test MODEL_ID --provider copilot\n\n操作说明：crosslane guide model-map"
     )]
     ModelMap {
         #[command(subcommand)]
@@ -271,13 +286,13 @@ enum Command {
     },
     /// 查看命令帮助。
     #[command(
-        after_help = "help 放在根命令或命令组内均可；-h 与 --help 都显示完整说明。\n\n示例：\n  crosslane help\n  crosslane help logs trace\n  crosslane logs help trace\n  crosslane help --all\n  crosslane help account --all"
+        after_help = "命令路径可使用别名。也可在命令末尾加 -h 或 --help 查看参数与示例。\n\n示例：\n  crosslane help\n  crosslane help logs trace\n  crosslane logs help trace\n  crosslane help --all\n  crosslane help account --all"
     )]
     Help {
-        /// 递归列出全部公开命令；指定命令路径时只列出该组。
+        /// 递归列出公开操作和别名。指定命令组时只列出该组，指定具体操作时显示该操作的帮助。
         #[arg(long)]
         all: bool,
-        /// 要查看的命令路径，例如 logs trace。
+        /// 要查看的命令路径，例如 logs trace。省略时查看顶层。
         #[arg(value_name = "COMMAND", num_args = 0..)]
         path: Vec<String>,
     },
@@ -292,7 +307,7 @@ enum Command {
     },
     /// 生成 Shell 补全脚本。
     #[command(
-        after_help = "示例：\n  crosslane completions bash\n  crosslane completions zsh\n  crosslane completions fish"
+        after_help = "脚本写到标准输出。保存后按目标 Shell 的方式加载，CLI 命令升级后可重新生成。\n\n示例：\n  crosslane completions bash > crosslane.bash\n  crosslane completions zsh > _crosslane\n  crosslane completions fish > crosslane.fish"
     )]
     Completions {
         /// 目标 Shell；输出可保存为补全脚本后加载。
@@ -518,16 +533,16 @@ impl RequestLogLevel {
 
 #[derive(Debug, Args)]
 struct RequestLogArgs {
-    /// 最多显示多少条最近请求（1～1000）。
+    /// 单次最多读取多少条匹配记录（1～1000）。
     #[arg(long, default_value_t = 50, value_parser = parse_log_tail)]
     tail: usize,
-    /// 请求范围：all/info 显示全部，warn 显示 4xx/5xx，error 显示 5xx。
+    /// 按 HTTP 状态筛选。all（默认，别名 info）显示全部，warn（别名 warning）显示 4xx/5xx，error 显示 5xx。
     #[arg(long, value_enum)]
     level: Option<RequestLogLevel>,
-    /// 按账号 ID、邮箱或名称过滤。
+    /// 按日志中的 account_id 精确筛选。可用 --json 查看该字段。
     #[arg(long)]
     account: Option<String>,
-    /// 按提供源实例 ID 过滤。
+    /// 按提供源实例 ID 精确筛选。--provider 和 CROSSLANE_PROVIDER 均未设置时查询全部来源。
     #[arg(long)]
     provider: Option<String>,
 }
@@ -558,37 +573,37 @@ impl LogFileLevel {
 enum LogsCommand {
     /// 显示 Kiro/Copilot 的结构化请求日志。
     #[command(
-        after_help = "省略 --provider 时显示全部来源；可与 --account 组合过滤。\n\n示例：\n  crosslane logs show --provider kiro --tail 200\n  crosslane logs show --provider copilot --tail 200"
+        after_help = "从 daemon 保留的最近请求中筛选，可组合 --provider、--account 和 --level。--json 每条请求输出一行 JSON（NDJSON）。\n\n示例：\n  crosslane logs show --provider kiro --tail 200\n  crosslane --json logs show --provider copilot --level warn"
     )]
     Show(RequestLogArgs),
     /// 持续跟踪 Kiro/Copilot 的结构化请求日志。
     #[command(
-        after_help = "示例：\n  crosslane logs follow --provider kiro\n  crosslane logs follow --provider copilot --level error"
+        after_help = "先读取最近的匹配请求，再等待新记录。按 Ctrl+C 结束。--json 每条请求输出一行 JSON（NDJSON）。\n\n示例：\n  crosslane logs follow --provider kiro\n  crosslane --json logs follow --provider copilot --level error"
     )]
     Follow(RequestLogArgs),
     /// 查询独立的 Admin 日志文件，包括 HTTP 审计和管理面事件。
     #[command(
-        after_help = "show 与不带 show 均查询独立的 Admin 日志文件。\n\n示例：\n  crosslane logs admin show --tail 100\n  crosslane logs admin show --request-id admin_0123456789abcdef0123456789abcdef\n  crosslane logs admin --level warn --tail 200"
+        after_help = "省略 show 时执行同一查询。HTTP Admin API 审计事件记录在 info 文件中，包含 4xx 和 5xx 响应。省略 --level 时扫描各级别已保留的文件。\n\n示例：\n  crosslane logs admin show --tail 100\n  crosslane logs admin show --request-id admin_0123456789abcdef0123456789abcdef\n  crosslane logs admin --level info --tail 200"
     )]
     Admin {
         #[command(subcommand)]
         command: Option<AdminLogsCommand>,
-        /// 只显示指定 HTTP Admin 请求 ID 的日志。
+        /// 按 HTTP Admin 响应头 x-request-id 精确筛选，格式为 admin_ 加 32 位小写十六进制字符。
         #[arg(long, global = true)]
         request_id: Option<String>,
         /// 最多显示最近多少条记录（1～1000）。
         #[arg(long, global = true, default_value_t = 100, value_parser = parse_log_tail)]
         tail: usize,
-        /// 只查询一个精确级别的物理分片。
+        /// 只查询指定日志级别的文件。HTTP Admin 审计使用 info。
         #[arg(long, global = true, value_enum)]
         level: Option<LogFileLevel>,
     },
     /// 按 trace ID 跨日期、跨级别查询完整请求链路。
     #[command(
-        after_help = "默认查询 info/warn/error/debug/trace 的所有物理分片。\n\n示例：\n  crosslane logs trace trace_0123456789abcdef0123456789abcdef\n  crosslane logs trace trace_0123456789abcdef0123456789abcdef --level error --tail 500"
+        after_help = "默认查询各级别已保留的 Service/daemon 文件。用 crosslane logs files 查看文件和保留范围。\n\n示例：\n  crosslane logs trace trace_0123456789abcdef0123456789abcdef\n  crosslane logs trace trace_0123456789abcdef0123456789abcdef --level error --tail 500"
     )]
     Trace {
-        /// 响应头 x-trace-id 或 request-id 中的 trace ID。
+        /// Service 响应头 x-trace-id 或 request-id 中的 trace_ 值，后缀为 32 位小写十六进制字符。
         trace_id: String,
         /// 最多显示最近多少条匹配记录（1～1000）。
         #[arg(long, default_value_t = 200, value_parser = parse_log_tail)]
@@ -597,9 +612,9 @@ enum LogsCommand {
         #[arg(long, value_enum)]
         level: Option<LogFileLevel>,
     },
-    /// 列出所有实际 daemon 日志文件、大小、级别和完整路径。
+    /// 列出保留的日志文件、大小、级别和完整路径。
     #[command(
-        after_help = "示例：\n  crosslane logs files\n  crosslane logs files --level error\n  crosslane --json logs files"
+        after_help = "默认列出 Service 和其他 daemon 日志。用 --admin 查看独立的 Admin 文件，可与 --level 组合。\n\n示例：\n  crosslane logs files\n  crosslane logs files --level error\n  crosslane --json logs files --admin"
     )]
     Files {
         /// 只列出指定级别的日志文件。
@@ -624,7 +639,7 @@ enum LogsCommand {
 enum AdminLogsCommand {
     /// 显示独立 Admin 日志文件中的最近记录。
     #[command(
-        after_help = "HTTP Admin API 审计事件写入 info 级别文件，包括 4xx/5xx 响应。\n\n示例：\n  crosslane logs admin show --request-id admin_0123456789abcdef0123456789abcdef"
+        after_help = "HTTP Admin API 审计事件写入 info 级别文件，包括 4xx 和 5xx 响应。--json 返回含 entries、files_scanned 和 truncated 的查询结果。\n\n示例：\n  crosslane --json logs admin show --tail 100\n  crosslane logs admin show --request-id admin_0123456789abcdef0123456789abcdef"
     )]
     Show,
 }
@@ -920,12 +935,12 @@ fn parse_percent(value: &str) -> std::result::Result<f64, String> {
 enum ConfigCommand {
     /// 列出配置模块及 Kiro/Copilot/全局适用范围。
     #[command(
-        after_help = "列表中的适用来源用于区分 Kiro 专项、按来源配置和全局配置。\n\n示例：\n  crosslane config list\n  crosslane --json config list"
+        after_help = "在本地列出 config show/edit/reset 可用的模块名、适用来源和可重置状态。\n\n示例：\n  crosslane config list\n  crosslane --json config list"
     )]
     List,
     /// 显示配置。
     #[command(
-        after_help = "Kiro 专项：upstream/pool/features/context/storage/sso 等；models 包含全局禁用规则和 Kiro 发现配置；Copilot 驱动配置：provider；server/log/admin 等为全局。默认脱敏展示；使用 --show-secrets 才输出原始凭证和注释。\n\n示例：\n  crosslane config list\n  crosslane config show pool --effective\n  crosslane provider show copilot"
+        after_help = "默认输出脱敏后的 TOML。--effective 输出合并默认值后的 JSON。--show-secrets 显示原始凭证，查看完整原始 TOML 时也保留注释。模块名与适用范围见 crosslane config list。\n\n示例：\n  crosslane config show\n  crosslane config show pool --effective\n  crosslane config show provider"
     )]
     Show {
         /// 只显示指定模块；使用 `crosslane config list` 查看模块名。
@@ -937,10 +952,10 @@ enum ConfigCommand {
         #[arg(long)]
         show_secrets: bool,
     },
-    /// 打印全部文件路径。
+    /// 显示 daemon 使用的配置、账号、统计、日志与管理 socket 路径。
     #[command(after_help = "示例：\n  crosslane config path\n  crosslane --json config path")]
     Path,
-    /// 手动触发重载。
+    /// 重新读取磁盘配置并应用可热重载的字段。
     #[command(
         after_help = "修改启用中服务的 account_tag 后，若该服务将没有可用账号，重载会被拒绝；确认后可加 --force 强制应用。\n\n示例：\n  crosslane config reload\n  crosslane config reload --force\n  crosslane --json config reload"
     )]
@@ -962,7 +977,7 @@ enum ConfigCommand {
     },
     /// 备份配置并重置指定模块或全部可重置的运行配置。
     #[command(
-        after_help = "指定模块时仅重置该模块；status-http 会同时关闭 Admin REST 并保留令牌，监听会热关闭，无需重启 daemon。admin 重置会清除全部管理令牌和重置 socket，不关闭状态监听。socket 默认值取自 daemon；旧 daemon 未提供默认值时保留当前 socket。pool/features/sso 等属于 Kiro 专项，server/log 等为全局。provider、api-key、proxy-service 不可按模块重置；不指定模块时重置 Kiro 与全局运行参数、清除管理令牌和模型映射、关闭 REST/状态监听，同时保留基础服务和告警配置。原配置自动备份。\n\n示例：\n  crosslane config reset status-http\n  crosslane config reset pool\n  crosslane config reset sso\n  crosslane config reset"
+        after_help = "原配置自动备份。可重置模块见 crosslane config list。\n重置 status-http 会关闭状态监听和 Admin REST，保留令牌。重置 admin 会清除管理令牌并恢复默认 socket，状态监听仍按原设置运行。socket 变更需重启 daemon，旧 daemon 未报告默认值时沿用当前路径。\n省略模块时恢复可重置的运行参数，清除管理令牌和模型映射，关闭状态监听和 REST。提供源、客户端 Key、代理服务、模型禁用规则和告警配置会保留。\n\n示例：\n  crosslane config reset status-http\n  crosslane config reset pool\n  crosslane config reset"
     )]
     Reset {
         /// 只重置指定模块；使用 `crosslane config list` 查看模块名。
@@ -971,9 +986,9 @@ enum ConfigCommand {
         #[arg(short = 'y', long)]
         yes: bool,
     },
-    /// 只校验配置，不应用。
+    /// 在本地校验 TOML 及配置字段，适合在应用配置前检查。
     #[command(
-        after_help = "示例：\n  crosslane config validate\n  crosslane config validate ./config.toml"
+        after_help = "显式指定的文件必须存在。省略文件时检查当前配置路径，文件不存在时校验内置默认配置。校验失败返回非零退出码。\n\n示例：\n  crosslane config validate\n  crosslane --json config validate ./config.toml"
     )]
     Validate {
         /// 要校验的 TOML 文件；省略时使用当前配置路径。

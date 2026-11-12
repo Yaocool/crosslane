@@ -35,15 +35,26 @@ fn parse(args: impl IntoIterator<Item = OsString>, require_provider: bool) -> Cl
         std::process::exit(0);
     }
     let mut cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+    if matches!(
+        cli.command,
+        None | Some(Command::Help { .. } | Command::Completions { .. })
+    ) {
+        return cli;
+    }
     let path = scope::selected_path(&matches);
     let selected_scope = scope::for_path(&path);
     let explicit_provider =
         matches.value_source("provider") == Some(clap::parser::ValueSource::CommandLine);
-    let global_policy = matches!(path.as_slice(), ["models", "disable" | "enable"]);
+    // Model policy accepts the all marker. Admin log queries retain the
+    // legacy provider argument and its validation for existing callers.
+    let accepts_global_provider = matches!(
+        path.as_slice(),
+        ["models", "disable" | "enable"] | ["logs", "admin", ..]
+    );
     if matches!(
         selected_scope,
         scope::Scope::Global | scope::Scope::Resource
-    ) && !global_policy
+    ) && !accepts_global_provider
     {
         if explicit_provider {
             clap::Error::raw(clap::error::ErrorKind::ArgumentConflict, format!(
@@ -148,7 +159,12 @@ fn validate_edit_changes(
 
 pub fn command() -> clap::Command {
     let mut command = Cli::command();
-    scope::decorate(&mut command, &mut Vec::new());
+    let global_args = command
+        .get_arguments()
+        .filter(|arg| arg.is_global_set())
+        .cloned()
+        .collect::<Vec<_>>();
+    scope::decorate(&mut command, &mut Vec::new(), &global_args);
     command
 }
 
@@ -208,7 +224,7 @@ fn validate_scope(cli: &Cli, require_provider: bool) -> Result<(), String> {
         return Err("来源权限配置需要具体实例 ID，不能使用 all；请用 --provider ID1,ID2 指定范围，运行 crosslane provider list 查看实例".into());
     }
     if cli.provider.len() > 1 && !multiple {
-        return Err("该命令只接受一个 provider；聚合查询请使用 --provider all".into());
+        return Err("该命令只接受一个提供源值。请检查 --provider 和 CROSSLANE_PROVIDER。".into());
     }
     let Some(provider) = cli
         .provider

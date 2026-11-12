@@ -1,6 +1,6 @@
 //! One scope vocabulary for nested help, command discovery and validation.
 
-use clap::{ArgMatches, Command};
+use clap::{Arg, ArgMatches, Command};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Scope {
@@ -35,6 +35,7 @@ pub(super) fn for_path(path: &[&str]) -> Scope {
         [] | ["help" | "guide" | "completions", ..] => Scope::Navigation,
         ["health" | "version" | "restart" | "stop" | "uninstall" | "config" | "admin", ..]
         | ["logs", "trace" | "files" | "path"]
+        | ["logs", "admin", ..]
         | ["alert"]
         | ["alert", "config" | "events" | "platforms" | "list" | "logs"]
         | ["models", "disable" | "enable"] => Scope::Global,
@@ -47,7 +48,7 @@ pub(super) fn for_path(path: &[&str]) -> Scope {
         | ["service", "show" | "enable" | "disable" | "delete" | "apikeys"]
         | ["apikey", "show" | "rm" | "enable" | "disable" | "limit" | "reset-usage"]
         | ["alert", "add" | "edit" | "delete" | "test"]
-        | ["model-map", "show" | "delete" | "enable" | "disable"] => Scope::Resource,
+        | ["model-map", "delete"] => Scope::Resource,
         ["tasks", "list"] => Scope::Global,
         ["tasks", ..] | ["account" | "logs" | "models"] => Scope::Mixed,
         _ => Scope::Shared,
@@ -64,10 +65,21 @@ pub(super) fn selected_path(matches: &ArgMatches) -> Vec<&str> {
     path
 }
 
-pub(super) fn decorate(command: &mut Command, path: &mut Vec<String>) {
-    let scope = for_path(&path.iter().map(String::as_str).collect::<Vec<_>>());
+pub(super) fn decorate(command: &mut Command, path: &mut Vec<String>, global_args: &[Arg]) {
     let path_segments = path.iter().map(String::as_str).collect::<Vec<_>>();
-    let tasks_list = matches!(path_segments.as_slice(), ["tasks", "list"]);
+    let segments = path_segments.as_slice();
+    let scope = for_path(segments);
+    let tasks_list = segments == ["tasks", "list"];
+    let global_model_policy = matches!(segments, ["models", "disable" | "enable"]);
+    let admin_logs = matches!(segments, ["logs", "admin"] | ["logs", "admin", "show"]);
+    let navigation = scope == Scope::Navigation && !segments.is_empty();
+    let host_lifecycle = matches!(segments, ["restart" | "stop" | "uninstall"]);
+    let uses_local_data = matches!(
+        segments,
+        ["version"]
+            | ["config", "list" | "validate"]
+            | ["alert", "config" | "events" | "platforms"]
+    );
     // Both help flags show the complete document, including long descriptions
     // and examples. Register group-local help explicitly: Clap's root-level
     // disable_help_subcommand setting is inherited by every child.
@@ -79,13 +91,46 @@ pub(super) fn decorate(command: &mut Command, path: &mut Vec<String>) {
             .help("显示完整帮助与示例"),
     );
     if !path.is_empty() && command.get_subcommands().next().is_some() {
-        *command = command
-            .clone()
-            .subcommand(super::help::group_help_command(path));
+        let inherited = command
+            .get_arguments()
+            .filter(|arg| arg.is_global_set())
+            .cloned()
+            .map(|arg| arg.hide(true));
+        let help = super::help::group_help_command(path).args(inherited);
+        *command = command.clone().subcommand(help);
+    }
+    // Hide inherited options that do not affect this command. Keep their
+    // definitions intact so existing invocations and diagnostics still work.
+    for arg in global_args {
+        let customized = match arg.get_id().as_str() {
+            "provider" if segments == ["guide"] => {
+                arg.clone().help("替换 Copilot 接入指南中的实例 ID。")
+            }
+            "provider" if global_model_policy => arg
+                .clone()
+                .value_name("all")
+                .help("用 all 覆盖 CROSSLANE_PROVIDER，显式选择全局范围。"),
+            "provider" if scope == Scope::Kiro => arg
+                .clone()
+                .value_name("kiro")
+                .help("仅接受 kiro。可覆盖 CROSSLANE_PROVIDER 中的其他实例 ID。"),
+            "provider" if matches!(scope, Scope::Global | Scope::Resource) || navigation => {
+                arg.clone().hide(true)
+            }
+            "socket" if navigation || host_lifecycle || uses_local_data => arg.clone().hide(true),
+            "json" if navigation || host_lifecycle => arg.clone().hide(true),
+            _ => continue,
+        };
+        if !command
+            .get_arguments()
+            .any(|existing| existing.get_id() == arg.get_id())
+        {
+            *command = command.clone().arg(customized);
+        }
     }
     if command
         .get_arguments()
-        .any(|arg| arg.get_id() == "provider")
+        .any(|arg| arg.get_id() == "provider" && !arg.is_global_set())
     {
         *command = command.clone().mut_arg("provider", |arg| {
             let arg = if arg.get_help().is_none() {
@@ -95,74 +140,49 @@ pub(super) fn decorate(command: &mut Command, path: &mut Vec<String>) {
             };
             arg.short('p').value_name("ID")
         });
-    } else if (matches!(scope, Scope::Global | Scope::Resource) || tasks_list)
-        && !matches!(path_segments.as_slice(), ["models", "disable" | "enable"])
-    {
-        // Keep accepting the global option for an actionable validation error,
-        // but do not advertise a selector that this command cannot apply.
-        *command = command.clone().arg(
-            clap::Arg::new("provider")
-                .long("provider")
-                .short('p')
-                .value_name("ID")
-                .action(clap::ArgAction::Append)
-                .value_delimiter(',')
-                .env("CROSSLANE_PROVIDER")
-                .global(true)
-                .hide(true),
-        );
     }
     let existing = command
         .get_after_help()
         .map(ToString::to_string)
         .unwrap_or_default();
     let detail = if tasks_list {
-        "展示全部周期任务；不接受 --provider。tasks run 仅支持任务列表中的可手工运行项。"
+        "展示全部周期任务。tasks run 仅支持任务列表中的可手工运行项。"
     } else if matches!(
-        path_segments.as_slice(),
+        segments,
         ["service", "create"] | ["apikey" | "model-map", "add"]
     ) {
         "此处 --provider/-p 设置新资源允许使用的实例范围，可重复或逗号分隔；省略时为 Kiro。"
-    } else if matches!(
-        path_segments.as_slice(),
-        ["service" | "apikey" | "model-map", "edit"]
-    ) {
+    } else if matches!(segments, ["service" | "apikey" | "model-map", "edit"]) {
         "此处 --provider/-p 整体替换资源允许使用的实例范围，可重复或逗号分隔。"
-    } else if matches!(path_segments.as_slice(), ["models", "disable" | "enable"]) {
+    } else if global_model_policy {
         "模型禁用/启用作用于全部提供源；只接受 --provider all 作为全局范围标记。"
-    } else if matches!(path_segments.as_slice(), ["alert", ..]) {
+    } else if admin_logs {
+        "按请求 ID 或日志级别查询 Admin 日志。兼容保留的 --provider 不参与筛选。"
+    } else if host_lifecycle {
+        "由 Docker 宿主机上的 crosslane wrapper 执行。"
+    } else if matches!(segments, ["alert", ..]) {
         "告警目标和通知平台是共享资源，不按 provider 筛选；当前可订阅的账号额度/token 事件来自 Kiro。"
     } else {
         match scope {
         Scope::Resource => "使用命令自身的 ID/名称参数定位或创建资源；不接受 --provider 筛选，CROSSLANE_PROVIDER 不影响本操作。",
         Scope::Global => "不按提供源筛选，不接受 --provider；CROSSLANE_PROVIDER 不影响本操作。",
-        Scope::Kiro => "Kiro 专项操作；不能用于 Copilot 实例。",
+        Scope::Kiro => "来源固定为 Kiro。",
         Scope::Copilot => "--provider/-p 填 GitHub Copilot 实例的 ID。",
         Scope::Navigation => "帮助、指南和补全不需要运行 daemon。",
-        Scope::Shared | Scope::Mixed => "--provider/-p 使用 provider list 中的实例 ID；默认范围见本命令的参数说明。",
+        Scope::Shared => "--provider/-p 使用 provider list 中的实例 ID。可用 CROSSLANE_PROVIDER 设置默认值。",
+        Scope::Mixed => "各操作的来源范围和默认值见对应帮助。",
         }
     };
-    let identity = if matches!(
-        scope,
-        Scope::Shared | Scope::Mixed | Scope::Kiro | Scope::Copilot
-    ) || path_segments.as_slice() == ["provider", "add"]
-    {
-        "\n示例中的 kiro/copilot 是实例 ID；自定义实例请替换为 provider list 中的 ID。"
-    } else {
-        ""
-    };
-    let edit_scope = if matches!(
-        path_segments.as_slice(),
-        ["service" | "apikey" | "model-map", "edit"]
-    ) {
-        "\n修改来源权限必须显式传入 --provider；CROSSLANE_PROVIDER 不改变资源现有权限。"
+    let edit_scope = if matches!(segments, ["service" | "apikey" | "model-map", "edit"]) {
+        "\n修改来源权限必须显式传入 --provider。CROSSLANE_PROVIDER 不改变资源现有权限。"
     } else {
         ""
     };
     let guide = match path.first().map(String::as_str) {
+        _ if navigation => "",
         Some("restart" | "stop" | "uninstall") => "docker",
         Some("ready") => "health",
-        Some("help" | "guide" | "completions") | None => "",
+        None => "",
         Some(group) => group,
     };
     let guide_hint = if guide.is_empty() || existing.contains("操作说明：") {
@@ -170,13 +190,16 @@ pub(super) fn decorate(command: &mut Command, path: &mut Vec<String>) {
     } else {
         format!("\n\n操作说明：crosslane guide {guide}")
     };
-    *command = command.clone().after_help(format!(
-        "适用范围：{}。{detail}{identity}{edit_scope}\n\n{existing}{guide_hint}",
-        scope.label()
-    ));
+    let mut footer = format!("适用范围：{}。{detail}{edit_scope}", scope.label());
+    if !existing.is_empty() {
+        footer.push_str("\n\n");
+        footer.push_str(&existing);
+    }
+    footer.push_str(&guide_hint);
+    *command = command.clone().after_help(footer);
     for child in command.get_subcommands_mut() {
         path.push(child.get_name().to_owned());
-        decorate(child, path);
+        decorate(child, path, global_args);
         path.pop();
     }
 }

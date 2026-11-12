@@ -100,7 +100,7 @@ pub enum AccountCommand {
     },
     /// 查看或配置整个 Kiro 账号池的 overage 策略。
     #[command(
-        long_about = "查看或配置整个 Kiro 账号池的 overage 策略。修改操作会原子更新配置并自动重载。\n\n示例：\n  crosslane account overage\n  crosslane account overage show\n  crosslane account overage enable --max-credits 500\n  crosslane account overage disable"
+        long_about = "查看或配置整个 Kiro 账号池的 overage 策略。省略子命令时等同于 show，读取已有额度记录。修改操作会保存配置并自动重载。\n\n示例：\n  crosslane account overage show\n  crosslane account overage show --refresh\n  crosslane account overage enable --max-credits 500\n  crosslane account overage disable"
     )]
     Overage {
         #[command(subcommand)]
@@ -119,19 +119,38 @@ pub enum AccountCommand {
     },
     /// 统一添加 Kiro SSO/API key 或 Copilot Device Flow/token 账号。
     #[command(
-        after_help = "--provider 填 provider add --id 创建的实例 ID。\n\nKiro：--auth sso 使用 IAM Identity Center；单个使用 --email EMAIL --password-stdin，批量使用 --batch accounts.csv，CSV 仅含 email,password 两列。两种方式提交相同的 Kiro 登录凭据，逐账号显示进度；--token-stdin 导入 API key。原 add-sso/add-api-key 命令继续可用。\n\nCopilot：使用独立的 Device Flow。--headless 交互填写账号并隐藏输入密码；提供浏览器凭证时，由远端 daemon 的独立无痕 Chromium 完成授权。--sso-username 表示标准输入密码仅用于 Azure SSO。未提供浏览器凭证时，在本地无痕窗口手动授权。\n\n示例：\n  crosslane account add --provider kiro --auth sso --email user@example.com --password-stdin\n  crosslane account add --provider kiro --auth sso --batch accounts.csv\n  crosslane account add --provider copilot --auth device-flow --headless\n  crosslane account add --provider copilot --batch copilot.csv\n  crosslane account add --provider copilot --auth device-flow --username USER_SHORTCODE --sso-username user@example.com --password-stdin\n  crosslane account add --provider copilot --auth device-flow --credentials-stdin < login.json\n  crosslane account add --provider copilot --auth device-flow\n  printf '%s\\n' \"$GITHUB_TOKEN\" | crosslane account add --provider copilot --token-stdin\n\nCopilot CSV 表头：github_username,github_password,sso_username,sso_password,sso_start_url,label；仅 github_username 为必选列，密码需提供 GitHub 或 Azure SSO 其中一套。",
+        after_help = r#"Kiro
+  SSO 登录需要 daemon 支持 SSO。单账号用 --email 和 --password-stdin，批量用 --batch，CSV 每行包含 email,password。SSO 入口默认读取 [sso].start_url。
+  API key 导入需要 --email。使用 --token-stdin 读取 ksk_ 开头的 key，或用 --auth api-key 从 KIRO_API_KEY 读取。
+
+GitHub Copilot
+  默认使用 Device Flow，在本机浏览器授权。--headless 提示输入账号和密码，由 daemon 的 Chromium 完成授权。也可用 --password-stdin、--credentials-stdin 或 --batch 提供凭证。
+  --credentials-stdin 读取 JSON，字段为 github_username、github_password、sso_username、sso_password、sso_start_url。CSV 可另外提供 label 列。
+  浏览器凭证须包含 GitHub 用户名和 GitHub 密码，或 GitHub 用户名及一对 Azure SSO 用户名和密码。使用 --sso-username 和 --password-stdin 时，密码用于 Azure。
+  导入已有 GitHub token 时使用 --token-stdin，省略 --auth 和浏览器登录参数。
+
+示例：
+  crosslane account add --provider kiro --auth sso --email user@example.com --password-stdin < /secure/kiro-password
+  crosslane account add --provider kiro --auth sso --batch accounts.csv
+  crosslane account add --provider kiro --auth api-key --email user@example.com --token-stdin < /secure/kiro-key
+  crosslane account add --provider copilot --auth device-flow
+  crosslane account add --provider copilot --headless
+  crosslane account add --provider copilot --batch copilot.csv
+  crosslane account add --provider copilot --username GITHUB_USERNAME --sso-username user@example.com --password-stdin < /secure/sso-password
+  crosslane account add --provider copilot --credentials-stdin < login.json
+  crosslane account add --provider copilot --token-stdin < /secure/github-token"#,
         group(clap::ArgGroup::new("browser_credentials").args(["username", "credentials_stdin", "headless", "batch"]).multiple(true))
     )]
     Add {
-        /// 提供源实例 ID，见 provider list 的实例 ID 列；不是驱动 kind。
+        /// 必须指定提供源实例 ID，可用 CROSSLANE_PROVIDER 提供。实例 ID 见 provider list。
         // Clap checks leaf requirements before propagating parent globals.
         // Validate the resolved value after propagation, allowing root scope.
         #[arg(long, default_value = "", hide_default_value = true)]
         provider: String,
-        /// Kiro 支持 sso/api-key；Copilot 支持 device-flow，省略时按来源选择。
+        /// Kiro 支持 sso、api-key，Copilot 支持 device-flow。省略时按来源和输入方式选择。
         #[arg(long, value_parser = ["device-flow", "sso", "api-key"])]
         auth: Option<String>,
-        /// 从标准输入读取 Kiro API key 或 GitHub token 并显式导入。
+        /// 从标准输入导入 Kiro API key 或 GitHub token。Kiro 需要 --email。
         #[arg(long, conflicts_with_all = ["credentials_stdin", "batch", "headless", "password_stdin", "capture_headers"])]
         token_stdin: bool,
         /// Kiro 邮箱（--email）或 GitHub 用户名/邮箱；Copilot SSO 必须用完整用户名。
@@ -146,7 +165,7 @@ pub enum AccountCommand {
         /// Copilot：交互填写账号并隐藏输入密码，由远端无痕浏览器登录。
         #[arg(long, conflicts_with_all = ["password_stdin", "credentials_stdin", "batch"])]
         headless: bool,
-        /// 批量添加：Kiro 用 email,password；Copilot 用下方 CSV 表头；- 表示标准输入。
+        /// 从 CSV 批量添加账号。使用 - 从标准输入读取，字段见下方。
         #[arg(long, value_name = "CSV", conflicts_with_all = ["username", "password_stdin", "sso_username", "credentials_stdin", "headless"])]
         batch: Option<String>,
         /// Kiro SSO 入口（--start-url）或 GitHub 组织/企业的 HTTPS SSO 入口。
@@ -161,7 +180,7 @@ pub enum AccountCommand {
         /// 在服务器受保护文件中记录完整请求/响应 header（含会话凭证）。
         #[arg(long, requires = "browser_credentials")]
         capture_headers: bool,
-        /// 账号备注，便于在列表和详情中识别。
+        /// Copilot 账号备注，便于在列表和详情中识别。
         #[arg(long)]
         label: Option<String>,
     },
@@ -170,7 +189,7 @@ pub enum AccountCommand {
         after_help = "配合 account add 的远端浏览器登录使用；--task 使用该登录过程提示的任务 ID。验证码从标准输入读取。\n\n示例：\n  crosslane account login-code --provider copilot --task LOGIN_TASK_ID --code-stdin < /secure/mfa-code"
     )]
     LoginCode {
-        /// 正在进行登录的 Copilot 提供源实例 ID。
+        /// 必须指定登录所属的 Copilot 实例 ID，可用 CROSSLANE_PROVIDER 提供。
         #[arg(long, default_value = "", hide_default_value = true)]
         provider: String,
         /// account add 登录过程中返回的任务 ID。
@@ -192,7 +211,7 @@ pub enum AccountCommand {
     },
     /// 从 JSON 导入已有 Kiro 凭证。
     #[command(
-        long_about = "导入已有 Kiro 凭证。id、machine_id、created_at 缺失时自动生成；--tag 会合并到本次导入的全部账号。GitHub Copilot 请用 account add --provider copilot。\n\n示例：\n  crosslane account import --file accounts.json --tag team-a\n  cat accounts.json | crosslane account import --stdin --tag team-a --tag prod",
+        long_about = "导入已有 Kiro 凭证。接受单个账号对象或账号对象数组，每项需要 email 和 credentials。id、machine_id、created_at 缺失时自动生成。可恢复 account export --include-secrets 生成的 Kiro 格式备份。\n\n示例：\n  crosslane account import --file accounts.json --tag team-a\n  crosslane account import --stdin --tag team-a --tag prod < accounts.json",
         group(clap::ArgGroup::new("import_source").required(true).multiple(false).args(["file", "stdin"]))
     )]
     Import {
@@ -241,7 +260,7 @@ pub enum AccountCommand {
     },
     /// 通过 IAM Identity Center SSO 登录并添加 Kiro 账号。
     #[command(
-        after_help = "仅适用于 Kiro 的 IAM Identity Center SSO；GitHub Copilot 请使用 account add --provider copilot --auth device-flow。\n\n示例：\n  printf '%s\\n' \"$PASSWORD\" | crosslane account add-sso --email user@example.com --start-url https://example.awsapps.com/start --password-stdin\n  crosslane account add-sso --batch accounts.csv --start-url https://example.awsapps.com/start"
+        after_help = "使用 IAM Identity Center SSO，需要 daemon 支持 SSO。默认读取 [sso].start_url，可用 --start-url 指定。批量支持 --batch - 从标准输入读取。\n\n示例：\n  crosslane account add-sso --email user@example.com --password-stdin < /secure/kiro-password\n  crosslane account add-sso --batch accounts.csv --start-url https://example.awsapps.com/start"
     )]
     AddSso {
         /// 单账号登录邮箱；需同时使用 --password-stdin。
@@ -360,7 +379,7 @@ pub enum AccountCommand {
     },
     /// 探测 Kiro/Copilot 账号可用端点与模型。
     #[command(
-        after_help = "Kiro 会执行真实推理探测；Copilot 刷新账号 token/模型目录，不发起同样的推理请求。\n\n示例：\n  crosslane account probe --provider kiro <ACCOUNT_ID>\n  crosslane account probe --provider copilot <ACCOUNT_ID>\n  crosslane account probe --provider all --all",
+        after_help = "Kiro 会发起真实推理。Copilot 探测包括刷新账号 token 和模型目录。\n\n示例：\n  crosslane account probe --provider kiro ACCOUNT_ID\n  crosslane account probe --provider copilot ACCOUNT_ID\n  crosslane account probe --provider all --all",
         group(clap::ArgGroup::new("probe_target").required(true).multiple(false).args(["id", "all"]))
     )]
     Probe {
@@ -375,7 +394,7 @@ pub enum AccountCommand {
     },
     /// 重置 Kiro 账号健康标记或 Copilot 运行错误。
     #[command(
-        after_help = "Kiro 清除冷却、封禁与额度耗尽标记；Copilot 清除该账号的运行错误状态。\n\n示例：\n  crosslane account reset-health --provider kiro --all\n  crosslane account reset-health --provider copilot <ACCOUNT_ID>",
+        after_help = "Kiro 清除冷却、封禁与额度耗尽标记；Copilot 清除该账号的运行错误状态。\n\n示例：\n  crosslane account reset-health --provider kiro --all\n  crosslane account reset-health --provider copilot ACCOUNT_ID",
         group(clap::ArgGroup::new("reset_health_target").required(true).multiple(false).args(["id", "all"]))
     )]
     ResetHealth {

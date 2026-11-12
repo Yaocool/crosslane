@@ -75,7 +75,7 @@ impl CancelMode {
 pub enum SubscriptionCommand {
     /// 列出支持的套餐名；不访问 AWS，也不验证 AWS 权限。
     #[command(
-        after_help = "示例：\n  crosslane admin kiro subscription plans\n  crosslane --json admin kiro subscription plans"
+        after_help = "通过 Unix socket 读取 daemon 支持的套餐名。可在配置 AWS 凭证前运行。\n\n示例：\n  crosslane admin kiro subscription plans\n  crosslane --json admin kiro subscription plans"
     )]
     Plans,
     /// 验证 AWS 身份并列出当前区域的 Kiro Profile。
@@ -148,7 +148,7 @@ pub enum SubscriptionCommand {
     Cancel {
         /// Identity Center 的精确 userName、UserId 或用户 ARN。
         user: String,
-        /// 周期结束取消（默认）或立即取消。
+        /// 周期结束取消（默认，兼容 end_of_period）或立即取消。
         #[arg(long, default_value = "end-of-period")]
         mode: CancelMode,
         /// 只读预览，不向 AWS 提交订阅写入。

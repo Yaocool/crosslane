@@ -49,6 +49,26 @@ fn help_distinguishes_ids_types_and_every_leaf_scope() {
     let tasks = stdout(&run(workspace.path(), &["tasks", "list", "--help"]));
     assert!(!tasks.contains("--provider <ID>"), "{tasks}");
     assert!(tasks.contains("不接受 --provider"));
+    for path in [
+        &["logs", "admin", "--help"][..],
+        &["logs", "admin", "show", "--help"][..],
+    ] {
+        let admin_logs = stdout(&run(workspace.path(), path));
+        assert!(admin_logs.contains("适用范围：全局"), "{admin_logs}");
+        assert!(!admin_logs.contains("-p, --provider"), "{admin_logs}");
+        assert!(admin_logs.contains("--request-id"), "{admin_logs}");
+    }
+    for path in [
+        &["help", "--help"][..],
+        &["logs", "admin", "help", "--help"][..],
+        &["completions", "--help"][..],
+        &["uninstall", "--help"][..],
+    ] {
+        let help = stdout(&run(workspace.path(), path));
+        for ignored in ["--socket", "--json", "-p, --provider"] {
+            assert!(!help.contains(ignored), "{path:?}: {help}");
+        }
+    }
     let tree = stdout(&run(workspace.path(), &["help", "--all"]));
     for label in [
         "[仅 Kiro]",
@@ -95,6 +115,12 @@ fn unsupported_scope_fails_before_loading_runtime_environment() {
         assert!(stderr(&output).contains("不接受 --provider"));
         assert!(!stderr(&output).contains("unterminated"));
     }
+    let admin_logs = run(
+        workspace.path(),
+        &["logs", "admin", "show", "--provider", "kiro,copilot"],
+    );
+    assert_eq!(admin_logs.status.code(), Some(2));
+    assert!(stderr(&admin_logs).contains("只接受一个提供源值"));
 }
 
 fn stderr(output: &Output) -> String {
@@ -279,6 +305,16 @@ fn every_command_supports_consistent_help_without_runtime_setup() {
     let alias = run(workspace.path(), &["help", "model", "--all"]);
     assert!(alias.status.success(), "{}", stderr(&alias));
     assert!(stdout(&alias).contains("models resolve"));
+    let nested_alias = run(
+        workspace.path(),
+        &["admin", "kiro", "help", "subscriptions", "rm", "--all"],
+    );
+    assert!(nested_alias.status.success(), "{}", stderr(&nested_alias));
+    let canonical = run(
+        workspace.path(),
+        &["admin", "kiro", "subscription", "cancel", "--help"],
+    );
+    assert_eq!(stdout(&nested_alias), stdout(&canonical));
 }
 
 #[test]
@@ -719,6 +755,9 @@ fn invalid_nested_commands_fail_before_runtime_setup() {
         &["logs", "missing"][..],
         &["logs", "trace"][..],
         &["help", "logs", "missing"][..],
+        &["help", "--", "--version"][..],
+        &["help", "--all", "--", "--help"][..],
+        &["logs", "admin", "help", "--", "--json"][..],
         &["logs", "--tail", "10", "files"][..],
     ] {
         let output = run(workspace.path(), args);
@@ -727,6 +766,23 @@ fn invalid_nested_commands_fail_before_runtime_setup() {
         let error = stderr(&output);
         assert!(!error.contains("unterminated"), "{args:?}: {error}");
     }
+}
+
+#[test]
+fn help_path_errors_point_to_the_last_valid_command() {
+    let workspace = tempfile::tempdir().unwrap();
+    let output = run(
+        workspace.path(),
+        &["help", "admin", "kiro", "subscriptions", "missing", "--all"],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stdout(&output).is_empty());
+    let error = stderr(&output);
+    assert!(
+        error.contains("crosslane admin kiro subscription --help"),
+        "{error}"
+    );
+    assert!(error.contains("missing"), "{error}");
 }
 
 #[test]

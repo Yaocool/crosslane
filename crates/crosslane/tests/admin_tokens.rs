@@ -181,7 +181,9 @@ async fn cli_queries_admin_logs_and_their_separate_files() {
     );
 
     let show = run(
-        &["--json", "logs", "admin", "show", "--tail", "25"],
+        &[
+            "--json", "logs", "admin", "show", "--tail", "25", "--provider", "copilot",
+        ],
         method::LOG_ADMIN,
         json!({"request_id":null,"level":null,"tail":25}),
         json!({

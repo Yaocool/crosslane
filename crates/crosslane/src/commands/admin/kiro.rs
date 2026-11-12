@@ -13,7 +13,20 @@ pub enum KiroAdminCommand {
     /// 查询、开通、升级、降级和取消 Kiro 企业订阅；使用 daemon 保存的 AWS 凭证。
     #[command(
         visible_alias = "subscriptions",
-        after_help = "通过本机 Unix socket 执行，不需要 Admin token 或 REST 监听。目标为 Identity Center 的精确 userName、UserId 或用户 ARN，不是 Crosslane 本地账号 ID。\n写命令默认实际提交，支持 --dry-run 只读预览。取消默认周期结束；旧控制面须显式 --mode immediate。\nAWS 按原生流程自动处理应用分配，Crosslane 不额外重复调用；不会导入账号池或执行浏览器 SSO。\n\n示例：\n  crosslane admin kiro subscription plans\n  crosslane admin kiro subscription profiles\n  crosslane admin kiro subscription scope\n  crosslane admin kiro subscription users\n  crosslane admin kiro subscription list\n  crosslane admin kiro subscription add user@example.com --plan power --dry-run\n  crosslane admin kiro subscription add user@example.com --plan power\n  crosslane admin kiro subscription show user@example.com\n  crosslane admin kiro subscription upgrade user@example.com --plan power --dry-run\n  crosslane admin kiro subscription downgrade user@example.com --plan pro --dry-run\n  crosslane admin kiro subscription cancel user@example.com --dry-run\n  crosslane admin kiro subscription cancel USER_ID --mode immediate\n  crosslane --json admin kiro subscription show user@example.com"
+        after_help = r#"通过 daemon 的 Unix socket 执行。plans 读取静态清单。其余操作使用 daemon 已配置的 AWS 凭证，可用 profiles 核对 AWS 身份和 Profile，用 scope 核对 Identity Center 范围。
+用户参数接受 Identity Center 的精确 userName、UserId 或用户 ARN。写命令默认实际提交，--dry-run 仅预览。取消默认在周期结束，旧控制面须显式使用 --mode immediate。
+
+示例：
+  crosslane admin kiro subscription plans
+  crosslane admin kiro subscription profiles
+  crosslane admin kiro subscription scope
+  crosslane admin kiro subscription users
+  crosslane admin kiro subscription list
+  crosslane --json admin kiro subscription show user@example.com
+  crosslane admin kiro subscription add user@example.com --plan power --dry-run
+  crosslane admin kiro subscription upgrade user@example.com --plan power --dry-run
+  crosslane admin kiro subscription downgrade user@example.com --plan pro --dry-run
+  crosslane admin kiro subscription cancel user@example.com --dry-run"#
     )]
     Subscription {
         #[command(subcommand)]
@@ -31,7 +44,7 @@ pub enum KiroAdminCommand {
     },
     /// 查看配置来源和状态，不显示 AK、SK、SessionToken。
     #[command(
-        after_help = "示例：\n  crosslane admin kiro show\n  crosslane --json admin kiro show\n\n只显示本地配置状态；用企业管理 GET /profiles 验证 AWS 身份与权限。"
+        after_help = "只读取 daemon 的凭证配置状态。用 crosslane admin kiro subscription profiles 查询 AWS 身份和当前区域可见的 Profile。\n\n示例：\n  crosslane admin kiro show\n  crosslane --json admin kiro show\n  crosslane admin kiro subscription profiles"
     )]
     Show,
     /// 删除保存的凭证并停用 Kiro 远程管理；不会回落到旧环境变量。

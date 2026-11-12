@@ -3,7 +3,6 @@
 use anyhow::Result;
 use clap::error::ErrorKind;
 use clap::Command as ClapCommand;
-use std::ffi::OsString;
 
 use crate::Command;
 
@@ -14,13 +13,13 @@ pub(super) fn group_help_command(path: &[String]) -> ClapCommand {
             clap::Arg::new("all")
                 .long("all")
                 .action(clap::ArgAction::SetTrue)
-                .help("递归列出本组或指定子命令下的公开命令"),
+                .help("递归列出本组或指定命令组的公开操作和别名。指定具体操作时显示该操作的帮助。"),
         )
         .arg(
             clap::Arg::new("path")
                 .value_name("COMMAND")
                 .num_args(0..)
-                .help("本组内的子命令路径；省略时显示本组帮助"),
+                .help("从本组开始的子命令路径。省略时查看本组。"),
         )
         .after_help(format!(
             "示例：\n  crosslane {} help\n  crosslane {} help --all",
@@ -93,11 +92,11 @@ pub fn empty_group_path(command: &Command) -> Option<&'static str> {
 }
 
 pub fn print_command_help(path: &[String]) -> Result<()> {
-    let mut args = Vec::with_capacity(path.len() + 2);
-    args.push(OsString::from("crosslane"));
-    args.extend(path.iter().map(OsString::from));
-    args.push(OsString::from("--help"));
-    match super::command().try_get_matches_from(args) {
+    print_help(command_at_path(path).unwrap_or_else(|error| error.exit()))
+}
+
+fn print_help(command: ClapCommand) -> Result<()> {
+    match command.try_get_matches_from(["crosslane", "--help"]) {
         Err(error) if error.kind() == ErrorKind::DisplayHelp => {
             error.print()?;
             Ok(())
@@ -108,17 +107,14 @@ pub fn print_command_help(path: &[String]) -> Result<()> {
 }
 
 pub fn print_all_commands(path: &[String]) -> Result<()> {
-    let Some(mut root) = command_at_path(path) else {
-        return print_command_help(path);
-    };
-    root.build();
+    let root = command_at_path(path).unwrap_or_else(|error| error.exit());
     if root.get_subcommands().next().is_none() {
-        return print_command_help(path);
+        return print_help(root);
     }
     let prefix = root.get_bin_name().unwrap_or("crosslane").to_owned();
     println!("{prefix} 公开命令：");
     print_children(&root, prefix.strip_prefix("crosslane ").unwrap_or(""), 0);
-    println!("\n使用 `crosslane help <命令路径>` 查看详细参数；`crosslane guide provider` 查看 Kiro/Copilot 命令适用范围。");
+    println!("\n用 `crosslane help <命令路径>` 查看参数和示例。用 `crosslane guide provider` 查看各来源的适用范围。");
     Ok(())
 }
 
@@ -127,7 +123,7 @@ pub fn exit_missing_action(path: &str) -> ! {
         .split_whitespace()
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    let mut command = command_at_path(&path).unwrap_or_else(super::command);
+    let mut command = command_at_path(&path).unwrap_or_else(|error| error.exit());
     let hint = match path[0].as_str() {
         "logs" => "请改用 `crosslane logs show`".to_owned(),
         "models" => "请改用 `crosslane models list`".to_owned(),
@@ -143,18 +139,21 @@ pub fn exit_missing_action(path: &str) -> ! {
         .exit()
 }
 
-fn command_at_path(path: &[String]) -> Option<ClapCommand> {
-    let mut command = super::command();
-    command.build();
-    let mut bin_name = String::from("crosslane");
+fn command_at_path(path: &[String]) -> Result<ClapCommand, clap::Error> {
+    let mut root = super::command();
+    root.build();
+    let mut command = &root;
     for segment in path {
-        let next = command.find_subcommand(segment)?.clone();
-        bin_name.push(' ');
-        bin_name.push_str(next.get_name());
+        let Some(next) = command.find_subcommand(segment) else {
+            let prefix = command.get_bin_name().unwrap_or("crosslane");
+            let message = format!(
+                "命令 `{prefix}` 下没有子命令 {segment:?}。请用 `{prefix} --help` 查看可用操作。"
+            );
+            return Err(command.clone().error(ErrorKind::InvalidSubcommand, message));
+        };
         command = next;
     }
-    command.set_bin_name(bin_name);
-    Some(command)
+    Ok(command.clone())
 }
 
 fn print_children(command: &ClapCommand, prefix: &str, depth: usize) {
@@ -191,6 +190,9 @@ mod tests {
     #[test]
     fn every_public_argument_and_operation_has_usable_help() {
         fn visit(command: &ClapCommand, path: &mut Vec<String>, missing: &mut Vec<String>) {
+            if command.get_about().is_none() {
+                missing.push(format!("{}: missing description", path.join(" ")));
+            }
             for arg in command.get_arguments().filter(|arg| !arg.is_hide_set()) {
                 if arg.get_help().is_none() && arg.get_long_help().is_none() {
                     missing.push(format!("{}: {}", path.join(" "), arg.get_id()));
@@ -201,10 +203,9 @@ mod tests {
             if !help.contains("示例：") {
                 missing.push(format!("{}: missing examples", path.join(" ")));
             }
-            let root = path.len() == 1;
             for child in command
                 .get_subcommands()
-                .filter(|child| !child.is_hide_set() && (root || child.get_name() != "help"))
+                .filter(|child| !child.is_hide_set())
             {
                 path.push(child.get_name().to_owned());
                 visit(child, path, missing);
@@ -244,10 +245,13 @@ mod tests {
                     {
                         args.truncate(index);
                     }
-                    args.push("--help".into());
-                    if !matches!(root.clone().try_get_matches_from(args), Err(error) if error.kind() == ErrorKind::DisplayHelp)
-                    {
-                        failures.push(line.to_owned());
+                    if let Err(error) = root.clone().try_get_matches_from(args) {
+                        if !matches!(
+                            error.kind(),
+                            ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+                        ) {
+                            failures.push(format!("{line}\n{error}"));
+                        }
                     }
                 }
             }
@@ -270,9 +274,9 @@ mod tests {
 
     #[test]
     fn nested_paths_resolve_from_the_real_command_tree() {
-        assert!(command_at_path(&["logs".into(), "trace".into()]).is_some());
-        assert!(command_at_path(&["apikey".into(), "create".into()]).is_some());
-        assert!(command_at_path(&["logs".into(), "missing".into()]).is_none());
+        assert!(command_at_path(&["logs".into(), "trace".into()]).is_ok());
+        assert!(command_at_path(&["apikey".into(), "create".into()]).is_ok());
+        assert!(command_at_path(&["logs".into(), "missing".into()]).is_err());
     }
 
     #[test]

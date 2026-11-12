@@ -86,7 +86,7 @@ pub enum ServiceCommand {
     },
     /// 修改服务监听、Kiro/Copilot 来源范围或 API key。
     #[command(
-        after_help = "--provider 替换允许来源；原默认来源不在新范围时自动使用第一个 ID。--default-provider 可显式指定默认来源。--account-tag/账号手工绑定支持 Kiro/Copilot，修改标签前需停用服务。API key 参数接受 ID 或名称，可重复使用。\n\n示例：\n  crosslane service edit main --provider kiro --provider copilot --default-provider kiro\n  crosslane service edit main --add-api-key ci\n  crosslane service edit main --skip-user-agent-check true"
+        after_help = "替换来源范围时，若原默认来源不在新范围内，自动使用第一个 ID。可用 --default-provider 从允许的来源中指定默认值。\n可直接修改运行中服务的 --account-tag。若修改后没有可用账号，需用 --force 才能应用。API key 参数接受 ID 或名称，可重复使用。\n\n示例：\n  crosslane service edit main --provider kiro --provider copilot --default-provider kiro\n  crosslane service edit main --account-tag team-a,prod\n  crosslane service edit main --add-api-key ci\n  crosslane service edit main --skip-user-agent-check true"
     )]
     Edit {
         /// 当前服务 ID 或名称。
@@ -124,7 +124,7 @@ pub enum ServiceCommand {
         /// 清空显式范围并恢复为旧版 Kiro-only 语义。
         #[arg(long)]
         clear_providers: bool,
-        /// 修改未带 provider 前缀的默认提供源。
+        /// 无来源前缀的模型请求优先使用的提供源，须在服务允许范围内。
         #[arg(long)]
         default_provider: Option<String>,
     },
