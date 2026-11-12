@@ -35,10 +35,31 @@
   }
   const no = first(['#idBtn_Back']);
   if (no && /stay signed in/i.test(document.body.innerText)) { no.click(); return 'kmsi'; }
-  const allow = first(['button[name="allow"]','[data-testid="allow-button"]','[data-testid="allow-access-button"]','button[value="allow"]','#allow-button','button.awsui-button--primary','#cli_login_button','button[data-analytics="allowButton"]']);
+  const allowText = el => /^(allow|authorize|allow access|continue|confirm|允许|确认授权)/i.test((el.innerText || el.value || '').trim());
+  const clickable = el => visible(el) && !el.matches(':disabled') && !el.closest('[aria-disabled="true"]');
+  const nativeButton = 'button,input[type="submit"],input[type="button"]';
+  const allowControl = el => {
+    if (el.matches(nativeButton)) return clickable(el) ? el : undefined;
+    // AWS can put the test ID on a component surrounding the form button.
+    const buttons = [...el.querySelectorAll(nativeButton)];
+    if (buttons.length) {
+      const submits = buttons.filter(button => button.type === 'submit');
+      const targets = submits.length ? submits : buttons;
+      const labelled = targets.filter(allowText);
+      if (labelled.length) return labelled.find(clickable);
+      if (targets.length === 1 && clickable(targets[0])) return targets[0];
+      return undefined;
+    }
+    return el.matches('a[href],[role="button"]') && clickable(el) ? el : undefined;
+  };
+  const allow = [
+    'button[name="allow"]', '[data-testid="allow-button"]', '[data-testid="allow-access-button"]',
+    'button[value="allow"]', '#allow-button', 'button.awsui-button--primary', '#cli_login_button',
+    'button[data-analytics="allowButton"]'
+  ].flatMap(selector => [...document.querySelectorAll(selector)]).map(allowControl).find(Boolean);
   if (allow) { allow.click(); return 'allow'; }
   const textAllow = [...document.querySelectorAll('button,input[type="submit"]')]
-    .find(el => visible(el) && /^(allow|authorize|allow access|continue|confirm|允许|确认授权)/i.test((el.innerText || el.value || '').trim()));
+    .find(el => clickable(el) && allowText(el));
   if (textAllow) { textAllow.click(); return 'allow-text'; }
   const visibleInputs = [...document.querySelectorAll('input')].filter(visible);
   const hasOtp = visibleInputs.some(el =>

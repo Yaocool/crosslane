@@ -349,6 +349,80 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a local Chromium executable"]
+    async fn kiro_allow_clicks_the_form_button_on_wrapped_and_legacy_pages() {
+        let (url, server) = fixture_page("<!doctype html><body></body>").await;
+        let mut browser = BrowserSession::launch_page(&url, false).await.unwrap();
+        let script = automation_script(r#""test@example.invalid""#, r#""fixture-password""#);
+        for (control, expected_action, expected_submitter) in [
+            (
+                r#"<awsui-button data-testid="allow-access-button">
+                    <button type="button" onclick="window.submittedBy='cancel'">Cancel</button>
+                    <button id="allow" type="submit">Allow access</button>
+                </awsui-button>"#,
+                "allow",
+                Some("allow"),
+            ),
+            (
+                r#"<button data-testid="allow-access-button" id="legacy" type="submit">Allow access</button>"#,
+                "allow",
+                Some("legacy"),
+            ),
+            (
+                r#"<input id="cli_login_button" type="submit" value="Allow access">"#,
+                "allow",
+                Some("cli_login_button"),
+            ),
+            (
+                r#"<button id="text-only" type="submit">Allow access</button>"#,
+                "allow-text",
+                Some("text-only"),
+            ),
+            (
+                r#"<awsui-button data-testid="allow-access-button" aria-disabled="true">
+                    <button id="disabled" type="submit">Allow access</button>
+                </awsui-button>"#,
+                "waiting:page",
+                None,
+            ),
+        ] {
+            let form = format!(
+                r#"<form onsubmit="event.preventDefault(); window.submittedBy=event.submitter.id">{control}</form>"#
+            );
+            browser
+                .page()
+                .evaluate(format!(
+                    "window.submittedBy = null; document.body.innerHTML = {}",
+                    serde_json::to_string(&form).unwrap()
+                ))
+                .await
+                .unwrap();
+            let action = browser
+                .page()
+                .evaluate(script.clone())
+                .await
+                .unwrap()
+                .into_value::<String>()
+                .unwrap();
+            let submitter = browser
+                .page()
+                .evaluate("window.submittedBy || ''")
+                .await
+                .unwrap()
+                .into_value::<String>()
+                .unwrap();
+            assert_eq!(action, expected_action, "{control}");
+            assert_eq!(
+                submitter,
+                expected_submitter.unwrap_or_default(),
+                "{control}"
+            );
+        }
+        browser.close().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a local Chromium executable"]
     async fn kiro_invalid_credentials_page_returns_a_specific_failure() {
         let (url, server) = fixture_page(
             r#"<div id="passwordError" role="alert">Your account or password is incorrect.</div>
